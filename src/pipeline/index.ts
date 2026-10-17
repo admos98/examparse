@@ -3,7 +3,7 @@
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
  * with content-hash caching, token thrift enforcement, and live stage status.
  */
-import { AppSettings, ExamDoc, SourceLine, StageStatus, UsageRecord } from '../types';
+import { AppSettings, ExamDoc, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
 import { extractDocument, ExtractedDocument } from './extract';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
@@ -12,7 +12,7 @@ import { assembleAndValidateQuestions } from './assemble';
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
-import { appendUsageRecord, saveExamDoc } from '../store';
+import { appendUsageRecord, loadExamDoc, loadPageThumbDataUrls, saveExamDoc } from '../store';
 import { calculateActualCost, updateTokenCalibration } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 
@@ -25,41 +25,66 @@ export async function runFullPipeline(
   file: File,
   settings: AppSettings,
   callbacks: PipelineCallbacks,
-  options?: { forceRerun?: boolean; answerKeyFile?: File | null }
+  options?: {
+    forceRerun?: boolean;
+    answerKeyFile?: File | null;
+    preExtracted?: ExtractedDocument;
+    fileHash?: string;
+    forceStages?: import('../types').PipelineStageId[];
+  }
 ): Promise<ExamDoc> {
   const { onStageUpdate, onUsageUpdate } = callbacks;
-  const force = options?.forceRerun || !settings.thrift.cacheEnabled;
+  const cacheEnabled = settings.thrift.cacheEnabled;
+  const forceAll = options?.forceRerun || !cacheEnabled;
+  const forcedStages = new Set(options?.forceStages || []);
+  const stageForced = (id: string) => forceAll || forcedStages.has(id as any);
+  const examIdForDedupe = (hash: string) => `exam_${hash.slice(0, 12)}`;
+  // Respect the cache toggle on writes: nothing is written while it is off.
+  const writeStageCache = async (params: Parameters<typeof setCachedStageResult>[0], data: any) => {
+    if (cacheEnabled) await setCachedStageResult(params, data);
+  };
 
   // Compute file SHA-256 for cache key
   const fileBuffer = await file.arrayBuffer();
   const fileHash = await sha256(fileBuffer);
 
-  // 1. STAGE: EXTRACT (Local, 0 API calls)
-  onStageUpdate({
-    id: 'extract',
-    name: 'Local Extraction',
-    status: 'running',
-    message: 'Extracting text coordinates, lines, and embedded images...',
-  });
-
-  const tExtractStart = Date.now();
-  const extracted: ExtractedDocument = await extractDocument(file);
-  const tExtractDuration = Date.now() - tExtractStart;
-
-  onStageUpdate({
-    id: 'extract',
-    name: 'Local Extraction',
-    status: 'completed',
-    durationMs: tExtractDuration,
-    message: `Extracted ${extracted.lines.length} lines, ${extracted.images.length} images from ${extracted.pages} page(s). (0 API calls)`,
-  });
+  // 1. STAGE: EXTRACT (Local, 0 API calls) — skipped when a matching pre-extraction is supplied.
+  let extracted: ExtractedDocument;
+  const canUsePreExtracted =
+    options?.preExtracted && options?.fileHash && options.fileHash === fileHash && !stageForced('extract');
+  if (canUsePreExtracted) {
+    extracted = options!.preExtracted!;
+    onStageUpdate({
+      id: 'extract',
+      name: 'Local Extraction',
+      status: 'cached',
+      message: `Extraction (cached) — ${extracted.lines.length} lines, ${extracted.images.length} images from ${extracted.pages} page(s). (0 API calls)`,
+    });
+  } else {
+    onStageUpdate({
+      id: 'extract',
+      name: 'Local Extraction',
+      status: 'running',
+      message: 'Extracting text coordinates, lines, and embedded images...',
+    });
+    const tExtractStart = Date.now();
+    extracted = await extractDocument(file);
+    const tExtractDuration = Date.now() - tExtractStart;
+    onStageUpdate({
+      id: 'extract',
+      name: 'Local Extraction',
+      status: 'completed',
+      durationMs: tExtractDuration,
+      message: `Extracted ${extracted.lines.length} lines, ${extracted.images.length} images from ${extracted.pages} page(s). (0 API calls)`,
+    });
+  }
 
   let workingLines = extracted.lines;
   let ocrUsed = extracted.ocrUsed;
   const usageRecords: UsageRecord[] = [];
 
   // 2. STAGE: OCR FOR SCANNED PAGES (If detected)
-  if (extracted.scannedPageIndices.length > 0 && extracted.pageImages.length > 0) {
+  if (extracted.scannedPageIndices.length > 0 && (extracted.pageImages.length > 0 || (extracted.pageThumbKeys && extracted.pageThumbKeys.length > 0))) {
     onStageUpdate({
       id: 'ocr',
       name: 'Scanned Pages OCR',
@@ -72,7 +97,7 @@ export async function runFullPipeline(
     const providerConfig = { ...ocrProvider, model: ocrRole.model };
 
     // Check cache
-    const cachedOcr = !force
+    const cachedOcr = !stageForced('ocr')
       ? await getCachedStageResult<{ lines?: any[]; mergedLines?: any[]; usage: any }>({
           fileHash,
           stage: 'ocr',
@@ -97,7 +122,7 @@ export async function runFullPipeline(
         isCachedHit: true,
       };
       usageRecords.push(cachedUsageRec);
-      appendUsageRecord(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:ocr:${providerConfig.model}`);
       onUsageUpdate?.(cachedUsageRec);
 
       onStageUpdate({
@@ -108,8 +133,17 @@ export async function runFullPipeline(
       });
     } else {
       const t0 = Date.now();
+      // OCR resolves page renders through thumb blobs (dataURLs only for scanned pages).
+      let ocrPageImages = extracted.pageImages;
+      const hasDataUrls = extracted.scannedPageIndices.some(
+        pg => typeof extracted.pageImages[pg - 1] === 'string' && extracted.pageImages[pg - 1].startsWith('data:')
+      );
+      if (!hasDataUrls && extracted.pageThumbKeys && extracted.pageThumbKeys.length > 0) {
+        const thumbMap = await loadPageThumbDataUrls(extracted.pageThumbKeys, extracted.scannedPageIndices);
+        ocrPageImages = Array.from({ length: extracted.pages }, (_, i) => thumbMap.get(i + 1) || '');
+      }
       const ocrRes = await runBatchedOcr({
-        pageImages: extracted.pageImages,
+        pageImages: ocrPageImages,
         scannedPageIndices: extracted.scannedPageIndices,
         startLineNum: 1,
         providerConfig,
@@ -174,7 +208,7 @@ export async function runFullPipeline(
       appendUsageRecord(usageRec);
       onUsageUpdate?.(usageRec);
 
-      await setCachedStageResult(
+      await writeStageCache(
         {
           fileHash,
           stage: 'ocr',
@@ -198,6 +232,10 @@ export async function runFullPipeline(
     }
   }
 
+  // Dependency-correct stage keys: hash of the (possibly OCR-merged) working lines.
+  const linesHash = (await sha256(workingLines.map(l => l.id + ' ' + l.text).join('\n'))).slice(0, 16);
+  const visionImgShas = [...new Set(extracted.images.map(img => img.sha).filter(Boolean))].sort();
+
   // Detect language & direction
   const fullSampleText = workingLines.slice(0, 40).map(l => l.text).join(' ');
   const detected = detectLanguageAndDirection(fullSampleText);
@@ -217,18 +255,24 @@ export async function runFullPipeline(
   const structProviderConfig = { ...structProvider, model: structRole.model };
 
   // Check cache for structure pass
-  const cachedStructure = !force
+  const cachedStructure = !stageForced('structure')
     ? await getCachedStageResult<any>({
         fileHash,
         stage: 'structure',
         provider: structProviderConfig.id,
         model: structProviderConfig.model,
-        options: { latex: settings.thrift.latexNormalization },
+        options: { latex: settings.thrift.latexNormalization, linesHash },
       })
     : null;
 
   let structureData: any;
-    if (cachedStructure) {
+    // Never serve a cached structure result with zero questions (or a json:null origin) — treat it as a miss.
+    const cachedStructureUsable =
+      cachedStructure &&
+      Array.isArray((cachedStructure as any).rawQuestions) &&
+      (cachedStructure as any).rawQuestions.length > 0 &&
+      !(cachedStructure as any).jsonNull;
+    if (cachedStructureUsable) {
       structureData = cachedStructure;
       const cachedUsageRec: UsageRecord = {
         ts: new Date().toISOString(),
@@ -242,7 +286,7 @@ export async function runFullPipeline(
         isCachedHit: true,
       };
       usageRecords.push(cachedUsageRec);
-      appendUsageRecord(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:structure:${structProviderConfig.model}`);
       onUsageUpdate?.(cachedUsageRec);
 
       onStageUpdate({
@@ -253,14 +297,29 @@ export async function runFullPipeline(
       });
     } else {
       const t0 = Date.now();
-      const structRes = await runStructurePass({
-        sourceLines: workingLines,
-        images: extracted.images,
-        languageHint: language,
-        latexEnabled: settings.thrift.latexNormalization,
-        providerConfig: structProviderConfig,
-        maxBudgetTokens: settings.budget.maxOutputTokens,
-      });
+      let structRes: Awaited<ReturnType<typeof runStructurePass>>;
+      try {
+        structRes = await runStructurePass({
+          sourceLines: workingLines,
+          images: extracted.images,
+          languageHint: language,
+          latexEnabled: settings.thrift.latexNormalization,
+          providerConfig: structProviderConfig,
+          maxBudgetTokens: settings.budget.maxOutputTokens,
+        });
+      } catch (err: any) {
+        onStageUpdate({
+          id: 'structure',
+          name: 'Structure Pass',
+          status: 'failed',
+          durationMs: Date.now() - t0,
+          inputTokens: err?.usage?.inputTokens,
+          outputTokens: err?.usage?.outputTokens,
+          attempts: err?.attempts,
+          message: err?.message || 'Structure Pass failed',
+        });
+        throw err;
+      }
 
       structureData = structRes;
 
@@ -291,16 +350,19 @@ export async function runFullPipeline(
       appendUsageRecord(usageRec);
       onUsageUpdate?.(usageRec);
 
-    await setCachedStageResult(
-      {
-        fileHash,
-        stage: 'structure',
-        provider: structProviderConfig.id,
-        model: structProviderConfig.model,
-        options: { latex: settings.thrift.latexNormalization },
-      },
-      structRes
-    );
+    // Never cache a structure result with zero questions or a json:null origin.
+    if (structRes.rawQuestions.length > 0 && !structRes.jsonNull) {
+      await writeStageCache(
+        {
+          fileHash,
+          stage: 'structure',
+          provider: structProviderConfig.id,
+          model: structProviderConfig.model,
+          options: { latex: settings.thrift.latexNormalization, linesHash },
+        },
+        structRes
+      );
+    }
 
     onStageUpdate({
       id: 'structure',
@@ -310,6 +372,7 @@ export async function runFullPipeline(
       inputTokens: structRes.usage.inputTokens,
       outputTokens: structRes.usage.outputTokens,
       costUsd,
+      attempts: structRes.attempts,
       message: `Parsed ${structRes.rawQuestions.length} questions across ${structRes.sections.length} sections.`,
     });
   }
@@ -329,18 +392,19 @@ export async function runFullPipeline(
     const visionProvider = settings.providers.find(p => p.id === visionRole.providerId) || settings.providers[0];
     const visionProviderConfig = { ...visionProvider, model: visionRole.model };
 
-    const cachedVision = !force
+    const cachedVision = !stageForced('vision')
       ? await getCachedStageResult<any>({
           fileHash,
           stage: 'vision',
           provider: visionProviderConfig.id,
           model: visionProviderConfig.model,
-          options: { imgCount: extracted.images.length },
+          options: { linesHash, imgShas: visionImgShas },
         })
       : null;
 
     if (cachedVision) {
       updatedImages = cachedVision.updatedImages;
+      visionStageFlags = cachedVision.flags || [];
       const cachedUsageRec: UsageRecord = {
         ts: new Date().toISOString(),
         role: 'vision',
@@ -353,7 +417,7 @@ export async function runFullPipeline(
         isCachedHit: true,
       };
       usageRecords.push(cachedUsageRec);
-      appendUsageRecord(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:vision:${visionProviderConfig.model}`);
       onUsageUpdate?.(cachedUsageRec);
 
       onStageUpdate({
@@ -398,13 +462,13 @@ export async function runFullPipeline(
       appendUsageRecord(usageRec);
       onUsageUpdate?.(usageRec);
 
-      await setCachedStageResult(
+      await writeStageCache(
         {
           fileHash,
           stage: 'vision',
           provider: visionProviderConfig.id,
           model: visionProviderConfig.model,
-          options: { imgCount: extracted.images.length },
+          options: { linesHash, imgShas: visionImgShas },
         },
         visionRes
       );
@@ -495,7 +559,7 @@ export async function runFullPipeline(
       })),
     };
 
-    const cachedRepair = !force
+    const cachedRepair = !stageForced('repair')
       ? await getCachedStageResult<{ repairedQuestions: any[]; usage: any }>({
           fileHash,
           stage: 'repair',
@@ -519,7 +583,7 @@ export async function runFullPipeline(
         isCachedHit: true,
       };
       usageRecords.push(cachedUsageRec);
-      appendUsageRecord(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:repair:${repairProviderConfig.model}`);
       onUsageUpdate?.(cachedUsageRec);
 
       onStageUpdate({
@@ -571,7 +635,7 @@ export async function runFullPipeline(
       appendUsageRecord(usageRec);
       onUsageUpdate?.(usageRec);
 
-      await setCachedStageResult(
+      await writeStageCache(
         {
           fileHash,
           stage: 'repair',
@@ -590,7 +654,7 @@ export async function runFullPipeline(
         inputTokens: repairRes.usage.inputTokens,
         outputTokens: repairRes.usage.outputTokens,
         costUsd,
-        message: `Repaired ${assembled.failingQuestions.length} items.`,
+        message: `Repaired ${repairRes.appliedCount ?? assembled.failingQuestions.length} items.`,
       });
     }
   } else {
@@ -622,10 +686,25 @@ export async function runFullPipeline(
   }
 
   // 7. BUILD FINAL EXAM DOC & PERSIST
+  const examId = `exam_${fileHash.slice(0, 12)}`;
+  // AI-metadata naming (no extra API call). Preserve a manual rename on re-analysis of the same file/id.
+  let displayName = computeDisplayName(structureData.meta, file.name);
+  let nameSource: 'ai' | 'manual' = 'ai';
+  try {
+    const existing = await loadExamDoc(examId);
+    if (existing?.nameSource === 'manual' && existing.displayName?.trim()) {
+      displayName = existing.displayName;
+      nameSource = 'manual';
+    }
+  } catch {
+    // No existing doc / storage unavailable — keep the AI-derived name.
+  }
   const examDoc: ExamDoc = {
-    id: `exam_${fileHash.slice(0, 12)}`,
+    id: examId,
     fileHash,
     createdAt: new Date().toISOString(),
+    displayName,
+    nameSource,
     meta: {
       title: structureData.meta?.title || file.name.replace(/\.[^/.]+$/, ''),
       subject: structureData.meta?.subject,
@@ -653,6 +732,7 @@ export async function runFullPipeline(
       ocrUsed,
       fileName: file.name,
       pageImages: extracted.pageImages,
+      pageThumbKeys: extracted.pageThumbKeys || [],
     },
     flags: allFlags,
     usage: usageRecords,

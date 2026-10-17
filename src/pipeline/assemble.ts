@@ -45,6 +45,13 @@ export const RawQuestionSchema = z.object({
       spans: z.array(SpanReferenceSchema).optional(),
     })
     .optional(),
+  tables: z
+    .array(
+      z.object({
+        spans: z.array(SpanReferenceSchema),
+      })
+    )
+    .optional(),
   rewrites: z
     .array(
       z.object({
@@ -116,6 +123,42 @@ export function sliceSourceSpans(
   }
 
   return chunks.join('\n');
+}
+
+
+function escapeHtmlCell(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Assemble tables from span slices: rows split into cells on tabs or 2+ spaces. */
+function assembleTables(
+  rawTables: any,
+  sourceLines: SourceLine[]
+): { html: string; spans: LineSpan[] }[] {
+  if (!Array.isArray(rawTables)) return [];
+  const out: { html: string; spans: LineSpan[] }[] = [];
+  for (const t of rawTables) {
+    const spans: LineSpan[] = Array.isArray(t?.spans) ? t.spans : [];
+    if (spans.length === 0) continue;
+    const text = sliceSourceSpans(spans, sourceLines);
+    const rows = text
+      .split(/\r?\n/)
+      .map(line => line.split(/\t| {2,}/).map(c => c.trim()).filter(c => c.length > 0))
+      .filter(cols => cols.length > 0);
+    if (rows.length === 0) continue;
+    const html =
+      '<table>' +
+      rows
+        .map(cols => '<tr>' + cols.map(c => `<td>${escapeHtmlCell(c)}</td>`).join('') + '</tr>')
+        .join('') +
+      '</table>';
+    out.push({ html, spans });
+  }
+  return out;
 }
 
 export interface AssembleResult {
@@ -251,6 +294,8 @@ export function assembleAndValidateQuestions(
       });
     }
 
+    const assembledTables = assembleTables(raw.tables, sourceLines);
+
     const questionObj: Question = {
       id: qId,
       label: raw.label || String(raw.no || idx + 1),
@@ -265,6 +310,7 @@ export function assembleAndValidateQuestions(
       answer: assembledAnswer,
       rewrites: raw.rewrites || [],
       images: raw.images || [],
+      tables: assembledTables.length > 0 ? assembledTables : undefined,
       confidence,
       flags: raw.flags || [],
     };

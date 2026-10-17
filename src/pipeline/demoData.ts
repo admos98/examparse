@@ -159,6 +159,8 @@ export async function createDemoExamDoc(): Promise<ExamDoc> {
     id: 'demo_exam_fa_001',
     fileHash: 'sha256_built_in_demo_doc',
     createdAt: new Date().toISOString(),
+    displayName: 'فیزیک و ریاضی \u2014 پایه دوازدهم ریاضی-فیزیک',
+    nameSource: 'ai',
     meta: {
       title: 'آزمون نهایی فیزیک و ریاضی دوازدهم',
       subject: 'فیزیک و ریاضی',

@@ -26,7 +26,8 @@ export interface ExtractedDocument {
   fileName: string;
   images: ImageAsset[];
   scannedPageIndices: number[]; // 1-based page indices with <100 chars
-  pageImages: string[]; // data URLs of rendered pages
+  pageImages: string[]; // data URLs of rendered pages (in-memory; persisted copies live under pageThumbKeys)
+  pageThumbKeys?: string[]; // blob keys thumb_{fileHash}_{page} for persisted page renders
 }
 
 function multiplyTransform(m1: number[], m2: number[]): number[] {
@@ -201,7 +202,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         lines.push({
           id: lineId,
           page: pageNum,
-          text: trimmed,
+          text: trimmed.normalize('NFKC'),
           y: segment[0].y,
         });
         globalLineNumber++;
@@ -335,7 +336,12 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           }
           if (ex._dHash && dHash) {
             const dist = hammingDistance(dHash, ex._dHash);
-            if (dist <= 6) {
+            const withinSize = (a: number, b: number) => a > 0 && b > 0 && Math.abs(a - b) / Math.max(a, b) <= 0.10;
+            if (
+              dist <= 6 &&
+              withinSize(ex.width, imgWidth) &&
+              withinSize(ex.height, imgHeight)
+            ) {
               duplicateId = ex.duplicateOf || ex.id;
               break;
             }
@@ -451,7 +457,7 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
       lines.push({
         id: `L${String(lineNum).padStart(4, '0')}`,
         page: 1,
-        text: sub,
+        text: sub.normalize('NFKC'),
       });
       lineNum++;
     }
@@ -537,7 +543,7 @@ async function extractPlainText(file: File): Promise<ExtractedDocument> {
     lines.push({
       id: `L${String(lineNum).padStart(4, '0')}`,
       page,
-      text: raw,
+      text: raw.normalize('NFKC'),
     });
     lineNum++;
   }

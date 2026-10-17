@@ -2,7 +2,7 @@
  * Prompt Templates & Schema Definitions (§8 of specifications)
  */
 
-export const PARSER_VERSION = 'v1.5';
+export const PARSER_VERSION = 'v1.6';
 export const PROMPT_VERSION = 't1-v2';
 
 export const T1_STRUCTURE_SYSTEM = `You are ExamStruct, a deterministic parser for printed exam papers. Output JSON only, matching the schema. No markdown, no commentary.
@@ -23,24 +23,30 @@ RULES
 8. questions may not share line ranges, except a group stem with sub-questions (use parentId).
 9. If a header exists, fill meta (subject, grade, school, term, year, durationMinutes, totalPoints); null when absent.
 10. Set confidence 0..1 per question; add short machine-readable flags for anomalies.
-11. Embedded Answer Keys & Solutions: If the document contains an Answer Key table, solutions section, or answers printed at the end or below questions (e.g., 'Answer Key', 'پاسخ‌نامه', 'کلید سوالات', 'Solutions', 'Correct Answer: B'), detect and link them! Set answer: {"spans": [[startLine, endLine]]} pointing to those exact source lines. Never copy long answers into free text; use spans only.`;
+11. Embedded Answer Keys & Solutions: If the document contains an Answer Key table, solutions section, or answers printed at the end or below questions (e.g., 'Answer Key', 'پاسخ‌نامه', 'کلید سوالات', 'Solutions', 'Correct Answer: B'), detect and link them! Set answer: {"spans": [[startLine, endLine]]} pointing to those exact source lines. Never copy long answers into free text; use spans only.
+Do not reason, narrate, or explain. Your first character must be { or [. /no_think`;
 
 export const T2_IMAGE_LABELING_SYSTEM = `You receive ONE batch of exam-paper images. Each image is preceded by {id, page, nearLine} and up to 6 source lines around that anchor.
 For EACH image return exactly: {"id": string, "role": "stem|option|table|decoration", "questionRef": "question label or null", "kind": "photo|diagram|chart|table|formula|handwriting|decoration", "caption": "≤12 words, source language", "needsText": boolean}
-Output either a JSON array of these objects or a JSON envelope {"items": [...]}. No descriptions beyond the caption. Prefer "decoration" for logos, borders, watermarks, page furniture. If the image is a graph/chart a solver must read, needsText=true. Never transcribe the question text.`;
+Output either a JSON array of these objects or a JSON envelope {"items": [...]}. No descriptions beyond the caption. Prefer "decoration" for logos, borders, watermarks, page furniture. If the image is a graph/chart a solver must read, needsText=true. Never transcribe the question text.
+Do not reason, narrate, or explain. Your first character must be { or [. /no_think`;
 
 export const T3_REPAIR_SYSTEM = `Items below failed validation. For each, return {"id": string, "patch": <RFC 7386 merge patch for that item>} — nothing else.
-Use the provided source lines with IDs. Keep the same numbering. Do not re-emit unchanged fields. Output either a JSON array of these objects or a JSON envelope {"items": [...]}.`;
+Use the provided source lines with IDs. Keep the same numbering. Do not re-emit unchanged fields. Output either a JSON array of these objects or a JSON envelope {"items": [...]}.
+Do not reason, narrate, or explain. Your first character must be { or [. /no_think`;
 
 export const T4_QUESTION_PATCH_SYSTEM = `Current question JSON and its source lines are below. Apply the user's instruction.
 Return ONLY an RFC 7386 merge patch object for this question (e.g. {"points": 2} or {"spans": [[41, 45]]}).
-Do not return the full object unless more than 60% of fields change. Output valid JSON only, no markdown.`;
+Do not return the full object unless more than 60% of fields change. Output valid JSON only, no markdown.
+Do not reason, narrate, or explain. Your first character must be { or [. /no_think`;
 
-export const T5_OCR_SYSTEM = `Transcribe each page as numbered lines: "[L0001] text". One line per visual line, top-to-bottom, preserve reading order and spacing of the layout. Do not correct spelling, do not translate, do not add commentary. Illegal/illegible: "⟨?⟩". Keep page headers/footers. Return {"pages":[{"page": 1, "lines":["[L0001] ..."]}]} only.`;
+export const T5_OCR_SYSTEM = `Transcribe each page as numbered lines: "[L0001] text". One line per visual line, top-to-bottom, preserve reading order and spacing of the layout. Do not correct spelling, do not translate, do not add commentary. Illegal/illegible: "⟨?⟩". Keep page headers/footers. Return {"pages":[{"page": 1, "lines":["[L0001] ..."]}]} only.
+Do not reason, narrate, or explain. Your first character must be { or [. /no_think`;
 
 export const T6_SOLVER_SYSTEM = `You are ExamSolver, an expert academic examiner. For each question provided, produce a concise, verified final answer or short step-by-step solution.
 Format: output either a JSON array of {"id": string, "answer": string} or a JSON envelope such as {"items": [...]} or {"answers": [...]} or {"results": [...]}.
-Keep answers concise (for MCQs, output the option letter and short rationale, e.g. 'Option B — acceleration is zero at maximum velocity'). Output in the source language of the exam. No conversational filler.`;
+Keep answers concise (for MCQs, output the option letter and short rationale, e.g. 'Option B — acceleration is zero at maximum velocity'). Output in the source language of the exam. No conversational filler.
+Do not reason, narrate, or explain. Your first character must be { or [.`;
 
 /**
  * Gemini Response Schema for T1 Structure Pass
@@ -132,6 +138,22 @@ export const T1_GEMINI_SCHEMA = {
                 },
               },
               required: ['key', 'spans'],
+            },
+          },
+          tables: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                spans: {
+                  type: 'array',
+                  items: {
+                    type: 'array',
+                    items: { type: 'number' },
+                  },
+                },
+              },
+              required: ['spans'],
             },
           },
           answer: {

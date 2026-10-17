@@ -3,7 +3,7 @@
  * Matches attached answer key lines to questions by question number or label.
  */
 import { Question } from '../types';
-import { extractDocument } from './extract';
+import { getOrExtractDocument } from './extractCache';
 import { normalizeDigitsToAscii } from '../utils/numbers';
 
 export interface KeyFileMatchResult {
@@ -15,13 +15,12 @@ export async function mergeAnswerKeyFile(
   keyFile: File,
   questions: Question[]
 ): Promise<KeyFileMatchResult> {
-  const extracted = await extractDocument(keyFile);
+  const { extracted } = await getOrExtractDocument(keyFile);
   const textLines = extracted.lines.map(l => l.text);
 
   // Match question numbers from lines
   // e.g. "1. B", "1- Option A", "سؤال ۱: گزینه ب", "(1) c"
   const answerMap = new Map<number, string>();
-  const answerLabelMap = new Map<string, string>();
 
   for (const line of textLines) {
     const trimmed = line.trim();
@@ -48,11 +47,10 @@ export async function mergeAnswerKeyFile(
 
   let matchedCount = 0;
   const updatedQuestions = questions.map(q => {
-    const fromNum = answerMap.get(q.no);
-    const fromLabel = answerLabelMap.get(q.label);
-    const matchedText = fromNum || fromLabel;
+    const matchedText = answerMap.get(q.no);
 
-    if (matchedText) {
+    // Key-file answers must NOT overwrite an existing in-paper answer.
+    if (matchedText && q.answer?.source !== 'paper') {
       matchedCount++;
       return {
         ...q,

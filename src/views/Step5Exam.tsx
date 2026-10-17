@@ -9,9 +9,10 @@ import {
   Eye,
   FileSpreadsheet,
 } from 'lucide-react';
-import { ExamDoc, ImageAsset } from '../types';
+import { ExamDoc, ImageAsset, getDisplayName, sanitizeFileName } from '../types';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
 import { saveExamDoc, getImageBlob } from '../store';
+import { duplicateExamDoc, exportExamJson } from '../utils/examExport';
 
 interface Props {
   doc: ExamDoc;
@@ -28,32 +29,9 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
     window.print();
   };
 
-  // Export JSON (excluding heavy binary and page images, preserving relative references per §4)
+  // Export JSON via the shared helper (also used by the Exam Library)
   const handleExportJson = () => {
-    const cleanImages = doc.images.map(img => {
-      const { dataUrl, ...rest } = img;
-      return {
-        ...rest,
-        exportPath: `images/${img.id}.${img.mime.split('/')[1] || 'jpg'}`,
-      };
-    });
-
-    // Strip source.pageImages (heavy data URLs) from export
-    const { pageImages, ...sourceWithoutPageImages } = doc.source;
-    const exportDoc = {
-      ...doc,
-      images: cleanImages,
-      source: sourceWithoutPageImages,
-    };
-
-    const jsonStr = JSON.stringify(exportDoc, null, 2);
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${doc.meta.title || 'Exam'}_structured.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    exportExamJson(doc);
   };
 
   // Import JSON to reconstruct exam view — re-links image dataUrls from IndexedDB by blobKey
@@ -97,17 +75,9 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
     reader.readAsText(file);
   };
 
-  // Duplicate exam -> new version (P1)
+  // Duplicate exam -> new version (shared helper, same semantics as the Library)
   const handleDuplicate = () => {
-    const newDoc: ExamDoc = {
-      ...doc,
-      id: `exam_${Date.now()}`,
-      meta: {
-        ...doc.meta,
-        title: `${doc.meta.title || 'Exam'} (Copy)`,
-      },
-      createdAt: new Date().toISOString(),
-    };
+    const newDoc = duplicateExamDoc(doc);
     onUpdateDoc(newDoc);
     saveExamDoc(newDoc);
   };
@@ -121,7 +91,7 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
       <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
       <head>
         <meta charset='utf-8'>
-        <title>${doc.meta.title || 'Exam'}</title>
+        <title>${getDisplayName(doc)}</title>
         <style>
           body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 11pt; direction: ${doc.meta.direction}; }
           table { border-collapse: collapse; width: 100%; }
@@ -140,7 +110,7 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${doc.meta.title || 'Exam'}.doc`;
+    a.download = `${sanitizeFileName(getDisplayName(doc))}.doc`;
     a.click();
     URL.revokeObjectURL(url);
   };

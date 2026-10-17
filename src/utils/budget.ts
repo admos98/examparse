@@ -29,6 +29,16 @@ function saveCalibrationMap(map: Record<string, CalibrationEntry>): void {
   } catch {
     // ignore quota errors
   }
+  // Write-through to folder storage when reachable (ignored in browser mode).
+  try {
+    void fetch('/api/cache/calibration', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(map),
+    }).catch(() => undefined);
+  } catch {
+    // ignore
+  }
 }
 
 /**

@@ -12,8 +12,9 @@ import { Step2Source } from './views/Step2Source';
 import { Step3Analyze } from './views/Step3Analyze';
 import { Step4Review } from './views/Step4Review';
 import { Step5Exam } from './views/Step5Exam';
+import { LibraryView } from './views/LibraryView';
 import { AppSettings, ExamDoc, StageStatus, UsageRecord } from './types';
-import { loadSettings, saveSettings, loadUsageLog, saveExamDoc } from './store';
+import { hydrateServerStorage, loadExamDoc, loadSettings, saveSettings, loadUsageLog, saveExamDoc } from './store';
 import { ExtractedDocument } from './pipeline/extract';
 import { createDemoExamDoc } from './pipeline/demoData';
 
@@ -30,10 +31,12 @@ export default function App() {
   const [examDoc, setExamDoc] = useState<ExamDoc | null>(null);
 
   const [stages, setStages] = useState<StageStatus[]>([]);
+  const [importedFileHash, setImportedFileHash] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isExplainerOpen, setIsExplainerOpen] = useState(false);
+  const [isLibraryOpen, setIsLibraryOpen] = useState(false);
 
   // Esc closes open modals
   useEffect(() => {
@@ -41,10 +44,25 @@ export default function App() {
       if (e.key === 'Escape') {
         setIsSettingsOpen(false);
         setIsExplainerOpen(false);
+        setIsLibraryOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Folder mode: server settings/usage/calibration override localStorage on mount.
+  useEffect(() => {
+    let mounted = true;
+    hydrateServerStorage()
+      .then(hydrated => {
+        if (mounted && hydrated) {
+          setSettings(loadSettings());
+          setUsageRecords(loadUsageLog());
+        }
+      })
+      .catch(() => undefined);
+    return () => { mounted = false; };
   }, []);
 
   const handleUpdateSettings = (newSettings: AppSettings) => {
@@ -52,8 +70,9 @@ export default function App() {
     saveSettings(newSettings);
   };
 
-  const handleDocumentLoaded = (doc: ExtractedDocument, file: File, keyFile?: File | null) => {
+  const handleDocumentLoaded = (doc: ExtractedDocument, file: File, keyFile?: File | null, fileHash?: string) => {
     setExtractedDoc(doc);
+    setImportedFileHash(fileHash || null);
     setRawFile(file);
     setAnswerKeyFile(keyFile || null);
     setCurrentStep(2);
@@ -62,6 +81,7 @@ export default function App() {
 
   const handleDemoLoaded = (demo: ExamDoc) => {
     setExamDoc(demo);
+    setImportedFileHash(null);
     setExtractedDoc({
       lines: demo.source.lines,
       pages: demo.source.pages,
@@ -70,6 +90,7 @@ export default function App() {
       images: demo.images,
       scannedPageIndices: [],
       pageImages: demo.source.pageImages || [],
+      pageThumbKeys: demo.source.pageThumbKeys || [],
     });
     // Create dummy File object so pipeline re-run is possible
     const dummyBlob = new Blob([demo.source.lines.map(l => l.text).join('\n')], { type: 'text/plain' });
@@ -85,6 +106,29 @@ export default function App() {
     setUsageRecords(loadUsageLog());
     setCurrentStep(4);
     setMaxReachedStep(prev => (prev < 4 ? 4 : prev));
+  };
+
+
+  // Library: opening an exam behaves exactly like loading the demo doc (Step 4).
+  const handleOpenExamFromLibrary = (doc: ExamDoc) => {
+    handleDemoLoaded(doc);
+    setIsLibraryOpen(false);
+  };
+
+  const handleLibraryExamRenamed = (updated: ExamDoc) => {
+    setExamDoc(prev => (prev && prev.id === updated.id ? updated : prev));
+  };
+
+  const handleLibraryExamDeleted = (id: string) => {
+    if (examDoc && examDoc.id === id) {
+      setExamDoc(null);
+      setExtractedDoc(null);
+      setRawFile(null);
+      setAnswerKeyFile(null);
+      setStages([]);
+      setCurrentStep(1);
+      setMaxReachedStep(1);
+    }
   };
 
   const handleDocUpdated = (updated: ExamDoc) => {
@@ -104,6 +148,7 @@ export default function App() {
           const demo = await createDemoExamDoc();
           handleDemoLoaded(demo);
         }}
+        onOpenLibrary={() => setIsLibraryOpen(true)}
       />
 
       {/* Guided 5-Step Stepper Navigation */}
@@ -120,6 +165,8 @@ export default function App() {
             onDocumentLoaded={handleDocumentLoaded}
             onDemoLoaded={handleDemoLoaded}
             isLoading={false}
+            cacheEnabled={settings.thrift.cacheEnabled}
+            onOpenSavedExam={handleOpenExamFromLibrary}
           />
         )}
 
@@ -129,6 +176,7 @@ export default function App() {
             pages={extractedDoc.pages}
             ocrUsed={extractedDoc.ocrUsed}
             pageImages={extractedDoc.pageImages}
+            pageThumbKeys={extractedDoc.pageThumbKeys}
             images={extractedDoc.images}
             onProceedToAnalyze={() => {
               setCurrentStep(3);
@@ -148,6 +196,8 @@ export default function App() {
             onAnalysisComplete={handleAnalysisComplete}
             isAnalyzing={isAnalyzing}
             setIsAnalyzing={setIsAnalyzing}
+            fileHash={importedFileHash || undefined}
+            onOpenSavedExam={handleOpenExamFromLibrary}
           />
         )}
 
@@ -167,6 +217,20 @@ export default function App() {
           <Step5Exam doc={examDoc} onUpdateDoc={handleDocUpdated} />
         )}
       </main>
+
+      {/* Exam Library (full-screen overlay, not a stepper step) */}
+      <LibraryView
+        isOpen={isLibraryOpen}
+        onClose={() => setIsLibraryOpen(false)}
+        activeExamId={examDoc?.id}
+        onOpenExam={handleOpenExamFromLibrary}
+        onExamRenamed={handleLibraryExamRenamed}
+        onExamDeleted={handleLibraryExamDeleted}
+        onGoToImport={() => {
+          setIsLibraryOpen(false);
+          setCurrentStep(1);
+        }}
+      />
 
       {/* Settings Modal */}
       <SettingsModal

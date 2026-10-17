@@ -28,6 +28,8 @@ interface Props {
   onAnalysisComplete: (examDoc: ExamDoc) => void;
   isAnalyzing: boolean;
   setIsAnalyzing: (val: boolean) => void;
+  fileHash?: string;
+  onOpenSavedExam?: (examDoc: ExamDoc) => void;
 }
 
 export const Step3Analyze: React.FC<Props> = ({
@@ -40,8 +42,13 @@ export const Step3Analyze: React.FC<Props> = ({
   onAnalysisComplete,
   isAnalyzing,
   setIsAnalyzing,
+  fileHash: fileHashProp,
+  onOpenSavedExam,
 }) => {
   const [forceRerun, setForceRerun] = useState(false);
+  const [forcedStages, setForcedStages] = useState<Set<string>>(new Set());
+  const [savedExam, setSavedExam] = useState<ExamDoc | null>(null);
+  const [probeFileHash, setProbeFileHash] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isPreflightCached, setIsPreflightCached] = useState<boolean>(false);
   const [cachedStages, setCachedStages] = useState<{
@@ -66,18 +73,51 @@ export const Step3Analyze: React.FC<Props> = ({
         const { getCachedStageResult } = await import('../pipeline/cache');
         const { assembleAndValidateQuestions } = await import('../pipeline/assemble');
         const buf = await rawFile.arrayBuffer();
-        const hash = await sha256(buf);
+        const hash = fileHashProp || (await sha256(buf));
+        if (isMounted) setProbeFileHash(hash);
 
-        // 1. Structure stage
+        // Saved-exam fast-path (B6)
+        try {
+          const { loadExamDoc } = await import('../store');
+          const saved = await loadExamDoc(`exam_${hash.slice(0, 12)}`);
+          if (isMounted) setSavedExam(saved || null);
+        } catch {
+          if (isMounted) setSavedExam(null);
+        }
+
+        // 3. OCR stage probe FIRST: the pipeline's real structure/vision keys
+        // depend on the OCR-merged lines when an OCR cache entry exists.
+        let ocrCached = true;
+        let effectiveLines = extractedDoc.lines;
+        if (extractedDoc.scannedPageIndices.length > 0) {
+          const oRole = settings.roleMapping.vision;
+          const oProv = settings.providers.find(p => p.id === oRole.providerId) || settings.providers[0];
+          const cachedO: any = await getCachedStageResult({
+            fileHash: hash,
+            stage: 'ocr',
+            provider: oProv.id,
+            model: oRole.model,
+            options: extractedDoc.scannedPageIndices,
+          });
+          ocrCached = Boolean(cachedO);
+          if (cachedO && (cachedO.mergedLines || cachedO.lines)) {
+            effectiveLines = cachedO.mergedLines || cachedO.lines;
+          }
+        }
+
+        const linesHash = (await sha256(effectiveLines.map((l: any) => l.id + ' ' + l.text).join('\n'))).slice(0, 16);
+        const imgShas = [...new Set(extractedDoc.images.map((i: any) => i.sha).filter(Boolean))].sort();
+
+        // 1. Structure stage (dependency-correct key)
         const cachedStruct = await getCachedStageResult<any>({
           fileHash: hash,
           stage: 'structure',
           provider: activeProvider.id,
           model: activeRole.model,
-          options: { latex: settings.thrift.latexNormalization },
+          options: { latex: settings.thrift.latexNormalization, linesHash },
         });
 
-        // 2. Vision stage
+        // 2. Vision stage (dependency-correct key)
         let visionCached = true;
         if (extractedDoc.images.length > 0) {
           const vRole = settings.roleMapping.vision;
@@ -87,30 +127,15 @@ export const Step3Analyze: React.FC<Props> = ({
             stage: 'vision',
             provider: vProv.id,
             model: vRole.model,
-            options: { imgCount: extractedDoc.images.length },
+            options: { linesHash, imgShas },
           });
           visionCached = Boolean(cachedV);
         }
 
-        // 3. OCR stage
-        let ocrCached = true;
-        if (extractedDoc.scannedPageIndices.length > 0) {
-          const oRole = settings.roleMapping.vision;
-          const oProv = settings.providers.find(p => p.id === oRole.providerId) || settings.providers[0];
-          const cachedO = await getCachedStageResult({
-            fileHash: hash,
-            stage: 'ocr',
-            provider: oProv.id,
-            model: oRole.model,
-            options: extractedDoc.scannedPageIndices,
-          });
-          ocrCached = Boolean(cachedO);
-        }
-
-        // 4. Repair stage
+        // 4. Repair stage: assemble against the OCR cache's mergedLines when present.
         let repairCached = true;
         if (cachedStruct && Array.isArray(cachedStruct.rawQuestions)) {
-          const assembled = assembleAndValidateQuestions(cachedStruct.rawQuestions, extractedDoc.lines);
+          const assembled = assembleAndValidateQuestions(cachedStruct.rawQuestions, effectiveLines);
           if (assembled.failingQuestions.length > 0) {
             const rRole = settings.roleMapping.escalation;
             const rProv = settings.providers.find(p => p.id === rRole.providerId) || settings.providers[0];
@@ -157,6 +182,12 @@ export const Step3Analyze: React.FC<Props> = ({
     settings.thrift.latexNormalization,
     extractedDoc.images.length,
     extractedDoc.scannedPageIndices.length,
+    extractedDoc.lines,
+    fileHashProp,
+    settings.roleMapping.vision.providerId,
+    settings.roleMapping.vision.model,
+    settings.roleMapping.escalation.providerId,
+    settings.roleMapping.escalation.model,
   ]);
 
   const isFullyCached =
@@ -249,7 +280,13 @@ export const Step3Analyze: React.FC<Props> = ({
             );
           },
         },
-        { forceRerun, answerKeyFile }
+        {
+          forceRerun,
+          answerKeyFile,
+          preExtracted: extractedDoc,
+          fileHash: probeFileHash || fileHashProp || undefined,
+          forceStages: [...forcedStages] as any,
+        }
       );
 
       setIsAnalyzing(false);
@@ -291,6 +328,21 @@ export const Step3Analyze: React.FC<Props> = ({
             <span className="font-bold">Budget / Execution Stop:</span>
             <p>{errorMsg}</p>
           </div>
+        </div>
+      )}
+
+      {/* Saved-result fast-path */}
+      {savedExam && onOpenSavedExam && (
+        <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs flex items-center justify-between gap-3">
+          <span>
+            <span className="font-semibold">Already parsed — Open saved result</span> — “{savedExam.displayName}” ({savedExam.questions.length} questions). Re-analyze remains available below.
+          </span>
+          <button
+            onClick={() => onOpenSavedExam(savedExam)}
+            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-medium shrink-0"
+          >
+            Open saved result
+          </button>
         </div>
       )}
 
@@ -488,6 +540,7 @@ export const Step3Analyze: React.FC<Props> = ({
                     {stage.message && (
                       <p className="text-[11px] text-slate-500 dark:text-slate-400">
                         {stage.message}
+                        {stage.attempts !== undefined && stage.attempts > 1 ? ` (${stage.attempts} attempts)` : ''}
                       </p>
                     )}
                   </div>
@@ -495,9 +548,27 @@ export const Step3Analyze: React.FC<Props> = ({
 
                 {/* Stage Metrics */}
                 <div className="flex items-center gap-3 text-right font-mono text-[11px]">
+                  <button
+                    onClick={() =>
+                      setForcedStages(prev => {
+                        const next = new Set(prev);
+                        if (next.has(stage.id)) next.delete(stage.id);
+                        else next.add(stage.id);
+                        return next;
+                      })
+                    }
+                    title={forcedStages.has(stage.id) ? `Cache bypass armed for ${stage.id} — click to disarm` : `Force re-run of ${stage.id} only`}
+                    className={`px-1.5 py-0.5 rounded border text-[11px] cursor-pointer ${
+                      forcedStages.has(stage.id)
+                        ? 'bg-amber-500/20 border-amber-500/50 text-amber-600 dark:text-amber-400 font-bold'
+                        : 'border-slate-200 dark:border-slate-700 text-slate-400 hover:text-slate-600'
+                    }`}
+                  >
+                    ↻
+                  </button>
                   {stage.inputTokens !== undefined && (
                     <span className="text-slate-600 dark:text-slate-400">
-                      {stage.inputTokens + (stage.outputTokens || 0)} toks
+                      {stage.inputTokens} in · {stage.outputTokens || 0} out
                     </span>
                   )}
                   {stage.costUsd !== undefined && (

@@ -59,6 +59,8 @@ export const SettingsModal: React.FC<Props> = ({
       kind: 'openai-compatible',
       baseURL: 'http://localhost:1234/v1',
       apiKey: '',
+      disableReasoning: true,
+      extraBodyJson: '',
     };
     setCurrent(prev => ({ ...prev, providers: [...prev.providers, newProvider] }));
   };
@@ -292,6 +294,34 @@ export const SettingsModal: React.FC<Props> = ({
                               onChange={e => handleUpdateProvider(p.id, { apiKey: e.target.value })}
                               className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-200 font-mono text-[11px]"
                             />
+                          </div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <div className="font-medium text-[11px] text-slate-900 dark:text-white">Disable Reasoning / Thinking</div>
+                              <div className="text-[11px] text-slate-500">Send reasoning-off fields on parse/transcribe calls (low for the solver). Turn off to send nothing extra.</div>
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={p.disableReasoning !== false}
+                              onChange={e => handleUpdateProvider(p.id, { disableReasoning: e.target.checked })}
+                              className="w-4 h-4 rounded text-blue-600"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] text-slate-500 mb-1">Extra body JSON</label>
+                            <textarea
+                              value={p.extraBodyJson || ''}
+                              onChange={e => handleUpdateProvider(p.id, { extraBodyJson: e.target.value })}
+                              placeholder='{"enable_thinking": false}'
+                              rows={2}
+                              className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-200 font-mono text-[11px]"
+                            />
+                            <p className="text-[11px] text-slate-500 mt-1">
+                              e.g. {'{"enable_thinking": false}'} or {'{"chat_template_kwargs": {"enable_thinking": false}}'} or {'{"thinking": {"type": "disabled"}}'} — provider-specific overrides.
+                            </p>
                           </div>
                         </div>
 

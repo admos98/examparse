@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { AppSettings, ExamDoc, StageStatus } from '../types';
 import { calculatePreflightEstimate } from '../utils/budget';
+import { detectLanguageAndDirection } from '../utils/numbers';
 import { ExtractedDocument } from '../pipeline/extract';
 import { runFullPipeline } from '../pipeline';
 
@@ -166,25 +167,47 @@ export const Step3Analyze: React.FC<Props> = ({
     cachedStages.repair;
 
   // Calculate pre-flight token & cost estimate for uncached stages only (§5.7)
+  // Detect RTL from extracted text rather than relying solely on settings
   const fullText = extractedDoc.lines.map(l => l.text).join('\n');
+  const detectedDir = detectLanguageAndDirection(extractedDoc.lines.slice(0, 40).map(l => l.text).join(' '));
+  const isRtl = settings.document.defaultLanguage === 'rtl' || (settings.document.defaultLanguage === 'auto' && detectedDir.direction === 'rtl');
+
+  // Resolve per-stage models for pricing each stage at its own role model
+  const resolveModel = (role: 'fast' | 'vision' | 'escalation') => {
+    const sel = settings.roleMapping[role];
+    const prov = settings.providers.find(p => p.id === sel.providerId) || settings.providers[0];
+    return sel.model;
+  };
+
+  const stageModels = {
+    structureModel: resolveModel('fast'),
+    ocrModel: resolveModel('vision'),
+    visionModel: resolveModel('vision'),
+    repairModel: resolveModel('escalation'),
+  };
+
+  // Applicable estimate: full estimate when forceRerun, else uncached-stages estimate
   const estimate = isFullyCached && !forceRerun
     ? {
         estimatedInputTokens: 0,
         estimatedOutputTokens: 0,
         estimatedCostUsd: 0,
-        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, structureTokens: 0 },
+        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, ocrCalls: 0 },
         exceedsBudget: false,
         warning50Percent: false,
       }
     : calculatePreflightEstimate({
         text: cachedStages.structure && !forceRerun ? '' : fullText,
-        isRtl: settings.document.defaultLanguage === 'rtl',
+        isRtl,
         images: cachedStages.vision && !forceRerun ? [] : extractedDoc.images,
         scannedPagesCount: cachedStages.ocr && !forceRerun ? 0 : extractedDoc.scannedPageIndices.length,
         isGemini: activeProvider.kind === 'gemini',
         model: activeRole.model,
         costTable: settings.costTable,
         maxUsdPerRun: settings.budget.maxUsdPerRun,
+        stageModels,
+        maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
+        providerKey: `${activeProvider.kind}:${activeProvider.id}`,
       });
 
   const handleStartAnalysis = async () => {
@@ -193,8 +216,8 @@ export const Step3Analyze: React.FC<Props> = ({
       return;
     }
 
-    // Never budget-block a fully cached run
-    if (!isFullyCached && !forceRerun && estimate.exceedsBudget) {
+    // Block when applicable estimate exceeds budget cap; never block when applicable estimate is 0
+    if (estimate.estimatedCostUsd > 0 && estimate.exceedsBudget) {
       setErrorMsg(
         `Pre-flight cost ($${estimate.estimatedCostUsd.toFixed(4)}) exceeds your configured budget cap ($${settings.budget.maxUsdPerRun}). Analysis halted.`
       );
@@ -209,7 +232,7 @@ export const Step3Analyze: React.FC<Props> = ({
       { id: 'extract', name: 'Local Text & Image Extraction', status: 'completed', message: '0 API calls (done)' },
       { id: 'ocr', name: 'Scanned Pages OCR', status: extractedDoc.scannedPageIndices.length > 0 ? 'idle' : 'skipped', message: 'Batched <= 3 pages' },
       { id: 'structure', name: 'Structure Pass (Span References)', status: 'idle', message: '1 text call' },
-      { id: 'vision', name: 'Batched Vision Labeling', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: '1 batched call' },
+      { id: 'vision', name: 'Batched Vision Labeling', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
       { id: 'assemble', name: 'Assemble & Validate', status: 'idle', message: 'Local assembly' },
       { id: 'repair', name: 'Escalation Repair', status: 'idle', message: 'Failing items only' },
     ];
@@ -373,10 +396,10 @@ export const Step3Analyze: React.FC<Props> = ({
           </label>
 
           <button
-            disabled={isAnalyzing || estimate.exceedsBudget}
+            disabled={isAnalyzing || (estimate.exceedsBudget && estimate.estimatedCostUsd > 0)}
             onClick={handleStartAnalysis}
             className={`flex items-center gap-2 px-6 py-2.5 rounded-2xl font-semibold text-xs text-white transition cursor-pointer shadow-md ${
-              isAnalyzing || estimate.exceedsBudget
+              isAnalyzing || (estimate.exceedsBudget && estimate.estimatedCostUsd > 0)
                 ? 'bg-slate-400 cursor-not-allowed'
                 : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-blue-500/20'
             }`}

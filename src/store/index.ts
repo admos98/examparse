@@ -42,12 +42,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
     vision: { providerId: 'google-gemini', model: 'gemini-2.5-flash' },
   },
   costTable: {
-    'gemini-2.5-flash-lite': { inputCostPerMillion: 0.075, outputCostPerMillion: 0.30 },
+    'gemini-2.5-flash-lite': { inputCostPerMillion: 0.10, outputCostPerMillion: 0.40 },
     'gemini-2.5-flash': { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 },
-    'gemini-2.5-pro': { inputCostPerMillion: 1.25, outputCostPerMillion: 5.00 },
+    'gemini-2.5-pro': { inputCostPerMillion: 1.25, outputCostPerMillion: 10.00 },
     'gemini-3.8-flash': { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 },
-    'gemini-3.1-flash-lite': { inputCostPerMillion: 0.075, outputCostPerMillion: 0.30 },
-    'gemini-4-argon': { inputCostPerMillion: 1.25, outputCostPerMillion: 5.00 },
+    'gemini-3.1-flash-lite': { inputCostPerMillion: 0.10, outputCostPerMillion: 0.40 },
+    'gemini-4-argon': { inputCostPerMillion: 1.25, outputCostPerMillion: 10.00 },
   },
   thrift: {
     latexNormalization: false,

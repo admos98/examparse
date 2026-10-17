@@ -40,8 +40,9 @@ export async function regenerateQuestionPatch(params: {
   sourceLines: SourceLine[];
   instruction?: string;
   providerConfig: any;
+  maxOutputTokens?: number;
 }): Promise<QuestionPatchResult> {
-  const { question, sourceLines, instruction, providerConfig } = params;
+  const { question, sourceLines, instruction, providerConfig, maxOutputTokens } = params;
 
   // Extract question spans + ±5 context lines around it
   let minLine = Infinity;
@@ -91,7 +92,7 @@ export async function regenerateQuestionPatch(params: {
     role: 'patch',
     system: T4_QUESTION_PATCH_SYSTEM,
     text: promptText,
-    maxOutputTokens: 1024,
+    maxOutputTokens: maxOutputTokens ? Math.min(maxOutputTokens, 1024) : 1024,
     label: `Patch Question ${question.label || question.no}`,
     providerConfig,
   };

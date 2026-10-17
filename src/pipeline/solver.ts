@@ -1,6 +1,8 @@
 /**
  * AI Solver Engine
  * Solves exam questions with verified, concise solutions in a single batched call or per-question.
+ * Parses {"items"|"answers"|"results": [...]} envelopes and bare arrays.
+ * On json: null (truncation), retries once at 2× cap.
  * Tagged with source: 'ai'
  */
 import { LLMRequest, Question, UsageRecord } from '../types';
@@ -13,12 +15,26 @@ export interface SolverResult {
   usageRecord: UsageRecord;
 }
 
+/**
+ * Extract answer array from JSON response — handles envelopes and bare arrays
+ */
+function extractAnswers(json: any): any[] {
+  if (Array.isArray(json)) return json;
+  if (json && typeof json === 'object') {
+    if (Array.isArray(json.items)) return json.items;
+    if (Array.isArray(json.answers)) return json.answers;
+    if (Array.isArray(json.results)) return json.results;
+  }
+  return [];
+}
+
 export async function solveQuestionsWithAI(params: {
   questions: Question[];
   questionIdsToSolve?: string[];
   providerConfig: any;
+  maxOutputTokens?: number;
 }): Promise<SolverResult> {
-  const { questions, questionIdsToSolve, providerConfig } = params;
+  const { questions, questionIdsToSolve, providerConfig, maxOutputTokens } = params;
 
   // Filter questions to solve (either specified IDs, or all questions lacking an answer)
   const targetQuestions = questions.filter(q => {
@@ -55,21 +71,42 @@ export async function solveQuestionsWithAI(params: {
     points: q.points,
   }));
 
-  const promptText = `Solve these ${items.length} questions. Output JSON array of {"id": string, "answer": string}:\n\n${JSON.stringify(items, null, 2)}`;
+  const budgetCap = maxOutputTokens || 8192;
+  const baseCap = Math.min(budgetCap, Math.min(4096, Math.max(500, items.length * 80)));
+
+  const promptText = `Solve these ${items.length} questions. Output JSON array of {"id": string, "answer": string} (or {"items": [...]}):\n\n${JSON.stringify(items, null, 2)}`;
 
   const request: LLMRequest = {
     role: 'standard',
     system: T6_SOLVER_SYSTEM,
     text: promptText,
-    maxOutputTokens: Math.min(4096, Math.max(500, items.length * 80)),
+    maxOutputTokens: baseCap,
     label: `AI Solver (${items.length} questions)`,
     providerConfig,
   };
 
-  const response = await LLMAdapter.execute(request);
-  const answers: any[] = Array.isArray(response.json) ? response.json : [];
-  const answerMap = new Map<string, string>();
+  let response = await LLMAdapter.execute(request);
+  let answers = extractAnswers(response.json);
+  let totalUsage = { ...response.usage };
 
+  // On json: null (truncation), retry once at 2× cap
+  if (response.json === null && baseCap < budgetCap) {
+    const retryCap = Math.min(budgetCap, baseCap * 2);
+    console.warn(`Solver truncated (json: null, finishReason=${response.finishReason}). Retrying once at 2x cap (${retryCap})...`);
+    const retryRequest: LLMRequest = {
+      ...request,
+      maxOutputTokens: retryCap,
+      label: `AI Solver (Retry 2x Cap, ${items.length} questions)`,
+    };
+    const retryResponse = await LLMAdapter.execute(retryRequest);
+    totalUsage.inputTokens += retryResponse.usage.inputTokens;
+    totalUsage.outputTokens += retryResponse.usage.outputTokens;
+    totalUsage.cachedTokens = (totalUsage.cachedTokens || 0) + (retryResponse.usage.cachedTokens || 0);
+    response = retryResponse;
+    answers = extractAnswers(response.json);
+  }
+
+  const answerMap = new Map<string, string>();
   for (const item of answers) {
     if (item && item.id && item.answer) {
       answerMap.set(item.id, String(item.answer).trim());
@@ -96,9 +133,9 @@ export async function solveQuestionsWithAI(params: {
     role: 'standard',
     provider: providerConfig.name,
     model: providerConfig.model,
-    inputTokens: response.usage.inputTokens,
-    outputTokens: response.usage.outputTokens,
-    cachedTokens: response.usage.cachedTokens,
+    inputTokens: totalUsage.inputTokens,
+    outputTokens: totalUsage.outputTokens,
+    cachedTokens: totalUsage.cachedTokens,
     label: `AI Solver (${solvedCount} questions solved)`,
   };
 
@@ -112,13 +149,15 @@ export async function solveQuestionsWithAI(params: {
 export async function solveSingleQuestionWithAI(params: {
   question: Question;
   providerConfig: any;
+  maxOutputTokens?: number;
 }): Promise<{ answerText: string; usageRecord: UsageRecord }> {
-  const { question, providerConfig } = params;
+  const { question, providerConfig, maxOutputTokens } = params;
 
   const res = await solveQuestionsWithAI({
     questions: [question],
     questionIdsToSolve: [question.id],
     providerConfig,
+    maxOutputTokens,
   });
 
   const ans = res.updatedQuestions[0]?.answer?.text || '';

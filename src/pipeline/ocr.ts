@@ -16,8 +16,9 @@ export async function runBatchedOcr(params: {
   scannedPageIndices: number[]; // 1-based page indices
   startLineNum?: number;
   providerConfig: any;
+  maxOutputTokens?: number;
 }): Promise<OcrResult> {
-  const { pageImages, scannedPageIndices, startLineNum = 1, providerConfig } = params;
+  const { pageImages, scannedPageIndices, startLineNum = 1, providerConfig, maxOutputTokens } = params;
 
   if (scannedPageIndices.length === 0 || pageImages.length === 0) {
     return {
@@ -59,7 +60,7 @@ export async function runBatchedOcr(params: {
       system: T5_OCR_SYSTEM,
       text: promptText,
       images: imagesPayload,
-      maxOutputTokens: 4096,
+      maxOutputTokens: maxOutputTokens ? Math.min(maxOutputTokens, 4096) : 4096,
       label: `OCR Pass (Pages ${batchIndices.join(', ')})`,
       providerConfig,
     };
@@ -88,10 +89,10 @@ export async function runBatchedOcr(params: {
         }
       }
     } else {
-      // Fallback: parse rawText line by line
+      // Fallback: parse rawText line by line (do NOT strip leading digits/question numbers)
       const textLines = response.rawText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
       for (const line of textLines) {
-        const clean = line.replace(/^\[L\d+\]\s*/, '').replace(/^[-\*\d\.\)]\s*/, '').trim();
+        const clean = line.replace(/^\[L\d+\]\s*/, '').trim();
         if (clean && !clean.startsWith('{') && !clean.startsWith('}')) {
           generatedLines.push({
             id: `L${String(currentLineIndex).padStart(4, '0')}`,

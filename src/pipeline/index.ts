@@ -13,7 +13,7 @@ import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
 import { appendUsageRecord, saveExamDoc } from '../store';
-import { calculateActualCost } from '../utils/budget';
+import { calculateActualCost, updateTokenCalibration } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 
 export interface PipelineCallbacks {
@@ -113,10 +113,13 @@ export async function runFullPipeline(
         scannedPageIndices: extracted.scannedPageIndices,
         startLineNum: 1,
         providerConfig,
+        maxOutputTokens: settings.budget.maxOutputTokens,
       });
 
       // Merge per-page in page order with central renumbering (no append-at-end)
+      // Build old→new line number map by page + per-page ordinal for anchorLine rewriting
       const merged: SourceLine[] = [];
+      const oldToNewLineMap = new Map<number, number>();
       let globalNum = 1;
       for (let p = 1; p <= extracted.pages; p++) {
         const isScanned = extracted.scannedPageIndices.includes(p);
@@ -124,6 +127,11 @@ export async function runFullPipeline(
           ? ocrRes.lines.filter(l => l.page === p)
           : extracted.lines.filter(l => l.page === p);
         for (const line of pLines) {
+          const oldNum = parseInt(String(line.id).replace(/\D/g, ''), 10);
+          const newNum = globalNum;
+          if (!isNaN(oldNum)) {
+            oldToNewLineMap.set(oldNum, newNum);
+          }
           merged.push({
             ...line,
             id: `L${String(globalNum).padStart(4, '0')}`,
@@ -134,6 +142,15 @@ export async function runFullPipeline(
       }
       workingLines = merged;
       ocrUsed = true;
+
+      // Rewrite image anchorLines through the old→new map
+      const rewriteAnchor = (oldLine: number | undefined): number | undefined => {
+        if (oldLine === undefined) return undefined;
+        return oldToNewLineMap.get(oldLine) ?? oldLine;
+      };
+      for (const img of extracted.images) {
+        img.anchorLine = rewriteAnchor(img.anchorLine);
+      }
 
       const costUsd = calculateActualCost(
         ocrRes.usage.inputTokens,
@@ -247,11 +264,10 @@ export async function runFullPipeline(
 
       structureData = structRes;
 
-      // Update token calibration running ratio
+      // Update token calibration with full sent text length (system + user prompt), per provider
       const rawSourceChars = workingLines.reduce((acc, l) => acc + l.text.length, 0);
-      import('../utils/budget').then(({ updateTokenCalibration }) => {
-        updateTokenCalibration(rawSourceChars, structRes.usage.inputTokens);
-      });
+      const providerKey = `${structProviderConfig.kind}:${structProviderConfig.id}`;
+      updateTokenCalibration(rawSourceChars, structRes.usage.inputTokens, providerKey);
 
       const costUsd = calculateActualCost(
         structRes.usage.inputTokens,
@@ -298,14 +314,15 @@ export async function runFullPipeline(
     });
   }
 
-  // 4. STAGE: VISION CALL (All images in ONE batched call)
+  // 4. STAGE: VISION CALL (All images in batched calls, chunked by maxImagesPerVisionCall)
   let updatedImages = extracted.images;
+  let visionStageFlags: any[] = [];
   if (extracted.images.length > 0) {
     onStageUpdate({
       id: 'vision',
       name: 'Batched Vision Labeling',
       status: 'running',
-      message: `Labeling ${extracted.images.length} image(s) in 1 batched call...`,
+      message: `Labeling ${extracted.images.length} image(s) in ${Math.ceil(extracted.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)...`,
     });
 
     const visionRole = settings.roleMapping.vision;
@@ -353,9 +370,12 @@ export async function runFullPipeline(
         providerConfig: visionProviderConfig,
         maxLongEdge: settings.thrift.imageMaxLongEdge,
         quality: settings.thrift.jpegQuality / 100,
+        maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
+        maxOutputTokens: settings.budget.maxOutputTokens,
       });
 
       updatedImages = visionRes.updatedImages;
+      visionStageFlags = visionRes.flags || [];
 
       const costUsd = calculateActualCost(
         visionRes.usage.inputTokens,
@@ -426,6 +446,11 @@ export async function runFullPipeline(
 
   let finalQuestions = assembled.questions;
   let allFlags = assembled.flags;
+
+  // Merge visionRes.flags (if vision ran)
+  if (visionStageFlags && visionStageFlags.length > 0) {
+    allFlags = [...allFlags, ...visionStageFlags];
+  }
 
   // Attach images to questions if labeled
   for (const img of updatedImages) {
@@ -510,9 +535,20 @@ export async function runFullPipeline(
         allQuestions: finalQuestions,
         sourceLines: workingLines,
         providerConfig: repairProviderConfig,
+        maxOutputTokens: settings.budget.maxOutputTokens,
       });
 
       finalQuestions = repairRes.repairedQuestions;
+
+      // Merge shapeMismatch flag from repair
+      if (repairRes.shapeMismatch) {
+        allFlags.push({
+          id: `flag_${allFlags.length + 1}`,
+          severity: 'warn',
+          code: 'REPAIR_SHAPE_MISMATCH',
+          message: 'Escalation repair response returned unexpected format; some items may not have been repaired.',
+        });
+      }
 
       const costUsd = calculateActualCost(
         repairRes.usage.inputTokens,

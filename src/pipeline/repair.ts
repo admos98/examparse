@@ -19,8 +19,9 @@ export async function runEscalationRepair(params: {
   allQuestions: Question[];
   sourceLines: SourceLine[];
   providerConfig: any;
+  maxOutputTokens?: number;
 }): Promise<RepairResult> {
-  const { failingItems, allQuestions, sourceLines, providerConfig } = params;
+  const { failingItems, allQuestions, sourceLines, providerConfig, maxOutputTokens } = params;
 
   if (failingItems.length === 0) {
     return {
@@ -100,7 +101,7 @@ export async function runEscalationRepair(params: {
     role: 'escalation',
     system: T3_REPAIR_SYSTEM,
     text: promptText,
-    maxOutputTokens: 2048,
+    maxOutputTokens: maxOutputTokens ? Math.min(maxOutputTokens, 2048) : 2048,
     label: `Escalation Repair (${batch.length} items)`,
     providerConfig,
   };

@@ -1,6 +1,7 @@
 /**
  * Stage 4: Batched Vision Labeling Pipeline (§6.4)
- * Sends all deduplicated images in ONE batched call with ≤ 6 source lines around each anchor.
+ * Chunks images by maxImagesPerVisionCall, each chunk gets its own manifest and call.
+ * Sums usage across chunks. optimizeImageForVision fills white before JPEG-encoding.
  */
 import { ImageAsset, LLMRequest, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
@@ -24,14 +25,16 @@ async function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
- * Downscale and compress image if needed (max long edge 1024px, JPEG q80)
+ * Downscale and compress image if needed (max long edge, JPEG q80)
+ * Fills white background before JPEG-encoding to avoid transparent→black artifacts.
+ * Rejects on img.onerror.
  */
 async function optimizeImageForVision(
   blob: Blob,
   maxLongEdge: number = 1024,
   quality: number = 0.8
 ): Promise<{ base64: string; mime: string; width: number; height: number }> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       let { width, height } = img;
@@ -50,6 +53,9 @@ async function optimizeImageForVision(
       canvas.height = height;
       const ctx = canvas.getContext('2d');
       if (ctx) {
+        // Fill white background before drawing (avoids transparent→black in JPEG)
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
         ctx.drawImage(img, 0, 0, width, height);
         const dataUrl = canvas.toDataURL('image/jpeg', quality);
         const base64 = dataUrl.split(',')[1] || '';
@@ -57,6 +63,9 @@ async function optimizeImageForVision(
       } else {
         blobToBase64(blob).then(base64 => resolve({ base64, mime: blob.type || 'image/jpeg', width: img.width, height: img.height }));
       }
+    };
+    img.onerror = (e) => {
+      reject(new Error(`optimizeImageForVision: img.onerror fired for blob (size=${blob.size}, type=${blob.type})`));
     };
     img.src = URL.createObjectURL(blob);
   });
@@ -68,39 +77,24 @@ export interface VisionLabelResult {
   flags?: any[];
 }
 
-export async function labelImagesBatched(params: {
-  images: ImageAsset[];
-  sourceLines: SourceLine[];
-  providerConfig: any;
-  maxLongEdge?: number;
-  quality?: number;
-}): Promise<VisionLabelResult> {
-  const { images, sourceLines, providerConfig, maxLongEdge = 1024, quality = 0.8 } = params;
-
-  if (images.length === 0) {
-    return {
-      updatedImages: [],
-      usage: { inputTokens: 0, outputTokens: 0 },
-    };
-  }
-
-  // Filter out duplicates (we map duplicate labels locally)
-  const uniqueImages = images.filter(img => !img.duplicateOf);
-
-  // Prepare images and anchor context text
+/**
+ * Process a single chunk of images through the vision model
+ */
+async function processVisionChunk(
+  chunkImages: { img: ImageAsset; base64: string; mime: string }[],
+  sourceLines: SourceLine[],
+  providerConfig: any,
+  maxOutputTokens?: number,
+): Promise<{
+  labelMap: Map<string, any>;
+  flags: any[];
+  usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
+}> {
   const payloadImages: { id: string; mime: string; data: string }[] = [];
   const manifestEntries: string[] = [];
 
-  for (const img of uniqueImages) {
-    const blob = await getImageBlob(img.blobKey);
-    if (!blob) continue;
-
-    const optimized = await optimizeImageForVision(blob, maxLongEdge, quality);
-    payloadImages.push({
-      id: img.id,
-      mime: optimized.mime,
-      data: optimized.base64,
-    });
+  for (const { img, base64, mime } of chunkImages) {
+    payloadImages.push({ id: img.id, mime, data: base64 });
 
     // Extract <= 6 source lines around anchor
     const anchorIdx = img.anchorLine
@@ -119,13 +113,6 @@ export async function labelImagesBatched(params: {
     );
   }
 
-  if (payloadImages.length === 0) {
-    return {
-      updatedImages: images,
-      usage: { inputTokens: 0, outputTokens: 0 },
-    };
-  }
-
   const promptText = `IMAGES ARE ATTACHED IN MANIFEST ORDER.\n\nMANIFEST:\n${manifestEntries.join('\n---\n')}\n\nReturn JSON: {"items": [{"id": string, "role": "stem|option|table|decoration", "questionRef": string|null, "kind": "photo|diagram|chart|table|formula|handwriting|decoration", "caption": string, "needsText": boolean}]} (or a JSON array).`;
 
   const request: LLMRequest = {
@@ -133,14 +120,16 @@ export async function labelImagesBatched(params: {
     system: T2_IMAGE_LABELING_SYSTEM,
     text: promptText,
     images: payloadImages,
-    maxOutputTokens: Math.max(500, payloadImages.length * 120),
+    maxOutputTokens: maxOutputTokens
+      ? Math.min(maxOutputTokens, Math.max(500, payloadImages.length * 120))
+      : Math.max(500, payloadImages.length * 120),
     label: `Vision Labeling (${payloadImages.length} images)`,
     providerConfig,
   };
 
   const response = await LLMAdapter.execute(request);
 
-  // Parse envelope {"items": [...]} or bare array
+  // Parse envelope or bare array
   let rawItems: any[] | null = null;
   if (Array.isArray(response.json)) {
     rawItems = response.json;
@@ -148,6 +137,7 @@ export async function labelImagesBatched(params: {
     const obj = response.json as any;
     if (Array.isArray(obj.items)) rawItems = obj.items;
     else if (Array.isArray(obj.images)) rawItems = obj.images;
+    else if (Array.isArray(obj.answers)) rawItems = obj.answers;
     else if (Array.isArray(obj.results)) rawItems = obj.results;
   }
 
@@ -169,10 +159,85 @@ export async function labelImagesBatched(params: {
     }
   }
 
+  return { labelMap, flags, usage: response.usage };
+}
+
+export async function labelImagesBatched(params: {
+  images: ImageAsset[];
+  sourceLines: SourceLine[];
+  providerConfig: any;
+  maxLongEdge?: number;
+  quality?: number;
+  maxImagesPerVisionCall?: number;
+  maxOutputTokens?: number;
+}): Promise<VisionLabelResult> {
+  const {
+    images,
+    sourceLines,
+    providerConfig,
+    maxLongEdge = 1024,
+    quality = 0.8,
+    maxImagesPerVisionCall = 16,
+    maxOutputTokens,
+  } = params;
+
+  if (images.length === 0) {
+    return {
+      updatedImages: [],
+      usage: { inputTokens: 0, outputTokens: 0 },
+    };
+  }
+
+  // Filter out duplicates (we map duplicate labels locally)
+  const uniqueImages = images.filter(img => !img.duplicateOf);
+
+  // Prepare optimized image payloads
+  const prepared: { img: ImageAsset; base64: string; mime: string }[] = [];
+  for (const img of uniqueImages) {
+    const blob = await getImageBlob(img.blobKey);
+    if (!blob) continue;
+    try {
+      const optimized = await optimizeImageForVision(blob, maxLongEdge, quality);
+      prepared.push({ img, base64: optimized.base64, mime: optimized.mime });
+    } catch (err) {
+      console.warn(`Vision: skipping image ${img.id} due to optimization error:`, err);
+    }
+  }
+
+  if (prepared.length === 0) {
+    return {
+      updatedImages: images,
+      usage: { inputTokens: 0, outputTokens: 0 },
+    };
+  }
+
+  // Chunk by maxImagesPerVisionCall (minimum chunks)
+  const chunkSize = Math.max(1, maxImagesPerVisionCall);
+  const chunks: typeof prepared[] = [];
+  for (let i = 0; i < prepared.length; i += chunkSize) {
+    chunks.push(prepared.slice(i, i + chunkSize));
+  }
+
+  // Process each chunk
+  const mergedLabelMap = new Map<string, any>();
+  const allFlags: any[] = [];
+  let totalUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+
+  for (const chunk of chunks) {
+    const result = await processVisionChunk(chunk, sourceLines, providerConfig, maxOutputTokens);
+    for (const [id, label] of result.labelMap) {
+      mergedLabelMap.set(id, label);
+    }
+    allFlags.push(...result.flags);
+    totalUsage.inputTokens += result.usage.inputTokens;
+    totalUsage.outputTokens += result.usage.outputTokens;
+    totalUsage.cachedTokens += result.usage.cachedTokens || 0;
+  }
+
   // Apply labels to images & propagate to duplicates
   const updatedImages = images.map(img => {
     const targetId = img.duplicateOf || img.id;
-    const label = labelMap.get(targetId);
+    const label = mergedLabelMap.get(targetId);
     if (label) {
       return {
         ...img,
@@ -190,7 +255,7 @@ export async function labelImagesBatched(params: {
 
   return {
     updatedImages,
-    usage: response.usage,
-    flags,
+    usage: totalUsage,
+    flags: allFlags,
   };
 }

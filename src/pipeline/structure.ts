@@ -89,7 +89,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
   const budgetCap = maxBudgetTokens || 8192;
   const estimatedInput = Math.ceil(lasText.length / 3.2);
   const estimatedOutput = Math.max(300, Math.ceil(estimatedInput * 0.10));
-  const baseCap = Math.max(2048, Math.min(budgetCap, Math.ceil(estimatedOutput * 1.5)));
+  const baseCap = Math.max(512, Math.min(budgetCap, Math.ceil(estimatedOutput * 1.5)));
 
   const request: LLMRequest = {
     role: 'fast',
@@ -181,7 +181,7 @@ async function runChunkedStructurePass(
       system: T1_STRUCTURE_SYSTEM,
       text: chunkPrompt,
       jsonSchema: isGemini ? T1_GEMINI_SCHEMA : undefined,
-      maxOutputTokens: 4096,
+      maxOutputTokens: Math.min(params.maxBudgetTokens || 8192, 4096),
       label: `Structure Pass (Chunk ${Math.floor(i / chunkSize) + 1})`,
       providerConfig,
     };
@@ -197,13 +197,16 @@ async function runChunkedStructurePass(
     if (Array.isArray(data.questions)) mergedQuestions.push(...data.questions);
   }
 
-  // Deduplicate questions by number
-  const seenNos = new Set<number>();
+  // Deduplicate questions by sectionId:no composite key
+  const seenKeys = new Set<string>();
   const dedupedQuestions: any[] = [];
   for (const q of mergedQuestions) {
-    if (q && !seenNos.has(q.no)) {
-      seenNos.add(q.no);
-      dedupedQuestions.push(q);
+    if (q) {
+      const key = `${q.sectionId || ''}:${q.no}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        dedupedQuestions.push(q);
+      }
     }
   }
 

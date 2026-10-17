@@ -9,9 +9,9 @@ import {
   Eye,
   FileSpreadsheet,
 } from 'lucide-react';
-import { ExamDoc } from '../types';
+import { ExamDoc, ImageAsset } from '../types';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
-import { saveExamDoc } from '../store';
+import { saveExamDoc, getImageBlob } from '../store';
 
 interface Props {
   doc: ExamDoc;
@@ -28,7 +28,7 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
     window.print();
   };
 
-  // Export JSON (excluding heavy binary, preserving relative references per §4)
+  // Export JSON (excluding heavy binary and page images, preserving relative references per §4)
   const handleExportJson = () => {
     const cleanImages = doc.images.map(img => {
       const { dataUrl, ...rest } = img;
@@ -38,9 +38,12 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
       };
     });
 
+    // Strip source.pageImages (heavy data URLs) from export
+    const { pageImages, ...sourceWithoutPageImages } = doc.source;
     const exportDoc = {
       ...doc,
       images: cleanImages,
+      source: sourceWithoutPageImages,
     };
 
     const jsonStr = JSON.stringify(exportDoc, null, 2);
@@ -53,16 +56,40 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
     URL.revokeObjectURL(url);
   };
 
-  // Import JSON to reconstruct exam view
+  // Import JSON to reconstruct exam view — re-links image dataUrls from IndexedDB by blobKey
   const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = async () => {
       try {
-        const parsed: ExamDoc = JSON.parse(reader.result as string);
-        onUpdateDoc(parsed);
-        await saveExamDoc(parsed);
+        const parsed = JSON.parse(reader.result as string);
+
+        // Validate parsed shape before accepting
+        if (!parsed || typeof parsed !== 'object') throw new Error('Not a valid object');
+        if (!Array.isArray(parsed.questions)) throw new Error('Missing questions array');
+        if (!parsed.source || !Array.isArray(parsed.source.lines)) throw new Error('Missing source.lines');
+        if (!parsed.meta || typeof parsed.meta !== 'object') throw new Error('Missing meta object');
+
+        // Re-link image dataUrls from IndexedDB by blobKey (same restore logic as loadExamDoc)
+        const restoredImages: ImageAsset[] = await Promise.all(
+          (parsed.images || []).map(async (img: any) => {
+            const blob = img.blobKey ? await getImageBlob(img.blobKey) : undefined;
+            let dataUrl: string | undefined = undefined;
+            if (blob) {
+              dataUrl = URL.createObjectURL(blob);
+            }
+            return { ...img, dataUrl };
+          })
+        );
+
+        const importedDoc: ExamDoc = {
+          ...parsed,
+          images: restoredImages,
+        };
+
+        onUpdateDoc(importedDoc);
+        await saveExamDoc(importedDoc);
       } catch (err: any) {
         alert(`Invalid Exam JSON: ${err.message}`);
       }

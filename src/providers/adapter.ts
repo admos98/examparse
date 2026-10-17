@@ -3,11 +3,18 @@
  */
 import { LLMRequest, LLMResponse, ProviderConfig } from '../types';
 
+export interface ExecuteOptions {
+  onDelta?: (channel: 'output' | 'reasoning', fullText: string, chunk: string) => void;
+  onInfo?: (note: string) => void;
+  salvagePartial?: boolean;
+}
+
 export class LLMAdapter {
   /**
    * Execute an LLM call via the server proxy with auto-fallback and bisection if needed
    */
-  static async execute(request: LLMRequest): Promise<LLMResponse> {
+  static async execute(request: LLMRequest, opts?: ExecuteOptions): Promise<LLMResponse> {
+    if (opts?.onDelta) return this.executeStreaming(request, opts);
     try {
       const response = await fetch('/api/llm', {
         method: 'POST',
@@ -36,6 +43,40 @@ export class LLMAdapter {
       }
 
       throw err;
+    }
+  }
+
+  private static async executeStreaming(request: LLMRequest, opts: ExecuteOptions): Promise<LLMResponse> {
+    let output = '', reasoning = '';
+    try {
+      const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...request, stream: true }) });
+      if (!response.ok) throw new Error((await response.text()).slice(0, 500) || `HTTP ${response.status}`);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Streaming response body unavailable');
+      const decoder = new TextDecoder(); let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary: number;
+        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
+          const event = frame.match(/^event:\s*(\w+)/m)?.[1] || 'message';
+          const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+          if (!data) continue;
+          const payload = JSON.parse(data);
+          if (event === 'info') opts.onInfo?.(payload.note || '');
+          else if (event === 'delta') { output += payload.text || ''; opts.onDelta?.('output', output, payload.text || ''); }
+          else if (event === 'reasoning') { reasoning += payload.text || ''; opts.onDelta?.('reasoning', reasoning, payload.text || ''); }
+          else if (event === 'error') throw new Error(payload.message || 'Stream error');
+          else if (event === 'done') return payload as LLMResponse;
+        }
+      }
+      throw new Error('Stream ended before done event');
+    } catch (err: any) {
+      if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'stream-died', usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil((output.length + reasoning.length) / 3) } };
+      opts.onInfo?.('stream-fallback');
+      return this.execute(request);
     }
   }
 

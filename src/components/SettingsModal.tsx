@@ -60,6 +60,7 @@ export const SettingsModal: React.FC<Props> = ({
       baseURL: 'http://localhost:1234/v1',
       apiKey: '',
       disableReasoning: true,
+      structuredOutputs: true,
       extraBodyJson: '',
     };
     setCurrent(prev => ({ ...prev, providers: [...prev.providers, newProvider] }));
@@ -309,6 +310,13 @@ export const SettingsModal: React.FC<Props> = ({
                               onChange={e => handleUpdateProvider(p.id, { disableReasoning: e.target.checked })}
                               className="w-4 h-4 rounded text-blue-600"
                             />
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <div className="font-medium text-[11px] text-slate-900 dark:text-white">Structured JSON mode (response_format)</div>
+                              <div className="text-[11px] text-slate-500">Turn off for models that reject JSON mode (e.g. some experimental/free models). Prompts still require JSON.</div>
+                            </div>
+                            <input type="checkbox" checked={p.structuredOutputs !== false} onChange={e => handleUpdateProvider(p.id, { structuredOutputs: e.target.checked })} className="w-4 h-4 rounded text-blue-600" />
                           </div>
                           <div>
                             <label className="block text-[11px] text-slate-500 mb-1">Extra body JSON</label>
@@ -619,6 +627,7 @@ export const SettingsModal: React.FC<Props> = ({
                     <label className="block font-medium text-slate-900 dark:text-white">
                       Max Output Tokens Limit
                     </label>
+                    <p className="text-xs text-slate-500">Ceiling only — you pay for tokens generated. Large or question-dense exams may need 16384–32768.</p>
                     <input
                       type="number"
                       step="1024"

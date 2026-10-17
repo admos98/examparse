@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
       baseURL: 'https://generativelanguage.googleapis.com',
       apiKey: '', // Empty means use platform default GEMINI_API_KEY from server env!
       disableReasoning: true,
+      structuredOutputs: true,
       extraBodyJson: '',
     },
     {
@@ -22,6 +23,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
       baseURL: 'http://localhost:20128/v1',
       apiKey: '',
       disableReasoning: true,
+      structuredOutputs: true,
       extraBodyJson: '',
     },
     {
@@ -31,6 +33,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
       baseURL: 'https://openrouter.ai/api/v1',
       apiKey: '',
       disableReasoning: true,
+      structuredOutputs: true,
       extraBodyJson: '',
     },
     {
@@ -40,6 +43,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
       baseURL: 'http://localhost:1234/v1',
       apiKey: '',
       disableReasoning: true,
+      structuredOutputs: true,
       extraBodyJson: '',
     },
   ],
@@ -66,7 +70,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   budget: {
     maxUsdPerRun: 0.25, // default hard cap
-    maxOutputTokens: 8192,
+    maxOutputTokens: 16384,
   },
   document: {
     defaultLanguage: 'auto',
@@ -211,7 +215,12 @@ export async function hydrateServerStorage(): Promise<boolean> {
     if (usageRes.ok) {
       const serverUsage = await usageRes.json().catch(() => null);
       if (Array.isArray(serverUsage)) {
-        localStorage.setItem(USAGE_STORAGE_KEY, JSON.stringify(serverUsage));
+        const localUsage = loadUsageLog();
+        if (serverUsage.length === 0 && localUsage.length > 0) {
+          await fetch('/api/usage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(localUsage) });
+        } else {
+          localStorage.setItem(USAGE_STORAGE_KEY, JSON.stringify(serverUsage));
+        }
       }
     }
     const calRes = await fetch('/api/cache/calibration');
@@ -368,8 +377,8 @@ export function appendUsageRecord(record: UsageRecord, dedupeKey?: string): void
     } else {
       records.push(storedRecord);
     }
-    // Keep last 200 records
-    const trimmed = records.slice(-200);
+    // Keep last 500 records (same cap as folder-mode server storage).
+    const trimmed = records.slice(-500);
     localStorage.setItem(USAGE_STORAGE_KEY, JSON.stringify(trimmed));
   } catch (err) {
     console.warn('Failed to append usage record:', err);

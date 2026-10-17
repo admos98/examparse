@@ -21,6 +21,7 @@ export async function runEscalationRepair(params: {
   sourceLines: SourceLine[];
   providerConfig: any;
   maxOutputTokens?: number;
+  onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<RepairResult> {
   const { failingItems, allQuestions, sourceLines, providerConfig, maxOutputTokens } = params;
 
@@ -108,7 +109,7 @@ export async function runEscalationRepair(params: {
     providerConfig,
   };
 
-  const response = await LLMAdapter.execute(request);
+  const response = await LLMAdapter.execute(request, { onDelta: (channel, full) => params.onLiveText?.(request.label, channel, full), onInfo: note => params.onLiveText?.(request.label, 'info', note) });
 
   // Parse envelope {"items": [...]} or bare array
   let rawPatches: any[] | null = null;

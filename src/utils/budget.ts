@@ -3,28 +3,70 @@
  */
 import { CostTable, UsageRecord } from '../types';
 
-let charsPerTokenRunningAvg = 3.2;
-let totalCalibrationChars = 0;
-let totalCalibrationTokens = 0;
+const CALIBRATION_STORAGE_KEY = 'examparse_calibration_v1';
 
 /**
- * Update calibration ratio with actual observed API usage
+ * Per-provider calibration: chars-per-token running average, persisted in localStorage, clamped 1.0–6.0
  */
-export function updateTokenCalibration(chars: number, actualTokens: number) {
-  if (chars <= 0 || actualTokens <= 0) return;
-  totalCalibrationChars += chars;
-  totalCalibrationTokens += actualTokens;
-  charsPerTokenRunningAvg = totalCalibrationChars / totalCalibrationTokens;
+interface CalibrationEntry {
+  totalChars: number;
+  totalTokens: number;
+  avg: number;
+}
+
+function loadCalibrationMap(): Record<string, CalibrationEntry> {
+  try {
+    const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveCalibrationMap(map: Record<string, CalibrationEntry>): void {
+  try {
+    localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // ignore quota errors
+  }
 }
 
 /**
- * Estimate input tokens from text length and language
+ * Get per-provider chars-per-token ratio, default 3.2
  */
-export function estimateTextTokens(text: string, isRtl: boolean = false): number {
+export function getCalibration(providerKey: string = 'default'): number {
+  const map = loadCalibrationMap();
+  return map[providerKey]?.avg || 3.2;
+}
+
+/**
+ * Update calibration ratio with actual observed API usage (computed from full sent text length: system + user prompt).
+ * Persists per provider in localStorage, clamped 1.0–6.0.
+ */
+export function updateTokenCalibration(
+  fullSentTextLength: number,
+  actualTokens: number,
+  providerKey: string = 'default'
+) {
+  if (fullSentTextLength <= 0 || actualTokens <= 0) return;
+  const map = loadCalibrationMap();
+  const entry = map[providerKey] || { totalChars: 0, totalTokens: 0, avg: 3.2 };
+  entry.totalChars += fullSentTextLength;
+  entry.totalTokens += actualTokens;
+  entry.avg = Math.max(1.0, Math.min(6.0, entry.totalChars / entry.totalTokens));
+  map[providerKey] = entry;
+  saveCalibrationMap(map);
+}
+
+/**
+ * Estimate input tokens from text length and language, using per-provider calibration
+ */
+export function estimateTextTokens(text: string, isRtl: boolean = false, providerKey: string = 'default'): number {
   if (!text) return 0;
+  const base = getCalibration(providerKey);
   // Persian / Arabic tokens tend to be ~2.2 - 2.8 chars per token
-  const baseCharsPerToken = isRtl ? Math.min(charsPerTokenRunningAvg, 2.5) : charsPerTokenRunningAvg;
-  return Math.ceil(text.length / baseCharsPerToken);
+  const charsPerToken = isRtl ? Math.min(base, 2.5) : base;
+  return Math.ceil(text.length / charsPerToken);
 }
 
 /**
@@ -41,6 +83,7 @@ export function estimateImageTokens(width: number, height: number, isGemini: boo
 
 /**
  * Estimate pre-flight pipeline tokens and cost
+ * Prices each stage at its own role model.
  */
 export interface PreflightEstimate {
   estimatedInputTokens: number;
@@ -57,6 +100,13 @@ export interface PreflightEstimate {
   };
 }
 
+export interface PreflightStageModels {
+  structureModel?: string;
+  ocrModel?: string;
+  visionModel?: string;
+  repairModel?: string;
+}
+
 export function calculatePreflightEstimate(params: {
   text: string;
   isRtl: boolean;
@@ -66,33 +116,67 @@ export function calculatePreflightEstimate(params: {
   model: string;
   costTable: CostTable;
   maxUsdPerRun: number;
+  stageModels?: PreflightStageModels;
+  maxImagesPerVisionCall?: number;
+  providerKey?: string;
 }): PreflightEstimate {
-  const { text, isRtl, images, scannedPagesCount, isGemini, model, costTable, maxUsdPerRun } = params;
+  const {
+    text,
+    isRtl,
+    images,
+    scannedPagesCount,
+    isGemini,
+    model,
+    costTable,
+    maxUsdPerRun,
+    stageModels,
+    maxImagesPerVisionCall = 16,
+    providerKey = 'default',
+  } = params;
 
-  // 1. Structure text input tokens
-  const textTokens = estimateTextTokens(text, isRtl);
+  // 1. Structure text input tokens (priced at structure model)
+  const structureModel = stageModels?.structureModel || model;
+  const textTokens = estimateTextTokens(text, isRtl, providerKey);
 
-  // 2. OCR tokens if scanned pages exist (3 pages per batch)
+  // 2. OCR tokens if scanned pages exist (3 pages per batch), priced at OCR model
+  const ocrModel = stageModels?.ocrModel || model;
   const ocrCalls = Math.ceil(scannedPagesCount / 3);
   const ocrTokens = scannedPagesCount * (isGemini ? 258 * 2 * 2 : 500);
 
-  // 3. Vision call tokens (1 batched call for images)
-  const visionCalls = images.length > 0 ? 1 : 0;
+  // 3. Vision calls: chunk by maxImagesPerVisionCall (minimum chunks)
+  const visionModel = stageModels?.visionModel || model;
+  const visionCalls = images.length > 0 ? Math.max(1, Math.ceil(images.length / Math.max(1, maxImagesPerVisionCall))) : 0;
   let imageTokens = 0;
   for (const img of images) {
     imageTokens += estimateImageTokens(img.width, img.height, isGemini);
   }
 
+  // Per-stage cost: each stage priced at its own model rate
+  const structureRate = costTable[structureModel] || { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 };
+  const ocrRate = costTable[ocrModel] || { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 };
+  const visionRate = costTable[visionModel] || { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 };
+
+  // Output estimates per stage
+  const structureOutputTokens = Math.max(250, Math.ceil(textTokens * 0.1));
+  const ocrOutputTokens = scannedPagesCount * 400;
+  const visionOutputTokens = images.length * 20;
+
   const estimatedInputTokens = textTokens + ocrTokens + imageTokens;
-  // Output estimate ≈ 10% of input for structure + small metadata
-  const estimatedOutputTokens = Math.max(250, Math.ceil(textTokens * 0.1) + images.length * 20);
+  const estimatedOutputTokens = structureOutputTokens + ocrOutputTokens + visionOutputTokens;
   const estimatedTotalTokens = estimatedInputTokens + estimatedOutputTokens;
 
-  // Cost calculation
-  const rate = costTable[model] || { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 };
-  const estimatedCostUsd =
-    (estimatedInputTokens / 1_000_000) * rate.inputCostPerMillion +
-    (estimatedOutputTokens / 1_000_000) * rate.outputCostPerMillion;
+  // Cost per stage
+  const structureCost =
+    (textTokens / 1_000_000) * structureRate.inputCostPerMillion +
+    (structureOutputTokens / 1_000_000) * structureRate.outputCostPerMillion;
+  const ocrCost =
+    (ocrTokens / 1_000_000) * ocrRate.inputCostPerMillion +
+    (ocrOutputTokens / 1_000_000) * ocrRate.outputCostPerMillion;
+  const visionCost =
+    (imageTokens / 1_000_000) * visionRate.inputCostPerMillion +
+    (visionOutputTokens / 1_000_000) * visionRate.outputCostPerMillion;
+
+  const estimatedCostUsd = structureCost + ocrCost + visionCost;
 
   const exceedsBudget = maxUsdPerRun > 0 && estimatedCostUsd > maxUsdPerRun;
   const warning50Percent = maxUsdPerRun > 0 && estimatedCostUsd > maxUsdPerRun * 0.5;

@@ -81,10 +81,15 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       let parsedJson: any = null;
       try {
         parsedJson = JSON.parse(rawText);
-      } catch (e) {
+      } catch (_e) {
         // Strip possible markdown fences defensively
-        const cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, '$1').trim();
-        parsedJson = JSON.parse(cleaned);
+        try {
+          const cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, '$1').trim();
+          parsedJson = JSON.parse(cleaned);
+        } catch {
+          // Both JSON.parse attempts failed — do NOT throw; return null json with real metadata
+          parsedJson = null;
+        }
       }
 
       const inputTokens = response.usageMetadata?.promptTokenCount || Math.ceil(text.length / 3);
@@ -92,7 +97,8 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       const thoughtsTokens = (response.usageMetadata as any)?.thoughtsTokenCount || 0;
       const outputTokens = (candidatesTokens + thoughtsTokens) || Math.ceil(rawText.length / 3);
       const cachedTokens = response.usageMetadata?.cachedContentTokenCount || 0;
-      const finishReason = response.candidates?.[0]?.finishReason || 'STOP';
+      const realFinishReason = response.candidates?.[0]?.finishReason || 'STOP';
+      const finishReason = parsedJson === null ? (realFinishReason || 'PARSE_ERROR') : realFinishReason;
 
       const result: LLMResponse = {
         json: parsedJson,
@@ -165,12 +171,17 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       try {
         parsedJson = JSON.parse(rawText);
       } catch {
-        const cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, '$1').trim();
-        parsedJson = JSON.parse(cleaned);
+        try {
+          const cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, '$1').trim();
+          parsedJson = JSON.parse(cleaned);
+        } catch {
+          parsedJson = null;
+        }
       }
 
       const usage = data.usage || {};
-      const finishReason = data.choices?.[0]?.finish_reason || 'stop';
+      const rawFinishReason = data.choices?.[0]?.finish_reason || 'stop';
+      const finishReason = parsedJson === null ? (rawFinishReason || 'PARSE_ERROR') : rawFinishReason;
       const result: LLMResponse = {
         json: parsedJson,
         usage: {

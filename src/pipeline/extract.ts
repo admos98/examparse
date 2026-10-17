@@ -419,10 +419,15 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
       if (['P', 'H1', 'H2', 'H3', 'LI', 'TR'].includes(el.tagName)) {
         const text = el.innerText?.trim();
         if (text) {
+          // Count <img> children even inside text-bearing elements before returning
+          const imgChildren = el.querySelectorAll('img');
+          for (let i = 0; i < imgChildren.length; i++) {
+            imgAnchorLines.push(currentLineIndex);
+          }
           rawParagraphs.push(text);
           const subCount = text.split('\n').map(s => s.trim()).filter(Boolean).length;
           currentLineIndex += subCount;
-          return;
+          return; // Don't walk children again — already counted imgs and used innerText
         }
       }
       for (let c = 0; c < el.childNodes.length; c++) {

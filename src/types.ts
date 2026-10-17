@@ -50,7 +50,7 @@ export interface Question {
   answer?: {
     spans?: LineSpan[];
     text?: string;
-    source: 'paper' | 'keyfile' | 'manual';
+    source: 'paper' | 'keyfile' | 'manual' | 'ai';
   };
   tables?: {
     html: string;
@@ -239,6 +239,7 @@ export interface LLMResponse {
     cachedTokens?: number;
   };
   rawText: string;
+  finishReason?: string;
 }
 
 /**

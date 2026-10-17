@@ -20,6 +20,7 @@ import { runFullPipeline } from '../pipeline';
 interface Props {
   extractedDoc: ExtractedDocument;
   rawFile: File | null;
+  answerKeyFile?: File | null;
   settings: AppSettings;
   stages: StageStatus[];
   onStagesUpdate: React.Dispatch<React.SetStateAction<StageStatus[]>>;
@@ -31,6 +32,7 @@ interface Props {
 export const Step3Analyze: React.FC<Props> = ({
   extractedDoc,
   rawFile,
+  answerKeyFile,
   settings,
   stages,
   onStagesUpdate,
@@ -41,56 +43,149 @@ export const Step3Analyze: React.FC<Props> = ({
   const [forceRerun, setForceRerun] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isPreflightCached, setIsPreflightCached] = useState<boolean>(false);
+  const [cachedStages, setCachedStages] = useState<{
+    structure: boolean;
+    vision: boolean;
+    ocr: boolean;
+    repair: boolean;
+  }>({ structure: false, vision: false, ocr: false, repair: true });
 
   // Selected role model for structure pass
   const activeRole = settings.roleMapping.fast;
   const activeProvider =
     settings.providers.find(p => p.id === activeRole.providerId) || settings.providers[0];
 
-  // Check if file is already cached in IndexedDB
+  // Check if pipeline stages are already cached in IndexedDB
   useEffect(() => {
     let isMounted = true;
-    async function checkCache() {
+    async function checkAllCaches() {
       if (!rawFile) return;
       try {
         const { sha256 } = await import('../utils/hash');
         const { getCachedStageResult } = await import('../pipeline/cache');
+        const { assembleAndValidateQuestions } = await import('../pipeline/assemble');
         const buf = await rawFile.arrayBuffer();
         const hash = await sha256(buf);
-        const cached = await getCachedStageResult({
+
+        // 1. Structure stage
+        const cachedStruct = await getCachedStageResult<any>({
           fileHash: hash,
           stage: 'structure',
           provider: activeProvider.id,
           model: activeRole.model,
           options: { latex: settings.thrift.latexNormalization },
         });
-        if (isMounted && cached) {
-          setIsPreflightCached(true);
-        } else if (isMounted) {
-          setIsPreflightCached(false);
+
+        // 2. Vision stage
+        let visionCached = true;
+        if (extractedDoc.images.length > 0) {
+          const vRole = settings.roleMapping.vision;
+          const vProv = settings.providers.find(p => p.id === vRole.providerId) || settings.providers[0];
+          const cachedV = await getCachedStageResult({
+            fileHash: hash,
+            stage: 'vision',
+            provider: vProv.id,
+            model: vRole.model,
+            options: { imgCount: extractedDoc.images.length },
+          });
+          visionCached = Boolean(cachedV);
+        }
+
+        // 3. OCR stage
+        let ocrCached = true;
+        if (extractedDoc.scannedPageIndices.length > 0) {
+          const oRole = settings.roleMapping.vision;
+          const oProv = settings.providers.find(p => p.id === oRole.providerId) || settings.providers[0];
+          const cachedO = await getCachedStageResult({
+            fileHash: hash,
+            stage: 'ocr',
+            provider: oProv.id,
+            model: oRole.model,
+            options: extractedDoc.scannedPageIndices,
+          });
+          ocrCached = Boolean(cachedO);
+        }
+
+        // 4. Repair stage
+        let repairCached = true;
+        if (cachedStruct && Array.isArray(cachedStruct.rawQuestions)) {
+          const assembled = assembleAndValidateQuestions(cachedStruct.rawQuestions, extractedDoc.lines);
+          if (assembled.failingQuestions.length > 0) {
+            const rRole = settings.roleMapping.escalation;
+            const rProv = settings.providers.find(p => p.id === rRole.providerId) || settings.providers[0];
+            const rOpts = {
+              failing: assembled.failingQuestions.map(f => ({
+                id: f.question.id,
+                errors: [...f.errors].sort(),
+              })),
+            };
+            const cachedR = await getCachedStageResult({
+              fileHash: hash,
+              stage: 'repair',
+              provider: rProv.id,
+              model: rRole.model,
+              options: rOpts,
+            });
+            repairCached = Boolean(cachedR);
+          }
+        }
+
+        if (isMounted) {
+          const status = {
+            structure: Boolean(cachedStruct),
+            vision: visionCached,
+            ocr: ocrCached,
+            repair: repairCached,
+          };
+          setCachedStages(status);
+          const allCached = status.structure && status.vision && status.ocr && status.repair;
+          setIsPreflightCached(allCached);
         }
       } catch {
         if (isMounted) setIsPreflightCached(false);
       }
     }
-    checkCache();
+    checkAllCaches();
     return () => {
       isMounted = false;
     };
-  }, [rawFile, activeProvider.id, activeRole.model, settings.thrift.latexNormalization]);
+  }, [
+    rawFile,
+    activeProvider.id,
+    activeRole.model,
+    settings.thrift.latexNormalization,
+    extractedDoc.images.length,
+    extractedDoc.scannedPageIndices.length,
+  ]);
 
-  // Calculate pre-flight token & cost estimate (§5.7)
+  const isFullyCached =
+    isPreflightCached &&
+    cachedStages.structure &&
+    (extractedDoc.images.length === 0 || cachedStages.vision) &&
+    (extractedDoc.scannedPageIndices.length === 0 || cachedStages.ocr) &&
+    cachedStages.repair;
+
+  // Calculate pre-flight token & cost estimate for uncached stages only (§5.7)
   const fullText = extractedDoc.lines.map(l => l.text).join('\n');
-  const estimate = calculatePreflightEstimate({
-    text: fullText,
-    isRtl: settings.document.defaultLanguage === 'rtl',
-    images: extractedDoc.images,
-    scannedPagesCount: extractedDoc.scannedPageIndices.length,
-    isGemini: activeProvider.kind === 'gemini',
-    model: activeRole.model,
-    costTable: settings.costTable,
-    maxUsdPerRun: settings.budget.maxUsdPerRun,
-  });
+  const estimate = isFullyCached && !forceRerun
+    ? {
+        estimatedInputTokens: 0,
+        estimatedOutputTokens: 0,
+        estimatedCostUsd: 0,
+        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, structureTokens: 0 },
+        exceedsBudget: false,
+        warning50Percent: false,
+      }
+    : calculatePreflightEstimate({
+        text: cachedStages.structure && !forceRerun ? '' : fullText,
+        isRtl: settings.document.defaultLanguage === 'rtl',
+        images: cachedStages.vision && !forceRerun ? [] : extractedDoc.images,
+        scannedPagesCount: cachedStages.ocr && !forceRerun ? 0 : extractedDoc.scannedPageIndices.length,
+        isGemini: activeProvider.kind === 'gemini',
+        model: activeRole.model,
+        costTable: settings.costTable,
+        maxUsdPerRun: settings.budget.maxUsdPerRun,
+      });
 
   const handleStartAnalysis = async () => {
     if (!rawFile) {
@@ -98,7 +193,8 @@ export const Step3Analyze: React.FC<Props> = ({
       return;
     }
 
-    if (estimate.exceedsBudget) {
+    // Never budget-block a fully cached run
+    if (!isFullyCached && !forceRerun && estimate.exceedsBudget) {
       setErrorMsg(
         `Pre-flight cost ($${estimate.estimatedCostUsd.toFixed(4)}) exceeds your configured budget cap ($${settings.budget.maxUsdPerRun}). Analysis halted.`
       );
@@ -130,7 +226,7 @@ export const Step3Analyze: React.FC<Props> = ({
             );
           },
         },
-        { forceRerun }
+        { forceRerun, answerKeyFile }
       );
 
       setIsAnalyzing(false);

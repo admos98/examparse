@@ -176,8 +176,20 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
 
                     {/* Answer Key Mode Display */}
                     {mode === 'answer-key' && q.answer && (
-                      <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs">
-                        <span className="font-bold">کلید پاسخ / Answer:</span> {q.answer.text}
+                      <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold">کلید پاسخ / Answer:</span>
+                          <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-200 text-emerald-800 uppercase font-semibold">
+                            {q.answer.source === 'paper'
+                              ? 'In-Doc Key'
+                              : q.answer.source === 'keyfile'
+                              ? 'Key File'
+                              : q.answer.source === 'ai'
+                              ? 'AI Solved'
+                              : 'Manual'}
+                          </span>
+                        </div>
+                        <div className="whitespace-pre-wrap">{q.answer.text}</div>
                       </div>
                     )}
 

@@ -65,6 +65,10 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       if (jsonSchema) {
         config.responseSchema = jsonSchema;
       }
+      // Disable thinking overhead for Flash / Flash-Lite models
+      if (model.toLowerCase().includes('flash')) {
+        config.thinkingConfig = { thinkingBudget: 0 };
+      }
 
       const startTime = Date.now();
       const response = await ai.models.generateContent({
@@ -84,8 +88,11 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       }
 
       const inputTokens = response.usageMetadata?.promptTokenCount || Math.ceil(text.length / 3);
-      const outputTokens = response.usageMetadata?.candidatesTokenCount || Math.ceil(rawText.length / 3);
+      const candidatesTokens = response.usageMetadata?.candidatesTokenCount || 0;
+      const thoughtsTokens = (response.usageMetadata as any)?.thoughtsTokenCount || 0;
+      const outputTokens = (candidatesTokens + thoughtsTokens) || Math.ceil(rawText.length / 3);
       const cachedTokens = response.usageMetadata?.cachedContentTokenCount || 0;
+      const finishReason = response.candidates?.[0]?.finishReason || 'STOP';
 
       const result: LLMResponse = {
         json: parsedJson,
@@ -95,6 +102,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           cachedTokens,
         },
         rawText,
+        finishReason,
       };
 
       return res.json(result);
@@ -162,6 +170,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       }
 
       const usage = data.usage || {};
+      const finishReason = data.choices?.[0]?.finish_reason || 'stop';
       const result: LLMResponse = {
         json: parsedJson,
         usage: {
@@ -170,6 +179,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           cachedTokens: usage.prompt_tokens_details?.cached_tokens || 0,
         },
         rawText,
+        finishReason,
       };
 
       return res.json(result);

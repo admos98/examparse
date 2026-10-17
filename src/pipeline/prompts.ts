@@ -22,7 +22,8 @@ RULES
 7. Assign each manifest image to a question and a role (stem|option|table|decoration); if unsure, stem. Do not describe images in this call.
 8. questions may not share line ranges, except a group stem with sub-questions (use parentId).
 9. If a header exists, fill meta (subject, grade, school, term, year, durationMinutes, totalPoints); null when absent.
-10. Set confidence 0..1 per question; add short machine-readable flags for anomalies.`;
+10. Set confidence 0..1 per question; add short machine-readable flags for anomalies.
+11. Embedded Answer Keys & Solutions: If the document contains an Answer Key table, solutions section, or answers printed at the end or below questions (e.g., 'Answer Key', 'پاسخ‌نامه', 'کلید سوالات', 'Solutions', 'Correct Answer: B'), detect and link them! Set answer: {"spans": [[startLine, endLine]]} pointing to those exact source lines. Never copy long answers into free text; use spans only.`;
 
 export const T2_IMAGE_LABELING_SYSTEM = `You receive ONE batch of exam-paper images. Each image is preceded by {id, page, nearLine} and up to 6 source lines around that anchor.
 For EACH image return exactly: {"id": string, "role": "stem|option|table|decoration", "questionRef": "question label or null", "kind": "photo|diagram|chart|table|formula|handwriting|decoration", "caption": "≤12 words, source language", "needsText": boolean}
@@ -36,6 +37,10 @@ Return ONLY an RFC 7386 merge patch object for this question (e.g. {"points": 2}
 Do not return the full object unless more than 60% of fields change. Output valid JSON only, no markdown.`;
 
 export const T5_OCR_SYSTEM = `Transcribe each page as numbered lines: "[L0001] text". One line per visual line, top-to-bottom, preserve reading order and spacing of the layout. Do not correct spelling, do not translate, do not add commentary. Illegal/illegible: "⟨?⟩". Keep page headers/footers. Return {"pages":[{"page": 1, "lines":["[L0001] ..."]}]} only.`;
+
+export const T6_SOLVER_SYSTEM = `You are ExamSolver, an expert academic examiner. For each question provided, produce a concise, verified final answer or short step-by-step solution.
+Format: JSON array of {"id": string, "answer": string}.
+Keep answers concise (for MCQs, output the option letter and short rationale, e.g. 'Option B — acceleration is zero at maximum velocity'). Output in the source language of the exam. No conversational filler.`;
 
 /**
  * Gemini Response Schema for T1 Structure Pass

@@ -14,14 +14,41 @@ export interface StructurePassResult {
   rawText: string;
 }
 
-export async function runStructurePass(params: {
+export interface StructurePassParams {
   sourceLines: SourceLine[];
   images: ImageAsset[];
   languageHint?: string;
   latexEnabled: boolean;
   providerConfig: any;
-}): Promise<StructurePassResult> {
-  const { sourceLines, images, languageHint, latexEnabled, providerConfig } = params;
+  maxBudgetTokens?: number;
+}
+
+const COMPACT_T1_SCHEMA = {
+  meta: { title: 'string?', language: 'string', direction: 'ltr|rtl', totalPoints: 'number?' },
+  sections: [
+    { id: 'string', index: 'number', title: 'string?', instructions: 'string?', spans: '[[startLine, endLine]]' },
+  ],
+  questions: [
+    {
+      id: 'string',
+      label: 'string',
+      no: 'number',
+      parentId: 'string?',
+      sectionId: 'string?',
+      spans: '[[startLine, endLine]]',
+      type: 'mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay',
+      points: 'number?',
+      options: [{ key: 'string', spans: '[[startLine, endLine]]' }],
+      answer: { spans: '[[startLine, endLine]]' },
+      rewrites: [{ line: 'number', text: 'string' }],
+      images: [{ imageId: 'string', role: 'stem|option|table|decoration' }],
+      confidence: 'number(0..1)',
+    },
+  ],
+};
+
+export async function runStructurePass(params: StructurePassParams): Promise<StructurePassResult> {
+  const { sourceLines, images, languageHint, latexEnabled, providerConfig, maxBudgetTokens } = params;
 
   // Format Line-Addressed Source (LAS)
   // Each line prefixed with [L0001], page markers === PAGE n ===
@@ -43,7 +70,14 @@ export async function runStructurePass(params: {
     nearLine: img.anchorLine || 'unknown',
   }));
 
-  const userPrompt = `CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint: languageHint || null })}\n\nIMAGE MANIFEST:\n${JSON.stringify(manifestEntries, null, 2)}\n\nSOURCE:\n${lasText}`;
+  const isGemini = providerConfig?.kind === 'gemini';
+
+  let userPrompt = `CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint: languageHint || null })}\n\nIMAGE MANIFEST:\n${JSON.stringify(manifestEntries, null, 2)}\n\nSOURCE:\n${lasText}`;
+
+  // For non-Gemini providers, embed a compact JSON schema directly in user prompt
+  if (!isGemini) {
+    userPrompt += `\n\nREQUIRED JSON SCHEMA CONTRACT (Strict):\n${JSON.stringify(COMPACT_T1_SCHEMA, null, 2)}`;
+  }
 
   // If source text > 120k characters, chunk by pages (rare for exams, but supported per §5.8 & §10)
   if (lasText.length > 120_000) {
@@ -51,38 +85,63 @@ export async function runStructurePass(params: {
   }
 
   // Estimate output tokens ≈ 10% of input + 20 tokens per section/question
-  // §5.6: maxOutputTokens = estimate × 1.5
+  // §5.6 & audit: structure maxOutputTokens = clamp(estimate × 1.5, 2048, settings.budget.maxOutputTokens)
+  const budgetCap = maxBudgetTokens || 8192;
   const estimatedInput = Math.ceil(lasText.length / 3.2);
   const estimatedOutput = Math.max(300, Math.ceil(estimatedInput * 0.10));
-  const maxOutput = Math.min(8192, Math.ceil(estimatedOutput * 1.5));
+  const baseCap = Math.max(2048, Math.min(budgetCap, Math.ceil(estimatedOutput * 1.5)));
 
-  const isGemini = providerConfig?.kind === 'gemini';
   const request: LLMRequest = {
     role: 'fast',
     system: T1_STRUCTURE_SYSTEM,
     text: userPrompt,
     jsonSchema: isGemini ? T1_GEMINI_SCHEMA : undefined,
-    maxOutputTokens: maxOutput,
+    maxOutputTokens: baseCap,
     label: 'Structure Pass',
     providerConfig,
   };
 
   const response = await LLMAdapter.execute(request);
-  const data: any = response.json || {};
+  let data: any = response.json || {};
+  const totalUsage = { ...response.usage };
+
+  // On MAX_TOKENS / length truncation or unparseable JSON, retry once at 2x cap (counted in usage)
+  const isTruncatedOrBroken =
+    response.finishReason === 'MAX_TOKENS' ||
+    response.finishReason === 'length' ||
+    !data ||
+    !Array.isArray(data.questions) ||
+    data.questions.length === 0;
+
+  if (isTruncatedOrBroken && baseCap < budgetCap) {
+    const retryCap = Math.min(budgetCap, baseCap * 2);
+    console.warn(`Structure pass truncated or unparseable (${response.finishReason}). Retrying once at 2x cap (${retryCap})...`);
+    const retryRequest: LLMRequest = {
+      ...request,
+      maxOutputTokens: retryCap,
+      label: 'Structure Pass (Retry 2x Cap)',
+    };
+    const retryResponse = await LLMAdapter.execute(retryRequest);
+    totalUsage.inputTokens += retryResponse.usage.inputTokens;
+    totalUsage.outputTokens += retryResponse.usage.outputTokens;
+    totalUsage.cachedTokens = (totalUsage.cachedTokens || 0) + (retryResponse.usage.cachedTokens || 0);
+
+    data = retryResponse.json || {};
+  }
 
   // Token-Thrift Acceptance Check (§12 Test 1): expect output ≤ 12% of input
-  const thriftRatio = response.usage.inputTokens > 0
-    ? (response.usage.outputTokens / response.usage.inputTokens) * 100
+  const thriftRatio = totalUsage.inputTokens > 0
+    ? (totalUsage.outputTokens / totalUsage.inputTokens) * 100
     : 0;
   console.log(
-    `[Token-Thrift Audit] Structure Pass: in=${response.usage.inputTokens}, out=${response.usage.outputTokens} (ratio: ${thriftRatio.toFixed(1)}%, target: <=12%)`
+    `[Token-Thrift Audit] Structure Pass: in=${totalUsage.inputTokens}, out=${totalUsage.outputTokens} (ratio: ${thriftRatio.toFixed(1)}%, target: <=12%)`
   );
 
   return {
     sections: Array.isArray(data.sections) ? data.sections : [],
     rawQuestions: Array.isArray(data.questions) ? data.questions : [],
     meta: data.meta || {},
-    usage: response.usage,
+    usage: totalUsage,
     rawText: response.rawText,
   };
 }

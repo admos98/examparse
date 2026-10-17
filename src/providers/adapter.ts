@@ -48,15 +48,51 @@ export class LLMAdapter {
     const chunk1 = images.slice(0, mid);
     const chunk2 = images.slice(mid);
 
+    const chunk1Ids = new Set(chunk1.map(i => i.id));
+    const chunk2Ids = new Set(chunk2.map(i => i.id));
+
+    // Slice manifest/context text in request.text to only the images in that chunk
+    const sliceManifestText = (text: string, allowedIds: Set<string>): string => {
+      if (text.includes('MANIFEST:')) {
+        const parts = text.split('MANIFEST:');
+        const header = parts[0];
+        const rest = parts.slice(1).join('MANIFEST:');
+        const entries = rest.split(/\n---\n|\n=====\n/);
+        const filteredEntries = entries.filter(e => {
+          for (const id of allowedIds) {
+            if (e.includes(`Image ${id}:`) || e.includes(`"${id}"`) || e.includes(id)) {
+              return true;
+            }
+          }
+          return false;
+        });
+        return `${header}MANIFEST:\n${filteredEntries.join('\n---\n')}\n\nReturn JSON: {"items": [...]} for the attached ${allowedIds.size} images.`;
+      }
+      return text;
+    };
+
+    const text1 = sliceManifestText(request.text, chunk1Ids);
+    const text2 = sliceManifestText(request.text, chunk2Ids);
+
     const [res1, res2] = await Promise.all([
-      this.execute({ ...request, images: chunk1 }),
-      this.execute({ ...request, images: chunk2 }),
+      this.execute({ ...request, images: chunk1, text: text1 }),
+      this.execute({ ...request, images: chunk2, text: text2 }),
     ]);
 
-    // Merge array JSON responses (like image labeling)
+    // Merge array or envelope JSON responses
     let mergedJson: any = [];
     if (Array.isArray(res1.json) && Array.isArray(res2.json)) {
       mergedJson = [...res1.json, ...res2.json];
+    } else if (
+      res1.json &&
+      res2.json &&
+      typeof res1.json === 'object' &&
+      typeof res2.json === 'object' &&
+      (Array.isArray((res1.json as any).items) || Array.isArray((res2.json as any).items))
+    ) {
+      mergedJson = {
+        items: [...((res1.json as any).items || []), ...((res2.json as any).items || [])],
+      };
     } else if (typeof res1.json === 'object' && typeof res2.json === 'object') {
       mergedJson = { ...(res1.json as any), ...(res2.json as any) };
     } else {

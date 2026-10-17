@@ -49,6 +49,8 @@ export const Step4Review: React.FC<Props> = ({
   const [filterType, setFilterType] = useState<string>('all');
   const [showFlagsPanel, setShowFlagsPanel] = useState<boolean>(true);
   const [showImageManager, setShowImageManager] = useState<boolean>(false);
+  const [isSolvingBatch, setIsSolvingBatch] = useState<boolean>(false);
+  const [solvingQuestionId, setSolvingQuestionId] = useState<string | null>(null);
 
   // Group questions by section
   const sections = examDoc.sections.length > 0 ? examDoc.sections : [{ id: 'sec_default', index: 1, title: 'General Section', spans: [] }];
@@ -141,6 +143,90 @@ export const Step4Review: React.FC<Props> = ({
     }
   };
 
+  // Solve all questions missing an answer in 1 batched call
+  const handleSolveAllMissing = async () => {
+    setIsSolvingBatch(true);
+    const standardRole = settings.roleMapping.standard;
+    const provider = settings.providers.find(p => p.id === standardRole.providerId) || settings.providers[0];
+    const providerConfig = { ...provider, model: standardRole.model };
+
+    try {
+      const { solveQuestionsWithAI } = await import('../pipeline/solver');
+      const { calculateActualCost } = await import('../utils/budget');
+      const { appendUsageRecord } = await import('../store');
+
+      const res = await solveQuestionsWithAI({
+        questions: examDoc.questions,
+        providerConfig,
+      });
+
+      if (res.solvedCount > 0) {
+        const costUsd = calculateActualCost(
+          res.usageRecord.inputTokens,
+          res.usageRecord.outputTokens,
+          providerConfig.model,
+          settings.costTable
+        );
+        res.usageRecord.costUsd = costUsd;
+        appendUsageRecord(res.usageRecord);
+
+        const newDoc: ExamDoc = {
+          ...examDoc,
+          questions: res.updatedQuestions,
+          usage: [...(examDoc.usage || []), res.usageRecord],
+        };
+        onUpdateDoc(newDoc);
+        saveExamDoc(newDoc);
+      }
+    } catch (err: any) {
+      alert(`AI Solve failed: ${err.message}`);
+    } finally {
+      setIsSolvingBatch(false);
+    }
+  };
+
+  // Solve single question with AI
+  const handleSolveSingle = async (q: Question) => {
+    setSolvingQuestionId(q.id);
+    const standardRole = settings.roleMapping.standard;
+    const provider = settings.providers.find(p => p.id === standardRole.providerId) || settings.providers[0];
+    const providerConfig = { ...provider, model: standardRole.model };
+
+    try {
+      const { solveSingleQuestionWithAI } = await import('../pipeline/solver');
+      const { calculateActualCost } = await import('../utils/budget');
+      const { appendUsageRecord } = await import('../store');
+
+      const res = await solveSingleQuestionWithAI({
+        question: q,
+        providerConfig,
+      });
+
+      const costUsd = calculateActualCost(
+        res.usageRecord.inputTokens,
+        res.usageRecord.outputTokens,
+        providerConfig.model,
+        settings.costTable
+      );
+      res.usageRecord.costUsd = costUsd;
+      appendUsageRecord(res.usageRecord);
+
+      const updatedQ: Question = {
+        ...q,
+        answer: {
+          text: res.answerText,
+          source: 'ai' as const,
+        },
+      };
+
+      handleUpdateQuestion(q.id, updatedQ);
+    } catch (err: any) {
+      alert(`Failed to solve question: ${err.message}`);
+    } finally {
+      setSolvingQuestionId(null);
+    }
+  };
+
   // Accept proposed patch
   const handleAcceptPatch = () => {
     if (!patchDiffResult) return;
@@ -180,6 +266,32 @@ export const Step4Review: React.FC<Props> = ({
         </div>
 
         <div className="flex items-center gap-2 text-xs">
+          {/* Solve Missing with AI Button */}
+          {(() => {
+            const missingCount = examDoc.questions.filter(q => !q.answer?.text).length;
+            return (
+              <button
+                disabled={isSolvingBatch || missingCount === 0}
+                onClick={handleSolveAllMissing}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border font-medium transition cursor-pointer ${
+                  missingCount > 0
+                    ? 'bg-purple-50 dark:bg-purple-950/40 border-purple-300 dark:border-purple-800 text-purple-700 dark:text-purple-300 hover:bg-purple-100'
+                    : 'border-slate-200 dark:border-slate-800 text-slate-400 opacity-60'
+                }`}
+                title="Solve all questions lacking an answer with AI in 1 batched call"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-purple-500" />
+                <span>
+                  {isSolvingBatch
+                    ? 'Solving Batch...'
+                    : missingCount > 0
+                    ? `Answer with AI (${missingCount})`
+                    : 'All Answered'}
+                </span>
+              </button>
+            );
+          })()}
+
           <button
             onClick={handleRenumberQuestions}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 font-medium transition cursor-pointer"
@@ -394,6 +506,17 @@ export const Step4Review: React.FC<Props> = ({
 
                         {/* Question Action Buttons */}
                         <div className="flex items-center gap-1.5">
+                          {/* Solve single with AI */}
+                          <button
+                            disabled={solvingQuestionId === q.id}
+                            onClick={() => handleSolveSingle(q)}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-purple-50 dark:bg-purple-950/40 border border-purple-300 dark:border-purple-800 text-purple-700 dark:text-purple-300 text-[11px] font-medium hover:bg-purple-100 dark:hover:bg-purple-900/40 transition cursor-pointer"
+                            title="Solve or regenerate answer for this question with AI"
+                          >
+                            <Sparkles className="w-3 h-3 text-purple-500" />
+                            <span>{solvingQuestionId === q.id ? 'Solving...' : q.answer?.text ? 'Re-solve' : 'AI Solve'}</span>
+                          </button>
+
                           {/* Minimal-Patch Regeneration Button (§5.4) */}
                           <button
                             onClick={() => {
@@ -484,12 +607,77 @@ export const Step4Review: React.FC<Props> = ({
                         </div>
                       )}
 
-                      {/* Answer Key preview */}
-                      {q.answer && (
-                        <div className="pt-1 text-[11px] text-emerald-700 dark:text-emerald-400 bg-emerald-50/50 dark:bg-emerald-950/20 p-2 rounded-xl border border-emerald-200/50 dark:border-emerald-800/30">
-                          <span className="font-semibold">Answer:</span> {q.answer.text}
-                        </div>
-                      )}
+                      {/* Answer Key preview with Origin Badge & Inline Edit */}
+                      <div className="pt-1">
+                        {q.answer && q.answer.text ? (
+                          <div className="text-[11px] bg-slate-50 dark:bg-slate-950/60 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-1.5">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-slate-800 dark:text-slate-200">Answer:</span>
+                                <span
+                                  className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-semibold uppercase ${
+                                    q.answer.source === 'paper'
+                                      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
+                                      : q.answer.source === 'keyfile'
+                                      ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20'
+                                      : q.answer.source === 'ai'
+                                      ? 'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20'
+                                      : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20'
+                                  }`}
+                                >
+                                  {q.answer.source === 'paper'
+                                    ? 'In-Doc Key'
+                                    : q.answer.source === 'keyfile'
+                                    ? 'Key File'
+                                    : q.answer.source === 'ai'
+                                    ? 'AI Solved'
+                                    : 'Manual'}
+                                </span>
+                              </div>
+                            </div>
+                            {isExpanded ? (
+                              <textarea
+                                rows={2}
+                                value={q.answer.text}
+                                onChange={e =>
+                                  handleUpdateQuestion(q.id, {
+                                    answer: { ...q.answer, text: e.target.value, source: 'manual' },
+                                  })
+                                }
+                                className="w-full p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs font-mono"
+                              />
+                            ) : (
+                              <div className="text-slate-700 dark:text-slate-300 font-medium whitespace-pre-wrap">
+                                {q.answer.text}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-between p-2 rounded-xl border border-dashed border-slate-300 dark:border-slate-800 text-[11px] text-slate-400">
+                            <span>No answer linked yet</span>
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => handleSolveSingle(q)}
+                                className="text-purple-600 dark:text-purple-400 hover:underline cursor-pointer flex items-center gap-1 font-medium"
+                              >
+                                <Sparkles className="w-3 h-3" />
+                                <span>Solve with AI</span>
+                              </button>
+                              <span>•</span>
+                              <button
+                                onClick={() =>
+                                  handleUpdateQuestion(q.id, {
+                                    answer: { text: '', source: 'manual' },
+                                  })
+                                }
+                                className="text-blue-500 hover:underline cursor-pointer"
+                              >
+                                + Add manual
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     </div>
                   );
                 })}

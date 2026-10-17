@@ -79,6 +79,15 @@ export function sliceSourceSpans(
 ): string {
   if (!spans || spans.length === 0) return '';
 
+  // Build id -> line map by numerical line ID (e.g. L0041 -> 41)
+  const idToLineMap = new Map<number, SourceLine>();
+  for (const line of sourceLines) {
+    const num = parseInt(line.id.replace(/\D/g, ''), 10);
+    if (!isNaN(num)) {
+      idToLineMap.set(num, line);
+    }
+  }
+
   const rewriteMap = new Map<number, string>();
   if (rewrites) {
     for (const r of rewrites) {
@@ -88,19 +97,17 @@ export function sliceSourceSpans(
 
   const chunks: string[] = [];
   for (const [start, end] of spans) {
-    // 1-based inclusive indices
-    const startIdx = Math.max(0, start - 1);
-    const endIdx = Math.min(sourceLines.length, end);
     const lineTexts: string[] = [];
-
-    for (let i = startIdx; i < endIdx; i++) {
-      const lineNum = i + 1;
+    for (let lineNum = start; lineNum <= end; lineNum++) {
       if (rewriteMap.has(lineNum)) {
         lineTexts.push(rewriteMap.get(lineNum)!);
-      } else if (sourceLines[i]) {
-        // Strip leading [Lxxxx] prefix if present in the raw text
-        const clean = sourceLines[i].text.replace(/^\[L\d+\]\s*/, '');
-        lineTexts.push(clean);
+      } else {
+        const line = idToLineMap.get(lineNum);
+        if (line) {
+          // Strip leading [Lxxxx] prefix if present in the raw text
+          const clean = line.text.replace(/^\[L\d+\]\s*/, '');
+          lineTexts.push(clean);
+        }
       }
     }
     if (lineTexts.length > 0) {
@@ -126,7 +133,9 @@ export function assembleAndValidateQuestions(
   const flags: Flag[] = [];
   const failingQuestions: { question: Question; errors: string[] }[] = [];
 
-  const totalLines = sourceLines.length;
+  const lineIds = sourceLines.map(l => parseInt(l.id.replace(/\D/g, ''), 10)).filter(n => !isNaN(n));
+  const minLineId = lineIds.length > 0 ? Math.min(...lineIds) : 1;
+  const maxLineId = lineIds.length > 0 ? Math.max(...lineIds) : sourceLines.length;
   const claimedSpans: { qId: string; span: LineSpan; parentId?: string }[] = [];
 
   for (let idx = 0; idx < rawQuestions.length; idx++) {
@@ -157,10 +166,10 @@ export function assembleAndValidateQuestions(
       errors.push(`Missing spans: Question ${raw.label || qId} has no source span references.`);
     }
 
-    // 2. Validate range bounds [1, totalLines], start <= end
+    // 2. Validate range bounds [minLineId, maxLineId], start <= end
     for (const [start, end] of spans) {
-      if (start < 1 || end > totalLines || start > end) {
-        errors.push(`Invalid span [${start}, ${end}]: out of source range [1, ${totalLines}]`);
+      if (start < minLineId || end > maxLineId || start > end) {
+        errors.push(`Invalid span [${start}, ${end}]: out of source range [${minLineId}, ${maxLineId}]`);
       }
     }
 
@@ -174,7 +183,7 @@ export function assembleAndValidateQuestions(
     const assembledOptions = (raw.options || []).map((opt: any) => {
       const optSpans: LineSpan[] = Array.isArray(opt.spans) ? opt.spans : [];
       for (const [s, e] of optSpans) {
-        if (s < 1 || e > totalLines || s > e) {
+        if (s < minLineId || e > maxLineId || s > e) {
           errors.push(`Option ${opt.key} invalid span [${s}, ${e}]`);
         }
       }

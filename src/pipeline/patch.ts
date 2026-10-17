@@ -44,20 +44,34 @@ export async function regenerateQuestionPatch(params: {
   const { question, sourceLines, instruction, providerConfig } = params;
 
   // Extract question spans + ±5 context lines around it
-  let minLine = sourceLines.length;
-  let maxLine = 1;
+  let minLine = Infinity;
+  let maxLine = -Infinity;
   for (const [start, end] of question.spans) {
     minLine = Math.min(minLine, start);
     maxLine = Math.max(maxLine, end);
   }
 
-  const contextStart = Math.max(0, minLine - 6);
-  const contextEnd = Math.min(sourceLines.length, maxLine + 5);
+  const idToIdxMap = new Map<number, number>();
+  sourceLines.forEach((l, idx) => {
+    const num = parseInt(l.id.replace(/\D/g, ''), 10);
+    if (!isNaN(num)) idToIdxMap.set(num, idx);
+  });
 
-  const contextSourceSlice = sourceLines
-    .slice(contextStart, contextEnd)
-    .map(l => `${l.id}: ${l.text}`)
-    .join('\n');
+  let contextSourceSlice = '';
+  if (isFinite(minLine) && isFinite(maxLine)) {
+    const contextStart = Math.max(0, (idToIdxMap.get(minLine) ?? 0) - 6);
+    const contextEnd = Math.min(sourceLines.length, (idToIdxMap.get(maxLine) ?? (sourceLines.length - 1)) + 6);
+    contextSourceSlice = sourceLines
+      .slice(contextStart, contextEnd)
+      .map(l => `${l.id}: ${l.text}`)
+      .join('\n');
+  } else {
+    // Questions with empty spans must send a page-window context (their page's lines), not an end-of-file slice
+    const pageLines = sourceLines.filter(l => l.page === 1);
+    contextSourceSlice = (pageLines.length > 0 ? pageLines : sourceLines.slice(0, 35))
+      .map(l => `${l.id}: ${l.text}`)
+      .join('\n');
+  }
 
   const questionSnapshot = {
     id: question.id,
@@ -93,19 +107,21 @@ export async function regenerateQuestionPatch(params: {
   const newRewrites = merged.rewrites || question.rewrites;
   const newStem = sliceSourceSpans(newSpans, sourceLines, newRewrites);
 
+  // Re-slice options text after patches
+  const rawOptions = merged.options !== undefined ? merged.options : question.options;
+  const newOptions = rawOptions?.map((opt: any) => ({
+    key: opt.key,
+    spans: opt.spans || [],
+    text: sliceSourceSpans(opt.spans || [], sourceLines),
+  }));
+
   const patchedQuestion: Question = {
     ...question,
     ...merged,
     spans: newSpans,
     stem: newStem,
     rewrites: newRewrites,
-    options: merged.options
-      ? merged.options.map((opt: any) => ({
-          key: opt.key,
-          spans: opt.spans,
-          text: sliceSourceSpans(opt.spans, sourceLines),
-        }))
-      : question.options,
+    options: newOptions,
   };
 
   // Build readable diff summary

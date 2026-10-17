@@ -26,6 +26,7 @@ export default function App() {
 
   const [extractedDoc, setExtractedDoc] = useState<ExtractedDocument | null>(null);
   const [rawFile, setRawFile] = useState<File | null>(null);
+  const [answerKeyFile, setAnswerKeyFile] = useState<File | null>(null);
   const [examDoc, setExamDoc] = useState<ExamDoc | null>(null);
 
   const [stages, setStages] = useState<StageStatus[]>([]);
@@ -51,9 +52,10 @@ export default function App() {
     saveSettings(newSettings);
   };
 
-  const handleDocumentLoaded = (doc: ExtractedDocument, file: File) => {
+  const handleDocumentLoaded = (doc: ExtractedDocument, file: File, keyFile?: File | null) => {
     setExtractedDoc(doc);
     setRawFile(file);
+    setAnswerKeyFile(keyFile || null);
     setCurrentStep(2);
     setMaxReachedStep(prev => (prev < 2 ? 2 : prev));
   };
@@ -139,6 +141,7 @@ export default function App() {
           <Step3Analyze
             extractedDoc={extractedDoc}
             rawFile={rawFile}
+            answerKeyFile={answerKeyFile}
             settings={settings}
             stages={stages}
             onStagesUpdate={setStages}

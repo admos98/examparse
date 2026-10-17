@@ -3,7 +3,7 @@
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
  * with content-hash caching, token thrift enforcement, and live stage status.
  */
-import { AppSettings, ExamDoc, StageStatus, UsageRecord } from '../types';
+import { AppSettings, ExamDoc, SourceLine, StageStatus, UsageRecord } from '../types';
 import { extractDocument, ExtractedDocument } from './extract';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
@@ -25,7 +25,7 @@ export async function runFullPipeline(
   file: File,
   settings: AppSettings,
   callbacks: PipelineCallbacks,
-  options?: { forceRerun?: boolean }
+  options?: { forceRerun?: boolean; answerKeyFile?: File | null }
 ): Promise<ExamDoc> {
   const { onStageUpdate, onUsageUpdate } = callbacks;
   const force = options?.forceRerun || !settings.thrift.cacheEnabled;
@@ -73,7 +73,7 @@ export async function runFullPipeline(
 
     // Check cache
     const cachedOcr = !force
-      ? await getCachedStageResult<{ lines: any[]; usage: any }>({
+      ? await getCachedStageResult<{ lines?: any[]; mergedLines?: any[]; usage: any }>({
           fileHash,
           stage: 'ocr',
           provider: providerConfig.id,
@@ -83,8 +83,23 @@ export async function runFullPipeline(
       : null;
 
     if (cachedOcr) {
-      workingLines = cachedOcr.lines;
+      workingLines = cachedOcr.mergedLines || cachedOcr.lines || workingLines;
       ocrUsed = true;
+      const cachedUsageRec: UsageRecord = {
+        ts: new Date().toISOString(),
+        role: 'ocr',
+        provider: providerConfig.name,
+        model: providerConfig.model,
+        inputTokens: cachedOcr.usage?.inputTokens || 0,
+        outputTokens: cachedOcr.usage?.outputTokens || 0,
+        costUsd: 0,
+        label: `Scanned Pages OCR (Cache Hit, ${extracted.scannedPageIndices.length} pages)`,
+        isCachedHit: true,
+      };
+      usageRecords.push(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec);
+      onUsageUpdate?.(cachedUsageRec);
+
       onStageUpdate({
         id: 'ocr',
         name: 'Scanned Pages OCR',
@@ -96,14 +111,29 @@ export async function runFullPipeline(
       const ocrRes = await runBatchedOcr({
         pageImages: extracted.pageImages,
         scannedPageIndices: extracted.scannedPageIndices,
-        startLineNum: workingLines.length + 1,
+        startLineNum: 1,
         providerConfig,
       });
 
-      if (ocrRes.lines.length > 0) {
-        workingLines = [...workingLines, ...ocrRes.lines];
-        ocrUsed = true;
+      // Merge per-page in page order with central renumbering (no append-at-end)
+      const merged: SourceLine[] = [];
+      let globalNum = 1;
+      for (let p = 1; p <= extracted.pages; p++) {
+        const isScanned = extracted.scannedPageIndices.includes(p);
+        const pLines = isScanned
+          ? ocrRes.lines.filter(l => l.page === p)
+          : extracted.lines.filter(l => l.page === p);
+        for (const line of pLines) {
+          merged.push({
+            ...line,
+            id: `L${String(globalNum).padStart(4, '0')}`,
+            page: p,
+          });
+          globalNum++;
+        }
       }
+      workingLines = merged;
+      ocrUsed = true;
 
       const costUsd = calculateActualCost(
         ocrRes.usage.inputTokens,
@@ -135,7 +165,7 @@ export async function runFullPipeline(
           model: providerConfig.model,
           options: extracted.scannedPageIndices,
         },
-        { lines: ocrRes.lines, usage: ocrRes.usage }
+        { mergedLines: workingLines, lines: ocrRes.lines, usage: ocrRes.usage }
       );
 
       onStageUpdate({
@@ -212,6 +242,7 @@ export async function runFullPipeline(
         languageHint: language,
         latexEnabled: settings.thrift.latexNormalization,
         providerConfig: structProviderConfig,
+        maxBudgetTokens: settings.budget.maxOutputTokens,
       });
 
       structureData = structRes;
@@ -432,47 +463,100 @@ export async function runFullPipeline(
     const repairProvider = settings.providers.find(p => p.id === repairRole.providerId) || settings.providers[0];
     const repairProviderConfig = { ...repairProvider, model: repairRole.model };
 
-    const t0 = Date.now();
-    const repairRes = await runEscalationRepair({
-      failingItems: assembled.failingQuestions,
-      allQuestions: finalQuestions,
-      sourceLines: workingLines,
-      providerConfig: repairProviderConfig,
-    });
-
-    finalQuestions = repairRes.repairedQuestions;
-
-    const costUsd = calculateActualCost(
-      repairRes.usage.inputTokens,
-      repairRes.usage.outputTokens,
-      repairProviderConfig.model,
-      settings.costTable
-    );
-
-    const usageRec: UsageRecord = {
-      ts: new Date().toISOString(),
-      role: 'escalation',
-      provider: repairProviderConfig.name,
-      model: repairProviderConfig.model,
-      inputTokens: repairRes.usage.inputTokens,
-      outputTokens: repairRes.usage.outputTokens,
-      costUsd,
-      label: `Escalation Repair (${assembled.failingQuestions.length} items)`,
+    const repairOptions = {
+      failing: assembled.failingQuestions.map(f => ({
+        id: f.question.id,
+        errors: [...f.errors].sort(),
+      })),
     };
-    usageRecords.push(usageRec);
-    appendUsageRecord(usageRec);
-    onUsageUpdate?.(usageRec);
 
-    onStageUpdate({
-      id: 'repair',
-      name: 'Escalation Repair',
-      status: 'completed',
-      durationMs: Date.now() - t0,
-      inputTokens: repairRes.usage.inputTokens,
-      outputTokens: repairRes.usage.outputTokens,
-      costUsd,
-      message: `Repaired ${assembled.failingQuestions.length} items.`,
-    });
+    const cachedRepair = !force
+      ? await getCachedStageResult<{ repairedQuestions: any[]; usage: any }>({
+          fileHash,
+          stage: 'repair',
+          provider: repairProviderConfig.id,
+          model: repairProviderConfig.model,
+          options: repairOptions,
+        })
+      : null;
+
+    if (cachedRepair) {
+      finalQuestions = cachedRepair.repairedQuestions;
+      const cachedUsageRec: UsageRecord = {
+        ts: new Date().toISOString(),
+        role: 'escalation',
+        provider: repairProviderConfig.name,
+        model: repairProviderConfig.model,
+        inputTokens: cachedRepair.usage?.inputTokens || 0,
+        outputTokens: cachedRepair.usage?.outputTokens || 0,
+        costUsd: 0,
+        label: `Escalation Repair (Cache Hit, ${assembled.failingQuestions.length} items)`,
+        isCachedHit: true,
+      };
+      usageRecords.push(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec);
+      onUsageUpdate?.(cachedUsageRec);
+
+      onStageUpdate({
+        id: 'repair',
+        name: 'Escalation Repair',
+        status: 'cached',
+        message: `Repaired ${assembled.failingQuestions.length} items from cache (0 calls, $0.00)`,
+      });
+    } else {
+      const t0 = Date.now();
+      const repairRes = await runEscalationRepair({
+        failingItems: assembled.failingQuestions,
+        allQuestions: finalQuestions,
+        sourceLines: workingLines,
+        providerConfig: repairProviderConfig,
+      });
+
+      finalQuestions = repairRes.repairedQuestions;
+
+      const costUsd = calculateActualCost(
+        repairRes.usage.inputTokens,
+        repairRes.usage.outputTokens,
+        repairProviderConfig.model,
+        settings.costTable
+      );
+
+      const usageRec: UsageRecord = {
+        ts: new Date().toISOString(),
+        role: 'escalation',
+        provider: repairProviderConfig.name,
+        model: repairProviderConfig.model,
+        inputTokens: repairRes.usage.inputTokens,
+        outputTokens: repairRes.usage.outputTokens,
+        costUsd,
+        label: `Escalation Repair (${assembled.failingQuestions.length} items)`,
+      };
+      usageRecords.push(usageRec);
+      appendUsageRecord(usageRec);
+      onUsageUpdate?.(usageRec);
+
+      await setCachedStageResult(
+        {
+          fileHash,
+          stage: 'repair',
+          provider: repairProviderConfig.id,
+          model: repairProviderConfig.model,
+          options: repairOptions,
+        },
+        { repairedQuestions: finalQuestions, usage: repairRes.usage }
+      );
+
+      onStageUpdate({
+        id: 'repair',
+        name: 'Escalation Repair',
+        status: 'completed',
+        durationMs: Date.now() - t0,
+        inputTokens: repairRes.usage.inputTokens,
+        outputTokens: repairRes.usage.outputTokens,
+        costUsd,
+        message: `Repaired ${assembled.failingQuestions.length} items.`,
+      });
+    }
   } else {
     onStageUpdate({
       id: 'repair',
@@ -480,6 +564,25 @@ export async function runFullPipeline(
       status: 'skipped',
       message: 'All questions passed validation cleanly (0 calls)',
     });
+  }
+
+  // 6.5 External Answer Key File Integration (If attached by user)
+  if (options?.answerKeyFile) {
+    try {
+      const { mergeAnswerKeyFile } = await import('./keyfile');
+      const keyResult = await mergeAnswerKeyFile(options.answerKeyFile, finalQuestions);
+      finalQuestions = keyResult.updatedQuestions;
+      if (keyResult.matchedCount > 0) {
+        allFlags.push({
+          id: `flag_${allFlags.length + 1}`,
+          severity: 'info',
+          code: 'KEYFILE_MERGED',
+          message: `Matched ${keyResult.matchedCount} answers from attached key file.`,
+        });
+      }
+    } catch (err: any) {
+      console.warn('Failed to merge answer key file:', err);
+    }
   }
 
   // 7. BUILD FINAL EXAM DOC & PERSIST

@@ -14,7 +14,7 @@ import { createDemoExamDoc } from '../pipeline/demoData';
 import { ExamDoc } from '../types';
 
 interface Props {
-  onDocumentLoaded: (doc: ExtractedDocument, rawFile: File) => void;
+  onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null) => void;
   onDemoLoaded: (demoDoc: ExamDoc) => void;
   isLoading: boolean;
 }
@@ -50,7 +50,7 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
 
     try {
       const extracted = await extractDocument(file);
-      onDocumentLoaded(extracted, file);
+      onDocumentLoaded(extracted, file, answerKeyFile);
     } catch (err: any) {
       setErrorMessage(`Failed to process document: ${err.message || 'Corrupt or unreadable file'}`);
     }
@@ -235,27 +235,42 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
           </button>
         </div>
 
-        {/* Optional Answer Key Attachment (P1) */}
-        <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/60 dark:bg-slate-900/40 flex items-center justify-between">
-          <div className="space-y-1">
+        {/* Answer Key Options Card */}
+        <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/60 dark:bg-slate-900/40 space-y-2">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200">
               <KeyRound className="w-4 h-4 text-amber-500" />
-              <span>Attach Answer Key (Optional)</span>
+              <span>Answer Key Strategy</span>
             </div>
-            <p className="text-[11px] text-slate-500">
-              {answerKeyFile ? answerKeyFile.name : 'Match answers automatically by question number.'}
-            </p>
+            <label className="px-3 py-1 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-[11px] font-medium transition cursor-pointer">
+              {answerKeyFile ? 'Change File' : 'Attach File'}
+              <input
+                ref={answerKeyInputRef}
+                type="file"
+                accept=".pdf,.txt,.docx"
+                onChange={e => {
+                  if (e.target.files?.[0]) setAnswerKeyFile(e.target.files[0]);
+                }}
+                className="hidden"
+              />
+            </label>
           </div>
-          <label className="px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-medium transition shrink-0 cursor-pointer">
-            {answerKeyFile ? 'Change' : 'Attach'}
-            <input
-              ref={answerKeyInputRef}
-              type="file"
-              accept=".pdf,.txt,.docx"
-              onChange={e => e.target.files?.[0] && setAnswerKeyFile(e.target.files[0])}
-              className="hidden"
-            />
-          </label>
+
+          <div className="text-[11px] text-slate-500 space-y-1">
+            <div className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400 font-medium">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"></span>
+              <span>In-Doc Detection: AI automatically detects embedded answer key tables or end solutions.</span>
+            </div>
+            {answerKeyFile ? (
+              <div className="text-blue-600 dark:text-blue-400 font-mono text-[10px]">
+                Attached file: {answerKeyFile.name} (will match by question #)
+              </div>
+            ) : (
+              <div className="text-slate-400 text-[10px]">
+                Or click &ldquo;Answer with AI&rdquo; in Step 4 to solve missing questions on demand.
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

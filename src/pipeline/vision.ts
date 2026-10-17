@@ -65,6 +65,7 @@ async function optimizeImageForVision(
 export interface VisionLabelResult {
   updatedImages: ImageAsset[];
   usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
+  flags?: any[];
 }
 
 export async function labelImagesBatched(params: {
@@ -125,7 +126,7 @@ export async function labelImagesBatched(params: {
     };
   }
 
-  const promptText = `MANIFEST:\n${manifestEntries.join('\n---\n')}\n\nReturn JSON array of {id, role, questionRef, kind, caption, needsText} for all ${payloadImages.length} images.`;
+  const promptText = `IMAGES ARE ATTACHED IN MANIFEST ORDER.\n\nMANIFEST:\n${manifestEntries.join('\n---\n')}\n\nReturn JSON: {"items": [{"id": string, "role": "stem|option|table|decoration", "questionRef": string|null, "kind": "photo|diagram|chart|table|formula|handwriting|decoration", "caption": string, "needsText": boolean}]} (or a JSON array).`;
 
   const request: LLMRequest = {
     role: 'vision',
@@ -139,12 +140,32 @@ export async function labelImagesBatched(params: {
 
   const response = await LLMAdapter.execute(request);
 
-  const labelMap = new Map<string, any>();
+  // Parse envelope {"items": [...]} or bare array
+  let rawItems: any[] | null = null;
   if (Array.isArray(response.json)) {
-    for (const item of response.json) {
-      if (item && item.id) {
-        labelMap.set(item.id, item);
-      }
+    rawItems = response.json;
+  } else if (response.json && typeof response.json === 'object') {
+    const obj = response.json as any;
+    if (Array.isArray(obj.items)) rawItems = obj.items;
+    else if (Array.isArray(obj.images)) rawItems = obj.images;
+    else if (Array.isArray(obj.results)) rawItems = obj.results;
+  }
+
+  const flags: { id: string; severity: 'info' | 'warn' | 'error'; code: string; message: string }[] = [];
+  if (!rawItems) {
+    flags.push({
+      id: `flag_vis_mismatch`,
+      severity: 'warn',
+      code: 'VISION_SHAPE_MISMATCH',
+      message: 'Vision response returned unexpected format instead of {"items": [...]}. Images assigned default roles.',
+    });
+    rawItems = [];
+  }
+
+  const labelMap = new Map<string, any>();
+  for (const item of rawItems) {
+    if (item && item.id) {
+      labelMap.set(item.id, item);
     }
   }
 
@@ -170,5 +191,6 @@ export async function labelImagesBatched(params: {
   return {
     updatedImages,
     usage: response.usage,
+    flags,
   };
 }

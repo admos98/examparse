@@ -15,10 +15,12 @@ import { getCachedStageResult, setCachedStageResult } from './cache';
 import { appendUsageRecord, loadExamDoc, loadPageThumbDataUrls, saveExamDoc } from '../store';
 import { calculateActualCost, updateTokenCalibration } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
+import { PARSER_VERSION } from './prompts';
 
 export interface PipelineCallbacks {
   onStageUpdate: (stage: StageStatus) => void;
   onUsageUpdate?: (record: UsageRecord) => void;
+  onLiveText?: (stageId: string, label: string, channel: 'output' | 'reasoning' | 'info', fullText: string) => void;
 }
 
 export async function runFullPipeline(
@@ -33,7 +35,7 @@ export async function runFullPipeline(
     forceStages?: import('../types').PipelineStageId[];
   }
 ): Promise<ExamDoc> {
-  const { onStageUpdate, onUsageUpdate } = callbacks;
+  const { onStageUpdate, onUsageUpdate, onLiveText } = callbacks;
   const cacheEnabled = settings.thrift.cacheEnabled;
   const forceAll = options?.forceRerun || !cacheEnabled;
   const forcedStages = new Set(options?.forceStages || []);
@@ -148,6 +150,7 @@ export async function runFullPipeline(
         startLineNum: 1,
         providerConfig,
         maxOutputTokens: settings.budget.maxOutputTokens,
+        onLiveText: (label, channel, text) => onLiveText?.('ocr', label, channel, text),
       });
 
       // Merge per-page in page order with central renumbering (no append-at-end)
@@ -306,6 +309,9 @@ export async function runFullPipeline(
           latexEnabled: settings.thrift.latexNormalization,
           providerConfig: structProviderConfig,
           maxBudgetTokens: settings.budget.maxOutputTokens,
+          journalEnabled: cacheEnabled && !stageForced('structure'),
+          journalKey: await sha256(`${fileHash}:${await sha256(JSON.stringify(workingLines))}:${structProviderConfig.id}:${structProviderConfig.model}:${PARSER_VERSION}`),
+          onLiveText: (label, channel, fullText) => onLiveText?.('structure', label, channel, fullText),
         });
       } catch (err: any) {
         onStageUpdate({
@@ -344,7 +350,7 @@ export async function runFullPipeline(
         outputTokens: structRes.usage.outputTokens,
         cachedTokens: structRes.usage.cachedTokens,
         costUsd,
-        label: 'Structure Pass',
+        label: structRes.label || 'Structure Pass',
       };
       usageRecords.push(usageRec);
       appendUsageRecord(usageRec);
@@ -373,7 +379,7 @@ export async function runFullPipeline(
       outputTokens: structRes.usage.outputTokens,
       costUsd,
       attempts: structRes.attempts,
-      message: `Parsed ${structRes.rawQuestions.length} questions across ${structRes.sections.length} sections.`,
+      message: `${structRes.flags?.some((f: any) => f.code === 'RESUMED_FROM_JOURNAL') ? `Resumed partial parse — ${structRes.rawQuestions.length} questions recovered, continuing at line ${structRes.resumeLine || 1}. ` : ''}Parsed ${structRes.rawQuestions.length} questions across ${structRes.sections.length} sections.`,
     });
   }
 
@@ -436,6 +442,7 @@ export async function runFullPipeline(
         quality: settings.thrift.jpegQuality / 100,
         maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
         maxOutputTokens: settings.budget.maxOutputTokens,
+        onLiveText: (label, channel, text) => onLiveText?.('vision', label, channel, text),
       });
 
       updatedImages = visionRes.updatedImages;
@@ -600,6 +607,7 @@ export async function runFullPipeline(
         sourceLines: workingLines,
         providerConfig: repairProviderConfig,
         maxOutputTokens: settings.budget.maxOutputTokens,
+        onLiveText: (label, channel, text) => onLiveText?.('repair', label, channel, text),
       });
 
       finalQuestions = repairRes.repairedQuestions;

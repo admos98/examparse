@@ -211,6 +211,8 @@ export interface ProviderConfig {
   defaultHeaders?: Record<string, string>;
   /** When true (default), reasoning/thinking is disabled (or minimised for the solver) on OpenAI-compatible calls. */
   disableReasoning?: boolean;
+  /** Send OpenAI-compatible response_format JSON mode unless explicitly disabled. */
+  structuredOutputs?: boolean;
   /** Raw JSON object string shallow-merged last into chat-completions bodies (user keys win). */
   extraBodyJson?: string;
 }
@@ -276,6 +278,7 @@ export interface LLMRequest {
   }[];
   jsonSchema?: object;
   maxOutputTokens?: number;
+  stream?: boolean;
   label: string; // for the usage log
   providerConfig?: {
     id: string;
@@ -286,6 +289,7 @@ export interface LLMRequest {
     defaultHeaders?: Record<string, string>;
     model: string;
     disableReasoning?: boolean;
+    structuredOutputs?: boolean;
     extraBodyJson?: string;
   };
 }
@@ -300,6 +304,7 @@ export interface LLMResponse {
     cachedTokens?: number;
   };
   rawText: string;
+  reasoningText?: string;
   finishReason?: string;
 }
 

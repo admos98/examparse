@@ -46,7 +46,7 @@ Do not reason, narrate, or explain. Your first character must be { or [. /no_thi
 export const T6_SOLVER_SYSTEM = `You are ExamSolver, an expert academic examiner. For each question provided, produce a concise, verified final answer or short step-by-step solution.
 Format: output either a JSON array of {"id": string, "answer": string} or a JSON envelope such as {"items": [...]} or {"answers": [...]} or {"results": [...]}.
 Keep answers concise (for MCQs, output the option letter and short rationale, e.g. 'Option B — acceleration is zero at maximum velocity'). Output in the source language of the exam. No conversational filler.
-Do not reason, narrate, or explain. Your first character must be { or [.`;
+Your first character must be { or [.`
 
 /**
  * Gemini Response Schema for T1 Structure Pass

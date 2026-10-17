@@ -85,6 +85,7 @@ async function processVisionChunk(
   sourceLines: SourceLine[],
   providerConfig: any,
   maxOutputTokens?: number,
+  onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void,
 ): Promise<{
   labelMap: Map<string, any>;
   flags: any[];
@@ -127,7 +128,7 @@ async function processVisionChunk(
     providerConfig,
   };
 
-  const response = await LLMAdapter.execute(request);
+  const response = await LLMAdapter.execute(request, { onDelta: (channel, full) => onLiveText?.(request.label, channel, full), onInfo: note => onLiveText?.(request.label, 'info', note) });
 
   // Parse envelope or bare array (accept labels/data/annotations keys, or a single {id, ...} object)
   let rawItems: any[] | null = null;
@@ -174,6 +175,7 @@ export async function labelImagesBatched(params: {
   quality?: number;
   maxImagesPerVisionCall?: number;
   maxOutputTokens?: number;
+  onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<VisionLabelResult> {
   const {
     images,
@@ -228,7 +230,7 @@ export async function labelImagesBatched(params: {
   let totalUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
 
   for (const chunk of chunks) {
-    const result = await processVisionChunk(chunk, sourceLines, providerConfig, maxOutputTokens);
+    const result = await processVisionChunk(chunk, sourceLines, providerConfig, maxOutputTokens, params.onLiveText);
     for (const [id, label] of result.labelMap) {
       mergedLabelMap.set(id, label);
     }

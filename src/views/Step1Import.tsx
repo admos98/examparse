@@ -66,7 +66,7 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
       // Exam fast-path (B6): a saved result for this exact file already exists.
       try {
         const saved = await loadExamDoc(`exam_${fileHash.slice(0, 12)}`);
-        if (saved) {
+        if (saved && Array.isArray(saved.questions) && saved.questions.length > 0) {
           setSavedExam(saved);
           setPendingImport({ doc: extracted, file, fileHash });
           return;

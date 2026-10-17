@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Play,
   RotateCcw,
@@ -17,6 +17,8 @@ import { calculatePreflightEstimate } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 import { ExtractedDocument } from '../pipeline/extract';
 import { runFullPipeline } from '../pipeline';
+import { loadJournal } from '../pipeline/journal';
+import { PARSER_VERSION } from '../pipeline/prompts';
 
 interface Props {
   extractedDoc: ExtractedDocument;
@@ -46,6 +48,14 @@ export const Step3Analyze: React.FC<Props> = ({
   onOpenSavedExam,
 }) => {
   const [forceRerun, setForceRerun] = useState(false);
+  const [live, setLive] = useState({ stage: '', label: '', output: '', reasoning: '', info: '', attempts: [] as Array<{ stage: string; label: string; output: string; reasoning: string; ts?: string; finishReason?: string }> });
+  const liveRef = useRef(live);
+  const [liveOpen, setLiveOpen] = useState(true);
+  const [attemptStage, setAttemptStage] = useState<string | null>(null);
+  const liveScroll = useRef<HTMLDivElement>(null);
+  const liveUserScrolledUp = useRef(false);
+  useEffect(() => { const id = window.setInterval(() => setLive({ ...liveRef.current }), 200); return () => clearInterval(id); }, []);
+  useEffect(() => { if (isAnalyzing && liveOpen && liveScroll.current && !liveUserScrolledUp.current) liveScroll.current.scrollTop = liveScroll.current.scrollHeight; }, [live, isAnalyzing, liveOpen]);
   const [forcedStages, setForcedStages] = useState<Set<string>>(new Set());
   const [savedExam, setSavedExam] = useState<ExamDoc | null>(null);
   const [probeFileHash, setProbeFileHash] = useState<string | null>(null);
@@ -58,10 +68,30 @@ export const Step3Analyze: React.FC<Props> = ({
     repair: boolean;
   }>({ structure: false, vision: false, ocr: false, repair: true });
 
+
+
   // Selected role model for structure pass
   const activeRole = settings.roleMapping.fast;
   const activeProvider =
     settings.providers.find(p => p.id === activeRole.providerId) || settings.providers[0];
+
+  useEffect(() => {
+    if (!probeFileHash) return;
+    let active = true;
+    (async () => {
+      try {
+        const { sha256 } = await import('../utils/hash');
+        const linesHash = await sha256(JSON.stringify(extractedDoc.lines));
+        const journalKey = await sha256(`${probeFileHash}:${linesHash}:${activeProvider.id}:${activeRole.model}:${PARSER_VERSION}`);
+        const journal = await loadJournal(journalKey);
+        if (!active || !journal) return;
+        const calls = [...journal.calls].reverse().map(call => ({ stage: 'structure', label: call.label, output: call.rawText || '', reasoning: call.reasoningText || '', ts: call.ts, finishReason: call.finishReason }));
+        liveRef.current = { ...liveRef.current, attempts: calls };
+        setLive({ ...liveRef.current });
+      } catch { /* journal history is best-effort */ }
+    })();
+    return () => { active = false; };
+  }, [probeFileHash, extractedDoc.lines, activeProvider.id, activeRole.model]);
 
   // Check if pipeline stages are already cached in IndexedDB
   useEffect(() => {
@@ -80,7 +110,7 @@ export const Step3Analyze: React.FC<Props> = ({
         try {
           const { loadExamDoc } = await import('../store');
           const saved = await loadExamDoc(`exam_${hash.slice(0, 12)}`);
-          if (isMounted) setSavedExam(saved || null);
+          if (isMounted) setSavedExam(saved?.questions?.length ? saved : null);
         } catch {
           if (isMounted) setSavedExam(null);
         }
@@ -256,6 +286,9 @@ export const Step3Analyze: React.FC<Props> = ({
     }
 
     setErrorMsg(null);
+    liveUserScrolledUp.current = false;
+    liveRef.current = { ...liveRef.current, stage: '', label: '', output: '', reasoning: '', info: '' };
+    setLive(liveRef.current);
     setIsAnalyzing(true);
 
     // Initial stage statuses
@@ -275,9 +308,18 @@ export const Step3Analyze: React.FC<Props> = ({
         settings,
         {
           onStageUpdate: updated => {
-            onStagesUpdate(prev =>
-              prev.map(s => (s.id === updated.id ? { ...s, ...updated } : s))
-            );
+            onStagesUpdate(prev => prev.map(s => (s.id === updated.id ? { ...s, ...updated } : s)));
+          },
+          onLiveText: (stage, label, channel, fullText) => {
+            const prev = liveRef.current;
+            const attempts = [...prev.attempts];
+            if (channel !== 'info') {
+              const index = attempts.findIndex(item => item.stage === stage && item.label === label);
+              const item = index >= 0 ? { ...attempts[index] } : { stage, label, output: '', reasoning: '' };
+              if (channel === 'output') item.output = fullText; else item.reasoning = fullText;
+              if (index >= 0) attempts[index] = item; else attempts.unshift(item);
+            }
+            liveRef.current = { ...prev, stage, label, attempts, ...(channel === 'output' ? { output: fullText } : channel === 'reasoning' ? { reasoning: fullText } : { info: `${prev.info}\n${fullText}`.trim() }) };
           },
         },
         {
@@ -530,7 +572,7 @@ export const Step3Analyze: React.FC<Props> = ({
 
                   <div>
                     <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                      <span>{stage.name}</span>
+                      <button type="button" onClick={() => setAttemptStage(current => current === stage.id ? null : stage.id)} className="text-left hover:underline" title="Show this stage's model calls">{stage.name}</button>
                       {isCached && (
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20">
                           0 calls · cached
@@ -586,6 +628,16 @@ export const Step3Analyze: React.FC<Props> = ({
               </div>
             );
           })}
+        </div>
+        <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+          <button className="w-full px-3 py-2 text-left text-xs font-semibold bg-slate-50 dark:bg-slate-800" onClick={() => setLiveOpen(v => !v)}>Live AI {live.stage ? `— ${live.stage} / ${live.label}` : ''} {liveOpen ? '▾' : '▸'}</button>
+          {liveOpen && <div ref={liveScroll} onScroll={e => { const el = e.currentTarget; liveUserScrolledUp.current = el.scrollHeight - el.scrollTop - el.clientHeight > 24; }} className="max-h-72 overflow-auto p-3 space-y-2 text-xs">
+            {live.reasoning && <div className="text-slate-500"><div className="font-semibold">Model reasoning — live (not part of the answer)</div><pre className="whitespace-pre-wrap font-mono">{live.reasoning.slice(-6000)}</pre></div>}
+            {live.output && <pre className="whitespace-pre-wrap font-mono text-slate-800 dark:text-slate-200">{live.output.length > 6000 ? '…earlier output elided in this view only\n' : ''}{live.output.slice(-6000)}</pre>}
+            {live.info && <div className="whitespace-pre-wrap text-amber-600 dark:text-amber-400">{live.info}</div>}
+            {!live.output && !live.reasoning && !live.info && <div className="text-slate-400">Waiting for model output…</div>}
+            {live.attempts.length > 0 && <div className="border-t border-slate-200 dark:border-slate-700 pt-2 space-y-1"><div className="font-semibold text-slate-500">Call attempts {attemptStage ? `— ${attemptStage}` : ''} <button onClick={() => setAttemptStage(null)} className="ml-2 text-blue-500">All</button></div>{live.attempts.filter(attempt => !attemptStage || attempt.stage === attemptStage).map((attempt, i) => <details key={`${attempt.stage}-${attempt.label}-${i}`} className="rounded border border-slate-200 dark:border-slate-700 p-2"><summary className="cursor-pointer">{attempt.stage} · {attempt.label}{attempt.finishReason ? ` · ${attempt.finishReason}` : ''}{attempt.ts ? ` · ${new Date(attempt.ts).toLocaleString()}` : ''}</summary>{attempt.reasoning && <pre className="mt-2 whitespace-pre-wrap text-slate-500">{attempt.reasoning.slice(-6000)}</pre>}<pre className="mt-2 whitespace-pre-wrap font-mono">{attempt.output.slice(-6000)}</pre></details>)}</div>}
+          </div>}
         </div>
       </div>
     </div>

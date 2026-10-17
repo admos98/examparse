@@ -238,9 +238,17 @@ app.get('/api/usage', (_req: Request, res: Response) => {
 app.post('/api/usage', (req: Request, res: Response) => {
   const current = readJsonFile<any[]>(USAGE_FILE, []);
   const incoming = Array.isArray(req.body) ? req.body : [req.body];
-  const next = [...current, ...incoming.filter(Boolean)].slice(-500);
-  atomicWriteJson(USAGE_FILE, next);
-  return res.json({ ok: true, count: next.length });
+  const next = [...current];
+  for (const record of incoming.filter(Boolean)) {
+    if (record?.dedupeKey) {
+      const index = next.findIndex((item: any) => item?.dedupeKey === record.dedupeKey);
+      if (index >= 0) next[index] = record;
+      else next.push(record);
+    } else next.push(record);
+  }
+  const trimmed = next.slice(-500);
+  atomicWriteJson(USAGE_FILE, trimmed);
+  return res.json({ ok: true, count: trimmed.length });
 });
 app.put('/api/usage', (req: Request, res: Response) => {
   const next = (Array.isArray(req.body) ? req.body : []).slice(-500);
@@ -391,7 +399,7 @@ function parseExtraBody(extraBodyJson: unknown): Record<string, any> {
  */
 app.post('/api/llm', async (req: Request, res: Response) => {
   const payload: LLMRequest = req.body;
-  const { role, system, text, images, jsonSchema, maxOutputTokens, label, providerConfig } = payload;
+  const { role, system, text, images, jsonSchema, maxOutputTokens, label, providerConfig, stream } = payload;
 
   const kind = providerConfig?.kind || 'gemini';
   const model = providerConfig?.model || (role === 'escalation' ? 'gemini-2.5-pro' : 'gemini-2.5-flash');
@@ -445,6 +453,28 @@ app.post('/api/llm', async (req: Request, res: Response) => {
         config.thinkingConfig = { thinkingBudget: 0 };
       } else if (modelLower.includes('pro')) {
         config.thinkingConfig = { thinkingBudget: 128 };
+      }
+
+      if (stream) {
+        const geminiAbort = new AbortController();
+        const geminiTimer = setTimeout(() => geminiAbort.abort(), 300_000);
+        config.abortSignal = geminiAbort.signal;
+        res.on('close', () => { if (!res.writableEnded) geminiAbort.abort(); clearTimeout(geminiTimer); });
+        res.status(200); res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-Accel-Buffering', 'no'); res.flushHeaders?.();
+        const emit = (event: string, data: any) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+        let rawText = ''; let finalChunk: any = null;
+        try {
+          const streamResult: any = await (ai.models as any).generateContentStream({ model, contents: { parts }, config });
+          for await (const chunk of streamResult) {
+            finalChunk = chunk;
+            const delta = typeof chunk.text === 'string' ? chunk.text : '';
+            if (delta) { rawText += delta; emit('delta', { text: delta }); }
+          }
+          const parsed = parseModelContent(rawText); const meta = finalChunk?.usageMetadata || {};
+          emit('done', { json: parsed, ...(label ? { label } : {}), rawText, finishReason: parsed === null ? (finalChunk?.candidates?.[0]?.finishReason || 'PARSE_ERROR') : (finalChunk?.candidates?.[0]?.finishReason || 'STOP'), usage: { inputTokens: meta.promptTokenCount || Math.ceil(text.length / 3), outputTokens: (meta.candidatesTokenCount || 0) + (meta.thoughtsTokenCount || 0) || Math.ceil(rawText.length / 3), cachedTokens: meta.cachedContentTokenCount || 0 } });
+          res.end(); clearTimeout(geminiTimer);
+        } catch (streamErr: any) { emit('error', { message: streamErr.message || 'Gemini stream failed' }); res.end(); clearTimeout(geminiTimer); }
+        return;
       }
 
       const startTime = Date.now();
@@ -512,7 +542,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           { role: 'user', content: userContent },
         ],
         temperature: 0,
-        response_format: { type: 'json_object' },
+        ...((providerConfig as any)?.structuredOutputs === false ? {} : { response_format: { type: 'json_object' } }),
       };
       if (maxOutputTokens) {
         baseBody.max_tokens = maxOutputTokens;
@@ -539,6 +569,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           return body;
         }
         const body: any = { ...baseBody };
+        if (stream) { body.stream = true; body.stream_options = { include_usage: true }; }
         if (disableReasoning) {
           if (PARSE_ROLES.has(role)) {
             body.reasoning = { effort: 'none', exclude: true };
@@ -547,50 +578,118 @@ app.post('/api/llm', async (req: Request, res: Response) => {
             body.reasoning = { effort: 'low', exclude: true };
           }
         }
-        // Extra body JSON is merged LAST on the primary rung: user keys win.
-        Object.assign(body, extraBody);
+        // Extra body JSON is merged last; null explicitly removes a provider field.
+        for (const [key, value] of Object.entries(extraBody)) {
+          if (value === null) delete body[key];
+          else body[key] = value;
+        }
         return body;
       };
 
-      // 400-fallback ladder: at most 2 retries, only for reasoning/thinking-related 400s.
+      if (stream) {
+        const streamAbort = new AbortController();
+        const streamTimer = setTimeout(() => streamAbort.abort(), 300_000);
+        res.on('close', () => { if (!res.writableEnded) streamAbort.abort(); clearTimeout(streamTimer); });
+        const dropped = new Set<string>(); let swapMax = false; let reasoningRung: 0 | 1 | 2 = 0; const suffixes: string[] = [];
+        let upstream: globalThis.Response | null = null;
+        for (let i = 0; i < 5; i++) {
+          const body = buildAttemptBody(reasoningRung);
+          for (const field of dropped) delete body[field];
+          if (swapMax && 'max_tokens' in body) { body.max_completion_tokens = body.max_tokens; delete body.max_tokens; }
+          upstream = await fetch(`${baseURL}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body), signal: streamAbort.signal });
+          if (upstream.ok) break;
+          const errBody = await upstream.text(); let rung = '';
+          if (upstream.status === 400 && reasoningRung < 2 && REASONING_400_RE.test(errBody) && ['reasoning','reasoning_effort','thinking','enable_thinking'].some(k => k in body)) { reasoningRung = (reasoningRung + 1) as 1 | 2; rung = reasoningRung === 1 ? '[r-min]' : '[r-off]'; }
+          else if (upstream.status === 400 && !dropped.has('response_format') && /response_format|json[_ -]?mode|structured/i.test(errBody) && 'response_format' in body) { dropped.add('response_format'); rung = '[no-rf]'; }
+          else if (upstream.status === 400 && !dropped.has('temperature') && /temperature/i.test(errBody) && 'temperature' in body) { dropped.add('temperature'); rung = '[no-temp]'; }
+          else if (upstream.status === 400 && !dropped.has('max_tokens') && /max_tokens|max_completion_tokens/i.test(errBody) && 'max_tokens' in body) { swapMax = true; rung = '[mt-swap]'; }
+          else if (upstream.status === 400 && !dropped.has('stream_options') && /stream_options/i.test(errBody) && 'stream_options' in body) { dropped.add('stream_options'); rung = '[no-stream-options]'; }
+          if (!rung || i === 4) { clearTimeout(streamTimer); return res.status(upstream.status).json({ error: `Provider error (${upstream.status}): ${errBody}` }); }
+          suffixes.push(rung);
+        }
+        if (!upstream?.ok) return res.status(502).json({ error: 'Provider stream failed' });
+        res.status(200); res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-Accel-Buffering', 'no'); res.flushHeaders?.();
+        const emit = (event: string, data: any) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+        for (const rung of suffixes) emit('info', { note: `Compatibility fallback ${rung}` });
+        let content = '', reasoning = '', finish = 'stop'; let usage: any = null;
+        const effectiveLabel = label ? `${label}${suffixes.join('')}` : undefined;
+        try {
+          const ct = upstream.headers.get('content-type') || '';
+          if (!ct.includes('text/event-stream')) {
+            const bodyText = await upstream.text(); const d: any = parseUpstreamBody(bodyText);
+            if (!d) throw new Error(`Provider returned non-JSON response: ${bodyText.slice(0, 250)}`);
+            const msg = d.choices?.[0]?.message || {}; content = typeof msg.content === 'string' ? msg.content : msg.content == null ? '' : JSON.stringify(msg.content);
+            reasoning = msg.reasoning_content || msg.reasoning || ''; usage = d.usage; finish = d.choices?.[0]?.finish_reason || 'stop';
+            if (content) emit('delta', { text: content });
+            if (reasoning) emit('reasoning', { text: reasoning });
+          } else {
+            const reader = upstream.body!.getReader(); const decoder = new TextDecoder(); let buf = '';
+            while (true) {
+              const { value, done } = await reader.read(); if (done) break; buf += decoder.decode(value, { stream: true });
+              let pos; while ((pos = buf.indexOf('\n\n')) >= 0) {
+                const frame = buf.slice(0, pos); buf = buf.slice(pos + 2);
+                const dat = frame.split('\n').filter(x => x.startsWith('data:')).map(x => x.slice(5).trim()).join('');
+                if (!dat || dat === '[DONE]') continue;
+                let chunk: any; try { chunk = JSON.parse(dat); } catch { continue; }
+                if (chunk.usage) usage = chunk.usage;
+                const choice = chunk.choices?.[0]; if (!choice) continue;
+                if (choice.finish_reason) finish = choice.finish_reason;
+                const delta = choice.delta || {};
+                const textDelta = typeof delta.content === 'string' ? delta.content : '';
+                const reasonDelta = delta.reasoning_content || delta.reasoning || '';
+                if (textDelta) { content += textDelta; emit('delta', { text: textDelta }); }
+                if (reasonDelta) { reasoning += reasonDelta; emit('reasoning', { text: reasonDelta }); }
+              }
+            }
+          }
+          const rawText = content || reasoning; const json = parseModelContent(rawText);
+          emit('done', { json, ...(effectiveLabel ? { label: effectiveLabel } : {}), rawText, ...(reasoning ? { reasoningText: reasoning } : {}), finishReason: json === null ? finish : finish || 'stop', usage: { inputTokens: usage?.prompt_tokens || Math.ceil(text.length / 3), outputTokens: usage?.completion_tokens || Math.ceil((content.length + reasoning.length) / 3), cachedTokens: usage?.prompt_tokens_details?.cached_tokens || 0 } });
+          res.end(); clearTimeout(streamTimer);
+        } catch (streamError: any) { emit('error', { message: streamError.message || 'Upstream stream failed' }); res.end(); clearTimeout(streamTimer); }
+        return;
+      }
+
+      // Independent, cumulative 400 compatibility fallbacks; at most five requests.
       let upstreamResponse: globalThis.Response | null = null;
       let upstreamBodyText = '';
-      let ladderSuffix = '';
-      for (let attempt = 0; attempt <= 2; attempt++) {
-        const attemptBody = buildAttemptBody(attempt as 0 | 1 | 2);
-        ladderSuffix = attempt === 1 ? ' [r-min]' : attempt === 2 ? ' [r-off]' : '';
+      const dropped = new Set<string>();
+      let swapMaxTokens = false;
+      let reasoningRung: 0 | 1 | 2 = 0;
+      const suffixes: string[] = [];
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const attemptBody = buildAttemptBody(reasoningRung);
+        for (const bit of dropped) delete attemptBody[bit];
+        if (swapMaxTokens && 'max_tokens' in attemptBody) { attemptBody.max_completion_tokens = attemptBody.max_tokens; delete attemptBody.max_tokens; }
         upstreamResponse = await fetch(`${baseURL}/chat/completions`, {
-          method: 'POST',
-          headers,
+          method: 'POST', headers,
           body: JSON.stringify(attemptBody),
           signal: AbortSignal.timeout(180_000),
         });
         upstreamBodyText = await upstreamResponse.text();
         if (upstreamResponse.ok) break;
-        const canLadder =
-          disableReasoning ||
-          'reasoning' in attemptBody ||
-          'reasoning_effort' in attemptBody ||
-          'thinking' in attemptBody ||
-          'enable_thinking' in attemptBody;
-        if (
-          upstreamResponse.status !== 400 ||
-          attempt >= 2 ||
-          !canLadder ||
-          !REASONING_400_RE.test(upstreamBodyText)
-        ) {
-          return res.status(upstreamResponse.status).json({
-            error: `Provider error (${upstreamResponse.status}): ${upstreamBodyText}`,
-          });
+        if (upstreamResponse.status !== 400) break;
+        let rung: string | undefined;
+        if (reasoningRung < 2 && REASONING_400_RE.test(upstreamBodyText) &&
+            ['reasoning','reasoning_effort','thinking','enable_thinking'].some(k => k in attemptBody)) {
+          reasoningRung = (reasoningRung + 1) as 1 | 2;
+          rung = reasoningRung === 1 ? '[r-min]' : '[r-off]';
+        } else if (!dropped.has('response_format') && /response_format|json[_ -]?mode|structured/i.test(upstreamBodyText) && 'response_format' in attemptBody) {
+          dropped.add('response_format'); rung = '[no-rf]';
+        } else if (!dropped.has('temperature') && /temperature/i.test(upstreamBodyText) && 'temperature' in attemptBody) {
+          dropped.add('temperature'); rung = '[no-temp]';
+        } else if (!dropped.has('max_tokens') && /max_tokens|max_completion_tokens/i.test(upstreamBodyText) && 'max_tokens' in attemptBody) {
+          swapMaxTokens = true; rung = '[mt-swap]';
+        } else if (!dropped.has('stream_options') && /stream_options/i.test(upstreamBodyText) && 'stream_options' in attemptBody) {
+          dropped.add('stream_options'); rung = '[no-stream-options]';
         }
-        console.warn(
-          `LLM ladder: ${label || role} rung ${attempt} rejected (400, reasoning-related); retrying rung ${attempt + 1}...`
-        );
+        if (!rung || attempt === 4) break;
+        suffixes.push(rung);
+        console.warn(`LLM ladder: ${label || role} rejected; retrying ${rung}...`);
       }
-
+      const ladderSuffix = suffixes.join('');
       if (!upstreamResponse || !upstreamResponse.ok) {
-        return res.status(502).json({
-          error: `Provider error: ${upstreamBodyText.slice(0, 300)}`,
+        return res.status(upstreamResponse?.status || 502).json({
+          error: `Provider error (${upstreamResponse?.status || 502}): ${upstreamBodyText.slice(0, 300)}`,
         });
       }
 
@@ -606,8 +705,10 @@ app.post('/api/llm', async (req: Request, res: Response) => {
         console.log(`LLM ladder: ${effectiveLabel} succeeded via rung${ladderSuffix}`);
       }
 
-      const rawContent = data.choices?.[0]?.message?.content;
-      const rawText = typeof rawContent === 'string' ? rawContent : rawContent != null ? JSON.stringify(rawContent) : '';
+      const message = data.choices?.[0]?.message || {};
+      const rawContent = message.content;
+      const reasoningText = typeof (message.reasoning_content ?? message.reasoning) === 'string' ? (message.reasoning_content ?? message.reasoning) : '';
+      const rawText = typeof rawContent === 'string' && rawContent.length > 0 ? rawContent : rawContent != null && typeof rawContent !== 'string' ? JSON.stringify(rawContent) : reasoningText;
       const parsedJson: any = parseModelContent(rawText);
 
       const usage = data.usage || {};
@@ -622,6 +723,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           cachedTokens: usage.prompt_tokens_details?.cached_tokens || 0,
         },
         rawText,
+        ...(reasoningText ? { reasoningText } : {}),
         finishReason,
       };
 

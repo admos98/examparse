@@ -17,6 +17,7 @@ export async function runBatchedOcr(params: {
   startLineNum?: number;
   providerConfig: any;
   maxOutputTokens?: number;
+  onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<OcrResult> {
   const { pageImages, scannedPageIndices, startLineNum = 1, providerConfig, maxOutputTokens } = params;
 
@@ -65,7 +66,7 @@ export async function runBatchedOcr(params: {
       providerConfig,
     };
 
-    const response = await LLMAdapter.execute(request);
+    const response = await LLMAdapter.execute(request, { onDelta: (channel, full) => params.onLiveText?.(request.label, channel, full), onInfo: note => params.onLiveText?.(request.label, 'info', note) });
     totalInputTokens += response.usage.inputTokens;
     totalOutputTokens += response.usage.outputTokens;
     totalCachedTokens += response.usage.cachedTokens || 0;

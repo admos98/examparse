@@ -1,0 +1,216 @@
+import React, { useState, useRef } from 'react';
+import {
+  Printer,
+  Download,
+  Upload,
+  FileText,
+  Copy,
+  Check,
+  Eye,
+  FileSpreadsheet,
+} from 'lucide-react';
+import { ExamDoc } from '../types';
+import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
+import { saveExamDoc } from '../store';
+
+interface Props {
+  doc: ExamDoc;
+  onUpdateDoc: (updated: ExamDoc) => void;
+}
+
+export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
+  const [renderMode, setRenderMode] = useState<ExamRenderMode>('paper');
+  const [copiedJson, setCopiedJson] = useState(false);
+  const jsonInputRef = useRef<HTMLInputElement>(null);
+
+  // Trigger browser print dialog for A4 output
+  const handlePrint = () => {
+    window.print();
+  };
+
+  // Export JSON (excluding heavy binary, preserving relative references per §4)
+  const handleExportJson = () => {
+    const cleanImages = doc.images.map(img => {
+      const { dataUrl, ...rest } = img;
+      return {
+        ...rest,
+        exportPath: `images/${img.id}.${img.mime.split('/')[1] || 'jpg'}`,
+      };
+    });
+
+    const exportDoc = {
+      ...doc,
+      images: cleanImages,
+    };
+
+    const jsonStr = JSON.stringify(exportDoc, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${doc.meta.title || 'Exam'}_structured.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Import JSON to reconstruct exam view
+  const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const parsed: ExamDoc = JSON.parse(reader.result as string);
+        onUpdateDoc(parsed);
+        await saveExamDoc(parsed);
+      } catch (err: any) {
+        alert(`Invalid Exam JSON: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Duplicate exam -> new version (P1)
+  const handleDuplicate = () => {
+    const newDoc: ExamDoc = {
+      ...doc,
+      id: `exam_${Date.now()}`,
+      meta: {
+        ...doc.meta,
+        title: `${doc.meta.title || 'Exam'} (Copy)`,
+      },
+      createdAt: new Date().toISOString(),
+    };
+    onUpdateDoc(newDoc);
+    saveExamDoc(newDoc);
+  };
+
+  // Export as DOCX format using HTML document MIME
+  const handleExportDocx = () => {
+    const printArea = document.getElementById('printable-exam-area');
+    if (!printArea) return;
+
+    const htmlContent = `
+      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+      <head>
+        <meta charset='utf-8'>
+        <title>${doc.meta.title || 'Exam'}</title>
+        <style>
+          body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 11pt; direction: ${doc.meta.direction}; }
+          table { border-collapse: collapse; width: 100%; }
+          td, th { border: 1px solid #999; padding: 6px; }
+        </style>
+      </head>
+      <body>
+        ${printArea.innerHTML}
+      </body>
+      </html>
+    `;
+
+    const blob = new Blob(['\ufeff', htmlContent], {
+      type: 'application/msword',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${doc.meta.title || 'Exam'}.doc`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="py-6 px-4 space-y-6">
+      {/* Top Action Bar (Hidden on print) */}
+      <div className="max-w-5xl mx-auto flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs print:hidden">
+        {/* Render Modes Selector */}
+        <div className="inline-flex rounded-xl p-1 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/60 text-xs font-medium">
+          <button
+            onClick={() => setRenderMode('paper')}
+            className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+              renderMode === 'paper'
+                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs font-semibold'
+                : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+            }`}
+          >
+            Exam Paper (Blank)
+          </button>
+          <button
+            onClick={() => setRenderMode('answer-key')}
+            className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+              renderMode === 'answer-key'
+                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs font-semibold'
+                : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+            }`}
+          >
+            Answer Key Mode
+          </button>
+          <button
+            onClick={() => setRenderMode('review')}
+            className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+              renderMode === 'review'
+                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs font-semibold'
+                : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+            }`}
+          >
+            Review (Anchors & Flags)
+          </button>
+        </div>
+
+        {/* Export & Print Action Buttons */}
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <button
+            onClick={handleDuplicate}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+            title="Duplicate exam to create Version B"
+          >
+            <Copy className="w-3.5 h-3.5 text-slate-500" />
+            <span>Duplicate</span>
+          </button>
+
+          <button
+            onClick={handleExportDocx}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+            title="Export DOCX document"
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-blue-500" />
+            <span>DOCX</span>
+          </button>
+
+          <button
+            onClick={handleExportJson}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+            title="Export clean ExamDoc JSON"
+          >
+            <Download className="w-3.5 h-3.5 text-emerald-500" />
+            <span>Export JSON</span>
+          </button>
+
+          <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer">
+            <Upload className="w-3.5 h-3.5 text-purple-500" />
+            <span>Import JSON</span>
+            <input
+              ref={jsonInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleImportJson}
+              className="hidden"
+            />
+          </label>
+
+          <button
+            onClick={handlePrint}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold transition cursor-pointer shadow-xs ml-1"
+          >
+            <Printer className="w-4 h-4" />
+            <span>Print / Save PDF</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Rendered Printable Exam Container */}
+      <div id="printable-exam-area" className="w-full overflow-x-auto pb-10">
+        <DeterministicRenderer doc={doc} mode={renderMode} />
+      </div>
+    </div>
+  );
+};

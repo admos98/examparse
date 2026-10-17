@@ -1,0 +1,174 @@
+/**
+ * Stage 4: Batched Vision Labeling Pipeline (§6.4)
+ * Sends all deduplicated images in ONE batched call with ≤ 6 source lines around each anchor.
+ */
+import { ImageAsset, LLMRequest, SourceLine } from '../types';
+import { LLMAdapter } from '../providers/adapter';
+import { T2_IMAGE_LABELING_SYSTEM } from './prompts';
+import { getImageBlob } from '../store';
+
+/**
+ * Convert a Blob to base64 string without data prefix
+ */
+async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      const base64 = dataUrl.split(',')[1] || '';
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Downscale and compress image if needed (max long edge 1024px, JPEG q80)
+ */
+async function optimizeImageForVision(
+  blob: Blob,
+  maxLongEdge: number = 1024,
+  quality: number = 0.8
+): Promise<{ base64: string; mime: string; width: number; height: number }> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxLongEdge || height > maxLongEdge) {
+        if (width > height) {
+          height = Math.round((height * maxLongEdge) / width);
+          width = maxLongEdge;
+        } else {
+          width = Math.round((width * maxLongEdge) / height);
+          height = maxLongEdge;
+        }
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        const base64 = dataUrl.split(',')[1] || '';
+        resolve({ base64, mime: 'image/jpeg', width, height });
+      } else {
+        blobToBase64(blob).then(base64 => resolve({ base64, mime: blob.type || 'image/jpeg', width: img.width, height: img.height }));
+      }
+    };
+    img.src = URL.createObjectURL(blob);
+  });
+}
+
+export interface VisionLabelResult {
+  updatedImages: ImageAsset[];
+  usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
+}
+
+export async function labelImagesBatched(params: {
+  images: ImageAsset[];
+  sourceLines: SourceLine[];
+  providerConfig: any;
+  maxLongEdge?: number;
+  quality?: number;
+}): Promise<VisionLabelResult> {
+  const { images, sourceLines, providerConfig, maxLongEdge = 1024, quality = 0.8 } = params;
+
+  if (images.length === 0) {
+    return {
+      updatedImages: [],
+      usage: { inputTokens: 0, outputTokens: 0 },
+    };
+  }
+
+  // Filter out duplicates (we map duplicate labels locally)
+  const uniqueImages = images.filter(img => !img.duplicateOf);
+
+  // Prepare images and anchor context text
+  const payloadImages: { id: string; mime: string; data: string }[] = [];
+  const manifestEntries: string[] = [];
+
+  for (const img of uniqueImages) {
+    const blob = await getImageBlob(img.blobKey);
+    if (!blob) continue;
+
+    const optimized = await optimizeImageForVision(blob, maxLongEdge, quality);
+    payloadImages.push({
+      id: img.id,
+      mime: optimized.mime,
+      data: optimized.base64,
+    });
+
+    // Extract <= 6 source lines around anchor
+    const anchorIdx = img.anchorLine
+      ? Math.max(0, img.anchorLine - 1)
+      : sourceLines.findIndex(l => l.page === img.page);
+
+    const startIdx = Math.max(0, anchorIdx - 2);
+    const endIdx = Math.min(sourceLines.length, anchorIdx + 4);
+    const contextLines = sourceLines
+      .slice(startIdx, endIdx)
+      .map(l => `${l.id}: ${l.text}`)
+      .join('\n');
+
+    manifestEntries.push(
+      `Image ${img.id}: page ${img.page}, near line ${img.anchorLine || 'unknown'}\nContext:\n${contextLines}`
+    );
+  }
+
+  if (payloadImages.length === 0) {
+    return {
+      updatedImages: images,
+      usage: { inputTokens: 0, outputTokens: 0 },
+    };
+  }
+
+  const promptText = `MANIFEST:\n${manifestEntries.join('\n---\n')}\n\nReturn JSON array of {id, role, questionRef, kind, caption, needsText} for all ${payloadImages.length} images.`;
+
+  const request: LLMRequest = {
+    role: 'vision',
+    system: T2_IMAGE_LABELING_SYSTEM,
+    text: promptText,
+    images: payloadImages,
+    maxOutputTokens: Math.max(500, payloadImages.length * 120),
+    label: `Vision Labeling (${payloadImages.length} images)`,
+    providerConfig,
+  };
+
+  const response = await LLMAdapter.execute(request);
+
+  const labelMap = new Map<string, any>();
+  if (Array.isArray(response.json)) {
+    for (const item of response.json) {
+      if (item && item.id) {
+        labelMap.set(item.id, item);
+      }
+    }
+  }
+
+  // Apply labels to images & propagate to duplicates
+  const updatedImages = images.map(img => {
+    const targetId = img.duplicateOf || img.id;
+    const label = labelMap.get(targetId);
+    if (label) {
+      return {
+        ...img,
+        label: {
+          role: label.role || 'stem',
+          questionRef: label.questionRef || undefined,
+          kind: label.kind || 'diagram',
+          caption: label.caption || undefined,
+          needsText: Boolean(label.needsText),
+        },
+      };
+    }
+    return img;
+  });
+
+  return {
+    updatedImages,
+    usage: response.usage,
+  };
+}

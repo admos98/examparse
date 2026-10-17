@@ -1,0 +1,6 @@
+{
+  "name": "ExamParse",
+  "description": "Convert local exam papers (PDF, DOCX, images) to structured JSON and rebuild clean, printable exam pages with minimal token usage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

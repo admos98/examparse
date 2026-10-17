@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    background-color: #f8fafc;
+    color: #0f172a;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  @media (prefers-color-scheme: dark) {
+    body {
+      background-color: #090d16;
+      color: #f8fafc;
+    }
+  }
+
+  .font-vazir {
+    font-family: Vazirmatn, Tahoma, 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Print Specific Rules for Clean A4 Output (§9) */
+@page {
+  size: A4 portrait;
+  margin: 18mm;
+}
+
+@media print {
+  /* Hide all app chrome, buttons, headers, steppers, and modals */
+  header,
+  nav,
+  button,
+  .print\:hidden {
+    display: none !important;
+  }
+
+  body {
+    background: white !important;
+    color: black !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  #printable-exam-area {
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: visible !important;
+  }
+
+  #printable-exam-area > div {
+    box-shadow: none !important;
+    padding: 0 !important;
+    max-width: 100% !important;
+    min-height: auto !important;
+  }
+
+  article {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  section {
+    break-inside: auto;
+  }
+}

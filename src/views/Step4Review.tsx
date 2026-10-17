@@ -50,6 +50,7 @@ export const Step4Review: React.FC<Props> = ({
   const [showFlagsPanel, setShowFlagsPanel] = useState<boolean>(true);
   const [showImageManager, setShowImageManager] = useState<boolean>(false);
   const [isSolvingBatch, setIsSolvingBatch] = useState<boolean>(false);
+  const [solverError, setSolverError] = useState<string | null>(null);
   const [solvingQuestionId, setSolvingQuestionId] = useState<string | null>(null);
 
   // Group questions by section
@@ -107,6 +108,7 @@ export const Step4Review: React.FC<Props> = ({
         sourceLines: examDoc.source.lines,
         instruction: patchInstruction,
         providerConfig,
+        maxOutputTokens: settings.budget.maxOutputTokens,
       });
 
       // Log usage for patch call (§5.4 & §5.7)
@@ -143,8 +145,31 @@ export const Step4Review: React.FC<Props> = ({
     }
   };
 
+
+  // Solver budget gate (C13): estimate target text cost at the standard-role model.
+  const checkSolverBudget = async (targets: Question[]): Promise<boolean> => {
+    const { estimateTextTokens, calculateActualCost } = await import('../utils/budget');
+    const standardRole = settings.roleMapping.standard;
+    const text = targets
+      .map(q => [q.stem || '', ...(q.options || []).map(o => o.text || '')].join(' '))
+      .join('\n');
+    const estInput = estimateTextTokens(text, examDoc.meta.direction === 'rtl');
+    const estOutput = Math.max(80, targets.length * 80);
+    const estCost = calculateActualCost(estInput, estOutput, standardRole.model, settings.costTable);
+    if (estCost > settings.budget.maxUsdPerRun) {
+      setSolverError(
+        `Solver estimate ($${estCost.toFixed(4)}) exceeds your configured budget cap ($${settings.budget.maxUsdPerRun}). Solving halted.`
+      );
+      return false;
+    }
+    setSolverError(null);
+    return true;
+  };
+
   // Solve all questions missing an answer in 1 batched call
   const handleSolveAllMissing = async () => {
+    const targets = examDoc.questions.filter(q => !q.answer || !q.answer.text);
+    if (!(await checkSolverBudget(targets))) return;
     setIsSolvingBatch(true);
     const standardRole = settings.roleMapping.standard;
     const provider = settings.providers.find(p => p.id === standardRole.providerId) || settings.providers[0];
@@ -158,6 +183,7 @@ export const Step4Review: React.FC<Props> = ({
       const res = await solveQuestionsWithAI({
         questions: examDoc.questions,
         providerConfig,
+        maxOutputTokens: settings.budget.maxOutputTokens,
       });
 
       if (res.solvedCount > 0) {
@@ -187,6 +213,7 @@ export const Step4Review: React.FC<Props> = ({
 
   // Solve single question with AI
   const handleSolveSingle = async (q: Question) => {
+    if (!(await checkSolverBudget([q]))) return;
     setSolvingQuestionId(q.id);
     const standardRole = settings.roleMapping.standard;
     const provider = settings.providers.find(p => p.id === standardRole.providerId) || settings.providers[0];
@@ -200,6 +227,7 @@ export const Step4Review: React.FC<Props> = ({
       const res = await solveSingleQuestionWithAI({
         question: q,
         providerConfig,
+        maxOutputTokens: settings.budget.maxOutputTokens,
       });
 
       const costUsd = calculateActualCost(
@@ -334,6 +362,20 @@ export const Step4Review: React.FC<Props> = ({
           </button>
         </div>
       </div>
+
+      {/* Solver Budget Stop Banner */}
+      {solverError && (
+        <div className="p-4 rounded-2xl border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300 flex items-start gap-3 text-xs">
+          <ShieldAlert className="w-5 h-5 shrink-0 text-red-500 mt-0.5" />
+          <div className="flex-1 space-y-1">
+            <span className="font-bold">Budget / Execution Stop:</span>
+            <p>{solverError}</p>
+          </div>
+          <button onClick={() => setSolverError(null)} className="text-red-400 hover:text-red-600">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Flags Panel (§4 & §6.3) */}
       {showFlagsPanel && examDoc.flags.length > 0 && (

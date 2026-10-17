@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   FileText,
   Zap,
@@ -8,10 +8,11 @@ import {
   TrendingDown,
   ChevronDown,
   Sparkles,
+  FolderOpen,
 } from 'lucide-react';
-import { ExamDoc, UsageRecord } from '../types';
+import { ExamDoc, UsageRecord, getDisplayName } from '../types';
 import { summarizeUsage } from '../utils/budget';
-import { loadSettings } from '../store';
+import { getStorageBackend, loadSettings } from '../store';
 
 interface Props {
   activeDoc: ExamDoc | null;
@@ -19,6 +20,7 @@ interface Props {
   onOpenSettings: () => void;
   onOpenExplainer: () => void;
   onLoadDemo: () => void;
+  onOpenLibrary: () => void;
 }
 
 export const Header: React.FC<Props> = ({
@@ -27,8 +29,21 @@ export const Header: React.FC<Props> = ({
   onOpenSettings,
   onOpenExplainer,
   onLoadDemo,
+  onOpenLibrary,
 }) => {
   const [showUsagePopover, setShowUsagePopover] = useState(false);
+  const [storageChip, setStorageChip] = useState('Storage: Browser');
+  useEffect(() => {
+    let mounted = true;
+    getStorageBackend()
+      .then(info => {
+        if (mounted) {
+          setStorageChip(info.mode === 'folder' ? `Storage: Folder (${info.dir || 'data'})` : 'Storage: Browser');
+        }
+      })
+      .catch(() => undefined);
+    return () => { mounted = false; };
+  }, []);
   const settings = loadSettings();
   const summary = summarizeUsage(usageRecords, settings.costTable);
 
@@ -44,12 +59,18 @@ export const Header: React.FC<Props> = ({
           <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
             zero-waste
           </span>
+          <span
+            className="hidden md:inline text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-500/10 text-slate-500 dark:text-slate-400 border border-slate-500/20 max-w-[260px] truncate"
+            title={storageChip}
+          >
+            {storageChip}
+          </span>
         </div>
 
         {activeDoc && (
           <div className="hidden sm:flex items-center gap-2 pl-3 border-l border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
-            <span className="font-medium text-slate-900 dark:text-slate-200 max-w-[200px] truncate" title={activeDoc.source.fileName}>
-              {activeDoc.source.fileName}
+            <span className="font-medium text-slate-900 dark:text-slate-200 max-w-[200px] truncate" title={getDisplayName(activeDoc)}>
+              {getDisplayName(activeDoc)}
             </span>
             <span className="text-slate-400">•</span>
             <span>{activeDoc.source.pages} page(s)</span>
@@ -132,6 +153,16 @@ export const Header: React.FC<Props> = ({
             </div>
           )}
         </div>
+
+        {/* Exam Library Button */}
+        <button
+          onClick={onOpenLibrary}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700/80 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700/50 text-xs font-medium transition cursor-pointer"
+          title="Open the exam library"
+        >
+          <FolderOpen className="w-3.5 h-3.5" />
+          <span>Library</span>
+        </button>
 
         {/* Demo Exam Button */}
         <button

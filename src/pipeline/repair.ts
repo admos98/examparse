@@ -12,6 +12,7 @@ export interface RepairResult {
   repairedQuestions: Question[];
   usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
   shapeMismatch?: boolean;
+  appliedCount?: number;
 }
 
 export async function runEscalationRepair(params: {
@@ -27,6 +28,7 @@ export async function runEscalationRepair(params: {
     return {
       repairedQuestions: allQuestions,
       usage: { inputTokens: 0, outputTokens: 0 },
+      appliedCount: 0,
     };
   }
 
@@ -133,8 +135,10 @@ export async function runEscalationRepair(params: {
     }
   }
 
+  let appliedCount = 0;
   const repairedQuestions = allQuestions.map(q => {
     if (patchMap.has(q.id)) {
+      appliedCount++;
       const patch = patchMap.get(q.id);
       const merged = applyMergePatch(q, patch);
       const newSpans = merged.spans || q.spans;
@@ -180,5 +184,6 @@ export async function runEscalationRepair(params: {
     repairedQuestions,
     usage: response.usage,
     shapeMismatch,
+    appliedCount,
   };
 }

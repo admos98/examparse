@@ -6,3 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+# Folder-backed storage (local runtime data)
+data/

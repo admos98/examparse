@@ -109,6 +109,8 @@ export interface UsageRecord {
   costUsd?: number;
   label: string;
   isCachedHit?: boolean;
+  /** Optional dedupe key: at most one global-log record per key (cached hits replace their timestamp). */
+  dedupeKey?: string;
 }
 
 export interface ExamMeta {
@@ -129,6 +131,9 @@ export interface ExamDoc {
   id: string;
   fileHash: string;
   createdAt: string;
+  /** Human-facing exam name derived from AI meta (or set manually via Library rename). */
+  displayName: string;
+  nameSource?: 'ai' | 'manual';
   meta: ExamMeta;
   sections: ExamSection[];
   questions: Question[];
@@ -138,10 +143,58 @@ export interface ExamDoc {
     pages: number;
     ocrUsed: boolean;
     fileName: string;
-    pageImages?: string[]; // rendered page preview data URLs
+    pageImages?: string[]; // rendered page preview data URLs (legacy / in-memory only; stripped on persist)
+    pageThumbKeys?: string[]; // blob keys (thumb_{fileHash}_{page}) for saved page renders
   };
   flags: Flag[];
   usage: UsageRecord[];
+}
+
+/** Strip a trailing file extension, e.g. "exam.pdf" -> "exam". */
+export function fileNameWithoutExtension(fileName?: string | null): string {
+  return (fileName || '').replace(/\.[^/.]+$/, '');
+}
+
+function nonEmpty(value?: string | null): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Compute a display name from AI-extracted meta + file name (no API call):
+ * [subject, grade] joined with " — " -> subject alone -> meta.title -> file name (no extension).
+ */
+export function computeDisplayName(
+  meta?: Partial<ExamMeta> | null,
+  fileName?: string | null
+): string {
+  const parts = [nonEmpty(meta?.subject), nonEmpty(meta?.grade)].filter(Boolean);
+  if (parts.length > 0) return parts.join(' \u2014 ');
+  const title = nonEmpty(meta?.title);
+  if (title) return title;
+  return fileNameWithoutExtension(fileName) || 'Exam';
+}
+
+/**
+ * Display name for any ExamDoc, applying the AI-meta fallback chain for
+ * legacy docs that lack the displayName field.
+ */
+export function getDisplayName(
+  doc?: (Partial<ExamDoc> & { meta?: Partial<ExamMeta>; source?: { fileName?: string } }) | null
+): string {
+  if (!doc) return 'Exam';
+  const stored = nonEmpty((doc as ExamDoc).displayName);
+  if (stored) return stored;
+  return computeDisplayName(doc.meta as Partial<ExamMeta>, doc.source?.fileName);
+}
+
+/** Make a string safe to use as a download file name (keeps Unicode letters such as Persian/Arabic). */
+export function sanitizeFileName(name: string): string {
+  const cleaned = (name || '')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+  return cleaned || 'Exam';
 }
 
 /**
@@ -156,6 +209,10 @@ export interface ProviderConfig {
   baseURL: string;
   apiKey: string; // stored locally
   defaultHeaders?: Record<string, string>;
+  /** When true (default), reasoning/thinking is disabled (or minimised for the solver) on OpenAI-compatible calls. */
+  disableReasoning?: boolean;
+  /** Raw JSON object string shallow-merged last into chat-completions bodies (user keys win). */
+  extraBodyJson?: string;
 }
 
 export interface RoleModelSelection {
@@ -228,11 +285,15 @@ export interface LLMRequest {
     apiKey?: string;
     defaultHeaders?: Record<string, string>;
     model: string;
+    disableReasoning?: boolean;
+    extraBodyJson?: string;
   };
 }
 
 export interface LLMResponse {
   json: unknown;
+  /** Request label, with a ladder suffix (e.g. " [r-min]") when a reasoning fallback rung succeeded. */
+  label?: string;
   usage: {
     inputTokens: number;
     outputTokens: number;
@@ -256,4 +317,6 @@ export interface StageStatus {
   outputTokens?: number;
   costUsd?: number;
   message?: string;
+  /** Number of attempts made for this stage (>1 when a retry fired). */
+  attempts?: number;
 }

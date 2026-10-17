@@ -129,7 +129,7 @@ async function processVisionChunk(
 
   const response = await LLMAdapter.execute(request);
 
-  // Parse envelope or bare array
+  // Parse envelope or bare array (accept labels/data/annotations keys, or a single {id, ...} object)
   let rawItems: any[] | null = null;
   if (Array.isArray(response.json)) {
     rawItems = response.json;
@@ -139,6 +139,10 @@ async function processVisionChunk(
     else if (Array.isArray(obj.images)) rawItems = obj.images;
     else if (Array.isArray(obj.answers)) rawItems = obj.answers;
     else if (Array.isArray(obj.results)) rawItems = obj.results;
+    else if (Array.isArray(obj.labels)) rawItems = obj.labels;
+    else if (Array.isArray(obj.data)) rawItems = obj.data;
+    else if (Array.isArray(obj.annotations)) rawItems = obj.annotations;
+    else if (typeof obj.id === 'string' && obj.id) rawItems = [obj];
   }
 
   const flags: { id: string; severity: 'info' | 'warn' | 'error'; code: string; message: string }[] = [];
@@ -147,7 +151,7 @@ async function processVisionChunk(
       id: `flag_vis_mismatch`,
       severity: 'warn',
       code: 'VISION_SHAPE_MISMATCH',
-      message: 'Vision response returned unexpected format instead of {"items": [...]}. Images assigned default roles.',
+      message: `Vision response returned unexpected format instead of {"items": [...]}. Images assigned default roles. Raw: ${(response.rawText || '').slice(0, 200)}`,
     });
     rawItems = [];
   }

@@ -12,6 +12,60 @@ export interface StructurePassResult {
   meta: any;
   usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
   rawText: string;
+  attempts?: number;
+  finishReason?: string;
+  flags?: any[];
+  /** True only if the (final) model response had json: null origin — such results must never be cached. */
+  jsonNull?: boolean;
+}
+
+/** Unwrap result/data/exam/output envelopes containing questions (sections/meta alongside win, outer is fallback). */
+export function unwrapStructureData(data: any): any {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+  if (Array.isArray(data.questions)) return data;
+  for (const key of ['result', 'data', 'exam', 'output'] as const) {
+    const env = data[key];
+    if (env && typeof env === 'object' && !Array.isArray(env) && Array.isArray(env.questions)) {
+      return {
+        ...data,
+        ...env,
+        questions: env.questions,
+        sections: Array.isArray(env.sections) ? env.sections : data.sections,
+        meta: env.meta ?? data.meta,
+      };
+    }
+  }
+  return data;
+}
+
+function buildStructureShapeError(params: {
+  finishReason?: string;
+  rawText?: string;
+  jsonNull: boolean;
+  attempts: number;
+  usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
+}): Error & any {
+  const rawText = params.rawText || '';
+  const snippet = rawText.slice(0, 300);
+  let message = `Structure response had no usable questions (finishReason=${params.finishReason || 'unknown'}): ${snippet}`;
+  if (params.jsonNull && !rawText.includes('{')) {
+    message = `Structure response had no usable questions (finishReason=${params.finishReason || 'unknown'}): the model spent its output on prose/reasoning instead of JSON; use a non-reasoning instruct model or a higher output cap. Raw: ${snippet}`;
+  }
+  const flag = {
+    id: 'flag_structure_shape_mismatch',
+    severity: 'error' as const,
+    code: 'STRUCTURE_SHAPE_MISMATCH',
+    message,
+  };
+  const err: any = new Error(message);
+  err.code = 'STRUCTURE_SHAPE_MISMATCH';
+  err.flag = flag;
+  err.flags = [flag];
+  err.attempts = params.attempts;
+  err.usage = params.usage;
+  err.finishReason = params.finishReason;
+  err.rawText = rawText;
+  return err;
 }
 
 export interface StructurePassParams {
@@ -36,9 +90,10 @@ const COMPACT_T1_SCHEMA = {
       parentId: 'string?',
       sectionId: 'string?',
       spans: '[[startLine, endLine]]',
-      type: 'mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay',
+      type: 'mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay|unknown',
       points: 'number?',
       options: [{ key: 'string', spans: '[[startLine, endLine]]' }],
+      tables: [{ spans: '[[startLine, endLine]]' }],
       answer: { spans: '[[startLine, endLine]]' },
       rewrites: [{ line: 'number', text: 'string' }],
       images: [{ imageId: 'string', role: 'stem|option|table|decoration' }],
@@ -84,12 +139,12 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
     return await runChunkedStructurePass(params, lasText, manifestEntries);
   }
 
-  // Estimate output tokens ≈ 10% of input + 20 tokens per section/question
-  // §5.6 & audit: structure maxOutputTokens = clamp(estimate × 1.5, 2048, settings.budget.maxOutputTokens)
+  // Output sizing: estimatedOutput = max(inputTokens × 0.10, sourceLines.length × 6);
+  // baseCap = clamp(estimatedOutput × 1.5, 4096, budgetCap)
   const budgetCap = maxBudgetTokens || 8192;
   const estimatedInput = Math.ceil(lasText.length / 3.2);
-  const estimatedOutput = Math.max(300, Math.ceil(estimatedInput * 0.10));
-  const baseCap = Math.max(512, Math.min(budgetCap, Math.ceil(estimatedOutput * 1.5)));
+  const estimatedOutput = Math.max(estimatedInput * 0.10, sourceLines.length * 6);
+  const baseCap = Math.min(budgetCap, Math.max(4096, Math.ceil(estimatedOutput * 1.5)));
 
   const request: LLMRequest = {
     role: 'fast',
@@ -101,19 +156,22 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
     providerConfig,
   };
 
-  const response = await LLMAdapter.execute(request);
-  let data: any = response.json || {};
+  let attempts = 1;
+  let response = await LLMAdapter.execute(request);
+  let data: any = unwrapStructureData(response.json);
   const totalUsage = { ...response.usage };
+  let finalFinishReason = response.finishReason;
+  let finalRawText = response.rawText;
 
-  // On MAX_TOKENS / length truncation or unparseable JSON, retry once at 2x cap (counted in usage)
-  const isTruncatedOrBroken =
+  // Retry at 2x cap ONLY on truncation (finishReason length/MAX_TOKENS, or json: null after salvage).
+  // A parseable but wrong-shape/empty reply must NOT re-send the document.
+  const isTruncation =
     response.finishReason === 'MAX_TOKENS' ||
     response.finishReason === 'length' ||
-    !data ||
-    !Array.isArray(data.questions) ||
-    data.questions.length === 0;
+    response.json === null ||
+    response.json === undefined;
 
-  if (isTruncatedOrBroken && baseCap < budgetCap) {
+  if (isTruncation) {
     const retryCap = Math.min(budgetCap, baseCap * 2);
     console.warn(`Structure pass truncated or unparseable (${response.finishReason}). Retrying once at 2x cap (${retryCap})...`);
     const retryRequest: LLMRequest = {
@@ -122,11 +180,26 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
       label: 'Structure Pass (Retry 2x Cap)',
     };
     const retryResponse = await LLMAdapter.execute(retryRequest);
+    attempts = 2;
     totalUsage.inputTokens += retryResponse.usage.inputTokens;
     totalUsage.outputTokens += retryResponse.usage.outputTokens;
     totalUsage.cachedTokens = (totalUsage.cachedTokens || 0) + (retryResponse.usage.cachedTokens || 0);
 
-    data = retryResponse.json || {};
+    response = retryResponse;
+    data = unwrapStructureData(retryResponse.json);
+    finalFinishReason = retryResponse.finishReason;
+    finalRawText = retryResponse.rawText;
+  }
+
+  const questions = data && Array.isArray(data.questions) ? data.questions : [];
+  if (questions.length === 0) {
+    throw buildStructureShapeError({
+      finishReason: finalFinishReason,
+      rawText: finalRawText,
+      jsonNull: response.json === null || response.json === undefined,
+      attempts,
+      usage: totalUsage,
+    });
   }
 
   // Token-Thrift Acceptance Check (§12 Test 1): expect output ≤ 12% of input
@@ -139,10 +212,14 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
 
   return {
     sections: Array.isArray(data.sections) ? data.sections : [],
-    rawQuestions: Array.isArray(data.questions) ? data.questions : [],
+    rawQuestions: questions,
     meta: data.meta || {},
     usage: totalUsage,
-    rawText: response.rawText,
+    rawText: finalRawText,
+    attempts,
+    finishReason: finalFinishReason,
+    flags: [],
+    jsonNull: response.json === null || response.json === undefined,
   };
 }
 
@@ -166,6 +243,9 @@ async function runChunkedStructurePass(
   let totalInTokens = 0;
   let totalOutTokens = 0;
   let totalCachedTokens = 0;
+  let lastFinishReason: string | undefined;
+  let lastRawText = '';
+  let lastJsonNull = false;
 
   for (let i = 0; i < sourceLines.length; i += chunkSize - overlap) {
     const chunkLines = sourceLines.slice(i, i + chunkSize);
@@ -174,7 +254,13 @@ async function runChunkedStructurePass(
       chunkLas += `[${line.id}] ${line.text}\n`;
     }
 
-    const chunkPrompt = `CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint })}\n\nIMAGE MANIFEST:\n${JSON.stringify(manifest)}\n\nSOURCE CHUNK:\n${chunkLas}`;
+    const chunkStart = parseInt(String(chunkLines[0]?.id || '').replace(/\D/g, ''), 10);
+    const chunkEnd = parseInt(String(chunkLines[chunkLines.length - 1]?.id || '').replace(/\D/g, ''), 10);
+    const chunkManifest = manifest.filter((m: any) => {
+      const near = typeof m?.nearLine === 'number' ? m.nearLine : parseInt(String(m?.nearLine || ''), 10);
+      return !isNaN(near) && !isNaN(chunkStart) && !isNaN(chunkEnd) && near >= chunkStart && near <= chunkEnd;
+    });
+    const chunkPrompt = `CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint })}\n\nIMAGE MANIFEST:\n${JSON.stringify(chunkManifest)}\n\nSOURCE CHUNK:\n${chunkLas}`;
 
     const req: LLMRequest = {
       role: 'fast',
@@ -191,10 +277,13 @@ async function runChunkedStructurePass(
     totalOutTokens += resp.usage.outputTokens;
     totalCachedTokens += resp.usage.cachedTokens || 0;
 
-    const data: any = resp.json || {};
+    const data: any = unwrapStructureData(resp.json) || {};
     if (data.meta && Object.keys(mergedMeta).length === 0) mergedMeta = data.meta;
     if (Array.isArray(data.sections)) mergedSections.push(...data.sections);
     if (Array.isArray(data.questions)) mergedQuestions.push(...data.questions);
+    lastFinishReason = resp.finishReason;
+    lastRawText = resp.rawText;
+    lastJsonNull = resp.json === null || resp.json === undefined;
   }
 
   // Deduplicate questions by sectionId:no composite key
@@ -210,6 +299,16 @@ async function runChunkedStructurePass(
     }
   }
 
+  if (dedupedQuestions.length === 0) {
+    throw buildStructureShapeError({
+      finishReason: lastFinishReason,
+      rawText: lastRawText,
+      jsonNull: lastJsonNull,
+      attempts: 1,
+      usage: { inputTokens: totalInTokens, outputTokens: totalOutTokens, cachedTokens: totalCachedTokens },
+    });
+  }
+
   return {
     sections: mergedSections,
     rawQuestions: dedupedQuestions,
@@ -220,5 +319,9 @@ async function runChunkedStructurePass(
       cachedTokens: totalCachedTokens,
     },
     rawText: 'Merged from chunks',
+    attempts: 1,
+    finishReason: lastFinishReason,
+    flags: [],
+    jsonNull: lastJsonNull,
   };
 }

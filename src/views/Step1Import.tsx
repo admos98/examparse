@@ -9,23 +9,30 @@ import {
   FileCode,
   ArrowRight,
 } from 'lucide-react';
-import { ExtractedDocument, extractDocument } from '../pipeline/extract';
+import { ExtractedDocument } from '../pipeline/extract';
+import { getOrExtractDocument } from '../pipeline/extractCache';
 import { createDemoExamDoc } from '../pipeline/demoData';
-import { ExamDoc } from '../types';
+import { ExamDoc, getDisplayName } from '../types';
+import { loadExamDoc } from '../store';
+import { sha256 } from '../utils/hash';
 
 interface Props {
-  onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null) => void;
+  onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null, fileHash?: string) => void;
   onDemoLoaded: (demoDoc: ExamDoc) => void;
   isLoading: boolean;
+  cacheEnabled?: boolean;
+  onOpenSavedExam?: (doc: ExamDoc) => void;
 }
 
-export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, isLoading }) => {
+export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
   const [dragOver, setDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'upload' | 'paste'>('upload');
   const [pastedText, setPastedText] = useState('');
   const [pastedFileName, setPastedFileName] = useState('pasted_exam.txt');
   const [answerKeyFile, setAnswerKeyFile] = useState<File | null>(null);
+  const [savedExam, setSavedExam] = useState<ExamDoc | null>(null);
+  const [pendingImport, setPendingImport] = useState<{ doc: ExtractedDocument; file: File; fileHash: string } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const answerKeyInputRef = useRef<HTMLInputElement>(null);
@@ -49,8 +56,26 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
     }
 
     try {
-      const extracted = await extractDocument(file);
-      onDocumentLoaded(extracted, file, answerKeyFile);
+      // Hash first: extraction cache + saved-exam fast-path key off the file hash.
+      const fileHash = await sha256(await file.arrayBuffer());
+      const { extracted } = await getOrExtractDocument(file, {
+        fileHash,
+        useCache: cacheEnabled,
+      });
+
+      // Exam fast-path (B6): a saved result for this exact file already exists.
+      try {
+        const saved = await loadExamDoc(`exam_${fileHash.slice(0, 12)}`);
+        if (saved) {
+          setSavedExam(saved);
+          setPendingImport({ doc: extracted, file, fileHash });
+          return;
+        }
+      } catch {
+        // No saved exam / storage unavailable — proceed with the fresh import.
+      }
+
+      onDocumentLoaded(extracted, file, answerKeyFile, fileHash);
     } catch (err: any) {
       setErrorMessage(`Failed to process document: ${err.message || 'Corrupt or unreadable file'}`);
     }
@@ -128,6 +153,40 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
           <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-red-600">
             &times;
           </button>
+        </div>
+      )}
+
+      {/* Saved-result fast-path */}
+      {savedExam && pendingImport && (
+        <div className="p-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-start gap-3">
+            <FileCheck className="w-5 h-5 shrink-0 text-emerald-500 mt-0.5" />
+            <div>
+              <div className="font-bold">Already parsed — Open saved result</div>
+              <p>
+                “{getDisplayName(savedExam)}” was analyzed before ({savedExam.questions.length} questions,{' '}
+                {new Date(savedExam.createdAt).toLocaleDateString()}). Re-analyze remains available.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onOpenSavedExam?.(savedExam)}
+              className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-medium transition cursor-pointer"
+            >
+              Open saved result
+            </button>
+            <button
+              onClick={() => {
+                onDocumentLoaded(pendingImport.doc, pendingImport.file, answerKeyFile, pendingImport.fileHash);
+                setSavedExam(null);
+                setPendingImport(null);
+              }}
+              className="px-4 py-2 rounded-xl border border-emerald-600/40 hover:bg-emerald-500/10 font-medium transition cursor-pointer"
+            >
+              Import &amp; re-analyze
+            </button>
+          </div>
         </div>
       )}
 

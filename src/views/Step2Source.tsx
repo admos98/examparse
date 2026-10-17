@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   FileCode2,
   AlertCircle,
@@ -9,12 +9,14 @@ import {
   ImageIcon,
 } from 'lucide-react';
 import { ImageAsset, SourceLine } from '../types';
+import { getImageBlob } from '../store';
 
 interface Props {
   lines: SourceLine[];
   pages: number;
   ocrUsed: boolean;
   pageImages?: string[];
+  pageThumbKeys?: string[];
   images: ImageAsset[];
   onProceedToAnalyze: () => void;
 }
@@ -24,12 +26,29 @@ export const Step2Source: React.FC<Props> = ({
   pages,
   ocrUsed,
   pageImages = [],
+  pageThumbKeys = [],
   images = [],
   onProceedToAnalyze,
 }) => {
   const [showLineIds, setShowLineIds] = useState(true);
   const [activePage, setActivePage] = useState<number>(1);
   const [searchQuery, setSearchQuery] = useState('');
+  const [thumbUrls, setThumbUrls] = useState<string[]>([]);
+
+  // Resolve page thumbnails through thumb blobs like regular images (A3).
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      if (!pageThumbKeys || pageThumbKeys.length === 0) return;
+      const urls: string[] = [];
+      for (const k of pageThumbKeys) {
+        const blob = await getImageBlob(k);
+        urls.push(blob ? URL.createObjectURL(blob) : '');
+      }
+      if (mounted) setThumbUrls(urls);
+    })();
+    return () => { mounted = false; };
+  }, [pageThumbKeys]);
 
   // Group lines by page
   const linesByPage: Record<number, SourceLine[]> = {};
@@ -113,7 +132,7 @@ export const Step2Source: React.FC<Props> = ({
           <div className="space-y-2">
             {Array.from({ length: pages }, (_, i) => i + 1).map(pageNum => {
               const isSelected = activePage === pageNum && !searchQuery;
-              const pageImg = pageImages[pageNum - 1];
+              const pageImg = pageImages[pageNum - 1] || thumbUrls[pageNum - 1];
               const lineCount = linesByPage[pageNum]?.length || 0;
               const pageAssetCount = images.filter(img => img.page === pageNum).length;
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { ExamDoc, Question } from '../types';
+import { ExamDoc, Question, getDisplayName } from '../types';
 import { toPersianDigits } from '../utils/numbers';
 
 export type ExamRenderMode = 'paper' | 'answer-key' | 'review';
@@ -39,7 +39,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
 
           <div className="w-2/4 space-y-1">
             <h1 className="text-base font-extrabold tracking-tight">
-              {meta.title || 'Official Exam Paper'}
+              {meta.title || getDisplayName(doc)}
             </h1>
             {meta.subject && (
               <div className="text-xs font-semibold text-slate-700">
@@ -149,6 +149,19 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
                             </figure>
                           );
                         })}
+                      </div>
+                    )}
+
+                    {/* Tables assembled from spans */}
+                    {q.tables && q.tables.length > 0 && (
+                      <div className="py-2 overflow-x-auto">
+                        {q.tables.map((t, ti) => (
+                          <div
+                            key={ti}
+                            className="[&_table]:border-collapse [&_table]:w-full [&_td]:border [&_td]:border-slate-400 [&_td]:px-2 [&_td]:py-1 [&_td]:text-xs"
+                            dangerouslySetInnerHTML={{ __html: t.html }}
+                          />
+                        ))}
                       </div>
                     )}
 

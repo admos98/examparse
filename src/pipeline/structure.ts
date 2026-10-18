@@ -85,6 +85,26 @@ export interface StructurePassParams {
   recoveryBudget?: { count: number };
 }
 
+export function coveredUntilLine(questions: any[]): number {
+  let maximum = 0;
+  const visit = (node: any): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node.spans)) {
+      for (const span of node.spans) {
+        if (!Array.isArray(span)) continue;
+        const endLine = Number(span[1]);
+        if (Number.isFinite(endLine)) maximum = Math.max(maximum, endLine);
+      }
+    }
+    for (const key of ['options', 'subQuestions', 'tables']) {
+      if (Array.isArray(node[key])) node[key].forEach(visit);
+    }
+    if (node.answer) visit(node.answer);
+  };
+  if (Array.isArray(questions)) questions.forEach(visit);
+  return maximum;
+}
+
 const COMPACT_T1_SCHEMA = {
   meta: { title: 'string?', language: 'string', direction: 'ltr|rtl', totalPoints: 'number?' },
   sections: [
@@ -181,13 +201,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
       if (recovered) {
         const questions = [...recovered.questions]; const sections = [...(recovered.sections || [])];
         const usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
-        let addedAtLeastOne = false; let covered = 0;
-        const scanCoverage = () => {
-          let n = 0;
-          const scan = (v: any): void => { if (!v || typeof v !== 'object') return; if (Array.isArray(v.spans)) for (const span of v.spans) if (Array.isArray(span) && Number.isFinite(span[1])) n = Math.max(n, span[1]); if (Array.isArray(v.options)) v.options.forEach(scan); if (Array.isArray(v.subQuestions)) v.subQuestions.forEach(scan); if (v.answer) scan(v.answer); };
-          questions.forEach(scan); sections.forEach(scan); return n;
-        };
-        covered = scanCoverage();
+        let addedAtLeastOne = false; let covered = coveredUntilLine(questions);
         for (let round = 0; round < 2; round++) {
           if (round > 0 && !consumeRecovery()) break;
           const startLine = Math.max(1, covered - 1);
@@ -203,14 +217,14 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
           const contract = !isGemini ? `\n\nREQUIRED JSON SCHEMA CONTRACT (Strict):\n${JSON.stringify(COMPACT_T1_SCHEMA)}` : '';
           const continuationReq: LLMRequest = { ...request, text: `${withMemory}\n\nSOURCE (continuation):\n${lines}${contract}`, maxOutputTokens: Math.min(budgetCap, Math.max(4096, Math.ceil(Math.max(remaining.length * 14, remaining.reduce((n,l)=>n+l.text.length,0)/3.2*0.25)*1.25))), label: `Structure Pass (Journal Continuation ${round + 1})` };
           const continuation = await LLMAdapter.execute(continuationReq, { onDelta: (channel, full) => params.onLiveText?.(continuationReq.label, channel, full), onInfo: note => params.onLiveText?.(continuationReq.label, 'info', note), salvagePartial: true });
-          if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: continuation.label || continuationReq.label, rawText: continuation.rawText, reasoningText: continuation.reasoningText, finishReason: continuation.finishReason, usage: continuation.usage, complete: true });
+          if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: continuationReq.label, rawText: continuation.rawText, reasoningText: continuation.reasoningText, finishReason: continuation.finishReason, usage: continuation.usage, complete: true });
           usage.inputTokens += continuation.usage.inputTokens; usage.outputTokens += continuation.usage.outputTokens; usage.cachedTokens = (usage.cachedTokens || 0) + (continuation.usage.cachedTokens || 0);
           let part: any = unwrapStructureData(continuation.json);
           if (!Array.isArray(part?.questions) && continuation.json == null) part = unwrapStructureData(repairTruncatedJson(continuation.rawText));
           const seen = new Set(questions.map(q => `${q.sectionId || ''}:${q.no}`));
           const added = (part?.questions || []).filter((q: any) => { const k = `${q.sectionId || ''}:${q.no}`; if (seen.has(k)) return false; seen.add(k); return true; });
           if (!added.length) break;
-          addedAtLeastOne = true; questions.push(...added); sections.push(...(part.sections || [])); recovered.meta = recovered.meta || part.meta; covered = scanCoverage();
+          addedAtLeastOne = true; questions.push(...added); sections.push(...(part.sections || [])); recovered.meta = recovered.meta || part.meta; covered = coveredUntilLine(questions);
           const lastSourceLine = Math.max(0, ...sourceLines.map(line => Number(line.id.replace(/\D/g, '')) || 0));
           if (covered >= lastSourceLine) break;
         }
@@ -238,7 +252,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
     };
   };
   let response = await LLMAdapter.execute(request, streamOpts(request.label));
-  if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: response.label || request.label, rawText: response.rawText, reasoningText: response.reasoningText, finishReason: response.finishReason, usage: response.usage, complete: true });
+  if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: request.label, rawText: response.rawText, reasoningText: response.reasoningText, finishReason: response.finishReason, usage: response.usage, complete: true });
   let data: any = unwrapStructureData(response.json);
   const totalUsage = { ...response.usage };
   let finalFinishReason = response.finishReason;
@@ -253,7 +267,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
     const retryReq = { ...request, maxOutputTokens: cap, label: `Structure Pass (Retry ${attempts + 1})` };
     const retryResponse = await LLMAdapter.execute(retryReq, streamOpts(retryReq.label));
     attempts++;
-    if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: retryResponse.label || `Structure Pass (Retry ${attempts})`, rawText: retryResponse.rawText, reasoningText: retryResponse.reasoningText, finishReason: retryResponse.finishReason, usage: retryResponse.usage, complete: true });
+    if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: retryReq.label, rawText: retryResponse.rawText, reasoningText: retryResponse.reasoningText, finishReason: retryResponse.finishReason, usage: retryResponse.usage, complete: true });
     totalUsage.inputTokens += retryResponse.usage.inputTokens;
     totalUsage.outputTokens += retryResponse.usage.outputTokens;
     totalUsage.cachedTokens = (totalUsage.cachedTokens || 0) + (retryResponse.usage.cachedTokens || 0);
@@ -286,7 +300,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
     const enforcedReq = { ...request, maxOutputTokens: budgetCap, system: `${request.system}\n\nYour previous reply was prose, which is invalid. Output JSON only — first character { — no reasoning text in the reply.`, label: 'Structure Pass (Format Retry)' };
     const enforced = await LLMAdapter.execute(enforcedReq, streamOpts(enforcedReq.label));
     attempts++;
-    if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: enforced.label || 'Structure Pass (Format Retry)', rawText: enforced.rawText, reasoningText: enforced.reasoningText, finishReason: enforced.finishReason, usage: enforced.usage, complete: true });
+    if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: enforcedReq.label, rawText: enforced.rawText, reasoningText: enforced.reasoningText, finishReason: enforced.finishReason, usage: enforced.usage, complete: true });
     totalUsage.inputTokens += enforced.usage.inputTokens;
     totalUsage.outputTokens += enforced.usage.outputTokens;
     totalUsage.cachedTokens = (totalUsage.cachedTokens || 0) + (enforced.usage.cachedTokens || 0);
@@ -318,17 +332,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
   }
   let coverageCompleted = false;
   if (needsContinuation && !params.journalEnabled && questions.length > 0) {
-    const coveredUntil = (items: any[]) => {
-      let maximum = 0;
-      const visit = (node: any): void => {
-        if (!node || typeof node !== 'object') return;
-        for (const span of node.spans || []) if (Array.isArray(span)) maximum = Math.max(maximum, Number(span[1]) || 0);
-        for (const key of ['options', 'subQuestions']) if (Array.isArray(node[key])) node[key].forEach(visit);
-        if (node.answer) visit(node.answer);
-      };
-      items.forEach(visit); return maximum;
-    };
-    let covered = coveredUntil(questions);
+    let covered = coveredUntilLine(questions);
     for (let round = 0; round < 2; round++) {
       if (round > 0 && !consumeRecovery()) break;
       const tail = sourceLines.filter(line => Number(line.id.replace(/\D/g, '')) >= Math.max(1, covered - 1));
@@ -337,8 +341,10 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
       questions.forEach((q: any) => { const id = q.sectionId || 'default'; lastNos[id] = Math.max(lastNos[id] || 0, Number(q.no) || 0); });
       const memory = `SESSION MEMORY (already established — do NOT repeat these): meta=${JSON.stringify(data.meta || {})}; sections=${JSON.stringify((data.sections || []).map((s: any) => ({ id: s.id, title: String(s.title || '').slice(0,40) })))}; lastQuestionNoBySection=${JSON.stringify(lastNos)}; coveredSourceLines=1..${covered}. Reuse these section ids; continue question numbering after the given numbers; output ONLY questions/sections for the source below.`.slice(0,1100);
       const lineText = tail.map(line => `[${line.id}] ${line.text}`).join('\n');
-      const marker = request.text.indexOf('\n');
-      const prompt = `${request.text.slice(0, marker)}\n${memory}${request.text.slice(marker).split('\n\nSOURCE:')[0].slice(marker)}\n\nSOURCE (continuation):\n${lineText}${!isGemini ? `\n\nREQUIRED JSON SCHEMA CONTRACT (Strict):\n${JSON.stringify(COMPACT_T1_SCHEMA)}` : ''}`;
+      const basePrefix = request.text.split('\n\nSOURCE:')[0];
+      const configEnd = basePrefix.indexOf('\n');
+      const withMemory = configEnd >= 0 ? `${basePrefix.slice(0, configEnd)}\n${memory}${basePrefix.slice(configEnd)}` : `${basePrefix}\n${memory}`;
+      const prompt = `${withMemory}\n\nSOURCE (continuation):\n${lineText}${!isGemini ? `\n\nREQUIRED JSON SCHEMA CONTRACT (Strict):\n${JSON.stringify(COMPACT_T1_SCHEMA)}` : ''}`;
       const continuationReq: LLMRequest = { ...request, text: prompt, label: `Structure Pass (Continuation ${round + 1})`, maxOutputTokens: budgetCap };
       const cont = await LLMAdapter.execute(continuationReq, streamOpts(continuationReq.label));
       attempts++; totalUsage.inputTokens += cont.usage.inputTokens; totalUsage.outputTokens += cont.usage.outputTokens; totalUsage.cachedTokens = (totalUsage.cachedTokens || 0) + (cont.usage.cachedTokens || 0);
@@ -347,7 +353,7 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
       const existing = new Set(questions.map((q: any) => `${q.sectionId || ''}:${q.no}`));
       const additions = (more?.questions || []).filter((q: any) => { const key = `${q.sectionId || ''}:${q.no}`; if (existing.has(key)) return false; existing.add(key); return true; });
       if (!additions.length) break;
-      questions.push(...additions); data.sections = [...(data.sections || []), ...(more.sections || [])]; covered = coveredUntil(questions); coverageCompleted = true;
+      questions.push(...additions); data.sections = [...(data.sections || []), ...(more.sections || [])]; covered = coveredUntilLine(questions); coverageCompleted = true;
       const lastSourceLine = Math.max(0, ...sourceLines.map(line => Number(line.id.replace(/\D/g, '')) || 0));
       if (covered >= lastSourceLine) break;
     }
@@ -386,17 +392,18 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
   let mergedMeta: any = {}; let totalInTokens = 0, totalOutTokens = 0, totalCachedTokens = 0, attempts = 0;
   let lastFinishReason: string | undefined, lastRawText = '', lastJsonNull = false;
   let capped = false;
+  let repairedPartial = false;
   const sessionBrief = () => {
     const lastBySection: Record<string, number> = {};
     for (const q of mergedQuestions) { const id = q.sectionId || 'default'; lastBySection[id] = Math.max(lastBySection[id] || 0, Number(q.no) || 0); }
-    const covered = mergedQuestions.reduce((max, q) => Math.max(max, ...(q.spans || []).map((sp: any) => Number(sp?.[1]) || 0)), 0);
+    const covered = coveredUntilLine(mergedQuestions);
     return `SESSION MEMORY (already established — do NOT repeat these): meta=${JSON.stringify(mergedMeta)}; sections=${JSON.stringify(mergedSections.map(s => ({ id: s.id, title: String(s.title || '').slice(0,40) })))}; lastQuestionNoBySection=${JSON.stringify(lastBySection)}; coveredSourceLines=1..${covered}. Reuse these section ids; continue question numbering after the given numbers; output ONLY questions/sections for the source below.`.slice(0, 1100);
   };
   const recordResponse = async (resp: any, label: string) => {
     attempts++;
     totalInTokens += resp.usage.inputTokens; totalOutTokens += resp.usage.outputTokens; totalCachedTokens += resp.usage.cachedTokens || 0;
     lastFinishReason = resp.finishReason; lastRawText = resp.rawText; lastJsonNull = resp.json == null;
-    if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: resp.label || label, rawText: resp.rawText, reasoningText: resp.reasoningText, finishReason: resp.finishReason, usage: resp.usage, complete: true });
+    if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label, rawText: resp.rawText, reasoningText: resp.reasoningText, finishReason: resp.finishReason, usage: resp.usage, complete: true });
   };
   const processChunk = async (lines: SourceLine[], label: string, depth: number): Promise<void> => {
     if (capped) return;
@@ -424,9 +431,17 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
     }, onInfo: (note: string) => params.onLiveText?.(label, 'info', note), salvagePartial: true };
     const resp = await LLMAdapter.execute(req, opts); await recordResponse(resp, label);
     let data: any = unwrapStructureData(resp.json);
-    if ((!Array.isArray(data?.questions) || !data.questions.length) && resp.json == null && resp.rawText.includes('{')) data = unwrapStructureData(repairTruncatedJson(resp.rawText));
     const trunc = resp.finishReason === 'length' || resp.finishReason === 'MAX_TOKENS' || resp.finishReason === 'stream-died' || resp.json == null;
-    if (trunc) {
+    let repaired = false;
+    if (trunc && (!Array.isArray(data?.questions) || !data.questions.length) && resp.rawText.includes('{')) {
+      const recovered = unwrapStructureData(repairTruncatedJson(resp.rawText));
+      if (Array.isArray(recovered?.questions) && recovered.questions.length > 0) {
+        data = recovered;
+        repaired = true;
+      }
+    }
+    const chunkQuestions = Array.isArray(data?.questions) ? data.questions : [];
+    if (trunc && chunkQuestions.length === 0) {
       if (depth < 3 && lines.length >= 20) {
         const mid = Math.ceil(lines.length / 2);
         await processChunk(lines.slice(0, mid), `${label} (bisect A)`, depth + 1);
@@ -435,7 +450,8 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
       }
       throw buildStructureShapeError({ finishReason: resp.finishReason, rawText: resp.rawText, jsonNull: resp.json == null, attempts, usage: { inputTokens: totalInTokens, outputTokens: totalOutTokens, cachedTokens: totalCachedTokens } });
     }
-    if (Array.isArray(data?.questions)) mergedQuestions.push(...data.questions);
+    if (trunc && repaired) repairedPartial = true;
+    if (chunkQuestions.length) mergedQuestions.push(...chunkQuestions);
     if (Array.isArray(data?.sections)) mergedSections.push(...data.sections);
     if (data?.meta && !Object.keys(mergedMeta).length) mergedMeta = data.meta;
   };
@@ -447,5 +463,5 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
   const questions = mergedQuestions.filter(q => { const key = `${q.sectionId || ''}:${q.no}`; if (seen.has(key)) return false; seen.add(key); return true; });
   if (!questions.length) throw buildStructureShapeError({ finishReason: lastFinishReason, rawText: lastRawText, jsonNull: lastJsonNull, attempts, usage: { inputTokens: totalInTokens, outputTokens: totalOutTokens, cachedTokens: totalCachedTokens } });
   if (!capped && !lastJsonNull && params.journalEnabled && params.journalKey) await markJournalComplete(params.journalKey);
-  return { sections: mergedSections, rawQuestions: questions, meta: mergedMeta, usage: { inputTokens: totalInTokens, outputTokens: totalOutTokens, cachedTokens: totalCachedTokens }, rawText: 'Merged from chunks', attempts, finishReason: lastFinishReason, flags: capped ? [{ code: 'PARTIAL_COVERAGE', message: 'Recovery call limit reached; returning recovered questions only.' }] : [], jsonNull: capped || lastJsonNull };
+  return { sections: mergedSections, rawQuestions: questions, meta: mergedMeta, usage: { inputTokens: totalInTokens, outputTokens: totalOutTokens, cachedTokens: totalCachedTokens }, rawText: 'Merged from chunks', attempts, finishReason: lastFinishReason, flags: [...(repairedPartial ? [{ code: 'TRUNCATED_JSON_REPAIRED', message: `Recovered ${questions.length} questions from truncated JSON.` }] : []), ...(capped ? [{ code: 'PARTIAL_COVERAGE', message: 'Recovery call limit reached; returning recovered questions only.' }] : [])], jsonNull: capped || lastJsonNull };
 }

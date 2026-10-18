@@ -12,7 +12,7 @@ import { assembleAndValidateQuestions } from './assemble';
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
-import { appendUsageRecord, loadExamDoc, loadPageThumbDataUrls, saveExamDoc } from '../store';
+import { appendUsageRecord, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
 import { calculateActualCost, updateTokenCalibration } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 import { PARSER_VERSION } from './prompts';
@@ -256,6 +256,10 @@ export async function runFullPipeline(
   const structRole = settings.roleMapping.fast;
   const structProvider = settings.providers.find(p => p.id === structRole.providerId) || settings.providers[0];
   const structProviderConfig = { ...structProvider, model: structRole.model };
+  const journalKey = await sha256(`${fileHash}:${await sha256(JSON.stringify(workingLines))}:${structProviderConfig.id}:${structProviderConfig.model}:${PARSER_VERSION}`);
+  if (cacheEnabled) {
+    try { await setPipelineCache(`journalkey:${fileHash}`, journalKey); } catch { /* attempt-history pointer is best-effort */ }
+  }
 
   // Check cache for structure pass
   const cachedStructure = !stageForced('structure')
@@ -310,7 +314,7 @@ export async function runFullPipeline(
           providerConfig: structProviderConfig,
           maxBudgetTokens: settings.budget.maxOutputTokens,
           journalEnabled: cacheEnabled && !stageForced('structure'),
-          journalKey: await sha256(`${fileHash}:${await sha256(JSON.stringify(workingLines))}:${structProviderConfig.id}:${structProviderConfig.model}:${PARSER_VERSION}`),
+          journalKey,
           onLiveText: (label, channel, fullText) => onLiveText?.('structure', label, channel, fullText),
         });
       } catch (err: any) {

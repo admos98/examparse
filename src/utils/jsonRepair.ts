@@ -33,6 +33,9 @@ export function repairTruncatedJson(rawText: string): unknown | null {
   const candidates = [...new Set<number>([...completeArrayCuts.reverse(), safe, ...stack.map(frame => frame.lastSafe)])];
   for (let cut of candidates.filter(n => n > 0)) {
     let prefix = text.slice(0, cut).replace(/[,\s]+$/, '');
+    // Only retain boundaries after a complete composite value. Closing the stack
+    // must not turn a cut-off scalar (for example the `11` in `[11,`) into data.
+    if (!/[}\]]$/.test(prefix)) continue;
     // A trailing key/value separator cannot form a valid entry.
     if (/:\s*$/.test(prefix)) continue;
     let inString = false, esc = false;

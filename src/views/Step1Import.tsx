@@ -15,6 +15,7 @@ import { createDemoExamDoc } from '../pipeline/demoData';
 import { ExamDoc, getDisplayName } from '../types';
 import { loadExamDoc } from '../store';
 import { sha256 } from '../utils/hash';
+import { MAX_SOURCE_FILE_BYTES } from '../utils/validation';
 
 interface Props {
   onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null, fileHash?: string) => void;
@@ -39,6 +40,9 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
 
   const handleFileProcess = async (file: File) => {
     setErrorMessage(null);
+    if (!file || file.size <= 0) { setErrorMessage('The selected file is empty.'); return; }
+    if (file.size > MAX_SOURCE_FILE_BYTES) { setErrorMessage(`File exceeds the ${Math.round(MAX_SOURCE_FILE_BYTES / 1024 / 1024)} MiB import limit.`); return; }
+    if (file.name.length > 255 || /[\u0000-\u001f]/.test(file.name)) { setErrorMessage('Invalid file name.'); return; }
     const ext = file.name.split('.').pop()?.toLowerCase();
 
     // Reject legacy .doc with friendly message
@@ -91,6 +95,7 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
 
   const handlePasteSubmit = async () => {
     if (!pastedText.trim()) return;
+    if (new TextEncoder().encode(pastedText).length > MAX_SOURCE_FILE_BYTES) { setErrorMessage('Pasted text exceeds the 50 MiB import limit.'); return; }
     const blob = new Blob([pastedText], { type: 'text/plain' });
     const file = new File([blob], pastedFileName || 'exam.txt', { type: 'text/plain' });
     handleFileProcess(file);
@@ -308,7 +313,16 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
                 type="file"
                 accept=".pdf,.txt,.docx"
                 onChange={e => {
-                  if (e.target.files?.[0]) setAnswerKeyFile(e.target.files[0]);
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const ext = file.name.split('.').pop()?.toLowerCase();
+                  if (!['pdf', 'txt', 'docx'].includes(ext || '') || file.size <= 0 || file.size > MAX_SOURCE_FILE_BYTES) {
+                    setErrorMessage(`Answer-key file must be PDF, TXT, or DOCX and no larger than ${Math.round(MAX_SOURCE_FILE_BYTES / 1024 / 1024)} MiB.`);
+                    e.target.value = '';
+                    return;
+                  }
+                  setErrorMessage(null);
+                  setAnswerKeyFile(file);
                 }}
                 className="hidden"
               />

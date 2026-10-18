@@ -8,6 +8,7 @@ import JSZip from 'jszip';
 import { ImageAsset, SourceLine } from '../types';
 import { computeImageDHash, hammingDistance, isNearUniformColor, sha256 } from '../utils/hash';
 import { saveImageBlob } from '../store';
+import { isSuspectStrip, mergeAdjacentImageGeometry } from './imageGeometry';
 
 // Configure pdfjs worker in Vite
 try {
@@ -15,8 +16,8 @@ try {
     'pdfjs-dist/build/pdf.worker.min.mjs',
     import.meta.url
   ).toString();
-} catch (e) {
-  console.warn('PDF.js worker setup fallback:', e);
+} catch {
+  console.warn('PDF.js worker setup fallback; continuing with main-thread PDF extraction.');
 }
 
 export interface ExtractedDocument {
@@ -65,7 +66,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
   const pdf = await loadingTask.promise;
 
   const lines: SourceLine[] = [];
-  const images: (ImageAsset & { _dHash?: string })[] = [];
+  const images: ImageAsset[] = [];
   const scannedPageIndices: number[] = [];
   const pageImages: string[] = [];
 
@@ -209,7 +210,8 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
       }
     }
 
-    // 3. Extract Embedded Images from PDF with transform tracking and placement geometry
+    // 3. Extract embedded images. Keep per-page candidates until strips can be merged against the rendered page canvas.
+    const pageAssets: ImageAsset[] = [];
     try {
       const ops = await page.getOperatorList();
       let currentMatrix = [1, 0, 0, 1, 0, 0];
@@ -254,7 +256,6 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         const imgWidth = imgObj.width || (imgObj.bitmap ? imgObj.bitmap.width : 100);
         const imgHeight = imgObj.height || (imgObj.bitmap ? imgObj.bitmap.height : 100);
 
-        if (imgWidth < 32 || imgHeight < 32) continue;
 
         // Placement from transform matrix
         const pdfX = transform[4];
@@ -329,13 +330,13 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
 
         // Deduplication check: compare SHA or dHash (Hamming distance <= 6)
         let duplicateId: string | undefined = undefined;
-        for (const ex of images) {
+        for (const ex of [...images, ...pageAssets]) {
           if (ex.sha === imgSha) {
             duplicateId = ex.duplicateOf || ex.id;
             break;
           }
-          if (ex._dHash && dHash) {
-            const dist = hammingDistance(dHash, ex._dHash);
+          if (ex.dHash && dHash) {
+            const dist = hammingDistance(dHash, ex.dHash);
             const withinSize = (a: number, b: number) => a > 0 && b > 0 && Math.abs(a - b) / Math.max(a, b) <= 0.10;
             if (
               dist <= 6 &&
@@ -348,8 +349,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           }
         }
 
-        const assetId = `img_${String(images.length + 1).padStart(3, '0')}`;
-        await saveImageBlob(imgSha, blob);
+        const assetId = `img_${String(images.length + pageAssets.length + 1).padStart(3, '0')}`;
 
         // Find nearest source line by y-coordinate on this page
         const pageLines = lines.filter(l => l.page === pageNum);
@@ -368,7 +368,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           ? parseInt(nearestLine.id.replace('L', ''), 10)
           : undefined;
 
-        images.push({
+        pageAssets.push({
           id: assetId,
           page: pageNum,
           bbox,
@@ -380,11 +380,54 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           duplicateOf: duplicateId,
           blobKey: imgSha,
           dataUrl: URL.createObjectURL(blob),
-          _dHash: dHash,
-        });
+          dHash,
+          _blob: blob,
+        } as ImageAsset & { _blob: Blob });
       }
-    } catch (err) {
-      console.warn('PDF image extraction note:', err);
+    } catch {
+      console.warn('PDF image extraction skipped one page image candidate; binary error details were omitted.');
+    }
+
+    // Merge adjacent renderer strips from the *page render* (never concatenate embedded JPEG bytes).
+    const groups = mergeAdjacentImageGeometry(pageAssets, viewport.scale);
+    for (const group of groups) {
+      const first = group.assets[0] as ImageAsset & { _blob?: Blob };
+      let finalAsset: ImageAsset & { _blob?: Blob } = { ...first, bbox: group.bbox };
+      if (group.assets.length > 1 && ctx) {
+        const x = Math.max(0, Math.floor(group.bbox.x));
+        const y = Math.max(0, Math.floor(group.bbox.y));
+        const w = Math.min(canvas.width - x, Math.ceil(group.bbox.w));
+        const h = Math.min(canvas.height - y, Math.ceil(group.bbox.h));
+        if (w > 0 && h > 0) {
+          const crop = document.createElement('canvas'); crop.width = w; crop.height = h;
+          const cropCtx = crop.getContext('2d');
+          if (cropCtx) {
+            cropCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+            const mergedBlob = await new Promise<Blob | null>(resolve => crop.toBlob(resolve, 'image/jpeg', 0.88));
+            if (mergedBlob) {
+              const hash = await sha256(await mergedBlob.arrayBuffer());
+              finalAsset = {
+                ...first, bbox: group.bbox, mime: 'image/jpeg', sha: hash, blobKey: hash,
+                width: w, height: h, dataUrl: URL.createObjectURL(mergedBlob),
+                dHash: await computeImageDHash(crop), duplicateOf: undefined, _blob: mergedBlob,
+              };
+              for (const old of group.assets as Array<ImageAsset & { _blob?: Blob }>) {
+                if (old.dataUrl) URL.revokeObjectURL(old.dataUrl);
+              }
+            }
+          }
+        }
+      }
+      const lineText = lines.find(line => Number(line.id.replace(/\D/g, '')) === finalAsset.anchorLine)?.text || '';
+      const questionAnchored = /^\s*[0-9۰-۹٠-٩]{1,3}\s*[.)\-–—:：]\s+\S/.test(lineText.normalize('NFKC'));
+      if (isSuspectStrip(finalAsset.bbox, viewport.scale)) {
+        finalAsset.imageFlags = [...(finalAsset.imageFlags || []), 'IMAGE_SUSPECT_STRIP'];
+        if (!questionAnchored) finalAsset.imageFlags.push('IMAGE_UNANCHORED');
+        console.warn(`IMAGE_SUSPECT_STRIP retained for review: ${finalAsset.id} on page ${pageNum} (${(finalAsset.bbox.w / viewport.scale).toFixed(1)}×${(finalAsset.bbox.h / viewport.scale).toFixed(1)}pt); ${questionAnchored ? 'question-anchored' : 'unanchored asset remains visible'}.`);
+      }
+      if (finalAsset._blob) await saveImageBlob(finalAsset.blobKey, finalAsset._blob);
+      const { _blob: _discard, ...serializable } = finalAsset;
+      images.push(serializable);
     }
   }
 
@@ -410,8 +453,7 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
   const html = result.value;
 
   // Convert HTML elements into sequential lines and track img positions in document order
-  const tempDiv = document.createElement('div');
-  tempDiv.innerHTML = html;
+  const tempDiv = new DOMParser().parseFromString(html, 'text/html').body;
   const rawParagraphs: string[] = [];
   const imgAnchorLines: number[] = [];
 
@@ -419,11 +461,15 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
   const walk = (node: Node) => {
     if (node.nodeType === Node.ELEMENT_NODE) {
       const el = node as HTMLElement;
+      if (['SCRIPT', 'STYLE', 'IFRAME', 'OBJECT', 'SVG', 'FORM'].includes(el.tagName)) return;
       if (el.tagName === 'IMG') {
         imgAnchorLines.push(currentLineIndex);
       }
       if (['P', 'H1', 'H2', 'H3', 'LI', 'TR'].includes(el.tagName)) {
-        const text = el.innerText?.trim();
+        const rowText = el.tagName === 'TR'
+          ? Array.from(el.querySelectorAll('th,td')).map(cell => (cell as HTMLElement).innerText?.trim() || cell.textContent?.trim() || '').join('\t')
+          : el.innerText ?? el.textContent;
+        const text = rowText?.trim();
         if (text) {
           // Count <img> children even inside text-bearing elements before returning
           const imgChildren = el.querySelectorAll('img');

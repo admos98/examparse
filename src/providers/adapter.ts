@@ -38,7 +38,7 @@ export class LLMAdapter {
         request.images.length > 2 &&
         request.providerConfig?.kind === 'openai-compatible'
       ) {
-        console.warn('Attempting image batch bisection due to failure:', err.message);
+        console.warn('Attempting image batch bisection after a provider request failure; error content was omitted.');
         return await this.bisectAndExecute(request);
       }
 

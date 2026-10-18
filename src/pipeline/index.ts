@@ -8,7 +8,8 @@ import { extractDocument, ExtractedDocument } from './extract';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
 import { labelImagesBatched } from './vision';
-import { assembleAndValidateQuestions } from './assemble';
+import { assembleAndValidateQuestions, assembleAndValidateSections, sliceSourceSpans } from './assemble';
+import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, parsePrintedNumberFromStem } from './quality';
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
@@ -244,13 +245,16 @@ export async function runFullPipeline(
   const detected = detectLanguageAndDirection(fullSampleText);
   const langDirection = settings.document.defaultLanguage === 'rtl' ? 'rtl' : settings.document.defaultLanguage === 'ltr' ? 'ltr' : detected.direction;
   const language = detected.language;
+  const expectedEnumeration = enumerateExpectedQuestionNos(workingLines);
+  const expectedQuestionNos = expectedEnumeration.numbers;
+  const keyTerritoryLineNos = [...expectedEnumeration.keyTerritory.lineNos].sort((a, b) => a - b);
 
-  // 3. STAGE: STRUCTURE PASS (1 text call, span references)
+  // 3. STAGE: STRUCTURE PASS (single call for short docs; bounded sections for long/weak-model docs)
   onStageUpdate({
     id: 'structure',
     name: 'Structure Pass',
     status: 'running',
-    message: 'Analyzing sections, questions, and span ranges in 1 call...',
+    message: `Expected ${expectedQuestionNos.length} printed question(s); deterministic completeness gate enabled.`,
   });
 
   const structRole = settings.roleMapping.fast;
@@ -273,14 +277,16 @@ export async function runFullPipeline(
     : null;
 
   let structureData: any;
-    // Never serve a cached structure result with zero questions (or a json:null origin) — treat it as a miss.
-    const cachedStructureUsable =
-      cachedStructure &&
-      Array.isArray((cachedStructure as any).rawQuestions) &&
-      (cachedStructure as any).rawQuestions.length > 0 &&
-      !(cachedStructure as any).jsonNull;
+    // Never serve empty, json:null, or incomplete structure caches. Incomplete results must re-enter the journal-aware recovery path.
+    const cachedCoverage = cachedStructure && Array.isArray((cachedStructure as any).rawQuestions)
+      ? evaluateCoverage(expectedQuestionNos, (cachedStructure as any).rawQuestions.map((q: any) => ({ ...q, stem: sliceSourceSpans(q.spans || [], workingLines) })), (cachedStructure as any).meta?.totalPoints)
+      : null;
+    const cachedStructureUsable = Boolean(
+      cachedStructure && Array.isArray((cachedStructure as any).rawQuestions) && (cachedStructure as any).rawQuestions.length > 0 &&
+      !(cachedStructure as any).jsonNull && cachedCoverage?.complete
+    );
     if (cachedStructureUsable) {
-      structureData = cachedStructure;
+      structureData = { ...cachedStructure, isCachedHit: true };
       const cachedUsageRec: UsageRecord = {
         ts: new Date().toISOString(),
         role: 'fast',
@@ -315,6 +321,8 @@ export async function runFullPipeline(
           maxBudgetTokens: settings.budget.maxOutputTokens,
           journalEnabled: cacheEnabled && !stageForced('structure'),
           journalKey,
+          forceSectionMode: structRole.model.toLowerCase().includes('free') || settings.budget.maxOutputTokens < 8192,
+          onProgress: message => onStageUpdate({ id: 'structure', name: 'Structure Pass', status: 'running', message }),
           onLiveText: (label, channel, fullText) => onLiveText?.('structure', label, channel, fullText),
         });
       } catch (err: any) {
@@ -338,30 +346,22 @@ export async function runFullPipeline(
       const providerKey = `${structProviderConfig.kind}:${structProviderConfig.id}`;
       updateTokenCalibration(rawSourceChars, structRes.usage.inputTokens, providerKey);
 
-      const costUsd = calculateActualCost(
-        structRes.usage.inputTokens,
-        structRes.usage.outputTokens,
-        structProviderConfig.model,
-        settings.costTable
-      );
+      const callRecords: UsageRecord[] = (structRes.callUsage?.length ? structRes.callUsage : [{ label: structRes.label || 'Structure Pass', ...structRes.usage }]).map(call => ({
+        ts: new Date().toISOString(), role: 'fast', provider: structProviderConfig.name, model: structProviderConfig.model,
+        inputTokens: call.inputTokens || 0, outputTokens: call.outputTokens || 0, cachedTokens: call.cachedTokens || 0,
+        costUsd: calculateActualCost(call.inputTokens || 0, call.outputTokens || 0, structProviderConfig.model, settings.costTable),
+        label: call.label || 'Structure Pass',
+      }));
+      const costUsd = callRecords.reduce((sum, call) => sum + (call.costUsd || 0), 0);
+      for (const usageRec of callRecords) {
+        usageRecords.push(usageRec);
+        appendUsageRecord(usageRec);
+        onUsageUpdate?.(usageRec);
+      }
 
-      const usageRec: UsageRecord = {
-        ts: new Date().toISOString(),
-        role: 'fast',
-        provider: structProviderConfig.name,
-        model: structProviderConfig.model,
-        inputTokens: structRes.usage.inputTokens,
-        outputTokens: structRes.usage.outputTokens,
-        cachedTokens: structRes.usage.cachedTokens,
-        costUsd,
-        label: structRes.label || 'Structure Pass',
-      };
-      usageRecords.push(usageRec);
-      appendUsageRecord(usageRec);
-      onUsageUpdate?.(usageRec);
-
-    // Never cache a structure result with zero questions or a json:null origin.
-    if (structRes.rawQuestions.length > 0 && !structRes.jsonNull) {
+    // Cache only complete coverage; partial structure is persisted via the journal and visible partial ExamDoc.
+    const structCoverage = evaluateCoverage(expectedQuestionNos, structRes.rawQuestions.map((q: any) => ({ ...q, stem: sliceSourceSpans(q.spans || [], workingLines) })), structRes.meta?.totalPoints);
+    if (structRes.rawQuestions.length > 0 && !structRes.jsonNull && structCoverage.complete) {
       await writeStageCache(
         {
           fileHash,
@@ -383,19 +383,26 @@ export async function runFullPipeline(
       outputTokens: structRes.usage.outputTokens,
       costUsd,
       attempts: structRes.attempts,
-      message: `${structRes.flags?.some((f: any) => f.code === 'RESUMED_FROM_JOURNAL') ? `Resumed partial parse — ${structRes.rawQuestions.length} questions recovered, continuing at line ${structRes.resumeLine || 1}. ` : ''}Parsed ${structRes.rawQuestions.length} questions across ${structRes.sections.length} sections.`,
+      message: `${structRes.flags?.some((f: any) => f.code === 'RESUMED_FROM_JOURNAL') ? `Resumed partial parse — ${structRes.rawQuestions.length} questions recovered, continuing at line ${structRes.resumeLine || 1}. ` : ''}Parsed ${structRes.rawQuestions.length} preliminary question(s) across ${structRes.sections.length} sections. Wire ${structRes.wireFormat || 'v2'}; estimated ${Math.round(structRes.outputTokensSavedPct || 0)}% fewer output tokens than v1.`,
     });
   }
 
-  // 4. STAGE: VISION CALL (All images in batched calls, chunked by maxImagesPerVisionCall)
-  let updatedImages = extracted.images;
+  // 4. STAGE: VISION CALL — geometric hints are set locally before the single bundled model pass.
+  let updatedImages = autoDecorateRepeatedImages(extracted.images);
+  const questionHints = computeImageQuestionHints(updatedImages, structureData.rawQuestions || [], workingLines);
+  updatedImages = updatedImages.map(img => {
+    const hint = questionHints[img.id];
+    if (!hint || img.label?.role === 'decoration' || img.label?.kind === 'decoration') return img;
+    return { ...img, label: { ...(img.label || {}), role: img.label?.role || 'stem', questionRef: img.label?.questionRef || hint.questionRef } };
+  });
   let visionStageFlags: any[] = [];
-  if (extracted.images.length > 0) {
+  const visionCandidates = updatedImages.filter(img => img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
+  if (updatedImages.length > 0 && visionCandidates.length > 0) {
     onStageUpdate({
       id: 'vision',
       name: 'Batched Vision Labeling',
       status: 'running',
-      message: `Labeling ${extracted.images.length} image(s) in ${Math.ceil(extracted.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)...`,
+      message: `Labeling ${visionCandidates.length} image(s) in ${Math.ceil(visionCandidates.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} bundled call(s); repeated logos were classified locally.`,
     });
 
     const visionRole = settings.roleMapping.vision;
@@ -413,95 +420,57 @@ export async function runFullPipeline(
       : null;
 
     if (cachedVision) {
-      updatedImages = cachedVision.updatedImages;
+      const cachedImages = autoDecorateRepeatedImages(cachedVision.updatedImages || []);
+      const cachedById = new Map(cachedImages.map((img: any) => [img.id, img]));
+      updatedImages = updatedImages.map(img => {
+        const cached = cachedById.get(img.id);
+        const hint = questionHints[img.id];
+        return cached ? { ...img, ...cached, label: cached.label || img.label } : img.label?.questionRef || !hint ? img : { ...img, label: { ...(img.label || {}), role: 'stem', questionRef: hint.questionRef } };
+      });
       visionStageFlags = cachedVision.flags || [];
       const cachedUsageRec: UsageRecord = {
-        ts: new Date().toISOString(),
-        role: 'vision',
-        provider: visionProviderConfig.name,
-        model: visionProviderConfig.model,
-        inputTokens: cachedVision.usage?.inputTokens || 0,
-        outputTokens: cachedVision.usage?.outputTokens || 0,
-        costUsd: 0,
-        label: 'Vision Labeling (Cache Hit)',
-        isCachedHit: true,
+        ts: new Date().toISOString(), role: 'vision', provider: visionProviderConfig.name, model: visionProviderConfig.model,
+        inputTokens: cachedVision.usage?.inputTokens || 0, outputTokens: cachedVision.usage?.outputTokens || 0, costUsd: 0,
+        label: 'Vision Labeling (Cache Hit)', isCachedHit: true,
       };
       usageRecords.push(cachedUsageRec);
       appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:vision:${visionProviderConfig.model}`);
       onUsageUpdate?.(cachedUsageRec);
-
-      onStageUpdate({
-        id: 'vision',
-        name: 'Batched Vision Labeling',
-        status: 'cached',
-        message: 'Images labeled from cache (0 calls, $0.00)',
-      });
+      onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'cached', message: 'Image labels loaded from cache; local geometric hints retained (0 calls).' });
     } else {
       const t0 = Date.now();
       const visionRes = await labelImagesBatched({
-        images: extracted.images,
+        images: visionCandidates,
         sourceLines: workingLines,
         providerConfig: visionProviderConfig,
         maxLongEdge: settings.thrift.imageMaxLongEdge,
         quality: settings.thrift.jpegQuality / 100,
         maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
         maxOutputTokens: settings.budget.maxOutputTokens,
+        questionHints,
         onLiveText: (label, channel, text) => onLiveText?.('vision', label, channel, text),
       });
-
-      updatedImages = visionRes.updatedImages;
+      const visionById = new Map(visionRes.updatedImages.map(img => [img.id, img]));
+      updatedImages = updatedImages.map(img => visionById.get(img.id) || img);
       visionStageFlags = visionRes.flags || [];
-
-      const costUsd = calculateActualCost(
-        visionRes.usage.inputTokens,
-        visionRes.usage.outputTokens,
-        visionProviderConfig.model,
-        settings.costTable
-      );
-
+      const costUsd = calculateActualCost(visionRes.usage.inputTokens, visionRes.usage.outputTokens, visionProviderConfig.model, settings.costTable);
       const usageRec: UsageRecord = {
-        ts: new Date().toISOString(),
-        role: 'vision',
-        provider: visionProviderConfig.name,
-        model: visionProviderConfig.model,
-        inputTokens: visionRes.usage.inputTokens,
-        outputTokens: visionRes.usage.outputTokens,
-        costUsd,
-        label: `Vision Labeling (${extracted.images.length} images)`,
+        ts: new Date().toISOString(), role: 'vision', provider: visionProviderConfig.name, model: visionProviderConfig.model,
+        inputTokens: visionRes.usage.inputTokens, outputTokens: visionRes.usage.outputTokens, costUsd,
+        label: `Vision Labeling (${visionCandidates.length} images)`,
       };
-      usageRecords.push(usageRec);
-      appendUsageRecord(usageRec);
-      onUsageUpdate?.(usageRec);
-
-      await writeStageCache(
-        {
-          fileHash,
-          stage: 'vision',
-          provider: visionProviderConfig.id,
-          model: visionProviderConfig.model,
-          options: { linesHash, imgShas: visionImgShas },
-        },
-        visionRes
-      );
-
+      usageRecords.push(usageRec); appendUsageRecord(usageRec); onUsageUpdate?.(usageRec);
+      await writeStageCache({ fileHash, stage: 'vision', provider: visionProviderConfig.id, model: visionProviderConfig.model, options: { linesHash, imgShas: visionImgShas } }, visionRes);
       onStageUpdate({
-        id: 'vision',
-        name: 'Batched Vision Labeling',
-        status: 'completed',
-        durationMs: Date.now() - t0,
-        inputTokens: visionRes.usage.inputTokens,
-        outputTokens: visionRes.usage.outputTokens,
-        costUsd,
-        message: `Mapped ${extracted.images.length} image(s) to roles & questions.`,
+        id: 'vision', name: 'Batched Vision Labeling', status: 'completed', durationMs: Date.now() - t0,
+        inputTokens: visionRes.usage.inputTokens, outputTokens: visionRes.usage.outputTokens, costUsd,
+        message: `Mapped ${visionCandidates.length} image(s); geometric hints supplied before model confirmation.`,
       });
     }
+  } else if (updatedImages.length > 0) {
+    onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'skipped', message: 'All detected images were repeated page decorations; classified locally (0 calls).' });
   } else {
-    onStageUpdate({
-      id: 'vision',
-      name: 'Batched Vision Labeling',
-      status: 'skipped',
-      message: 'No images detected in document (0 calls)',
-    });
+    onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'skipped', message: 'No images detected in document (0 calls).' });
   }
 
   // 5. STAGE: ASSEMBLE & VALIDATE (Local)
@@ -513,42 +482,36 @@ export async function runFullPipeline(
   });
 
   const totalDeclaredPoints = structureData.meta?.totalPoints;
+  const unresolvedImageIds = updatedImages.filter(img => !img.dataUrl).map(img => img.id);
   const assembled = assembleAndValidateQuestions(
-    structureData.rawQuestions,
+    structureData.rawQuestions || [],
     workingLines,
-    totalDeclaredPoints
+    totalDeclaredPoints,
+    { keyTerritoryLineNos, imageIds: updatedImages.map(img => img.id), unresolvedImageIds }
   );
 
   let finalQuestions = assembled.questions;
-  let allFlags = assembled.flags;
+  let allFlags: any[] = [
+    ...(structureData.flags || []),
+    ...assembled.flags,
+    ...(visionStageFlags || []),
+  ].map((f: any, i: number) => ({ ...f, id: f.id || `flag_pipeline_${i + 1}` }));
 
-  // Merge visionRes.flags (if vision ran)
-  if (visionStageFlags && visionStageFlags.length > 0) {
-    allFlags = [...allFlags, ...visionStageFlags];
-  }
-
-  // Attach images to questions if labeled
+  // Attach locally hinted / vision-confirmed assets. Parent/group references are resolved before children.
   for (const img of updatedImages) {
-    if (img.label && img.label.questionRef) {
-      const matchQ = finalQuestions.find(
-        q => q.label === img.label?.questionRef || String(q.no) === img.label?.questionRef
-      );
-      if (matchQ && !matchQ.images.some(i => i.imageId === img.id)) {
-        matchQ.images.push({
-          imageId: img.id,
-          role: img.label.role || 'stem',
-          anchorLine: img.anchorLine,
-        });
+    if (img.label?.questionRef && img.label.role !== 'decoration' && img.label.kind !== 'decoration') {
+      const matchQ = finalQuestions.find(q => q.id === img.label?.questionRef || q.label === img.label?.questionRef || String(q.no) === img.label?.questionRef);
+      if (matchQ && !matchQ.images.some(ref => ref.imageId === img.id)) {
+        matchQ.images.push({ imageId: img.id, role: img.label.role || 'stem', anchorLine: img.anchorLine });
       }
     }
+    for (const imageFlag of img.imageFlags || []) {
+      const message = imageFlag === 'IMAGE_UNANCHORED'
+        ? `${img.id} on page ${img.page} could not be confidently anchored to a question; the asset is retained for review.`
+        : `${img.id} on page ${img.page} has suspect strip geometry and was retained for review.`;
+      allFlags.push({ id: `flag_${imageFlag}_${img.id}`, severity: 'warn', code: imageFlag, message });
+    }
   }
-
-  onStageUpdate({
-    id: 'assemble',
-    name: 'Assemble & Validate',
-    status: 'completed',
-    message: `Assembled ${finalQuestions.length} questions. Flags: ${allFlags.length}. Failing: ${assembled.failingQuestions.length}.`,
-  });
 
   // 6. STAGE: ESCALATION REPAIR (≤ 1 call, escalation model)
   if (assembled.failingQuestions.length > 0) {
@@ -609,12 +572,15 @@ export async function runFullPipeline(
         failingItems: assembled.failingQuestions,
         allQuestions: finalQuestions,
         sourceLines: workingLines,
+        keyTerritoryLineNos,
         providerConfig: repairProviderConfig,
         maxOutputTokens: settings.budget.maxOutputTokens,
         onLiveText: (label, channel, text) => onLiveText?.('repair', label, channel, text),
       });
 
       finalQuestions = repairRes.repairedQuestions;
+      if (repairRes.rejectedCount) allFlags.push({ id: `flag_repair_rejected_${allFlags.length + 1}`, severity: 'error', code: 'REPAIR_SPAN_REJECTED', message: `${repairRes.rejectedCount} repaired question(s) were excluded because no safe question spans remained outside answer-key territory.` });
+      if (repairRes.restrictedCount) allFlags.push({ id: `flag_repair_restricted_${allFlags.length + 1}`, severity: 'warn', code: 'REPAIR_SPAN_RESTRICTED', message: `${repairRes.restrictedCount} repaired item(s) had unsafe or answer-key spans clipped locally; review the remaining source anchors.` });
 
       // Merge shapeMismatch flag from repair
       if (repairRes.shapeMismatch) {
@@ -693,9 +659,47 @@ export async function runFullPipeline(
         });
       }
     } catch (err: any) {
-      console.warn('Failed to merge answer key file:', err);
+      console.warn('Failed to merge answer-key file; source contents and provider credentials were omitted.');
     }
   }
+
+  // Local completeness and section hygiene run after every structure outcome, including cache/resume/chunk/repair paths.
+  const coverage = evaluateCoverage(expectedQuestionNos, finalQuestions, totalDeclaredPoints);
+  if (coverage.missing.length && !allFlags.some(f => f.code === 'COVERAGE_MISSING')) allFlags.push({ id: 'flag_coverage_missing', severity: 'error', code: 'COVERAGE_MISSING', message: `Missing printed question numbers: ${coverage.missing.join(', ')}.` });
+  if (coverage.duplicates.length && !allFlags.some(f => f.code === 'COVERAGE_DUPLICATE')) allFlags.push({ id: 'flag_coverage_duplicate', severity: 'warn', code: 'COVERAGE_DUPLICATE', message: `Duplicate printed question numbers: ${coverage.duplicates.join(', ')}.` });
+  if (!coverage.pointsMatch && !allFlags.some(f => f.code === 'POINTS_MISMATCH')) allFlags.push({ id: 'flag_points_mismatch', severity: 'warn', code: 'POINTS_MISMATCH', message: `Points sum ${coverage.pointsParsed} does not match header ${totalDeclaredPoints}; deficit ${coverage.pointDeficit}.` });
+  if (coverage.missing.length && !allFlags.some(f => f.code === 'PARTIAL_COVERAGE')) allFlags.push({ id: 'flag_partial_coverage', severity: 'error', code: 'PARTIAL_COVERAGE', message: `Recovery exhausted with ${coverage.missing.length} missing question(s): ${coverage.missing.join(', ')}.` });
+  if (!finalQuestions.length && !allFlags.some(f => f.code === 'STRUCTURE_EMPTY')) allFlags.push({ id: 'flag_structure_empty', severity: 'error', code: 'STRUCTURE_EMPTY', message: 'No questions were reconstructed; the document remains incomplete.' });
+
+  // Fill undeclared section ids locally from the question's source span.
+  finalQuestions = finalQuestions.map(question => {
+    if (question.sectionId) return question;
+    const firstLine = question.spans[0]?.[0];
+    const section = structureData.sections?.find((candidate: any) => (candidate.spans || []).some((span: any) => firstLine >= span[0] && firstLine <= span[1]));
+    return section ? { ...question, sectionId: section.id } : question;
+  });
+  const sectionAssembly = assembleAndValidateSections(structureData.sections, workingLines, finalQuestions, keyTerritoryLineNos);
+  allFlags.push(...sectionAssembly.flags.map((f, i) => ({ ...f, id: f.id || `flag_section_${i + 1}` })));
+
+  const pointsSummary = `${coverage.pointsParsed}${totalDeclaredPoints !== undefined ? ` of ${totalDeclaredPoints}` : ''}`;
+  const missingSummary = coverage.missing.length ? `missing ${coverage.missing.join(', ')}` : 'missing none';
+  const structureSummary = `Expected ${expectedQuestionNos.length} questions · parsed ${coverage.parsedNumbers.length} · ${missingSummary} · points ${pointsSummary} · attempts ${structureData.attempts || 0} · recovery calls used ${structureData.recoveryCalls || 0}.`;
+  const isIncomplete = !coverage.complete || finalQuestions.length === 0;
+  const structureStatus = structureData.isCachedHit && !isIncomplete
+    ? 'cached'
+    : coverage.missing.length > 0 && coverage.coveragePercent < 80
+      ? 'partial'
+      : isIncomplete ? 'completed-with-problems' : 'completed';
+  onStageUpdate({
+    id: 'structure', name: 'Structure Pass', status: structureStatus as any,
+    inputTokens: structureData.usage?.inputTokens, outputTokens: structureData.usage?.outputTokens,
+    attempts: structureData.attempts, message: structureSummary,
+  });
+  onStageUpdate({
+    id: 'assemble', name: 'Assemble & Validate',
+    status: isIncomplete ? (coverage.coveragePercent < 80 ? 'partial' : 'completed-with-problems') : 'completed',
+    message: `Assembled ${finalQuestions.length} questions across ${sectionAssembly.sections.length} sections. ${structureSummary}`,
+  });
 
   // 7. BUILD FINAL EXAM DOC & PERSIST
   const examId = `exam_${fileHash.slice(0, 12)}`;
@@ -729,13 +733,7 @@ export async function runFullPipeline(
       language,
       direction: langDirection,
     },
-    sections: structureData.sections.map((s: any, i: number) => ({
-      id: s.id || `sec_${i + 1}`,
-      index: s.index || i + 1,
-      title: s.title,
-      instructions: s.instructions,
-      spans: s.spans || [],
-    })),
+    sections: sectionAssembly.sections,
     questions: finalQuestions,
     images: updatedImages,
     source: {
@@ -745,6 +743,8 @@ export async function runFullPipeline(
       fileName: file.name,
       pageImages: extracted.pageImages,
       pageThumbKeys: extracted.pageThumbKeys || [],
+      expectedQuestionNos,
+      keyTerritoryLineNos,
     },
     flags: allFlags,
     usage: usageRecords,

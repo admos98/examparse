@@ -84,6 +84,7 @@ async function processVisionChunk(
   chunkImages: { img: ImageAsset; base64: string; mime: string }[],
   sourceLines: SourceLine[],
   providerConfig: any,
+  questionHints: Record<string, { questionRef: string; group: string; page: number }>,
   maxOutputTokens?: number,
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void,
 ): Promise<{
@@ -106,15 +107,17 @@ async function processVisionChunk(
     const endIdx = Math.min(sourceLines.length, anchorIdx + 4);
     const contextLines = sourceLines
       .slice(startIdx, endIdx)
-      .map(l => `${l.id}: ${l.text}`)
+      .map(l => l.text.replace(/^\[L\d+\]\s*/, ''))
       .join('\n');
+    const hint = questionHints[img.id];
+    const hintText = hint ? `Geometric ground-truth hint: printed inside Q${hint.group}, page ${hint.page}; confirm or reassign with reason.` : 'No deterministic question anchor; do not invent a question pairing.';
 
     manifestEntries.push(
-      `Image ${img.id}: page ${img.page}, near line ${img.anchorLine || 'unknown'}\nContext:\n${contextLines}`
+      `Image ${img.id}: page ${img.page}, near line ${img.anchorLine || 'unknown'}\n${hintText}\nContext:\n${contextLines}`
     );
   }
 
-  const promptText = `IMAGES ARE ATTACHED IN MANIFEST ORDER.\n\nMANIFEST:\n${manifestEntries.join('\n---\n')}\n\nReturn JSON: {"items": [{"id": string, "role": "stem|option|table|decoration", "questionRef": string|null, "kind": "photo|diagram|chart|table|formula|handwriting|decoration", "caption": string, "needsText": boolean}]} (or a JSON array).`;
+  const promptText = `IMAGES ARE ATTACHED IN MANIFEST ORDER.\n\nMANIFEST:\n${manifestEntries.join('\n---\n')}\n\nReturn JSON: {"items": [{"id": string, "role": "stem|option|table|decoration", "questionRef": string|null, "kind": "photo|diagram|chart|table|formula|handwriting|decoration", "caption": "at most 6 words", "reason": "required for decoration/reassignment", "needsText": boolean}]} (or a JSON array).`;
 
   const request: LLMRequest = {
     role: 'vision',
@@ -175,6 +178,7 @@ export async function labelImagesBatched(params: {
   quality?: number;
   maxImagesPerVisionCall?: number;
   maxOutputTokens?: number;
+  questionHints?: Record<string, { questionRef: string; group: string; page: number }>;
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<VisionLabelResult> {
   const {
@@ -205,8 +209,8 @@ export async function labelImagesBatched(params: {
     try {
       const optimized = await optimizeImageForVision(blob, maxLongEdge, quality);
       prepared.push({ img, base64: optimized.base64, mime: optimized.mime });
-    } catch (err) {
-      console.warn(`Vision: skipping image ${img.id} due to optimization error:`, err);
+    } catch {
+      console.warn(`Vision: skipping optimization for image ${img.id}; diagnostic details were omitted.`);
     }
   }
 
@@ -230,7 +234,7 @@ export async function labelImagesBatched(params: {
   let totalUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
 
   for (const chunk of chunks) {
-    const result = await processVisionChunk(chunk, sourceLines, providerConfig, maxOutputTokens, params.onLiveText);
+    const result = await processVisionChunk(chunk, sourceLines, providerConfig, params.questionHints || {}, maxOutputTokens, params.onLiveText);
     for (const [id, label] of result.labelMap) {
       mergedLabelMap.set(id, label);
     }
@@ -245,13 +249,22 @@ export async function labelImagesBatched(params: {
     const targetId = img.duplicateOf || img.id;
     const label = mergedLabelMap.get(targetId);
     if (label) {
+      const hint = params.questionHints?.[targetId] || params.questionHints?.[img.id];
+      const role = label.role || 'stem';
+      const reassigned = Boolean(hint && label.questionRef && String(label.questionRef) !== hint.questionRef);
+      if (reassigned && !String(label.reason || '').trim()) allFlags.push({ id: `flag_vision_reassign_${img.id}`, severity: 'warn', code: 'VISION_REASSIGNMENT_UNJUSTIFIED', message: `${img.id} was reassigned from geometric hint Q${hint!.questionRef} without a reason.` });
+      const kind = label.kind || 'diagram';
+      const caption = String(label.caption || '').trim().split(/\s+/).slice(0, 6).join(' ');
+      const decorationCaption = role === 'decoration' || kind === 'decoration' ? (caption || 'Decoration; model supplied no caption') : caption;
+      if ((role === 'decoration' || kind === 'decoration') && !caption) allFlags.push({ id: `flag_vision_decoration_${img.id}`, severity: 'warn', code: 'DECORATION_UNJUSTIFIED', message: `${img.id} was marked decoration without a caption.` });
       return {
         ...img,
         label: {
-          role: label.role || 'stem',
-          questionRef: label.questionRef || undefined,
-          kind: label.kind || 'diagram',
-          caption: label.caption || undefined,
+          role,
+          questionRef: label.questionRef || hint?.questionRef || undefined,
+          kind,
+          caption: decorationCaption || undefined,
+          reason: String(label.reason || '').trim() || undefined,
           needsText: Boolean(label.needsText),
         },
       };

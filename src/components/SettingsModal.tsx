@@ -17,6 +17,7 @@ import {
 import { AppSettings, ProviderConfig, ProviderKind } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { clearAllCachesAndData } from '../store';
+import { MAX_SETTINGS_JSON_BYTES, redactSettingsForExport, validateAppSettings, validateProviderBaseUrl, validateHeaders } from '../utils/validation';
 
 interface Props {
   isOpen: boolean;
@@ -74,6 +75,14 @@ export const SettingsModal: React.FC<Props> = ({
   };
 
   const handleTestConnection = async (provider: ProviderConfig) => {
+    if (provider.kind === 'openai-compatible' && !validateProviderBaseUrl(provider.baseURL)) {
+      setTestResults(prev => ({ ...prev, [provider.id]: { ok: false, msg: 'Rejected: base URL must be http(s) without credentials, query, or fragment.' } }));
+      return;
+    }
+    if (!validateHeaders(provider.defaultHeaders)) {
+      setTestResults(prev => ({ ...prev, [provider.id]: { ok: false, msg: 'Rejected: invalid HTTP header name/value.' } }));
+      return;
+    }
     setTestingId(provider.id);
     const res = await LLMAdapter.testConnection(provider);
     setTestingId(null);
@@ -100,7 +109,7 @@ export const SettingsModal: React.FC<Props> = ({
   };
 
   const handleExportSettings = () => {
-    const jsonStr = JSON.stringify(current, null, 2);
+    const jsonStr = JSON.stringify(redactSettingsForExport(current), null, 2);
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -113,22 +122,24 @@ export const SettingsModal: React.FC<Props> = ({
   const handleImportSettings = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > MAX_SETTINGS_JSON_BYTES) { alert('Settings JSON exceeds the 1 MiB import limit.'); e.target.value = ''; return; }
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const imported = JSON.parse(reader.result as string);
+        const imported = validateAppSettings(JSON.parse(String(reader.result || '')));
         setCurrent(imported);
         onSaveSettings(imported);
-      } catch (err) {
-        alert('Invalid settings JSON file');
-      }
+      } catch (error: any) {
+        alert(`Settings import rejected: ${error?.issues?.slice?.(0, 3).map((issue: any) => issue.message).join('; ') || 'invalid or unsafe settings JSON'}`);
+      } finally { e.target.value = ''; }
     };
+    reader.onerror = () => { alert('Could not read settings file.'); e.target.value = ''; };
     reader.readAsText(file);
   };
 
   const handleSaveAndClose = () => {
-    onSaveSettings(current);
-    onClose();
+    try { const validated = validateAppSettings(current); onSaveSettings(validated); onClose(); }
+    catch (error: any) { alert(`Settings rejected: ${error?.issues?.slice?.(0, 3).map((issue: any) => issue.message).join('; ') || 'invalid provider URL, headers, or settings value'}`); }
   };
 
   return (

@@ -6,24 +6,28 @@ import { LLMRequest, Question, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { T3_REPAIR_SYSTEM } from './prompts';
 import { applyMergePatch } from './patch';
-import { RawQuestionSchema, sliceSourceSpans } from './assemble';
+import { RawQuestionSchema, assembleTables, sanitizeSpansAgainstSource, sliceSourceSpans } from './assemble';
 
 export interface RepairResult {
   repairedQuestions: Question[];
   usage: { inputTokens: number; outputTokens: number; cachedTokens?: number };
   shapeMismatch?: boolean;
   appliedCount?: number;
+  rejectedCount?: number;
+  restrictedCount?: number;
 }
 
 export async function runEscalationRepair(params: {
   failingItems: { question: Question; errors: string[] }[];
   allQuestions: Question[];
   sourceLines: SourceLine[];
+  keyTerritoryLineNos?: number[];
   providerConfig: any;
   maxOutputTokens?: number;
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<RepairResult> {
   const { failingItems, allQuestions, sourceLines, providerConfig, maxOutputTokens } = params;
+  const keyLineNos = new Set(params.keyTerritoryLineNos || []);
 
   if (failingItems.length === 0) {
     return {
@@ -58,7 +62,7 @@ export async function runEscalationRepair(params: {
       const endIdx = Math.min(sourceLines.length, (idToIdxMap.get(maxL) ?? (sourceLines.length - 1)) + 4);
       slice = sourceLines
         .slice(startIdx, endIdx)
-        .map(l => `${l.id}: ${l.text}`)
+        .map(l => `${l.id}: ${keyLineNos.has(parseInt(l.id.replace(/\D/g, ''), 10)) ? '[KEY] ' : ''}${l.text}`)
         .join('\n');
     } else {
       // Questions with empty spans must send a page-window context (their page's lines), not an end-of-file slice
@@ -77,7 +81,7 @@ export async function runEscalationRepair(params: {
       }
       const pageLines = sourceLines.filter(l => l.page === targetPage);
       slice = (pageLines.length > 0 ? pageLines : sourceLines.slice(0, 35))
-        .map(l => `${l.id}: ${l.text}`)
+        .map(l => `${l.id}: ${keyLineNos.has(parseInt(l.id.replace(/\D/g, ''), 10)) ? '[KEY] ' : ''}${l.text}`)
         .join('\n');
     }
 
@@ -124,7 +128,7 @@ export async function runEscalationRepair(params: {
 
   let shapeMismatch = false;
   if (!rawPatches) {
-    console.warn('Escalation repair response returned unexpected format instead of {"items": [...]}:', response.rawText);
+    console.warn('Escalation repair response had an unexpected JSON shape; raw model output was omitted.');
     shapeMismatch = true;
     rawPatches = [];
   }
@@ -137,54 +141,83 @@ export async function runEscalationRepair(params: {
   }
 
   let appliedCount = 0;
-  const repairedQuestions = allQuestions.map(q => {
-    if (patchMap.has(q.id)) {
-      appliedCount++;
-      const patch = patchMap.get(q.id);
-      const merged = applyMergePatch(q, patch);
-      const newSpans = merged.spans || q.spans;
-      const newRewrites = merged.rewrites || q.rewrites;
+  let rejectedCount = 0;
+  let restrictedCount = 0;
+  const repairedCandidates = allQuestions.map(q => {
+    if (!patchMap.has(q.id)) return q;
+    appliedCount++;
+    const patch = patchMap.get(q.id);
+    const merged = applyMergePatch(q, patch);
+    const newRewrites = merged.rewrites || q.rewrites;
+    let restricted = false;
 
-      // Re-slice option texts after patches
-      const rawOptions = merged.options !== undefined ? merged.options : q.options;
-      const newOptions = rawOptions?.map((opt: any) => ({
-        key: opt.key,
-        spans: opt.spans || [],
-        text: sliceSourceSpans(opt.spans || [], sourceLines),
-      }));
-
-      // Remove hard-coded confidence: 0.95; preserve model confidence or patch confidence
-      const updatedConfidence = typeof patch.confidence === 'number'
-        ? patch.confidence
-        : typeof merged.confidence === 'number'
-        ? merged.confidence
-        : q.confidence;
-
-      const repairedQ: Question = {
-        ...q,
-        ...merged,
-        spans: newSpans,
-        stem: sliceSourceSpans(newSpans, sourceLines, newRewrites),
-        rewrites: newRewrites,
-        options: newOptions,
-        confidence: updatedConfidence,
-      };
-
-      // Re-validate repaired question
-      const validation = RawQuestionSchema.safeParse(repairedQ);
-      if (!validation.success) {
-        repairedQ.flags = [...(repairedQ.flags || []), 'REPAIR_VALIDATION_WARNING'];
-      }
-
-      return repairedQ;
+    const safeQuestionSpans = sanitizeSpansAgainstSource(merged.spans || q.spans, sourceLines, keyLineNos);
+    restricted ||= safeQuestionSpans.clippedKeyLines || safeQuestionSpans.clippedMissingLines;
+    if (!safeQuestionSpans.spans.length) {
+      rejectedCount++;
+      if (restricted || (merged.spans || q.spans || []).length) restrictedCount++;
+      return null;
     }
-    return q;
+
+    const rawOptions = merged.options !== undefined ? merged.options : q.options;
+    const newOptions = rawOptions?.flatMap((option: any) => {
+      const safe = sanitizeSpansAgainstSource(option?.spans, sourceLines, keyLineNos);
+      restricted ||= safe.clippedKeyLines || safe.clippedMissingLines;
+      if (!safe.spans.length) return [];
+      return [{ key: String(option?.key || ''), spans: safe.spans, text: sliceSourceSpans(safe.spans, sourceLines) }];
+    });
+
+    const rawTables = merged.tables !== undefined ? merged.tables : q.tables;
+    const safeTables = (rawTables || []).flatMap((table: any) => {
+      const safe = sanitizeSpansAgainstSource(table?.spans, sourceLines, keyLineNos);
+      restricted ||= safe.clippedKeyLines || safe.clippedMissingLines;
+      return safe.spans.length ? [{ ...table, spans: safe.spans }] : [];
+    });
+    const newTables = assembleTables(safeTables, sourceLines, keyLineNos);
+
+    const answerCandidate = merged.answer !== undefined ? merged.answer : q.answer;
+    let safeAnswer = answerCandidate;
+    if (answerCandidate?.spans) {
+      const safe = sanitizeSpansAgainstSource(answerCandidate.spans, sourceLines, keyLineNos, true);
+      if (safe.clippedMissingLines) restricted = true;
+      safeAnswer = { ...answerCandidate, spans: safe.spans, text: safe.spans.length ? sliceSourceSpans(safe.spans, sourceLines) : answerCandidate.text || '' };
+    }
+
+    const requestedConfidence = typeof patch.confidence === 'number'
+      ? patch.confidence
+      : typeof merged.confidence === 'number' ? merged.confidence : q.confidence;
+    const updatedConfidence = restricted ? Math.min(Number(requestedConfidence) || 0, 0.5) : requestedConfidence;
+    const repairedQ: Question = {
+      ...q,
+      ...merged,
+      id: q.id,
+      label: q.label,
+      no: q.no,
+      parentId: q.parentId,
+      sectionId: q.sectionId,
+      spans: safeQuestionSpans.spans,
+      stem: sliceSourceSpans(safeQuestionSpans.spans, sourceLines, newRewrites),
+      rewrites: newRewrites,
+      options: newOptions?.length ? newOptions : undefined,
+      answer: safeAnswer,
+      tables: newTables.length ? newTables : undefined,
+      confidence: updatedConfidence,
+      flags: restricted ? [...(q.flags || []), 'REPAIR_SPAN_RESTRICTED'] : q.flags,
+    };
+
+    if (restricted) restrictedCount++;
+    const validation = RawQuestionSchema.safeParse(repairedQ);
+    if (!validation.success) repairedQ.flags = [...(repairedQ.flags || []), 'REPAIR_VALIDATION_WARNING'];
+    return repairedQ;
   });
+  const repairedQuestions = repairedCandidates.filter((question): question is Question => question !== null);
 
   return {
     repairedQuestions,
     usage: response.usage,
     shapeMismatch,
     appliedCount,
+    rejectedCount,
+    restrictedCount,
   };
 }

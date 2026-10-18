@@ -3,6 +3,13 @@
  */
 import { get, set, del, keys } from 'idb-keyval';
 import { AppSettings, ExamDoc, ImageAsset, UsageRecord, getDisplayName } from '../types';
+import { SAFE_STORAGE_KEY, validateAppSettings, validateJsonSize } from '../utils/validation';
+import { getExamHealth } from '../pipeline/quality';
+
+const MAX_STORED_EXAM_BYTES = 32 * 1024 * 1024;
+const MAX_STORED_CACHE_BYTES = 20 * 1024 * 1024;
+const MAX_STORED_IMAGE_BYTES = 32 * 1024 * 1024;
+const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp']);
 
 export const DEFAULT_SETTINGS: AppSettings = {
   providers: [
@@ -326,7 +333,7 @@ export function loadSettings(): AppSettings {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(raw);
-    return {
+    const merged = {
       ...DEFAULT_SETTINGS,
       ...parsed,
       roleMapping: { ...DEFAULT_SETTINGS.roleMapping, ...(parsed.roleMapping || {}) },
@@ -335,6 +342,7 @@ export function loadSettings(): AppSettings {
       budget: { ...DEFAULT_SETTINGS.budget, ...(parsed.budget || {}) },
       document: { ...DEFAULT_SETTINGS.document, ...(parsed.document || {}) },
     };
+    return validateAppSettings(merged);
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -423,6 +431,10 @@ export async function saveExamDoc(doc: ExamDoc): Promise<void> {
       pageThumbKeys,
     },
   };
+  if (!SAFE_STORAGE_KEY.test(docToSave.id)) throw new Error('Invalid exam storage id.');
+  if (docToSave.images.some(image => !SAFE_STORAGE_KEY.test(image.id) || Boolean(image.blobKey) && !SAFE_STORAGE_KEY.test(image.blobKey))) throw new Error('Invalid image storage key in ExamDoc.');
+  if (pageThumbKeys.some(key => !SAFE_STORAGE_KEY.test(key))) throw new Error('Invalid page-thumbnail storage key.');
+  if (!validateJsonSize(docToSave, MAX_STORED_EXAM_BYTES)) throw new Error('ExamDoc exceeds the 32 MiB storage limit.');
 
   if (await isFolderMode()) {
     const res = await fetch(`/api/exams/${encodeURIComponent(doc.id)}`, {
@@ -437,6 +449,7 @@ export async function saveExamDoc(doc: ExamDoc): Promise<void> {
 }
 
 export async function loadExamDoc(id: string): Promise<ExamDoc | undefined> {
+  if (!SAFE_STORAGE_KEY.test(id)) return undefined;
   if (await isFolderMode()) {
     const res = await fetch(`/api/exams/${encodeURIComponent(id)}`);
     if (res.status === 404) return undefined;
@@ -489,8 +502,11 @@ export async function loadExamDoc(id: string): Promise<ExamDoc | undefined> {
 }
 
 export async function saveImageBlob(key: string, blob: Blob): Promise<void> {
+  if (!SAFE_STORAGE_KEY.test(key)) throw new Error('Invalid image storage key.');
+  if (!(blob instanceof Blob) || blob.size <= 0 || blob.size > MAX_STORED_IMAGE_BYTES) throw new Error('Image blob is empty or exceeds the 32 MiB storage limit.');
+  const mime = blob.type || 'image/jpeg';
+  if (!ALLOWED_IMAGE_MIMES.has(mime)) throw new Error('Unsupported image MIME type.');
   if (await isFolderMode()) {
-    const mime = blob.type || 'application/octet-stream';
     const res = await fetch(`/api/images/${encodeURIComponent(key)}?mime=${encodeURIComponent(mime)}`, {
       method: 'PUT',
       body: blob,
@@ -502,6 +518,7 @@ export async function saveImageBlob(key: string, blob: Blob): Promise<void> {
 }
 
 export async function getImageBlob(key: string): Promise<Blob | undefined> {
+  if (!SAFE_STORAGE_KEY.test(key)) return undefined;
   if (await isFolderMode()) {
     try {
       const res = await fetch(`/api/images/${encodeURIComponent(key)}`);
@@ -529,6 +546,12 @@ export interface ExamSummary {
   fileName: string;
   pages: number;
   questionCount: number;
+  expectedQuestionCount: number;
+  parsedQuestionCount: number;
+  coveragePercent: number;
+  missingQuestionNos: number[];
+  duplicateQuestionNos: number[];
+  complete: boolean;
   sectionCount: number;
   imageCount: number;
   ocrUsed: boolean;
@@ -550,8 +573,10 @@ export async function listExamSummaries(): Promise<ExamSummary[]> {
   const docs = await Promise.all(examKeys.map(k => get<ExamDoc>(k)));
   const summaries: ExamSummary[] = [];
   for (const doc of docs) {
-    if (!doc || !doc.id) continue;
+    if (!doc || !SAFE_STORAGE_KEY.test(doc.id || '')) continue;
     const usage = Array.isArray(doc.usage) ? doc.usage : [];
+    let health: ReturnType<typeof getExamHealth>;
+    try { health = getExamHealth(doc); } catch { health = { expectedCount: doc.questions?.length || 0, parsedCount: doc.questions?.length || 0, missing: [], duplicates: [], pointsParsed: 0, pointDeficit: 0, unplacedImages: [], unresolvedImageRefs: [], lowConfidenceCount: 0, coveragePercent: 0, state: 'amber', complete: false }; }
     summaries.push({
       id: doc.id,
       displayName: getDisplayName(doc),
@@ -563,6 +588,12 @@ export async function listExamSummaries(): Promise<ExamSummary[]> {
       fileName: doc.source?.fileName || '',
       pages: doc.source?.pages || 0,
       questionCount: Array.isArray(doc.questions) ? doc.questions.length : 0,
+      expectedQuestionCount: health.expectedCount,
+      parsedQuestionCount: health.parsedCount,
+      coveragePercent: health.coveragePercent,
+      missingQuestionNos: health.missing,
+      duplicateQuestionNos: health.duplicates,
+      complete: health.complete,
       sectionCount: Array.isArray(doc.sections) ? doc.sections.length : 0,
       imageCount: Array.isArray(doc.images) ? doc.images.length : 0,
       ocrUsed: Boolean(doc.source?.ocrUsed),
@@ -584,6 +615,7 @@ export async function listExamSummaries(): Promise<ExamSummary[]> {
  * In folder mode the server performs the same orphan sweep.
  */
 export async function deleteExam(id: string): Promise<void> {
+  if (!SAFE_STORAGE_KEY.test(id)) throw new Error('Invalid exam storage id.');
   if (await isFolderMode()) {
     await fetch(`/api/exams/${encodeURIComponent(id)}`, { method: 'DELETE' });
     return;
@@ -633,6 +665,7 @@ export async function clearPipelineCaches(): Promise<void> {
  * Cache storage
  */
 export async function getPipelineCache<T>(cacheKey: string): Promise<T | undefined> {
+  if (!cacheKey || cacheKey.length > 2048) return undefined;
   if (await isFolderMode()) {
     try {
       const res = await fetch(`/api/cache/${safeCacheSegment(cacheKey)}`);
@@ -646,6 +679,8 @@ export async function getPipelineCache<T>(cacheKey: string): Promise<T | undefin
 }
 
 export async function setPipelineCache<T>(cacheKey: string, value: T): Promise<void> {
+  if (!cacheKey || cacheKey.length > 2048) throw new Error('Invalid cache key.');
+  if (!validateJsonSize(value ?? null, MAX_STORED_CACHE_BYTES)) throw new Error('Pipeline cache entry exceeds the 20 MiB storage limit.');
   if (await isFolderMode()) {
     await fetch(`/api/cache/${safeCacheSegment(cacheKey)}`, {
       method: 'PUT',

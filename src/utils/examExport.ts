@@ -3,6 +3,8 @@
  * Used by Step5Exam and the Exam Library so both share identical semantics.
  */
 import { ExamDoc, getDisplayName, sanitizeFileName } from '../types';
+import { getExamHealth } from '../pipeline/quality';
+import { stripCredentialFields } from './validation';
 
 /** Build the clean export payload: no image dataUrls, no heavy page-image data URLs. */
 export function buildExportDoc(doc: ExamDoc): any {
@@ -15,16 +17,33 @@ export function buildExportDoc(doc: ExamDoc): any {
   });
 
   const { pageImages, ...sourceWithoutPageImages } = (doc.source || {}) as any;
-  return {
+  return stripCredentialFields({
     ...doc,
     displayName: getDisplayName(doc),
     images: cleanImages,
     source: sourceWithoutPageImages,
-  };
+  });
+}
+
+/** Never silently export an incomplete exam; native confirmation works for every export surface. */
+export function confirmPartialExport(doc: ExamDoc, action = 'export'): boolean {
+  const health = getExamHealth(doc);
+  if (health.complete) return true;
+  const issues = [
+    health.missing.length ? `missing questions: ${health.missing.join(', ')}` : '',
+    health.duplicates.length ? `duplicate question numbers: ${health.duplicates.join(', ')}` : '',
+    health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51 ? `points deficit: ${health.pointDeficit}` : '',
+    health.unplacedImages.length ? `${health.unplacedImages.length} unplaced image(s)` : '',
+    health.unresolvedImageRefs.length ? `${health.unresolvedImageRefs.length} unresolved image reference(s)` : '',
+    (health.parentLinkIssueCount || 0) ? `${health.parentLinkIssueCount} invalid nested-question link(s)` : '',
+  ].filter(Boolean).join('; ') || 'integrity checks need review';
+  if (typeof window === 'undefined' || typeof window.confirm !== 'function') return false;
+  return window.confirm(`This exam is PARTIAL (${issues}). ${action} it anyway?`);
 }
 
 /** Download an ExamDoc as `<displayName>_structured.json` (filesystem-sanitized). */
 export function exportExamJson(doc: ExamDoc): void {
+  if (!confirmPartialExport(doc, 'Export')) return;
   const jsonStr = JSON.stringify(buildExportDoc(doc), null, 2);
   const blob = new Blob([jsonStr], { type: 'application/json' });
   const url = URL.createObjectURL(blob);

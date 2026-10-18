@@ -330,6 +330,9 @@ export const LibraryView: React.FC<Props> = ({
               const termYear = [s.term, s.year].filter(Boolean).join(' ');
               const chips = [s.subject, s.grade, termYear].filter(Boolean) as string[];
               const isActive = activeExamId === s.id;
+              const summaryCoverage = Number.isFinite(s.coveragePercent) ? s.coveragePercent : 0;
+              const summaryMissing = Array.isArray(s.missingQuestionNos) ? s.missingQuestionNos : [];
+              const summaryDuplicates = Array.isArray(s.duplicateQuestionNos) ? s.duplicateQuestionNos : [];
               return (
                 <div
                   key={s.id}
@@ -368,6 +371,7 @@ export const LibraryView: React.FC<Props> = ({
                       ) : (
                         <div className="font-semibold text-base text-slate-900 dark:text-white truncate">
                           {s.displayName}
+                          {s.complete !== true && <span title={`Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`} className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/30 align-middle">PARTIAL — {s.parsedQuestionCount ?? s.questionCount}/{s.expectedQuestionCount ?? '?'}</span>}
                           {isActive && (
                             <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 align-middle">
                               open

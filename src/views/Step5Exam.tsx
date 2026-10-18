@@ -12,7 +12,9 @@ import {
 import { ExamDoc, ImageAsset, getDisplayName, sanitizeFileName } from '../types';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
 import { saveExamDoc, getImageBlob } from '../store';
-import { duplicateExamDoc, exportExamJson } from '../utils/examExport';
+import { duplicateExamDoc, exportExamJson, confirmPartialExport } from '../utils/examExport';
+import { ExamHealthBanner } from '../components/ExamHealthBanner';
+import { MAX_EXAM_JSON_BYTES, parseExamDocImport } from '../utils/validation';
 
 interface Props {
   doc: ExamDoc;
@@ -26,6 +28,7 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
 
   // Trigger browser print dialog for A4 output
   const handlePrint = () => {
+    if (!confirmPartialExport(doc, 'Print / Save PDF')) return;
     window.print();
   };
 
@@ -38,40 +41,25 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
   const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > MAX_EXAM_JSON_BYTES) { alert(`Exam JSON exceeds the ${Math.round(MAX_EXAM_JSON_BYTES / 1024 / 1024)} MiB import limit.`); e.target.value = ''; return; }
     const reader = new FileReader();
     reader.onload = async () => {
       try {
-        const parsed = JSON.parse(reader.result as string);
-
-        // Validate parsed shape before accepting
-        if (!parsed || typeof parsed !== 'object') throw new Error('Not a valid object');
-        if (!Array.isArray(parsed.questions)) throw new Error('Missing questions array');
-        if (!parsed.source || !Array.isArray(parsed.source.lines)) throw new Error('Missing source.lines');
-        if (!parsed.meta || typeof parsed.meta !== 'object') throw new Error('Missing meta object');
-
-        // Re-link image dataUrls from IndexedDB by blobKey (same restore logic as loadExamDoc)
-        const restoredImages: ImageAsset[] = await Promise.all(
-          (parsed.images || []).map(async (img: any) => {
-            const blob = img.blobKey ? await getImageBlob(img.blobKey) : undefined;
-            let dataUrl: string | undefined = undefined;
-            if (blob) {
-              dataUrl = URL.createObjectURL(blob);
-            }
-            return { ...img, dataUrl };
-          })
-        );
-
-        const importedDoc: ExamDoc = {
-          ...parsed,
-          images: restoredImages,
-        };
-
+        const parsed = parseExamDocImport(String(reader.result || ''));
+        if (!parsed.doc) throw new Error(parsed.error || 'ExamDoc validation failed');
+        const imported = parsed.doc;
+        const restoredImages: ImageAsset[] = await Promise.all(imported.images.map(async image => {
+          const blob = image.blobKey ? await getImageBlob(image.blobKey) : undefined;
+          return { ...image, dataUrl: blob ? URL.createObjectURL(blob) : undefined };
+        }));
+        const importedDoc: ExamDoc = { ...imported, images: restoredImages };
         onUpdateDoc(importedDoc);
         await saveExamDoc(importedDoc);
-      } catch (err: any) {
-        alert(`Invalid Exam JSON: ${err.message}`);
-      }
+      } catch (error: any) {
+        alert(`Invalid Exam JSON: ${error?.message || 'validation failed'}`);
+      } finally { e.target.value = ''; }
     };
+    reader.onerror = () => { alert('Could not read Exam JSON file.'); e.target.value = ''; };
     reader.readAsText(file);
   };
 
@@ -84,14 +72,16 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
 
   // Export as DOCX format using HTML document MIME
   const handleExportDocx = () => {
+    if (!confirmPartialExport(doc, 'Export DOCX')) return;
     const printArea = document.getElementById('printable-exam-area');
     if (!printArea) return;
 
+    const safeTitle = getDisplayName(doc).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     const htmlContent = `
       <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
       <head>
         <meta charset='utf-8'>
-        <title>${getDisplayName(doc)}</title>
+        <title>${safeTitle}</title>
         <style>
           body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 11pt; direction: ${doc.meta.direction}; }
           table { border-collapse: collapse; width: 100%; }
@@ -117,6 +107,7 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
 
   return (
     <div className="py-6 px-4 space-y-6">
+      <div className="max-w-5xl mx-auto print:hidden"><ExamHealthBanner doc={doc} /></div>
       {/* Top Action Bar (Hidden on print) */}
       <div className="max-w-5xl mx-auto flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs print:hidden">
         {/* Render Modes Selector */}

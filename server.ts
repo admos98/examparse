@@ -4,6 +4,8 @@ import path from 'path';
 import fs from 'fs';
 import { GoogleGenAI } from '@google/genai';
 import { LLMRequest, LLMResponse, getDisplayName } from './src/types';
+import { AppSettingsSchema, SAFE_STORAGE_KEY, isSensitiveCredentialName, validateExtraBodyJson, validateHeaders, validateJsonSize, validateProviderBaseUrl } from './src/utils/validation';
+import { getExamHealth } from './src/pipeline/quality';
 
 dotenv.config();
 
@@ -38,11 +40,88 @@ function assertInsideDir(res: Response, dir: string, file: string): string | nul
 }
 function safeSegment(res: Response, value: string): boolean {
   if (!SAFE_SEGMENT.test(value || '')) {
-    res.status(400).json({ error: `Invalid path segment: ${value}` });
+    res.status(400).json({ error: 'Invalid path segment.' });
     return false;
   }
   return true;
 }
+const MAX_EXAM_BYTES = 32 * 1024 * 1024;
+const MAX_CACHE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+
+function redactSensitiveText(value: unknown, secrets: Array<string | undefined> = []): string {
+  let text = String(value || 'Request failed')
+    .replace(/\b(api[_-]?key|access[_-]?token|authorization|bearer)\s*["']?\s*[:= ]\s*["']?[^\s,"'&}]+/gi, '$1=[REDACTED]')
+    .replace(/\bBearer\s+[^\s,"']+/gi, 'Bearer [REDACTED]')
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[REDACTED]')
+    .replace(/([?&](?:key|token|api_key)=)[^&\s]+/gi, '$1[REDACTED]');
+  for (const secret of secrets) if (secret && secret.length >= 6) text = text.split(secret).join('[REDACTED]');
+  return text.replace(/[\r\n\t]+/g, ' ').slice(0, 500);
+}
+
+function collectNamedSecrets(value: unknown, sensitiveParent = false): string[] {
+  if (typeof value === 'string') return sensitiveParent ? [value] : [];
+  if (Array.isArray(value)) return value.flatMap(item => collectNamedSecrets(item, sensitiveParent));
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value as Record<string, unknown>).flatMap(([name, child]) => collectNamedSecrets(child, isSensitiveCredentialName(name)));
+}
+
+function providerSecrets(config: any): Array<string | undefined> {
+  const headerSecrets = Object.entries(config?.defaultHeaders || {}).filter(([name]) => isSensitiveCredentialName(name)).map(([, value]) => typeof value === 'string' ? value : undefined);
+  let extraBodySecrets: string[] = [];
+  try { extraBodySecrets = collectNamedSecrets(JSON.parse(config?.extraBodyJson || 'null')); } catch { /* invalid extra body is rejected before provider use */ }
+  return [config?.apiKey, process.env.GEMINI_API_KEY, ...headerSecrets, ...extraBodySecrets];
+}
+
+function hasSafeJsonSize(res: Response, body: unknown, maxBytes: number): boolean {
+  if (!validateJsonSize(body, maxBytes)) {
+    res.status(413).json({ error: `JSON payload exceeds the ${Math.floor(maxBytes / 1024 / 1024)} MiB storage limit.` });
+    return false;
+  }
+  return true;
+}
+
+function validateStoredExam(body: any, routeId: string): string | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'ExamDoc object required.';
+  if (body.id !== routeId) return 'Exam id must match the storage path.';
+  if (!body.meta || typeof body.meta !== 'object' || !body.source || typeof body.source !== 'object') return 'Exam meta and source objects are required.';
+  if (!Array.isArray(body.source.lines) || body.source.lines.length > 200_000) return 'Exam source lines are invalid or exceed the line limit.';
+  if (!Array.isArray(body.questions) || body.questions.length > 5_000) return 'Exam questions are invalid or exceed the question limit.';
+  if (!Array.isArray(body.images) || body.images.length > 2_000) return 'Exam images are invalid or exceed the image limit.';
+  if (!Array.isArray(body.sections) || body.sections.length > 500) return 'Exam sections are invalid or exceed the section limit.';
+  for (const line of body.source.lines) {
+    if (!line || typeof line !== 'object' || !/^L\d{1,9}$/.test(String(line.id || '')) || !Number.isInteger(line.page) || typeof line.text !== 'string' || line.text.length > 100_000) return 'Exam source contains an invalid line.';
+  }
+  for (const image of body.images) {
+    if (!image || typeof image !== 'object' || !SAFE_STORAGE_KEY.test(String(image.id || '')) || (image.blobKey && !SAFE_STORAGE_KEY.test(String(image.blobKey)))) return 'Exam image metadata contains an invalid storage key.';
+  }
+  for (const key of body.source.pageThumbKeys || []) if (!SAFE_STORAGE_KEY.test(String(key))) return 'Exam page thumbnail key is invalid.';
+  return null;
+}
+
+function validateLlmRequest(value: any): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'LLM request object required.';
+  if (!['fast', 'standard', 'escalation', 'vision', 'ocr', 'patch'].includes(value.role)) return 'Unsupported LLM role.';
+  if (typeof value.system !== 'string' || value.system.length > 200_000 || typeof value.text !== 'string' || value.text.length > 25_000_000) return 'LLM prompt is invalid or exceeds the size limit.';
+  if (value.label !== undefined && (typeof value.label !== 'string' || value.label.length > 500)) return 'LLM request label is invalid.';
+  if (value.maxOutputTokens !== undefined && (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 1 || value.maxOutputTokens > 65_536)) return 'LLM output token limit is invalid.';
+  if (value.images !== undefined && (!Array.isArray(value.images) || value.images.length > 64)) return 'LLM image batch exceeds the 64-image limit.';
+  let imageBytes = 0;
+  for (const image of value.images || []) {
+    if (!image || !['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'].includes(image.mime) || typeof image.data !== 'string' || image.data.length > MAX_IMAGE_BYTES * 4 / 3 || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)) return 'LLM image payload is invalid.';
+    imageBytes += image.data.length * 0.75;
+  }
+  if (imageBytes > MAX_IMAGE_BYTES) return 'LLM image payload exceeds the 32 MiB limit.';
+  const config = value.providerConfig;
+  if (config !== undefined) {
+    if (!config || typeof config !== 'object' || !['gemini', 'openai-compatible'].includes(config.kind) || typeof config.model !== 'string' || config.model.length > 300 || (config.apiKey !== undefined && (typeof config.apiKey !== 'string' || config.apiKey.length > 8192))) return 'Provider configuration is invalid.';
+    if (config.kind === 'openai-compatible' && !validateProviderBaseUrl(config.baseURL)) return 'Provider URL must be http(s), without credentials, query, or fragment.';
+    if (!validateHeaders(config.defaultHeaders)) return 'Provider headers are invalid.';
+    if (!validateExtraBodyJson(config.extraBodyJson)) return 'Provider extra body must be a bounded, safe JSON object.';
+  }
+  return null;
+}
+
 function readJsonFile<T>(file: string, fallback: T): T {
   try {
     if (!fs.existsSync(file)) return fallback;
@@ -73,6 +152,8 @@ function listExamFiles(): string[] {
 }
 function summarizeStoredExam(doc: any): any {
   const usage = Array.isArray(doc?.usage) ? doc.usage : [];
+  let health: ReturnType<typeof getExamHealth>;
+  try { health = getExamHealth(doc); } catch { health = { expectedCount: doc?.questions?.length || 0, parsedCount: doc?.questions?.length || 0, missing: [], duplicates: [], pointsParsed: 0, pointDeficit: 0, unplacedImages: [], unresolvedImageRefs: [], lowConfidenceCount: 0, coveragePercent: 0, state: 'amber', complete: false }; }
   return {
     id: doc.id,
     displayName: getDisplayName(doc),
@@ -84,6 +165,12 @@ function summarizeStoredExam(doc: any): any {
     fileName: doc.source?.fileName || '',
     pages: doc.source?.pages || 0,
     questionCount: Array.isArray(doc.questions) ? doc.questions.length : 0,
+    expectedQuestionCount: health.expectedCount,
+    parsedQuestionCount: health.parsedCount,
+    coveragePercent: health.coveragePercent,
+    missingQuestionNos: health.missing,
+    duplicateQuestionNos: health.duplicates,
+    complete: health.complete,
     sectionCount: Array.isArray(doc.sections) ? doc.sections.length : 0,
     imageCount: Array.isArray(doc.images) ? doc.images.length : 0,
     ocrUsed: Boolean(doc.source?.ocrUsed),
@@ -127,7 +214,9 @@ app.put('/api/exams/:id', (req: Request, res: Response) => {
   if (!safeSegment(res, req.params.id)) return;
   const file = assertInsideDir(res, EXAMS_DIR, path.join(EXAMS_DIR, `${req.params.id}.json`));
   if (!file) return;
-  if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'ExamDoc JSON body required' });
+  const validationError = validateStoredExam(req.body, req.params.id);
+  if (validationError) return res.status(400).json({ error: validationError });
+  if (!hasSafeJsonSize(res, req.body, MAX_EXAM_BYTES)) return;
   atomicWriteJson(file, req.body);
   return res.json({ ok: true, id: req.params.id });
 });
@@ -166,9 +255,10 @@ app.get('/api/images/:sha', (req: Request, res: Response) => {
   return res.sendFile(checked);
 });
 
-app.put('/api/images/:sha', express.raw({ type: () => true, limit: '32mb' }), (req: Request, res: Response) => {
+app.put('/api/images/:sha', express.raw({ type: () => true, limit: MAX_IMAGE_BYTES }), (req: Request, res: Response) => {
   if (!safeSegment(res, req.params.sha)) return;
   const mime = String(req.query.mime || 'application/octet-stream');
+  if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'].includes(mime)) return res.status(415).json({ error: 'Unsupported image MIME type.' });
   let ext = mime.includes('/') ? mime.split('/')[1] : 'bin';
   ext = ext.replace(/[^A-Za-z0-9]/g, '').toLowerCase() || 'bin';
   if (ext === 'jpg') ext = 'jpeg';
@@ -204,6 +294,7 @@ app.put('/api/cache/:key', (req: Request, res: Response) => {
   if (!safeSegment(res, req.params.key)) return;
   const file = assertInsideDir(res, CACHE_DIR, path.join(CACHE_DIR, `${req.params.key}.json`));
   if (!file) return;
+  if (!hasSafeJsonSize(res, req.body ?? null, MAX_CACHE_BYTES)) return;
   atomicWriteJson(file, req.body ?? null);
   return res.json({ ok: true, key: req.params.key });
 });
@@ -228,7 +319,10 @@ app.get('/api/settings', (_req: Request, res: Response) => {
   return res.json(readJsonFile(SETTINGS_FILE, null));
 });
 app.put('/api/settings', (req: Request, res: Response) => {
-  atomicWriteJson(SETTINGS_FILE, req.body ?? null);
+  const parsed = AppSettingsSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Settings payload failed validation; provider secrets were not logged.' });
+  if (!hasSafeJsonSize(res, parsed.data, 2 * 1024 * 1024)) return;
+  atomicWriteJson(SETTINGS_FILE, parsed.data);
   return res.json({ ok: true });
 });
 
@@ -238,6 +332,9 @@ app.get('/api/usage', (_req: Request, res: Response) => {
 app.post('/api/usage', (req: Request, res: Response) => {
   const current = readJsonFile<any[]>(USAGE_FILE, []);
   const incoming = Array.isArray(req.body) ? req.body : [req.body];
+  if (incoming.length > 500) return res.status(413).json({ error: 'Usage batch exceeds the 500-record limit.' });
+  if (!hasSafeJsonSize(res, incoming, 2 * 1024 * 1024)) return;
+  if (incoming.some(record => !record || typeof record !== 'object' || typeof record.label !== 'string' || record.label.length > 1000 || typeof record.provider !== 'string' || record.provider.length > 200 || typeof record.model !== 'string' || record.model.length > 300)) return res.status(400).json({ error: 'Usage records failed validation.' });
   const next = [...current];
   for (const record of incoming.filter(Boolean)) {
     if (record?.dedupeKey) {
@@ -251,7 +348,9 @@ app.post('/api/usage', (req: Request, res: Response) => {
   return res.json({ ok: true, count: trimmed.length });
 });
 app.put('/api/usage', (req: Request, res: Response) => {
-  const next = (Array.isArray(req.body) ? req.body : []).slice(-500);
+  if (!Array.isArray(req.body) || req.body.length > 500) return res.status(400).json({ error: 'Usage payload must be an array of at most 500 records.' });
+  if (!hasSafeJsonSize(res, req.body, 2 * 1024 * 1024)) return;
+  const next = req.body;
   atomicWriteJson(USAGE_FILE, next);
   return res.json({ ok: true, count: next.length });
 });
@@ -389,7 +488,7 @@ function parseExtraBody(extraBodyJson: unknown): Record<string, any> {
     console.warn('extraBodyJson is not a JSON object; ignoring it.');
     return {};
   } catch (err: any) {
-    console.warn('extraBodyJson is invalid JSON; ignoring it:', err?.message || err);
+    console.warn('Provider extra body is invalid JSON; details were omitted.');
     return {};
   }
 }
@@ -398,6 +497,8 @@ function parseExtraBody(extraBodyJson: unknown): Record<string, any> {
  * Single thin proxy route POST /api/llm (§7)
  */
 app.post('/api/llm', async (req: Request, res: Response) => {
+  const validationError = validateLlmRequest(req.body);
+  if (validationError) return res.status(400).json({ error: validationError });
   const payload: LLMRequest = req.body;
   const { role, system, text, images, jsonSchema, maxOutputTokens, label, providerConfig, stream } = payload;
 
@@ -473,7 +574,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           const parsed = parseModelContent(rawText); const meta = finalChunk?.usageMetadata || {};
           emit('done', { json: parsed, ...(label ? { label } : {}), rawText, finishReason: parsed === null ? (finalChunk?.candidates?.[0]?.finishReason || 'PARSE_ERROR') : (finalChunk?.candidates?.[0]?.finishReason || 'STOP'), usage: { inputTokens: meta.promptTokenCount || Math.ceil(text.length / 3), outputTokens: (meta.candidatesTokenCount || 0) + (meta.thoughtsTokenCount || 0) || Math.ceil(rawText.length / 3), cachedTokens: meta.cachedContentTokenCount || 0 } });
           res.end(); clearTimeout(geminiTimer);
-        } catch (streamErr: any) { emit('error', { message: streamErr.message || 'Gemini stream failed' }); res.end(); clearTimeout(geminiTimer); }
+        } catch (streamErr: any) { emit('error', { message: redactSensitiveText(streamErr?.message || 'Gemini stream failed', providerSecrets(providerConfig)) }); res.end(); clearTimeout(geminiTimer); }
         return;
       }
 
@@ -604,7 +705,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           else if (upstream.status === 400 && !dropped.has('temperature') && /temperature/i.test(errBody) && 'temperature' in body) { dropped.add('temperature'); rung = '[no-temp]'; }
           else if (upstream.status === 400 && !dropped.has('max_tokens') && /max_tokens|max_completion_tokens/i.test(errBody) && 'max_tokens' in body) { swapMax = true; rung = '[mt-swap]'; }
           else if (upstream.status === 400 && !dropped.has('stream_options') && /stream_options/i.test(errBody) && 'stream_options' in body) { dropped.add('stream_options'); rung = '[no-stream-options]'; }
-          if (!rung || i === 4) { clearTimeout(streamTimer); return res.status(upstream.status).json({ error: `Provider error (${upstream.status}): ${errBody}` }); }
+          if (!rung || i === 4) { clearTimeout(streamTimer); return res.status(upstream.status).json({ error: `Provider error (${upstream.status}): ${redactSensitiveText(errBody, providerSecrets(providerConfig))}` }); }
           suffixes.push(rung);
         }
         if (!upstream?.ok) return res.status(502).json({ error: 'Provider stream failed' });
@@ -617,7 +718,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           const ct = upstream.headers.get('content-type') || '';
           if (!ct.includes('text/event-stream')) {
             const bodyText = await upstream.text(); const d: any = parseUpstreamBody(bodyText);
-            if (!d) throw new Error(`Provider returned non-JSON response: ${bodyText.slice(0, 250)}`);
+            if (!d) throw new Error('Provider returned a non-JSON response.');
             const msg = d.choices?.[0]?.message || {}; content = typeof msg.content === 'string' ? msg.content : msg.content == null ? '' : JSON.stringify(msg.content);
             reasoning = msg.reasoning_content || msg.reasoning || ''; usage = d.usage; finish = d.choices?.[0]?.finish_reason || 'stop';
             if (content) emit('delta', { text: content });
@@ -645,7 +746,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           const rawText = content || reasoning; const json = parseModelContent(rawText);
           emit('done', { json, ...(effectiveLabel ? { label: effectiveLabel } : {}), rawText, ...(reasoning ? { reasoningText: reasoning } : {}), finishReason: json === null ? finish : finish || 'stop', usage: { inputTokens: usage?.prompt_tokens || Math.ceil(text.length / 3), outputTokens: usage?.completion_tokens || Math.ceil((content.length + reasoning.length) / 3), cachedTokens: usage?.prompt_tokens_details?.cached_tokens || 0 } });
           res.end(); clearTimeout(streamTimer);
-        } catch (streamError: any) { emit('error', { message: streamError.message || 'Upstream stream failed' }); res.end(); clearTimeout(streamTimer); }
+        } catch (streamError: any) { emit('error', { message: redactSensitiveText(streamError?.message || 'Upstream stream failed', providerSecrets(providerConfig)) }); res.end(); clearTimeout(streamTimer); }
         return;
       }
 
@@ -689,14 +790,14 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       const ladderSuffix = suffixes.join('');
       if (!upstreamResponse || !upstreamResponse.ok) {
         return res.status(upstreamResponse?.status || 502).json({
-          error: `Provider error (${upstreamResponse?.status || 502}): ${upstreamBodyText.slice(0, 300)}`,
+          error: `Provider error (${upstreamResponse?.status || 502}): ${redactSensitiveText(upstreamBodyText, providerSecrets(providerConfig))}`,
         });
       }
 
       const data: any = parseUpstreamBody(upstreamBodyText);
       if (!data) {
         return res.status(502).json({
-          error: `Provider returned non-JSON response: ${upstreamBodyText.slice(0, 300)}`,
+          error: 'Provider returned a non-JSON response.'
         });
       }
 
@@ -730,9 +831,9 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       return res.json(result);
     }
   } catch (err: any) {
-    console.error('LLM proxy call error:', err?.message || err);
+    console.error('[LLM proxy] Provider request failed; sensitive diagnostic details were omitted.');
     return res.status(500).json({
-      error: err?.message || 'Internal proxy error during LLM execution',
+      error: redactSensitiveText(err?.message || 'Internal proxy error during LLM execution', providerSecrets(providerConfig)),
     });
   }
 });
@@ -741,8 +842,12 @@ app.post('/api/llm', async (req: Request, res: Response) => {
  * Test connection endpoint
  */
 app.post('/api/test-connection', async (req: Request, res: Response) => {
-  const { providerConfig } = req.body;
+  const { providerConfig } = req.body || {};
   const kind = providerConfig?.kind || 'gemini';
+  if (!['gemini', 'openai-compatible'].includes(kind)) return res.status(400).json({ ok: false, error: 'Unsupported provider type.' });
+  if (kind === 'openai-compatible' && !validateProviderBaseUrl(providerConfig?.baseURL)) return res.status(400).json({ ok: false, error: 'Provider URL must be http(s), without credentials, query, or fragment.' });
+  if (!validateHeaders(providerConfig?.defaultHeaders)) return res.status(400).json({ ok: false, error: 'Provider headers are invalid.' });
+  if (providerConfig?.apiKey !== undefined && (typeof providerConfig.apiKey !== 'string' || providerConfig.apiKey.length > 8192)) return res.status(400).json({ ok: false, error: 'Provider API key field is invalid.' });
 
   try {
     if (kind === 'gemini') {
@@ -767,7 +872,7 @@ app.post('/api/test-connection', async (req: Request, res: Response) => {
       const apiKey = providerConfig?.apiKey?.trim() || '';
       const t0 = Date.now();
       const resp = await fetch(`${baseURL}/models`, {
-        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        headers: { ...(providerConfig?.defaultHeaders || {}), ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
       });
       const latencyMs = Date.now() - t0;
       if (resp.ok) {
@@ -775,11 +880,11 @@ app.post('/api/test-connection', async (req: Request, res: Response) => {
         return res.json({ ok: true, latencyMs, count: data.data?.length || 0 });
       } else {
         const text = await resp.text();
-        return res.status(resp.status).json({ ok: false, error: `HTTP ${resp.status}: ${text}` });
+        return res.status(resp.status).json({ ok: false, error: `HTTP ${resp.status}: ${redactSensitiveText(text, providerSecrets(providerConfig))}` });
       }
     }
   } catch (err: any) {
-    return res.status(500).json({ ok: false, error: err?.message || 'Connection failed' });
+    return res.status(500).json({ ok: false, error: redactSensitiveText(err?.message || 'Connection failed', providerSecrets(providerConfig)) });
   }
 });
 
@@ -787,8 +892,12 @@ app.post('/api/test-connection', async (req: Request, res: Response) => {
  * Fetch models endpoint
  */
 app.post('/api/models', async (req: Request, res: Response) => {
-  const { providerConfig } = req.body;
+  const { providerConfig } = req.body || {};
   const kind = providerConfig?.kind || 'gemini';
+  if (!['gemini', 'openai-compatible'].includes(kind)) return res.status(400).json({ error: 'Unsupported provider type.' });
+  if (kind === 'openai-compatible' && !validateProviderBaseUrl(providerConfig?.baseURL)) return res.status(400).json({ error: 'Provider URL must be http(s), without credentials, query, or fragment.' });
+  if (!validateHeaders(providerConfig?.defaultHeaders)) return res.status(400).json({ error: 'Provider headers are invalid.' });
+  if (providerConfig?.apiKey !== undefined && (typeof providerConfig.apiKey !== 'string' || providerConfig.apiKey.length > 8192)) return res.status(400).json({ error: 'Provider API key field is invalid.' });
 
   if (kind === 'gemini') {
     return res.json({
@@ -807,7 +916,7 @@ app.post('/api/models', async (req: Request, res: Response) => {
     const baseURL = (providerConfig?.baseURL || '').replace(/\/+$/, '');
     const apiKey = providerConfig?.apiKey?.trim() || '';
     const resp = await fetch(`${baseURL}/models`, {
-      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      headers: { ...(providerConfig?.defaultHeaders || {}), ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
     });
     if (!resp.ok) {
       throw new Error(`HTTP ${resp.status}`);
@@ -819,9 +928,16 @@ app.post('/api/models', async (req: Request, res: Response) => {
     return res.json({
       models: ['default-model', 'gpt-4o-mini', 'llama-3-8b-instruct'],
       fallback: true,
-      error: err.message,
+      error: redactSensitiveText(err?.message, providerSecrets(providerConfig)),
     });
   }
+});
+
+// Keep parser errors bounded and non-reflective; never echo submitted JSON or credentials.
+app.use((err: any, _req: Request, res: Response, next: (error?: any) => void) => {
+  if (res.headersSent) return next(err);
+  const status = err?.status === 413 || err?.statusCode === 413 ? 413 : 400;
+  return res.status(status).json({ error: status === 413 ? 'Request payload exceeds the configured size limit.' : 'Malformed or invalid request payload.' });
 });
 
 /**

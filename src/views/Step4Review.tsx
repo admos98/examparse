@@ -21,6 +21,10 @@ import {
 import { AppSettings, ExamDoc, Flag, Question } from '../types';
 import { regenerateQuestionPatch } from '../pipeline/patch';
 import { saveExamDoc } from '../store';
+import { ExamHealthBanner } from '../components/ExamHealthBanner';
+import { getExamHealth } from '../pipeline/quality';
+import { retryMissingCoverage } from '../pipeline/retryCoverage';
+import { buildQuestionTree } from '../utils/questionTree';
 
 interface Props {
   examDoc: ExamDoc;
@@ -52,6 +56,10 @@ export const Step4Review: React.FC<Props> = ({
   const [isSolvingBatch, setIsSolvingBatch] = useState<boolean>(false);
   const [solverError, setSolverError] = useState<string | null>(null);
   const [solvingQuestionId, setSolvingQuestionId] = useState<string | null>(null);
+  const [retryingCoverage, setRetryingCoverage] = useState(false);
+  const [retryProgress, setRetryProgress] = useState('');
+  const [coverageError, setCoverageError] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
 
   // Group questions by section
   const sections = examDoc.sections.length > 0 ? examDoc.sections : [{ id: 'sec_default', index: 1, title: 'General Section', spans: [] }];
@@ -64,6 +72,42 @@ export const Step4Review: React.FC<Props> = ({
     const secId = q.sectionId && questionsBySection[q.sectionId] ? q.sectionId : sections[0].id;
     questionsBySection[secId].push(q);
   }
+  for (const questions of Object.values(questionsBySection)) questions.sort((a, b) => (a.confidence ?? 1) - (b.confidence ?? 1) || a.no - b.no);
+
+  const health = getExamHealth(examDoc);
+
+  const handleRetryMissingCoverage = async () => {
+    if (retryingCoverage || health.missing.length === 0) return;
+    setRetryingCoverage(true);
+    setRetryProgress('Preparing bounded, journal-aware section recovery…');
+    setCoverageError(null);
+    try {
+      const updated = await retryMissingCoverage(examDoc, settings, setRetryProgress);
+      onUpdateDoc(updated);
+      setRetryProgress('');
+    } catch (error: any) {
+      setCoverageError(error?.message || 'Coverage recovery failed. The exam remains visibly partial.');
+    } finally {
+      setRetryingCoverage(false);
+    }
+  };
+
+  const handleAssignImage = (imageId: string, questionId: string) => {
+    const question = examDoc.questions.find(item => item.id === questionId);
+    if (!question) return;
+    const image = examDoc.images.find(item => item.id === imageId);
+    const nextQuestions = examDoc.questions.map(item => ({
+      ...item,
+      images: (item.images || []).filter(ref => ref.imageId !== imageId),
+    }));
+    const target = nextQuestions.find(item => item.id === questionId)!;
+    target.images ||= [];
+    target.images.push({ imageId, role: image?.label?.role && image.label.role !== 'decoration' ? image.label.role as any : 'stem', anchorLine: image?.anchorLine });
+    const nextImages: ExamDoc['images'] = examDoc.images.map(item => item.id === imageId ? { ...item, label: { ...(item.label || {}), role: 'stem' as const, questionRef: question.label || String(question.no) } } : item);
+    const updated: ExamDoc = { ...examDoc, questions: nextQuestions, images: nextImages };
+    onUpdateDoc(updated);
+    saveExamDoc(updated);
+  };
 
   // Update a question in examDoc
   const handleUpdateQuestion = (qId: string, updates: Partial<Question>) => {
@@ -275,7 +319,14 @@ export const Step4Review: React.FC<Props> = ({
       return img;
     });
 
-    const newDoc = { ...examDoc, images: updatedImages };
+    const updatedAsset = updatedImages.find(img => img.id === imgId)!;
+    const target = examDoc.questions.find(q => updatedAsset.label?.questionRef && (q.id === updatedAsset.label.questionRef || q.label === updatedAsset.label.questionRef || String(q.no) === updatedAsset.label.questionRef));
+    const updatedQuestions = examDoc.questions.map(q => {
+      const withoutImage = (q.images || []).filter(ref => ref.imageId !== imgId);
+      if (target?.id === q.id && updatedAsset.label?.role !== 'decoration') withoutImage.push({ imageId: imgId, role: updatedAsset.label?.role as any || 'stem', anchorLine: updatedAsset.anchorLine });
+      return { ...q, images: withoutImage };
+    });
+    const newDoc = { ...examDoc, images: updatedImages, questions: updatedQuestions };
     onUpdateDoc(newDoc);
     saveExamDoc(newDoc);
   };
@@ -362,6 +413,31 @@ export const Step4Review: React.FC<Props> = ({
           </button>
         </div>
       </div>
+
+      <ExamHealthBanner doc={examDoc} />
+      {health.missing.length > 0 && (
+        <div className="rounded-2xl border border-red-300 bg-red-50 p-4 text-xs text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div><strong>PARTIAL COVERAGE — {health.missing.length} expected question(s) are missing.</strong><div className="mt-1">Missing printed numbers: {health.missing.join(', ')}. This document remains incomplete and exports require confirmation.</div></div>
+            <button disabled={retryingCoverage} onClick={handleRetryMissingCoverage} className="rounded-lg bg-red-700 px-3 py-2 font-semibold text-white disabled:opacity-50">
+              {retryingCoverage ? 'Recovering…' : 'Retry missing questions'}
+            </button>
+          </div>
+          {retryProgress && <div role="status" className="mt-2 font-mono">{retryProgress}</div>}
+          {coverageError && <div role="alert" className="mt-2 font-semibold">{coverageError}</div>}
+        </div>
+      )}
+      {health.unplacedImages.length > 0 && (
+        <section className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-xs dark:border-amber-900 dark:bg-amber-950/30">
+          <h2 className="font-bold text-amber-900 dark:text-amber-200">Unplaced image assets ({health.unplacedImages.length}) — none are hidden</h2>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{health.unplacedImages.map(image => (
+            <div key={image.id} className="flex gap-3 rounded-xl border border-amber-300 bg-white p-2 dark:border-amber-800 dark:bg-slate-900">
+              {image.dataUrl ? <img src={image.dataUrl} alt={image.id} className="h-16 w-20 object-contain rounded bg-slate-100" /> : <div className="flex h-16 w-20 items-center justify-center rounded border border-dashed border-amber-500 text-[10px]">Missing asset</div>}
+              <div className="min-w-0 flex-1"><div className="font-mono font-bold">{image.id} · page {image.page}</div><div className="truncate text-slate-600">{image.label?.caption || 'Unassigned extracted image'}</div><label className="mt-1 block text-[10px]">Assign to question<select value="" onChange={event => event.target.value && handleAssignImage(image.id, event.target.value)} className="mt-1 w-full rounded border border-amber-300 bg-white p-1 dark:bg-slate-900"><option value="">Choose question…</option>{examDoc.questions.filter(question => !question.parentId).map(question => <option key={question.id} value={question.id}>Q{question.label} — {(question.stem || '').slice(0, 60)}</option>)}</select></label></div>
+            </div>
+          ))}</div>
+        </section>
+      )}
 
       {/* Solver Budget Stop Banner */}
       {solverError && (
@@ -485,29 +561,46 @@ export const Step4Review: React.FC<Props> = ({
       <div className="space-y-6">
         {sections.map(sec => {
           const secQuestions = questionsBySection[sec.id] || [];
-          if (secQuestions.length === 0) return null;
+          const hierarchy = buildQuestionTree(secQuestions);
+          const rootQuestions = hierarchy.roots;
+          const renderNestedChildren = (parentId: string, depth = 1): React.ReactNode => {
+            const children = hierarchy.children.get(parentId) || [];
+            if (!children.length) return null;
+            return <div className={`${depth === 1 ? 'ml-4 border-l-2 border-indigo-300 pl-3 dark:border-indigo-700' : 'ml-4 border-l border-indigo-200 pl-3 dark:border-indigo-800'} space-y-2`}>
+              {children.map((child, childIndex) => <div key={child.id} className="rounded-xl border border-indigo-200 bg-indigo-50/60 p-3 text-xs dark:border-indigo-900 dark:bg-indigo-950/20">
+                <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded bg-indigo-200 px-1.5 py-0.5 font-mono font-bold text-indigo-900 dark:bg-indigo-900 dark:text-indigo-100">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span><span className="text-[10px] text-slate-500">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {child.spans.map(([start, end]) => `L${start}..L${end}`).join(', ')}</span></div><button onClick={() => setActiveQuestionId(activeQuestionId === child.id ? null : child.id)} className="text-[10px] font-semibold text-indigo-700 underline dark:text-indigo-300">{activeQuestionId === child.id ? 'Close edit' : 'Edit child'}</button></div>
+                {activeQuestionId === child.id ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded border border-indigo-300 bg-white p-2 dark:bg-slate-900" /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
+                {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
+                {child.answer?.text && <div className="mt-2 border-t border-indigo-200 pt-2"><b>Answer:</b> {child.answer.text}</div>}
+                {renderNestedChildren(child.id, depth + 1)}
+              </div>)}
+            </div>;
+          };
+          if (secQuestions.length === 0 && !sec.passage) return null;
 
           return (
             <div key={sec.id} className="space-y-3">
+              {(hierarchy.cycleBreaks.size > 0 || hierarchy.orphanedParents.size > 0) && <div role="status" className="rounded-lg border border-amber-300 bg-amber-50 p-2 text-[11px] text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">Invalid nested-question links were flattened so all {hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size} affected question(s) remain visible.</div>}
               {/* Section Header */}
               <div className="flex items-center justify-between pb-1 border-b border-slate-200 dark:border-slate-800">
                 <div className="space-y-0.5">
                   <h2 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
                     {sec.title || `Section ${sec.index}`}
                   </h2>
-                  {sec.instructions && (
-                    <p className="text-[11px] text-slate-500 italic">{sec.instructions}</p>
-                  )}
+                  {sec.instructions && <p dir="auto" className="text-[11px] text-slate-500 italic">{sec.instructions}</p>}
+                  {sec.passage && <div dir="auto" className="mt-2 max-w-4xl whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">{sec.passage}</div>}
                 </div>
                 <span className="text-[11px] font-mono text-slate-400">
-                  {secQuestions.length} question(s)
+                  {sec.points !== undefined ? `${sec.points} pts · ` : ''}{secQuestions.length} question(s)
                 </span>
               </div>
 
               {/* Question Cards List */}
               <div className="space-y-3">
-                {secQuestions.map(q => {
+                {rootQuestions.map(q => {
                   const isExpanded = activeQuestionId === q.id;
+                  const groupChildren = hierarchy.children.get(q.id) || [];
+                  const showChildren = Boolean(expandedGroups[q.id]);
 
                   return (
                     <div
@@ -542,8 +635,9 @@ export const Step4Review: React.FC<Props> = ({
                                 : 'bg-amber-500/10 text-amber-600'
                             }`}
                           >
-                            {(q.confidence * 100).toFixed(0)}% conf
+                            {((q.confidence ?? 1) * 100).toFixed(0)}% conf
                           </span>
+                          {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded bg-indigo-50 px-2 py-1 text-[10px] font-semibold text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
                         </div>
 
                         {/* Question Action Buttons */}
@@ -610,7 +704,11 @@ export const Step4Review: React.FC<Props> = ({
                         <div className="flex flex-wrap gap-2 pt-1">
                           {q.images.map(imgRef => {
                             const asset = examDoc.images.find(i => i.id === imgRef.imageId);
-                            if (!asset || !asset.dataUrl) return null;
+                            if (!asset || !asset.dataUrl) return (
+                              <div key={imgRef.imageId} className="rounded-xl border-2 border-dashed border-amber-500 bg-amber-50 p-3 text-[10px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                                Missing image {imgRef.imageId} — open original page {asset?.page ?? 'unknown'}
+                              </div>
+                            );
                             return (
                               <div
                                 key={imgRef.imageId}
@@ -619,8 +717,10 @@ export const Step4Review: React.FC<Props> = ({
                                 <img
                                   src={asset.dataUrl}
                                   alt={asset.id}
+                                  onError={event => { event.currentTarget.style.display = 'none'; const fallback = event.currentTarget.parentElement?.querySelector('[data-image-error]') as HTMLElement | null; if (fallback) fallback.hidden = false; }}
                                   className="max-h-24 rounded-lg object-contain bg-white"
                                 />
+                                <div hidden data-image-error className="p-2 text-[10px] text-amber-900">Image unavailable — open original page {asset.page}.</div>
                                 <span className="absolute bottom-1 right-1 text-[9px] font-mono px-1 rounded bg-black/70 text-white">
                                   {imgRef.role}
                                 </span>
@@ -720,6 +820,7 @@ export const Step4Review: React.FC<Props> = ({
                           </div>
                         )}
                       </div>
+                      {showChildren && groupChildren.length > 0 && renderNestedChildren(q.id)}
                     </div>
                   );
                 })}

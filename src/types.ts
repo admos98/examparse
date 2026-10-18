@@ -17,6 +17,10 @@ export interface ExamSection {
   index: number;
   title?: string;
   instructions?: string;
+  /** Section total parsed from the section header when available. */
+  points?: number;
+  /** Locally sliced reading passage / listening dialogue; never copied from model output. */
+  passage?: string;
   spans: LineSpan[];
 }
 
@@ -78,11 +82,15 @@ export interface ImageAsset {
   width: number;
   height: number;
   anchorLine?: number; // nearest source line computed from coordinates
+  imageFlags?: string[]; // deterministic extraction warnings (e.g. suspicious strip)
   duplicateOf?: string; // dedupe by sha or perceptual hash
+  dHash?: string; // stable perceptual hash, used to identify repeated page furniture locally
   label?: {
     role: Question['images'][number]['role'];
     questionRef?: string;
     caption?: string;
+    /** Short local/model justification required when marked as decoration. */
+    reason?: string;
     kind?: 'photo' | 'diagram' | 'chart' | 'table' | 'formula' | 'handwriting' | 'decoration';
     needsText?: boolean;
   };
@@ -145,6 +153,10 @@ export interface ExamDoc {
     fileName: string;
     pageImages?: string[]; // rendered page preview data URLs (legacy / in-memory only; stripped on persist)
     pageThumbKeys?: string[]; // blob keys (thumb_{fileHash}_{page}) for saved page renders
+    /** Deterministic pre-key printed-number tripwire, persisted for health banners and retry. */
+    expectedQuestionNos?: number[];
+    /** 1-based LAS line numbers belonging to official key territory. */
+    keyTerritoryLineNos?: number[];
   };
   flags: Flag[];
   usage: UsageRecord[];
@@ -316,7 +328,7 @@ export type PipelineStageId = 'extract' | 'ocr' | 'structure' | 'vision' | 'asse
 export interface StageStatus {
   id: PipelineStageId;
   name: string;
-  status: 'idle' | 'running' | 'completed' | 'skipped' | 'failed' | 'cached';
+  status: 'idle' | 'running' | 'completed' | 'completed-with-problems' | 'partial' | 'skipped' | 'failed' | 'cached';
   durationMs?: number;
   inputTokens?: number;
   outputTokens?: number;

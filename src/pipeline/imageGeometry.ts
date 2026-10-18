@@ -38,3 +38,16 @@ export function isSuspectStrip(bbox: ImageAsset['bbox'], renderScale = 1): boole
   const ratio = Math.max(wPt, hPt) / Math.max(1, min);
   return min < 24 || ratio > 8;
 }
+
+/** Materialize a merged asset exclusively from the rendered page crop, not any strip's bytes/metadata. */
+export async function materializeMergedCrop(
+  assets: ImageAsset[], bbox: ImageAsset['bbox'], sourceLines: import('../types').SourceLine[], pdfY: number,
+  cropPage: (bbox: ImageAsset['bbox']) => Promise<{ blob: Blob; width: number; height: number; dHash: string }>,
+): Promise<ImageAsset & { _blob: Blob }> {
+  const { sha256 } = await import('../utils/hash');
+  const crop = await cropPage(bbox); const sha = await sha256(await crop.blob.arrayBuffer());
+  const first = assets[0];
+  const nearest = sourceLines.filter(l => l.page === first.page && l.y !== undefined && !l.furniture).sort((a, b) => Math.abs(a.y! - pdfY) - Math.abs(b.y! - pdfY))[0];
+  return { ...first, bbox, mime: 'image/jpeg', sha, blobKey: sha, width: crop.width, height: crop.height, dHash: crop.dHash,
+    anchorLine: nearest ? Number(nearest.id.slice(1)) : undefined, duplicateOf: undefined, dataUrl: URL.createObjectURL(crop.blob), _blob: crop.blob };
+}

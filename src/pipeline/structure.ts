@@ -7,7 +7,7 @@ import { LLMAdapter } from '../providers/adapter';
 import { T1_GEMINI_SCHEMA, T1_STRUCTURE_SYSTEM } from './prompts';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { appendJournalCall, loadJournal, markJournalComplete } from './journal';
-import { evaluateCoverage, enumerateExpectedQuestionNos, normalizeDigits, parsePrintedNumberFromStem } from './quality';
+import { evaluateCoverage, enumerateExpectedQuestionNos, normalizeForMatching, matchingView, parsePrintedNumberFromStem } from './quality';
 
 
 export interface StructurePassResult {
@@ -167,6 +167,8 @@ export interface StructurePassParams {
   /** Recovery may target only these printed numbers. */
   recoveryOnlyNumbers?: number[];
   onProgress?: (message: string) => void;
+  /** Audit completed section calls immediately, including candidates later rejected or interrupted. */
+  onCallUsage?: (call: { label: string; inputTokens: number; outputTokens: number; cachedTokens?: number }) => Promise<void>;
   existingRawQuestions?: any[];
   existingSections?: any[];
   existingMeta?: any;
@@ -201,28 +203,23 @@ const COMPACT_T1_SCHEMA = {
 interface SectionPlan { id: string; index: number; title: string; start: number; end: number; expected: number[] }
 
 function isSectionHeading(text: string): string | undefined {
-  const value = normalizeDigits(text).trim();
-  const match = value.match(/^\s*(?:(?:section|part|unit)\s*|(?:بخش|قسمت)\s*)?\d{0,2}\s*[.)：:-]?\s*(listening|vocabulary|grammar|reading|writing|other|use of english|language focus|بخش شنیداری|واژگان|دستور زبان|درک مطلب|نگارش)\s*$/i);
+  const value = normalizeForMatching(text).trim();
+  const match = value.match(/^\s*(?:(?:section|part|unit)\s*|(?:بخش|قسمت)\s*)?\d{0,2}\s*[.)：:-]?\s*(listening|vocabulary|grammar|reading|writing|other|use of english|language focus|شنیداری|بخش شنیداری|واژگان|دستور زبان|گرامر|درک مطلب|نوشتاری|نگارش)\s*$/i);
   if (!match) return undefined;
-  return match[1].replace(/\b\w/g, letter => letter.toUpperCase());
+  const view = matchingView(text.trim()); const start = match[0].lastIndexOf(match[1]);
+  return text.trim().slice(view.originalOffset(start), view.originalOffset(start + match[1].length));
 }
 
 function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], expectedLineByNo: Map<number, number>): SectionPlan[] {
   const sorted = [...sourceLines].sort((a, b) => Number(a.id.replace(/\D/g, '')) - Number(b.id.replace(/\D/g, '')));
   if (!sorted.length) return [];
   const headings = sorted.flatMap((line, index) => {
-    const title = isSectionHeading(line.text);
+    const title = line.furniture ? undefined : isSectionHeading(line.text);
     return title ? [{ index, title, line: Number(line.id.replace(/\D/g, '')) }] : [];
   });
   let boundaries: Array<{ start: number; end: number; title: string }> = [];
-  if (headings.length) {
-    const firstLine = Number(sorted[0].id.replace(/\D/g, '')) || 1;
-    boundaries = headings.map((heading, i) => ({
-      start: i === 0 ? firstLine : heading.line,
-      end: i + 1 < headings.length ? Math.max(heading.line, headings[i + 1].line - 1) : Number(sorted[sorted.length - 1].id.replace(/\D/g, '')),
-      title: heading.title,
-    }));
-  } else if (expectedNumbers.length > 25) {
+  // Section vocabulary is a title HINT only; geometry/enumeration determines bounded work windows.
+  if (expectedNumbers.length > 25) {
     const ordered = [...expectedNumbers].sort((a, b) => a - b);
     const groups: number[][] = [];
     for (let i = 0; i < ordered.length; i += 25) groups.push(ordered.slice(i, i + 25));
@@ -256,7 +253,7 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
       const nLine = expectedLineByNo.get(n) || -1;
       return nLine >= boundary.start && nLine <= boundary.end;
     });
-    return { id, index: index + 1, title: boundary.title, start: boundary.start, end: boundary.end, expected };
+    return { id, index: index + 1, title: headings.find(h => h.line >= boundary.start && h.line <= boundary.end)?.title || boundary.title, start: boundary.start, end: boundary.end, expected };
   }).filter(plan => plan.end >= plan.start);
 }
 
@@ -365,7 +362,7 @@ function formatLas(sourceLines: SourceLine[], keyLines: Set<number>): string {
   for (const line of sourceLines) {
     if (line.page !== currentPage) { currentPage = line.page; text += `=== PAGE ${currentPage} ===\n`; }
     const n = Number(line.id.replace(/\D/g, ''));
-    text += `[${line.id}] ${keyLines.has(n) ? '[KEY] ' : ''}${line.text.replace(/^\[L\d+\]\s*/, '')}\n`;
+    text += `[${line.id}] ${keyLines.has(n) ? '[KEY] ' : ''}${line.furniture ? '[FURNITURE] ' : ''}${line.text}\n`;
   }
   return text;
 }
@@ -459,7 +456,7 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
   const keyAnswerLines = params.sourceLines.filter(line => keyLines.has(Number(line.id.replace(/\D/g, ''))));
   const relevantKeyLines = keyAnswerLines.length <= 160 || !targetNumbers.length
     ? keyAnswerLines
-    : keyAnswerLines.filter(line => normalizedTargets.some(n => new RegExp(`(?:^|\\D)${n}\\s*[.)：:-]`).test(normalizeDigits(line.text))));
+    : keyAnswerLines.filter(line => normalizedTargets.some(n => new RegExp(`(?:^|\\D)${n}\\s*[.)：:-]`).test(normalizeForMatching(line.text))));
   const lines = [...new Map([...sectionLines, ...relevantKeyLines].map(line => [line.id, line])).values()].sort((a, b) => Number(a.id.replace(/\D/g, '')) - Number(b.id.replace(/\D/g, '')));
   const manifest = params.images.filter(img => img.anchorLine && img.anchorLine >= plan.start && img.anchorLine <= plan.end).map(img => ({ id: img.id, page: img.page, nearLine: img.anchorLine }));
   const las = formatLas(lines, keyLines);
@@ -477,6 +474,7 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
     onInfo: note => params.onLiveText?.(label, 'info', note),
     salvagePartial: true,
   });
+  await params.onCallUsage?.({ label, ...response.usage });
   if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label, rawText: response.rawText, reasoningText: response.reasoningText, finishReason: response.finishReason, usage: response.usage, complete: true });
   const data = await parseStructureResponse(response);
   const tripwires = responseTripwires(data, { ...plan, expected: targetNumbers }, params.sourceLines, keyLines);
@@ -704,7 +702,7 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
           const memory = `SESSION MEMORY (already established — do NOT repeat these): meta=${JSON.stringify(recovered.meta || {})}; sections=${JSON.stringify(sections.map(s => ({ id: s.id, title: String(s.title || '').slice(0, 40) })))}; lastQuestionNoBySection=${JSON.stringify(lastBySection)}; coveredSourceLines=1..${covered}. Reuse these section ids; continue question numbering after the given numbers; output ONLY questions/sections for the source below.`.slice(0, 1100);
           const lines = remaining.map(line => {
             const lineNo = Number(line.id.replace(/\D/g, ''));
-            return `[${line.id}] ${keyTerritory.lineNos.has(lineNo) ? '[KEY] ' : ''}${line.text.replace(/^\[L\d+\]\s*/, '')}`;
+            return `[${line.id}] ${keyTerritory.lineNos.has(lineNo) ? '[KEY] ' : ''}${line.furniture ? '[FURNITURE] ' : ''}${line.text}`;
           }).join('\n');
           const sourceMarker = request.text.indexOf('\nSOURCE:');
           const basePrefix = sourceMarker >= 0 ? request.text.slice(0, sourceMarker) : request.text;
@@ -848,7 +846,7 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
       const lastNos: Record<string, number> = {};
       questions.forEach((q: any) => { const id = q.sectionId || 'default'; lastNos[id] = Math.max(lastNos[id] || 0, Number(q.no) || 0); });
       const memory = `SESSION MEMORY (already established — do NOT repeat these): meta=${JSON.stringify(data.meta || {})}; sections=${JSON.stringify((data.sections || []).map((s: any) => ({ id: s.id, title: String(s.title || '').slice(0,40) })))}; lastQuestionNoBySection=${JSON.stringify(lastNos)}; coveredSourceLines=1..${covered}. Reuse these section ids; continue question numbering after the given numbers; output ONLY questions/sections for the source below.`.slice(0,1100);
-      const lineText = tail.map(line => `[${line.id}] ${line.text}`).join('\n');
+      const lineText = tail.map(line => `[${line.id}] ${line.furniture ? '[FURNITURE] ' : ''}${line.text}`).join('\n');
       const basePrefix = request.text.split('\n\nSOURCE:')[0];
       const configEnd = basePrefix.indexOf('\n');
       const withMemory = configEnd >= 0 ? `${basePrefix.slice(0, configEnd)}\n${memory}${basePrefix.slice(configEnd)}` : `${basePrefix}\n${memory}`;
@@ -935,7 +933,7 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
     }
     const las = lines.map(line => {
       const n = Number(line.id.replace(/\D/g, ''));
-      return `[${line.id}] ${keyLines.has(n) ? '[KEY] ' : ''}${line.text.replace(/^\[L\d+\]\s*/, '')}`;
+      return `[${line.id}] ${keyLines.has(n) ? '[KEY] ' : ''}${line.furniture ? '[FURNITURE] ' : ''}${line.text}`;
     }).join('\n');
     const start = Number(lines[0]?.id.replace(/\D/g,'')), end = Number(lines[lines.length-1]?.id.replace(/\D/g,''));
     const chunkManifest = manifest.filter((m:any) => { const n = Number(m.nearLine); return n >= start && n <= end; });

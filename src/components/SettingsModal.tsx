@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   Plus,
@@ -15,6 +15,8 @@ import {
   FileCheck,
 } from 'lucide-react';
 import { AppSettings, ProviderConfig, ProviderKind } from '../types';
+import { applyTheme } from '../pipeline/agentTheme';
+import { StoragePanel } from './StoragePanel';
 import { LLMAdapter } from '../providers/adapter';
 import { clearAllCachesAndData } from '../store';
 import { MAX_SETTINGS_JSON_BYTES, redactSettingsForExport, validateAppSettings, validateProviderBaseUrl, validateHeaders } from '../utils/validation';
@@ -43,6 +45,7 @@ export const SettingsModal: React.FC<Props> = ({
   const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
   const [clearSuccess, setClearSuccess] = useState(false);
 
+  useEffect(() => { if (isOpen) setCurrent(settings); }, [isOpen]);
   if (!isOpen) return null;
 
   const handleUpdateProvider = (id: string, updates: Partial<ProviderConfig>) => {
@@ -231,7 +234,7 @@ export const SettingsModal: React.FC<Props> = ({
                   : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'
               }`}
             >
-              <Database className="w-3.5 h-3.5" /> Privacy & Data
+              <Database className="w-3.5 h-3.5" /> Storage & Privacy
             </button>
           </div>
 
@@ -391,9 +394,10 @@ export const SettingsModal: React.FC<Props> = ({
                 </div>
 
                 <div className="space-y-4">
-                  {(['fast', 'standard', 'escalation', 'vision'] as const).map(role => {
-                    const sel = current.roleMapping[role];
+                  {(['fast', 'standard', 'escalation', 'vision', 'agent'] as const).map(role => {
+                    const sel = current.roleMapping[role] || current.roleMapping.fast;
                     const labelMap: Record<string, string> = {
+                      agent: 'Assistant (defaults to Fast until configured)',
                       fast: 'Fast (Structure Pass — Span references)',
                       standard: 'Standard (General questions)',
                       escalation: 'Escalation (Repair failing items & ambiguity)',
@@ -705,9 +709,13 @@ export const SettingsModal: React.FC<Props> = ({
 
             {/* PRIVACY & DATA TAB */}
             {activeTab === 'privacy' && (
-              <div className="space-y-6">
+              <div className="space-y-6"><StoragePanel />
+                <label className="block text-xs">Assistant monthly soft cap (USD)
+                  <input type="number" min="0" step="0.1" placeholder="No soft cap" className="border rounded p-2 ml-2" value={current.assistantMonthlySoftCapUsd ?? ''} onChange={e => setCurrent(s => ({ ...s, assistantMonthlySoftCapUsd: e.target.value === '' ? undefined : Number(e.target.value) }))} />
+                </label>
+                <button className="border rounded p-2 text-xs" onClick={() => { const reset = { ...current, themeTokens: {} }; setCurrent(reset); onSaveSettings(reset); applyTheme(reset); }}>Reset theme / بازنشانی رنگ‌ها</button>
                 <div>
-                  <h3 className="font-semibold text-slate-900 dark:text-white text-sm">Local-First Privacy & Data</h3>
+                  <h3 className="font-semibold text-slate-900 dark:text-white text-sm">Local-First Storage & Privacy</h3>
                   <p className="text-xs text-slate-500">Data ownership, caching, and export</p>
                 </div>
 
@@ -716,7 +724,7 @@ export const SettingsModal: React.FC<Props> = ({
                     <Shield className="w-4 h-4" /> Local-First Guarantee
                   </div>
                   <p className="leading-relaxed text-[11px]">
-                    Files are parsed locally in the browser and stored in your device&apos;s IndexedDB. They are never uploaded anywhere except as parts of explicit LLM requests to your chosen provider. No telemetry, no third-party tracking.
+                    Files are extracted locally and saved in your chosen server-side local folder. They are never uploaded anywhere except as parts of explicit LLM requests to your chosen provider. No telemetry, no third-party tracking.
                   </p>
                 </div>
 

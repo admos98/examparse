@@ -8,8 +8,8 @@ const previousFetch = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const path = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
   if (path === '/api/storage/health') return new Response(JSON.stringify({ mode: 'folder', dir: '/test' }), { status: 200 });
-  if (path.startsWith('/api/cache/')) {
-    const key = decodeURIComponent(path.slice('/api/cache/'.length));
+  if (path.startsWith('/api/cache/') || path.startsWith('/api/journals/')) {
+    const key = decodeURIComponent(path.slice(path.lastIndexOf('/') + 1));
     if (init?.method === 'PUT') {
       cache.set(key, JSON.parse(String(init.body || 'null')));
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -47,8 +47,8 @@ test('journal resume continues from raw partial output and completes only full p
   const sourceLines: SourceLine[] = [
     { id: 'L0001', page: 1, text: '1. First question' },
     { id: 'L0002', page: 1, text: '2. Second question' },
-    { id: 'L0003', page: 1, text: 'Answer Key' },
-    { id: 'L0004', page: 1, text: '1. A 2. B' },
+    { id: 'L0003', page: 2, text: 'Answer Key' },
+    { id: 'L0004', page: 2, text: '1. A 2. B' },
   ];
   const originalExecute = LLMAdapter.execute;
   LLMAdapter.execute = (async (request: LLMRequest) => {

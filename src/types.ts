@@ -8,6 +8,9 @@ export type SourceLine = {
   page: number;
   text: string;
   y?: number;
+  pageHeight?: number; // PDF coordinate height, for conservative header/footer-only furniture
+  furniture?: boolean;
+  layoutWarning?: string;
 };
 
 export type LineSpan = [number, number]; // inclusive start/end, 1-based (e.g. [41, 45])
@@ -94,7 +97,7 @@ export interface ImageAsset {
     kind?: 'photo' | 'diagram' | 'chart' | 'table' | 'formula' | 'handwriting' | 'decoration';
     needsText?: boolean;
   };
-  blobKey: string; // IndexedDB key; binary is NEVER base64'd into JSON exports
+  blobKey: string; // Folder image key; binary is NEVER base64'd into JSON exports
   dataUrl?: string; // cached in-memory preview
 }
 
@@ -108,7 +111,7 @@ export interface Flag {
 
 export interface UsageRecord {
   ts: string;
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent';
   provider: string;
   model: string;
   inputTokens: number;
@@ -147,6 +150,7 @@ export interface ExamDoc {
   questions: Question[];
   images: ImageAsset[];
   source: {
+    diagnostics?: import('./pipeline/extractionQuality').ExtractionDiagnostics;
     lines: SourceLine[];
     pages: number;
     ocrUsed: boolean;
@@ -239,6 +243,7 @@ export interface RoleMapping {
   standard: RoleModelSelection;
   escalation: RoleModelSelection;
   vision: RoleModelSelection;
+  agent?: RoleModelSelection;
 }
 
 export interface CostRate {
@@ -274,13 +279,18 @@ export interface AppSettings {
   thrift: TokenThriftSettings;
   budget: BudgetSettings;
   document: DocSettings;
+  assistantMonthlySoftCapUsd?: number;
+  themeTokens?: Partial<Record<'primary' | 'background' | 'foreground', string>>;
+  uiLanguage?: 'fa' | 'en';
+  defaultExamMode?: 'exam' | 'review';
+  livePanel?: boolean;
 }
 
 /**
  * LLM Request & Response Abstraction (§7)
  */
 export interface LLMRequest {
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent';
   system: string;
   text: string;
   images?: {
@@ -300,6 +310,7 @@ export interface LLMRequest {
     apiKey?: string;
     defaultHeaders?: Record<string, string>;
     model: string;
+    agentBudgetId?: string;
     disableReasoning?: boolean;
     structuredOutputs?: boolean;
     extraBodyJson?: string;
@@ -308,6 +319,7 @@ export interface LLMRequest {
 
 export interface LLMResponse {
   json: unknown;
+  tool_calls?: Array<{ function: { name: string; arguments: string } }>;
   /** Request label, with a ladder suffix (e.g. " [r-min]") when a reasoning fallback rung succeeded. */
   label?: string;
   usage: {

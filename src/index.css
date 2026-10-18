@@ -1,9 +1,15 @@
 @import "tailwindcss";
 
+@theme inline {
+  --color-blue-500: var(--app-primary, #3B82F6);
+  --color-blue-600: var(--app-primary, #3B82F6);
+  --color-blue-700: var(--app-primary, #3B82F6);
+}
+:root { --app-primary: #3B82F6; --app-background: #F8FAFC; --app-foreground: #0F172A; }
 @layer base {
   body {
-    background-color: #f8fafc;
-    color: #0f172a;
+    background-color: var(--app-background);
+    color: var(--app-foreground);
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
 

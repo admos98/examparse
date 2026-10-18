@@ -5,6 +5,7 @@
  */
 import { AppSettings, ExamDoc, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
 import { extractDocument, ExtractedDocument } from './extract';
+import { tagFurniture, extractionDiagnostics } from './extractionQuality';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
 import { labelImagesBatched } from './vision';
@@ -236,6 +237,7 @@ export async function runFullPipeline(
     }
   }
 
+  workingLines = tagFurniture(workingLines, extracted.pages);
   // Dependency-correct stage keys: hash of the (possibly OCR-merged) working lines.
   const linesHash = (await sha256(workingLines.map(l => l.id + ' ' + l.text).join('\n'))).slice(0, 16);
   const visionImgShas = [...new Set(extracted.images.map(img => img.sha).filter(Boolean))].sort();
@@ -715,6 +717,9 @@ export async function runFullPipeline(
   } catch {
     // No existing doc / storage unavailable — keep the AI-derived name.
   }
+  const diagnostics = extractionDiagnostics(workingLines, extracted.pages, updatedImages,
+    extracted.scannedPageIndices.filter(page => workingLines.some(line => line.page === page)), extracted.diagnostics);
+  for (const page of diagnostics.emptyPages) allFlags.push({ id: `extraction_empty_${page}`, code: 'EXTRACTION_PAGE_EMPTY', severity: 'error', message: `Page ${page} has no extracted or OCR text. Review import.` });
   const examDoc: ExamDoc = {
     id: examId,
     fileHash,
@@ -737,6 +742,7 @@ export async function runFullPipeline(
     questions: finalQuestions,
     images: updatedImages,
     source: {
+      diagnostics,
       lines: workingLines,
       pages: extracted.pages,
       ocrUsed,

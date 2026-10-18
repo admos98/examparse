@@ -8,7 +8,9 @@ import JSZip from 'jszip';
 import { ImageAsset, SourceLine } from '../types';
 import { computeImageDHash, hammingDistance, isNearUniformColor, sha256 } from '../utils/hash';
 import { saveImageBlob } from '../store';
-import { isSuspectStrip, mergeAdjacentImageGeometry } from './imageGeometry';
+import { normalizeForMatching, parsePrintedNumberFromStem } from './quality';
+import { columnSegments, tagFurniture, extractionDiagnostics, ExtractionDiagnostics } from './extractionQuality';
+import { isSuspectStrip, mergeAdjacentImageGeometry, materializeMergedCrop } from './imageGeometry';
 
 // Configure pdfjs worker in Vite
 try {
@@ -28,6 +30,7 @@ export interface ExtractedDocument {
   images: ImageAsset[];
   scannedPageIndices: number[]; // 1-based page indices with <100 chars
   pageImages: string[]; // data URLs of rendered pages (in-memory; persisted copies live under pageThumbKeys)
+  diagnostics?: ExtractionDiagnostics;
   pageThumbKeys?: string[]; // blob keys thumb_{fileHash}_{page} for persisted page renders
 }
 
@@ -45,16 +48,13 @@ function multiplyTransform(m1: number[], m2: number[]): number[] {
 export async function extractDocument(file: File): Promise<ExtractedDocument> {
   const extension = file.name.split('.').pop()?.toLowerCase();
 
-  if (extension === 'pdf') {
-    return await extractPdf(file);
-  } else if (extension === 'docx') {
-    return await extractDocx(file);
-  } else if (['jpg', 'jpeg', 'png', 'webp'].includes(extension || '')) {
-    return await extractSingleImageScan(file);
-  } else {
-    // txt, md, etc.
-    return await extractPlainText(file);
-  }
+  const result = extension === 'pdf' ? await extractPdf(file)
+    : extension === 'docx' ? await extractDocx(file)
+    : ['jpg', 'jpeg', 'png', 'webp'].includes(extension || '') ? await extractSingleImageScan(file)
+    : await extractPlainText(file);
+  result.lines = tagFurniture(result.lines, result.pages);
+  result.diagnostics = extractionDiagnostics(result.lines, result.pages, result.images, [], result.diagnostics);
+  return result;
 }
 
 /**
@@ -71,6 +71,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
   const pageImages: string[] = [];
 
   let globalLineNumber = 1;
+  let imagesFound = 0; let imagesMerged = 0; let candidatesKept = 0;
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
@@ -146,36 +147,10 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         cluster.sort((a, b) => a.x - b.x);
       }
 
-      // Split a y-cluster into separate lines on large x-gaps (column break)
-      const columnSegments: TextItemPos[][] = [];
-      let currentSegment: TextItemPos[] = [];
-
-      for (let i = 0; i < cluster.length; i++) {
-        const item = cluster[i];
-        if (currentSegment.length === 0) {
-          currentSegment.push(item);
-        } else {
-          const prev = currentSegment[currentSegment.length - 1];
-          const gap = isRtl
-            ? (prev.x - (item.x + item.w))
-            : (item.x - (prev.x + prev.w));
-          const avgFontHeight = (prev.h + item.h) / 2 || 12;
-
-          // Split into separate lines on large x-gaps (column break: gap > 45px or > 3.5x font height)
-          if (gap > Math.max(45, avgFontHeight * 3.5)) {
-            columnSegments.push(currentSegment);
-            currentSegment = [item];
-          } else {
-            currentSegment.push(item);
-          }
-        }
-      }
-      if (currentSegment.length > 0) {
-        columnSegments.push(currentSegment);
-      }
+      const { segments: columnSegmentsForLine, ambiguous } = columnSegments(cluster, items, viewport.width / viewport.scale);
 
       // For each segment: join fragments by x-gap (space only when gap > ~0.3x font height)
-      for (const segment of columnSegments) {
+      for (const segment of columnSegmentsForLine) {
         let lineText = '';
         for (let i = 0; i < segment.length; i++) {
           const item = segment[i];
@@ -203,8 +178,10 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         lines.push({
           id: lineId,
           page: pageNum,
-          text: trimmed.normalize('NFKC'),
+          text: trimmed,
+          layoutWarning: ambiguous ? 'COLUMN_AMBIGUOUS_LEGACY_ORDER' : undefined,
           y: segment[0].y,
+          pageHeight: page.view[3] - page.view[1],
         });
         globalLineNumber++;
       }
@@ -238,6 +215,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         }
       }
 
+      imagesFound += imagePlacements.length;
       for (let idx = 0; idx < imagePlacements.length; idx++) {
         const { name: objName, transform } = imagePlacements[idx];
         let imgObj: any = null;
@@ -318,7 +296,8 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           imgCtx.putImageData(imgData, 0, 0);
         }
 
-        if (isNearUniformColor(imgCanvas)) continue;
+        // Thin renderer strips must reach adjacency merging, even if a strip is uniform.
+        if (!isSuspectStrip(bbox, viewport.scale) && isNearUniformColor(imgCanvas)) continue;
 
         // Convert to Blob and compute SHA-256 & dHash
         const blob = await new Promise<Blob | null>(res => imgCanvas.toBlob(res, 'image/jpeg', 0.85));
@@ -388,10 +367,12 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
       console.warn('PDF image extraction skipped one page image candidate; binary error details were omitted.');
     }
 
+    candidatesKept += pageAssets.length;
     // Merge adjacent renderer strips from the *page render* (never concatenate embedded JPEG bytes).
     const groups = mergeAdjacentImageGeometry(pageAssets, viewport.scale);
     for (const group of groups) {
       const first = group.assets[0] as ImageAsset & { _blob?: Blob };
+      let cropSucceeded = group.assets.length === 1;
       let finalAsset: ImageAsset & { _blob?: Blob } = { ...first, bbox: group.bbox };
       if (group.assets.length > 1 && ctx) {
         const x = Math.max(0, Math.floor(group.bbox.x));
@@ -405,12 +386,11 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
             cropCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
             const mergedBlob = await new Promise<Blob | null>(resolve => crop.toBlob(resolve, 'image/jpeg', 0.88));
             if (mergedBlob) {
-              const hash = await sha256(await mergedBlob.arrayBuffer());
-              finalAsset = {
-                ...first, bbox: group.bbox, mime: 'image/jpeg', sha: hash, blobKey: hash,
-                width: w, height: h, dataUrl: URL.createObjectURL(mergedBlob),
-                dHash: await computeImageDHash(crop), duplicateOf: undefined, _blob: mergedBlob,
-              };
+              finalAsset = await materializeMergedCrop(group.assets, group.bbox, lines,
+                page.view[3] - (group.bbox.y + group.bbox.h / 2) / viewport.scale,
+                async () => ({ blob: mergedBlob, width: w, height: h, dHash: await computeImageDHash(crop) }));
+              cropSucceeded = true;
+              imagesMerged += group.assets.length - 1;
               for (const old of group.assets as Array<ImageAsset & { _blob?: Blob }>) {
                 if (old.dataUrl) URL.revokeObjectURL(old.dataUrl);
               }
@@ -418,8 +398,9 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           }
         }
       }
+      if (!cropSucceeded) throw new Error(`EXTRACTION_IMAGE_MERGE_FAILED: page ${pageNum}. Could not materialize page crop; import stopped instead of dropping strips.`);
       const lineText = lines.find(line => Number(line.id.replace(/\D/g, '')) === finalAsset.anchorLine)?.text || '';
-      const questionAnchored = /^\s*[0-9۰-۹٠-٩]{1,3}\s*[.)\-–—:：]\s+\S/.test(lineText.normalize('NFKC'));
+      const questionAnchored = parsePrintedNumberFromStem(lineText) !== undefined;
       if (isSuspectStrip(finalAsset.bbox, viewport.scale)) {
         finalAsset.imageFlags = [...(finalAsset.imageFlags || []), 'IMAGE_SUSPECT_STRIP'];
         if (!questionAnchored) finalAsset.imageFlags.push('IMAGE_UNANCHORED');
@@ -433,6 +414,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
 
   return {
     lines,
+    diagnostics: extractionDiagnostics(lines, pdf.numPages, images, [], { imagesFound, imagesMerged, imagesDropped: imagesFound - candidatesKept }),
     pages: pdf.numPages,
     ocrUsed: scannedPageIndices.length > 0,
     fileName: file.name,
@@ -503,7 +485,7 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
       lines.push({
         id: `L${String(lineNum).padStart(4, '0')}`,
         page: 1,
-        text: sub.normalize('NFKC'),
+        text: sub,
       });
       lineNum++;
     }
@@ -580,8 +562,8 @@ async function extractPlainText(file: File): Promise<ExtractedDocument> {
   for (const raw of rawLines) {
     const trimmed = raw.trim();
     if (!trimmed) continue;
-    if (trimmed.startsWith('=== PAGE') && trimmed.endsWith('===')) {
-      const match = trimmed.match(/=== PAGE\s*(\d+)\s*===/i);
+    if (normalizeForMatching(trimmed).startsWith('=== page') && trimmed.endsWith('===')) {
+      const match = normalizeForMatching(trimmed).match(/=== page\s*(\d+)\s*===/i);
       if (match) page = parseInt(match[1], 10);
       continue;
     }
@@ -589,7 +571,7 @@ async function extractPlainText(file: File): Promise<ExtractedDocument> {
     lines.push({
       id: `L${String(lineNum).padStart(4, '0')}`,
       page,
-      text: raw.normalize('NFKC'),
+      text: raw,
     });
     lineNum++;
   }

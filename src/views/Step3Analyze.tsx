@@ -51,7 +51,8 @@ export const Step3Analyze: React.FC<Props> = ({
   const [forceRerun, setForceRerun] = useState(false);
   const [live, setLive] = useState({ stage: '', label: '', output: '', reasoning: '', info: '', attempts: [] as Array<{ stage: string; label: string; output: string; reasoning: string; ts?: string; finishReason?: string }> });
   const liveRef = useRef(live);
-  const [liveOpen, setLiveOpen] = useState(true);
+  const [liveOpen, setLiveOpen] = useState(settings.livePanel ?? true);
+  useEffect(() => { setLiveOpen(settings.livePanel ?? true); }, [settings.livePanel]);
   const [attemptStage, setAttemptStage] = useState<string | null>(null);
   const liveScroll = useRef<HTMLDivElement>(null);
   const liveUserScrolledUp = useRef(false);
@@ -97,7 +98,7 @@ export const Step3Analyze: React.FC<Props> = ({
     return () => { active = false; };
   }, [probeFileHash, extractedDoc.lines, activeProvider.id, activeRole.model]);
 
-  // Check if pipeline stages are already cached in IndexedDB
+  // Check if pipeline stages are already cached in the local folder
   useEffect(() => {
     let isMounted = true;
     async function checkAllCaches() {

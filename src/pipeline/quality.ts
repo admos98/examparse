@@ -2,13 +2,42 @@
 import { ExamDoc, ExamSection, ImageAsset, Question, SourceLine } from '../types';
 import { buildQuestionTree } from '../utils/questionTree';
 
-const DIGIT_MAP: Record<string, string> = {
-  '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4', '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
-  '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4', '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
-};
+/** Matching/indexing ONLY. Never assign this result to source text or rendered fields. */
+export function normalizeForMatching(text: string): string {
+  const letters: Record<string, string> = { 'ي': 'ی', 'ك': 'ک', 'ة': 'ه', 'ۀ': 'ه', 'أ': 'ا', 'إ': 'ا', 'آ': 'ا', 'ؤ': 'و', 'ئ': 'ی', 'ى': 'ی' };
+  const punctuation: Record<string, string> = { '؟': '?', '،': ',', '؛': ';', '«': '"', '»': '"', '–': '-', '—': '-' };
+  return text.normalize('NFKC')
+    .replace(/[\u0640\u064b-\u0652\u0670]/g, '')
+    .replace(/[يكةۀأإآؤئى]/g, c => letters[c] || c)
+    .replace(/[۰-۹٠-٩０-９]/g, c => String(c.charCodeAt(0) - (c >= '０' ? 0xff10 : c >= '۰' ? 0x6f0 : 0x660)))
+    .replace(/[؟،؛«»–—]/g, c => punctuation[c])
+    // Known glued extraction watermarks are furniture, not question content.
+    .replace(/www[.-]kanoon[.-]ir/gi, '')
+    .replace(/[\s\u200c\u200d]+/g, ' ').toLowerCase();
+}
+/** @deprecated Use normalizeForMatching. */
+export const normalizeDigits = normalizeForMatching;
 
-export function normalizeDigits(value: string): string {
-  return value.replace(/[۰-۹٠-٩]/g, digit => DIGIT_MAP[digit] || digit);
+/** Offsets into the ORIGINAL, including NFKC expansions, marks and joiners. */
+export function matchingView(text: string): { text: string; originalOffset: (offset: number) => number } {
+  const starts: number[] = []; const ends: number[] = []; let copy = '';
+  const segments = new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text);
+  for (const part of segments) {
+    const normalized = normalizeForMatching(part.segment);
+    for (const c of normalized) {
+      if (c === ' ' && copy.endsWith(' ')) { ends[ends.length - 1] = part.index + part.segment.length; continue; }
+      for (let i = 0; i < c.length; i++) { starts.push(part.index); ends.push(part.index + part.segment.length); }
+      copy += c;
+    }
+  }
+  // Apply the lexicon across grapheme boundaries without losing original offsets.
+  const watermark = /www[.-]kanoon[.-]ir/gi;
+  let hit: RegExpExecArray | null;
+  while ((hit = watermark.exec(copy))) {
+    const n = hit[0].length; copy = copy.slice(0, hit.index) + copy.slice(hit.index + n);
+    starts.splice(hit.index, n); ends.splice(hit.index, n); watermark.lastIndex = hit.index;
+  }
+  return { text: copy, originalOffset: offset => offset >= starts.length ? text.length : starts[Math.max(0, offset)] };
 }
 
 export function lineNumber(line: SourceLine): number {
@@ -16,69 +45,58 @@ export function lineNumber(line: SourceLine): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-const KEY_MARKER = /^\s*(?:(?:official|suggested)\s+)?(?:راهنمای\s*تصحیح|کلید\s*پاسخ|marking\s*guide|answer\s*key)(?:\s*(?:[:：\-–—|]\s*.{0,80}|\b(?:for|of)\b.{0,70}))?\s*$/i;
+const KEY_PHRASE = /(?:راهنمای\s*تصحیح|کلید\s*پاسخ|پاسخنامه\s+تشریحی|marking guide|answer key|suggested answers|mark scheme)/;
+export interface KeyTerritory { markerLine?: number; lineNos: Set<number> }
 
-function isKeyMarker(text: string): boolean {
-  const value = normalizeDigits(text).trim();
-  return value.length <= 120 && !/[?؟]/.test(value) && KEY_MARKER.test(value);
-}
-
-export interface KeyTerritory {
-  markerLine?: number;
-  lineNos: Set<number>;
-}
-
-/** A standalone answer-key heading starts key territory at its own line, not the page start. */
 export function detectKeyTerritory(lines: SourceLine[]): KeyTerritory {
   const sorted = [...lines].sort((a, b) => lineNumber(a) - lineNumber(b));
+  const pages = new Map<number, SourceLine[]>();
+  for (const line of sorted) pages.set(line.page, [...(pages.get(line.page) || []), line]);
   let markerLine: number | undefined;
-  for (const line of sorted) {
-    const n = lineNumber(line);
-    if (isKeyMarker(line.text)) markerLine = markerLine === undefined ? n : Math.min(markerLine, n);
+  for (const page of pages.values()) for (let i = 0; i < page.length; i++) {
+    const value = normalizeForMatching(page[i].text).trim();
+    if (page[i].furniture || /^\s*\d{1,3}[.)\-:]\s/.test(value)) continue;
+    const phrase = KEY_PHRASE.exec(value);
+    const pageStartName = i < 12 && /^پاسخنامه(?: |$)/.test(value);
+    const standalone = phrase && value.length <= 120 && !value.includes('?') &&
+      /^(?:(?:official|suggested) )?(?:راهنمای\s*تصحیح|کلید\s*پاسخ|پاسخنامه\s+تشریحی|marking guide|answer key|suggested answers|mark scheme)(?:$|\s*[:|\-]| for | of )/.test(value);
+    if ((phrase && i < 12) || pageStartName || standalone) {
+      const n = lineNumber(i < 12 ? page[0] : page[i]);
+      markerLine = markerLine === undefined ? n : Math.min(markerLine, n);
+    }
   }
-  const lineNos = new Set<number>();
-  if (markerLine !== undefined) {
-    for (const line of sorted) if (lineNumber(line) >= markerLine) lineNos.add(lineNumber(line));
-  }
-  return { markerLine, lineNos };
+  return { markerLine, lineNos: new Set(sorted.filter(l => markerLine !== undefined && lineNumber(l) >= markerLine).map(lineNumber)) };
 }
 
 function parseStartNumber(text: string): number | undefined {
-  const normalized = normalizeDigits(text);
-  const direct = normalized.match(/^\s*(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*)\S/);
-  if (direct) return Number(direct[1]);
-  // OCR may join a Persian/Arabic instruction lead-in to the printed number.
-  const prefixed = normalized.match(/^\s*[\p{Script=Arabic}\p{M}\s،؛:,-]{1,100}?\s(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*)\S/u);
-  if (prefixed) return Number(prefixed[1]);
+  const value = normalizeForMatching(text);
+  const direct = value.match(/^\s*(?:\((\d{1,3})\)|([0-9]{1,3})\s*[.)\-:])(?:\s+|$)(?!\d)/);
+  if (direct) return Number(direct[1] || direct[2]);
   return undefined;
 }
-
-export interface ExpectedQuestions {
-  numbers: number[];
-  lineByNumber: Map<number, number>;
-  keyTerritory: KeyTerritory;
-}
-
+export interface ExpectedQuestions { numbers: number[]; lineByNumber: Map<number, number>; keyTerritory: KeyTerritory }
 export function enumerateExpectedQuestionNos(lines: SourceLine[]): ExpectedQuestions {
   const keyTerritory = detectKeyTerritory(lines);
   const lineByNumber = new Map<number, number>();
   for (const line of lines) {
-    const lineNo = lineNumber(line);
-    if (keyTerritory.lineNos.has(lineNo)) continue;
-    const n = parseStartNumber(line.text);
-    if (n === undefined || n < 1 || n > 300) continue;
-    // Keep the first occurrence; repeats are reported as model/output duplicates, not new expected items.
-    if (!lineByNumber.has(n)) lineByNumber.set(n, lineNo);
+    if (line.furniture || keyTerritory.lineNos.has(lineNumber(line))) continue;
+    const value = normalizeForMatching(line.text);
+    const candidates: number[] = [];
+    const leading = parseStartNumber(value); if (leading !== undefined) candidates.push(leading);
+    // Explicit grouped labels and dotted dialogue slots are not years, times or fractions.
+    for (const m of value.matchAll(/\((\d{1,3})\)|(?:\.{2,}|…+)(\d{1,3})(?=\.{2,}|…+)/g)) candidates.push(Number(m[1] || m[2]));
+    // Multiple printed items on one line require an option marker, avoiding prose numbers.
+    for (const m of value.matchAll(/(?:^|\s)(\d{1,3})[.)]\s+(?=(?:[a-h][).:]|\([a-h]\)|(?:الف|ب|ج|د)[).])\s)/g)) candidates.push(Number(m[1]));
+    for (const n of candidates) if (n >= 1 && n <= 300 && !lineByNumber.has(n)) lineByNumber.set(n, lineNumber(line));
   }
   return { numbers: [...lineByNumber.keys()].sort((a, b) => a - b), lineByNumber, keyTerritory };
 }
-
 export function parsePrintedNumberFromStem(stem?: string): number | undefined {
   if (!stem) return undefined;
-  const match = normalizeDigits(stem).match(/^\s*(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*|[.)]$)/);
-  if (!match) return undefined;
-  const n = Number(match[1]);
-  return n >= 1 && n <= 300 ? n : undefined;
+  for (const line of stem.slice(0, 240).split(/\r?\n/).slice(0, 2)) {
+    const n = parseStartNumber(line); if (n !== undefined && n >= 1 && n <= 300) return n;
+  }
+  return undefined;
 }
 
 export interface CoverageResult {
@@ -136,7 +154,9 @@ export interface ExamHealth {
 
 export function getExamHealth(doc: ExamDoc): ExamHealth {
   const expected = doc.source?.expectedQuestionNos || enumerateExpectedQuestionNos(doc.source?.lines || []).numbers;
-  const coverage = evaluateCoverage(expected, doc.questions || [], doc.meta?.totalPoints);
+  const sourceLines = doc.source?.lines || [];
+  const contentQuestions = (doc.questions || []).filter(q => !q.spans?.length || !sourceLines.length || q.spans.some(([a, b]) => sourceLines.some(l => !l.furniture && lineNumber(l) >= a && lineNumber(l) <= b)));
+  const coverage = evaluateCoverage(expected, contentQuestions, doc.meta?.totalPoints);
   const referenced = new Set<string>();
   const unresolved = new Set<string>();
   for (const q of doc.questions || []) {
@@ -268,4 +288,9 @@ export function sectionRangesFromSections(sections: ExamSection[]): Array<{ id: 
       end: Math.max(...section.spans.map(s => s[1])),
     }];
   });
+}
+
+/** Stable optimistic-concurrency fingerprint; transient object URLs and usage are not exam content. */
+export function examContentRevision(doc: ExamDoc): string {
+  return JSON.stringify([doc.questions, doc.sections, (doc.images || []).map(({ dataUrl, ...image }) => image), doc.meta, doc.displayName, doc.nameSource, doc.flags, { lines: doc.source?.lines, expectedQuestionNos: doc.source?.expectedQuestionNos, keyTerritoryLineNos: doc.source?.keyTerritoryLineNos }]);
 }

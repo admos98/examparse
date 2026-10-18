@@ -1,3 +1,4 @@
+import { applyExamMutation } from '../pipeline/patch';
 import React, { useState } from 'react';
 import {
   Edit3,
@@ -119,8 +120,7 @@ export const Step4Review: React.FC<Props> = ({
 
   // Delete a question
   const handleDeleteQuestion = (qId: string) => {
-    const updatedQuestions = examDoc.questions.filter(q => q.id !== qId);
-    const newDoc = { ...examDoc, questions: updatedQuestions };
+    const newDoc = applyExamMutation(examDoc, { name: 'delete_question', questionId: qId });
     onUpdateDoc(newDoc);
     saveExamDoc(newDoc);
   };

@@ -4,7 +4,7 @@
  */
 import { Question } from '../types';
 import { getOrExtractDocument } from './extractCache';
-import { normalizeDigitsToAscii } from '../utils/numbers';
+import { normalizeForMatching, matchingView } from './quality';
 
 export interface KeyFileMatchResult {
   updatedQuestions: Question[];
@@ -26,20 +26,21 @@ export async function mergeAnswerKeyFile(
     const trimmed = line.trim();
     if (!trimmed) continue;
 
-    const norm = normalizeDigitsToAscii(trimmed);
+    const view = matchingView(trimmed);
+    const norm = view.text;
 
     // Look for lines starting with question number e.g. "1. B", "1) False", "Q1: A"
     const match = norm.match(/^(?:(?:[Qq]uestion|[Qq]|[Ss]ؤال|سوال|Ans|Answer)\s*)?\(?(\d{1,3})\)?[\.\-\:\)]\s*(.+)$/i);
     if (match) {
       const qNum = parseInt(match[1], 10);
-      const ansText = match[2].trim();
+      const ansText = trimmed.slice(view.originalOffset(match.index! + match[0].lastIndexOf(match[2]))).trim();
       answerMap.set(qNum, ansText);
     } else {
       // Check simple "1 B" or "1: B"
       const matchSimple = norm.match(/^(\d{1,3})\s*[:\-\s]\s*([A-Za-z0-9\u0600-\u06FF].+)$/);
       if (matchSimple) {
         const qNum = parseInt(matchSimple[1], 10);
-        const ansText = matchSimple[2].trim();
+        const ansText = trimmed.slice(view.originalOffset(matchSimple.index! + matchSimple[0].lastIndexOf(matchSimple[2]))).trim();
         answerMap.set(qNum, ansText);
       }
     }

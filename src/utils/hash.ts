@@ -92,17 +92,17 @@ export function isNearUniformColor(canvas: HTMLCanvasElement): boolean {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return false;
     const { width, height } = canvas;
-    if (width < 32 || height < 32) return true;
+    if (width < 1 || height < 1) return true;
 
     // Sample 25 points
-    const stepX = Math.floor(width / 6);
-    const stepY = Math.floor(height / 6);
+    const stepX = Math.max(1, Math.floor(width / 6));
+    const stepY = Math.max(1, Math.floor(height / 6));
     let minR = 255, maxR = 0;
     let minG = 255, maxG = 0;
     let minB = 255, maxB = 0;
 
-    for (let x = stepX; x < width; x += stepX) {
-      for (let y = stepY; y < height; y += stepY) {
+    for (let x = Math.min(stepX, width - 1); x < width; x += stepX) {
+      for (let y = Math.min(stepY, height - 1); y < height; y += stepY) {
         const pixel = ctx.getImageData(x, y, 1, 1).data;
         minR = Math.min(minR, pixel[0]);
         maxR = Math.max(maxR, pixel[0]);

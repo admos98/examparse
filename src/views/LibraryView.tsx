@@ -1,6 +1,6 @@
 /**
  * Exam Library (full-screen overlay, not a stepper step).
- * Lists stored exams from IndexedDB with open / rename / duplicate / export / delete.
+ * Lists stored exams from the local folder with open / rename / duplicate / export / delete.
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -21,12 +21,10 @@ import { ExamDoc } from '../types';
 import {
   ExamSummary,
   clearPipelineCaches,
-  countBrowserExams,
   deleteExam,
   getStorageBackend,
   listExamSummaries,
   loadExamDoc,
-  migrateBrowserToFolder,
   saveExamDoc,
 } from '../store';
 import { duplicateExamDoc, exportExamJson } from '../utils/examExport';
@@ -52,6 +50,7 @@ export const LibraryView: React.FC<Props> = ({
   onExamDeleted,
   onGoToImport,
 }) => {
+  const [legacyNotice, setLegacyNotice] = useState(() => localStorage.getItem('examparse_legacy_notice_seen') !== '1');
   const [summaries, setSummaries] = useState<ExamSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -61,10 +60,7 @@ export const LibraryView: React.FC<Props> = ({
   const [renameValue, setRenameValue] = useState('');
   const [pendingDelete, setPendingDelete] = useState<ExamSummary | null>(null);
   const [cacheCleared, setCacheCleared] = useState(false);
-  const [storageMode, setStorageMode] = useState<{ mode: string; dir?: string }>({ mode: 'browser' });
-  const [browserExamCount, setBrowserExamCount] = useState(0);
-  const [migrationMsg, setMigrationMsg] = useState<string | null>(null);
-  const [migrating, setMigrating] = useState(false);
+  const [storageMode, setStorageMode] = useState<{ mode: string; dir?: string }>({ mode: 'unavailable' });
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const refreshStorage = useCallback(async () => {
@@ -89,9 +85,7 @@ export const LibraryView: React.FC<Props> = ({
       try {
         const backend = await getStorageBackend();
         setStorageMode(backend);
-        if (backend.mode === 'folder') {
-          setBrowserExamCount(await countBrowserExams());
-        }
+
       } catch {
         // storage probe is best-effort
       }
@@ -221,7 +215,7 @@ export const LibraryView: React.FC<Props> = ({
               <p className="text-xs text-slate-500">
                 {summaries.length} exam(s) stored locally
                 {storageMb !== null ? ` · ${storageMb.toFixed(1)} MB used` : ''} ·{' '}
-                {storageMode.mode === 'folder' ? `Storage: Folder (${storageMode.dir || 'data'})` : 'Storage: Browser'}
+                {storageMode.mode === 'folder' ? `Storage: Folder (${storageMode.dir || 'data'})` : 'Storage: Folder unavailable'}
               </p>
             </div>
           </div>
@@ -266,37 +260,13 @@ export const LibraryView: React.FC<Props> = ({
           </button>
         </div>
 
-        {storageMode.mode === 'folder' && summaries.length === 0 && browserExamCount > 0 && (
-          <div className="p-4 rounded-2xl border border-blue-500/30 bg-blue-500/10 text-blue-800 dark:text-blue-300 flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div>
-              <div className="font-bold">Migrate {browserExamCount} exams from browser storage to folder</div>
-              <p>Folder storage is active ({storageMode.dir || 'data'}) but empty. Your browser copy is never deleted by migration.</p>
-              {migrationMsg && <p className="mt-1 font-medium">{migrationMsg}</p>}
-            </div>
-            <button
-              disabled={migrating}
-              onClick={async () => {
-                setMigrating(true);
-                try {
-                  const res = await migrateBrowserToFolder();
-                  setMigrationMsg(
-                    res.verified
-                      ? `Migrated ${res.examsCopied} exams, ${res.imagesCopied} images, ${res.cachesCopied} caches — counts verified (${res.folderExamCount} in folder). Browser copy kept.`
-                      : `Migration finished but counts differ: copied ${res.examsCopied}, folder has ${res.folderExamCount}. Browser copy kept.`
-                  );
-                  await refresh();
-                } catch (err: any) {
-                  setMigrationMsg(`Migration failed: ${err?.message || err}`);
-                } finally {
-                  setMigrating(false);
-                }
-              }}
-              className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium transition disabled:opacity-50"
-            >
-              {migrating ? 'Migrating…' : 'Migrate to folder'}
-            </button>
-          </div>
-        )}
+        <div className="p-3 text-xs border rounded-xl">
+          {legacyNotice && <p>Old browser-stored exams are read-only from this version; export them from Library if needed. <button className="underline" onClick={() => { localStorage.setItem('examparse_legacy_notice_seen', '1'); setLegacyNotice(false); }}>Dismiss</button></p>}
+          <button className="underline ml-2" onClick={async () => {
+            try { const { exportLegacyExams } = await import('../store/legacy'); await exportLegacyExams(); }
+            catch (error) { setErrorMsg(String(error)); }
+          }}>Export old browser exams (read-only)</button>
+        </div>
 
         {errorMsg && (
           <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 text-xs flex items-center gap-2">

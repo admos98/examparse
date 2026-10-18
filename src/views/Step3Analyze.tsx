@@ -18,6 +18,7 @@ import { detectLanguageAndDirection } from '../utils/numbers';
 import { ExtractedDocument } from '../pipeline/extract';
 import { runFullPipeline } from '../pipeline';
 import { loadJournal } from '../pipeline/journal';
+import { getPipelineCache } from '../store';
 import { PARSER_VERSION } from '../pipeline/prompts';
 
 interface Props {
@@ -81,8 +82,11 @@ export const Step3Analyze: React.FC<Props> = ({
     (async () => {
       try {
         const { sha256 } = await import('../utils/hash');
-        const linesHash = await sha256(JSON.stringify(extractedDoc.lines));
-        const journalKey = await sha256(`${probeFileHash}:${linesHash}:${activeProvider.id}:${activeRole.model}:${PARSER_VERSION}`);
+        let journalKey = await getPipelineCache<string>(`journalkey:${probeFileHash}`);
+        if (journalKey == null) {
+          const linesHash = await sha256(JSON.stringify(extractedDoc.lines));
+          journalKey = await sha256(`${probeFileHash}:${linesHash}:${activeProvider.id}:${activeRole.model}:${PARSER_VERSION}`);
+        }
         const journal = await loadJournal(journalKey);
         if (!active || !journal) return;
         const calls = [...journal.calls].reverse().map(call => ({ stage: 'structure', label: call.label, output: call.rawText || '', reasoning: call.reasoningText || '', ts: call.ts, finishReason: call.finishReason }));

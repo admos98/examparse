@@ -1,15 +1,30 @@
 /**
- * IndexedDB and LocalStorage State Management
+ * Folder-only persistence; localStorage holds small client settings only.
  */
-import { get, set, del, keys } from 'idb-keyval';
-import { AppSettings, ExamDoc, ImageAsset, UsageRecord, getDisplayName } from '../types';
-import { SAFE_STORAGE_KEY, validateAppSettings, validateJsonSize } from '../utils/validation';
+import {
+  AppSettings,
+  ExamDoc,
+  ImageAsset,
+  UsageRecord,
+  getDisplayName,
+} from '../types';
+import {
+  SAFE_STORAGE_KEY,
+  validateAppSettings,
+  validateJsonSize,
+} from '../utils/validation';
 import { getExamHealth } from '../pipeline/quality';
 
 const MAX_STORED_EXAM_BYTES = 32 * 1024 * 1024;
 const MAX_STORED_CACHE_BYTES = 20 * 1024 * 1024;
 const MAX_STORED_IMAGE_BYTES = 32 * 1024 * 1024;
-const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp']);
+const ALLOWED_IMAGE_MIMES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'image/bmp',
+]);
 
 export const DEFAULT_SETTINGS: AppSettings = {
   providers: [
@@ -61,12 +76,21 @@ export const DEFAULT_SETTINGS: AppSettings = {
     vision: { providerId: 'google-gemini', model: 'gemini-2.5-flash' },
   },
   costTable: {
-    'gemini-2.5-flash-lite': { inputCostPerMillion: 0.10, outputCostPerMillion: 0.40 },
-    'gemini-2.5-flash': { inputCostPerMillion: 0.30, outputCostPerMillion: 2.50 },
-    'gemini-2.5-pro': { inputCostPerMillion: 1.25, outputCostPerMillion: 10.00 },
-    'gemini-3.8-flash': { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 },
-    'gemini-3.1-flash-lite': { inputCostPerMillion: 0.10, outputCostPerMillion: 0.40 },
-    'gemini-4-argon': { inputCostPerMillion: 1.25, outputCostPerMillion: 10.00 },
+    'gemini-2.5-flash-lite': {
+      inputCostPerMillion: 0.1,
+      outputCostPerMillion: 0.4,
+    },
+    'gemini-2.5-flash': { inputCostPerMillion: 0.3, outputCostPerMillion: 2.5 },
+    'gemini-2.5-pro': { inputCostPerMillion: 1.25, outputCostPerMillion: 10.0 },
+    'gemini-3.8-flash': {
+      inputCostPerMillion: 0.15,
+      outputCostPerMillion: 0.6,
+    },
+    'gemini-3.1-flash-lite': {
+      inputCostPerMillion: 0.1,
+      outputCostPerMillion: 0.4,
+    },
+    'gemini-4-argon': { inputCostPerMillion: 1.25, outputCostPerMillion: 10.0 },
   },
   thrift: {
     latexNormalization: false,
@@ -86,62 +110,60 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
 };
 
-
-/* ------------------------------------------------------------------ */
-/* Storage backend: folder (server /api/storage) or IndexedDB (A)      */
-/* ------------------------------------------------------------------ */
 export interface StorageBackendInfo {
-  mode: 'folder' | 'browser';
+  mode: 'folder' | 'unavailable';
   dir?: string;
+  configured?: boolean;
+  error?: string;
 }
-
-let backendInfo: StorageBackendInfo = { mode: 'browser' };
-
-async function probeStorageBackend(): Promise<StorageBackendInfo> {
+export async function getStorageBackend(): Promise<StorageBackendInfo> {
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1500);
-    try {
-      const res = await fetch('/api/storage/health', { signal: ctrl.signal });
-      if (res.ok) {
-        const j: any = await res.json().catch(() => null);
-        if (j && j.mode === 'folder') {
-          backendInfo = { mode: 'folder', dir: j.dir };
-        }
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  } catch {
-    // Hosted preview / offline: keep the IndexedDB backend.
+    const res = await fetch('/api/storage/health');
+    if (!res.ok) throw new Error(`Storage HTTP ${res.status}`);
+    return await res.json();
+  } catch (error) {
+    return { mode: 'unavailable', error: String(error) };
   }
-  return backendInfo;
 }
-
-const backendReady: Promise<StorageBackendInfo> =
-  typeof fetch !== 'undefined' ? probeStorageBackend() : Promise.resolve(backendInfo);
-
-/** Resolve once the storage-backend probe has finished. */
-export function getStorageBackend(): Promise<StorageBackendInfo> {
-  return backendReady;
-}
-
-async function isFolderMode(): Promise<boolean> {
-  return (await backendReady).mode === 'folder';
-}
-
 function fireAndForgetFolder(path: string, init: RequestInit): void {
-  void backendReady
-    .then(info => {
-      if (info.mode !== 'folder') return;
-      return fetch(path, init).catch(() => undefined);
+  void fetch(path, init)
+    .then((res) => {
+      if (!res.ok) throw new Error(`Storage HTTP ${res.status}`);
     })
-    .catch(() => undefined);
+    .catch((error) => {
+      console.error('Folder write failed', error);
+      if (typeof window !== 'undefined')
+        window.dispatchEvent(
+          new CustomEvent('storage-error', { detail: String(error) }),
+        );
+    });
 }
-
-/** Server-safe cache file segment (cache keys may contain ':' etc.). */
 function safeCacheSegment(key: string): string {
   return key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128) || 'cache';
+}
+function cacheBucket(key: string): string {
+  return key.startsWith('journal:') ||
+    key.startsWith('journalkey:') ||
+    key.startsWith('agent:')
+    ? 'journals'
+    : 'cache';
+}
+function storageFailure(message: string): Error {
+  if (typeof window !== 'undefined')
+    window.dispatchEvent(new CustomEvent('storage-error', { detail: message }));
+  return new Error(message);
+}
+async function checkedFetch(
+  url: string,
+  init?: RequestInit,
+): Promise<Response> {
+  try {
+    const res = await fetch(url, init);
+    if (!res.ok) throw new Error(`Folder storage ${url}: HTTP ${res.status}`);
+    return res;
+  } catch (error) {
+    throw storageFailure(String(error));
+  }
 }
 
 export function dataUrlToBlob(dataUrl: string): Blob {
@@ -165,18 +187,18 @@ export async function blobToDataUrl(blob: Blob): Promise<string> {
 /** Persist page-render dataURLs as thumb_{fileHash}_{page} blobs; returns the keys. */
 export async function savePageThumbBlobs(
   fileHash: string,
-  pageImages: (string | undefined)[]
+  pageImages: (string | undefined)[],
 ): Promise<string[]> {
   const keysOut: string[] = [];
   for (let i = 0; i < pageImages.length; i++) {
     const dataUrl = pageImages[i];
     const key = `thumb_${fileHash}_${i + 1}`;
     if (dataUrl && dataUrl.startsWith('data:')) {
-      try {
-        await saveImageBlob(key, dataUrlToBlob(dataUrl));
-      } catch (err) {
-        console.warn(`Failed to persist page thumb ${key}:`, err);
-      }
+      await saveImageBlob(key, dataUrlToBlob(dataUrl));
+    } else if (dataUrl?.startsWith('blob:')) {
+      const res = await fetch(dataUrl);
+      if (!res.ok) throw storageFailure('Could not persist the in-memory page render.');
+      await saveImageBlob(key, await res.blob());
     }
     keysOut.push(key);
   }
@@ -186,7 +208,7 @@ export async function savePageThumbBlobs(
 /** Resolve thumb keys to dataURLs (only for the given 1-based pages, when provided). */
 export async function loadPageThumbDataUrls(
   pageThumbKeys: string[] | undefined,
-  pages?: number[]
+  pages?: number[],
 ): Promise<Map<number, string>> {
   const out = new Map<number, string>();
   if (!pageThumbKeys || pageThumbKeys.length === 0) return out;
@@ -206,127 +228,18 @@ export async function loadPageThumbDataUrls(
   return out;
 }
 
-/** On app mount in folder mode the server is the source of truth for settings/usage/calibration. */
+let usageMemory: UsageRecord[] = [];
+/** Folder is authoritative; usage is only mirrored in memory for synchronous UI reads. */
 export async function hydrateServerStorage(): Promise<boolean> {
-  const info = await backendReady;
-  if (info.mode !== 'folder') return false;
-  try {
-    const settingsRes = await fetch('/api/settings');
-    if (settingsRes.ok) {
-      const serverSettings = await settingsRes.json().catch(() => null);
-      if (serverSettings) {
-        localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(serverSettings));
-      }
-    }
-    const usageRes = await fetch('/api/usage');
-    if (usageRes.ok) {
-      const serverUsage = await usageRes.json().catch(() => null);
-      if (Array.isArray(serverUsage)) {
-        const localUsage = loadUsageLog();
-        if (serverUsage.length === 0 && localUsage.length > 0) {
-          await fetch('/api/usage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(localUsage) });
-        } else {
-          localStorage.setItem(USAGE_STORAGE_KEY, JSON.stringify(serverUsage));
-        }
-      }
-    }
-    const calRes = await fetch('/api/cache/calibration');
-    if (calRes.ok) {
-      const calibration = await calRes.json().catch(() => null);
-      if (calibration && typeof calibration === 'object') {
-        localStorage.setItem('examparse_calibration_v1', JSON.stringify(calibration));
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/* ------------------------- Migration (A) ------------------------- */
-export interface MigrationResult {
-  examsCopied: number;
-  imagesCopied: number;
-  cachesCopied: number;
-  folderExamCount: number;
-  verified: boolean;
-}
-
-/** Count exams still held in IndexedDB (browser storage), regardless of active backend. */
-export async function countBrowserExams(): Promise<number> {
-  const allKeys = await keys();
-  return allKeys.filter(k => typeof k === 'string' && k.startsWith('exam:')).length;
-}
-
-/**
- * Copy exams, image/thumb blobs, pipeline caches, settings and usage from
- * IndexedDB/localStorage to the folder backend. Verifies counts and NEVER
- * deletes the browser copy.
- */
-export async function migrateBrowserToFolder(): Promise<MigrationResult> {
-  const info = await backendReady;
-  if (info.mode !== 'folder') throw new Error('Folder storage is not active');
-  const allKeys = await keys();
-  const examKeys = allKeys.filter((k): k is string => typeof k === 'string' && k.startsWith('exam:'));
-  const imgKeys = allKeys.filter((k): k is string => typeof k === 'string' && k.startsWith('img:'));
-  const cacheKeys = allKeys.filter((k): k is string => typeof k === 'string' && k.startsWith('cache:'));
-
-  let examsCopied = 0;
-  for (const k of examKeys) {
-    const doc = await get<ExamDoc>(k);
-    if (doc) {
-      await saveExamDoc(doc);
-      examsCopied++;
-    }
-  }
-  let imagesCopied = 0;
-  for (const k of imgKeys) {
-    const blob = await get<Blob>(k);
-    if (blob) {
-      await saveImageBlob(k.slice('img:'.length), blob);
-      imagesCopied++;
-    }
-  }
-  let cachesCopied = 0;
-  for (const k of cacheKeys) {
-    const value = await get(k);
-    if (value !== undefined) {
-      await setPipelineCache(k.slice('cache:'.length), value);
-      cachesCopied++;
-    }
-  }
-  // Settings + usage (server copies).
-  try {
-    await fetch('/api/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(loadSettings()),
-    });
-    await fetch('/api/usage', { method: 'DELETE' });
-    const usage = loadUsageLog();
-    if (usage.length > 0) {
-      await fetch('/api/usage', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(usage),
-      });
-    }
-  } catch {
-    // Settings/usage copy is best-effort; exam verification below is authoritative.
-  }
-
-  const folderSummaries = await listExamSummaries();
-  return {
-    examsCopied,
-    imagesCopied,
-    cachesCopied,
-    folderExamCount: folderSummaries.length,
-    verified: folderSummaries.length === examsCopied,
-  };
+  const info = await getStorageBackend();
+  if (info.mode !== 'folder' || !info.configured) return false;
+  usageMemory = await (await checkedFetch('/api/usage')).json();
+  const { hydrateCalibrationMap } = await import('../utils/budget');
+  await hydrateCalibrationMap();
+  return true;
 }
 
 const SETTINGS_STORAGE_KEY = 'examparse_settings_v1';
-const USAGE_STORAGE_KEY = 'examparse_usage_log_v1';
 
 export function loadSettings(): AppSettings {
   try {
@@ -336,7 +249,10 @@ export function loadSettings(): AppSettings {
     const merged = {
       ...DEFAULT_SETTINGS,
       ...parsed,
-      roleMapping: { ...DEFAULT_SETTINGS.roleMapping, ...(parsed.roleMapping || {}) },
+      roleMapping: {
+        ...DEFAULT_SETTINGS.roleMapping,
+        ...(parsed.roleMapping || {}),
+      },
       costTable: { ...DEFAULT_SETTINGS.costTable, ...(parsed.costTable || {}) },
       thrift: { ...DEFAULT_SETTINGS.thrift, ...(parsed.thrift || {}) },
       budget: { ...DEFAULT_SETTINGS.budget, ...(parsed.budget || {}) },
@@ -354,32 +270,26 @@ export function saveSettings(settings: AppSettings): void {
   } catch (err) {
     console.warn('Failed to save settings to localStorage:', err);
   }
-  // Write-through to the folder backend (server is source of truth when reachable).
-  fireAndForgetFolder('/api/settings', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(settings),
-  });
 }
 
 export function loadUsageLog(): UsageRecord[] {
-  try {
-    const raw = localStorage.getItem(USAGE_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  return [...usageMemory];
 }
 
-export function appendUsageRecord(record: UsageRecord, dedupeKey?: string): void {
+export function appendUsageRecord(
+  record: UsageRecord,
+  dedupeKey?: string,
+): void {
   const effectiveKey = dedupeKey || record.dedupeKey;
-  const storedRecord: UsageRecord = effectiveKey ? { ...record, dedupeKey: effectiveKey } : record;
+  const storedRecord: UsageRecord = effectiveKey
+    ? { ...record, dedupeKey: effectiveKey }
+    : record;
   try {
     const records = loadUsageLog();
     if (effectiveKey) {
       // Idempotent cache accounting: at most ONE record per dedupe key;
       // re-running replaces its timestamp instead of appending.
-      const idx = records.findIndex(r => r.dedupeKey === effectiveKey);
+      const idx = records.findIndex((r) => r.dedupeKey === effectiveKey);
       if (idx >= 0) records[idx] = storedRecord;
       else records.push(storedRecord);
     } else {
@@ -387,7 +297,7 @@ export function appendUsageRecord(record: UsageRecord, dedupeKey?: string): void
     }
     // Keep last 500 records (same cap as folder-mode server storage).
     const trimmed = records.slice(-500);
-    localStorage.setItem(USAGE_STORAGE_KEY, JSON.stringify(trimmed));
+    usageMemory = trimmed;
   } catch (err) {
     console.warn('Failed to append usage record:', err);
   }
@@ -399,16 +309,19 @@ export function appendUsageRecord(record: UsageRecord, dedupeKey?: string): void
 }
 
 export function clearUsageLog(): void {
-  localStorage.removeItem(USAGE_STORAGE_KEY);
+  usageMemory = [];
   fireAndForgetFolder('/api/usage', { method: 'DELETE' });
 }
 
 /**
- * IndexedDB Persistence for Exam Documents & Image Blobs
+ * Folder persistence for Exam Documents & Image Blobs
  */
-export async function saveExamDoc(doc: ExamDoc): Promise<void> {
+export async function saveExamDoc(
+  doc: ExamDoc,
+  expectedContentHash?: string,
+): Promise<void> {
   // Save doc without dataUrls to keep it compact
-  const cleanImages: ImageAsset[] = (doc.images || []).map(img => {
+  const cleanImages: ImageAsset[] = (doc.images || []).map((img) => {
     const { dataUrl, ...rest } = img;
     return rest as ImageAsset;
   });
@@ -416,12 +329,18 @@ export async function saveExamDoc(doc: ExamDoc): Promise<void> {
   // Stop persisting embedded page renders: convert pageImages dataURLs to
   // thumb_{fileHash}_{page} blobs and strip pageImages from the saved doc.
   let pageThumbKeys: string[] =
-    doc.source?.pageThumbKeys && doc.source.pageThumbKeys.length > 0 ? [...doc.source.pageThumbKeys] : [];
-  if (doc.source?.pageImages && doc.source.pageImages.length > 0) {
-    const converted = await savePageThumbBlobs(doc.fileHash, doc.source.pageImages);
+    doc.source?.pageThumbKeys && doc.source.pageThumbKeys.length > 0
+      ? [...doc.source.pageThumbKeys]
+      : [];
+  if (doc.source?.pageImages?.some(url => url.startsWith('data:') || url.startsWith('blob:'))) {
+    const converted = await savePageThumbBlobs(
+      doc.fileHash,
+      doc.source.pageImages,
+    );
     if (converted.length > 0) pageThumbKeys = converted;
   }
-  const { pageImages: _strippedPageImages, ...sourceRest } = (doc.source || {}) as any;
+  const { pageImages: _strippedPageImages, ...sourceRest } = (doc.source ||
+    {}) as any;
 
   const docToSave = {
     ...doc,
@@ -431,106 +350,106 @@ export async function saveExamDoc(doc: ExamDoc): Promise<void> {
       pageThumbKeys,
     },
   };
-  if (!SAFE_STORAGE_KEY.test(docToSave.id)) throw new Error('Invalid exam storage id.');
-  if (docToSave.images.some(image => !SAFE_STORAGE_KEY.test(image.id) || Boolean(image.blobKey) && !SAFE_STORAGE_KEY.test(image.blobKey))) throw new Error('Invalid image storage key in ExamDoc.');
-  if (pageThumbKeys.some(key => !SAFE_STORAGE_KEY.test(key))) throw new Error('Invalid page-thumbnail storage key.');
-  if (!validateJsonSize(docToSave, MAX_STORED_EXAM_BYTES)) throw new Error('ExamDoc exceeds the 32 MiB storage limit.');
+  if (!SAFE_STORAGE_KEY.test(docToSave.id))
+    throw new Error('Invalid exam storage id.');
+  if (
+    docToSave.images.some(
+      (image) =>
+        !SAFE_STORAGE_KEY.test(image.id) ||
+        (Boolean(image.blobKey) && !SAFE_STORAGE_KEY.test(image.blobKey)),
+    )
+  )
+    throw new Error('Invalid image storage key in ExamDoc.');
+  if (pageThumbKeys.some((key) => !SAFE_STORAGE_KEY.test(key)))
+    throw new Error('Invalid page-thumbnail storage key.');
+  if (!validateJsonSize(docToSave, MAX_STORED_EXAM_BYTES))
+    throw new Error('ExamDoc exceeds the 32 MiB storage limit.');
 
-  if (await isFolderMode()) {
-    const res = await fetch(`/api/exams/${encodeURIComponent(doc.id)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(docToSave),
-    });
-    if (!res.ok) throw new Error(`Failed to save exam to folder storage (HTTP ${res.status})`);
-    return;
-  }
-  await set(`exam:${doc.id}`, docToSave);
+  const res = await checkedFetch(`/api/exams/${encodeURIComponent(doc.id)}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(expectedContentHash ? { 'If-Match': expectedContentHash } : {}),
+    },
+    body: JSON.stringify(docToSave),
+  });
+  if (!res.ok)
+    throw new Error(
+      `Failed to save exam to folder storage (HTTP ${res.status})`,
+    );
+  return;
 }
 
 export async function loadExamDoc(id: string): Promise<ExamDoc | undefined> {
   if (!SAFE_STORAGE_KEY.test(id)) return undefined;
-  if (await isFolderMode()) {
-    const res = await fetch(`/api/exams/${encodeURIComponent(id)}`);
-    if (res.status === 404) return undefined;
-    if (!res.ok) throw new Error(`Failed to load exam from folder storage (HTTP ${res.status})`);
-    const doc = (await res.json()) as ExamDoc;
-    if (!doc) return undefined;
-    // In folder mode image dataUrl is the server URL string (no blob fetch).
-    const images: ImageAsset[] = (doc.images || []).map(img => ({
-      ...img,
-      dataUrl: img.blobKey || (img as any).sha ? `/api/images/${img.blobKey || (img as any).sha}` : undefined,
-    }));
-    const pageImages = (doc.source?.pageThumbKeys || []).map(k => `/api/images/${k}`);
-    return {
-      ...doc,
-      images,
-      source: {
-        ...doc.source,
-        pageImages: pageImages.length > 0 ? pageImages : doc.source?.pageImages,
-      },
-    };
-  }
 
-  const doc = await get<ExamDoc>(`exam:${id}`);
+  const res = await fetch(`/api/exams/${encodeURIComponent(id)}`);
+  if (res.status === 404) return undefined;
+  if (!res.ok)
+    throw new Error(
+      `Failed to load exam from folder storage (HTTP ${res.status})`,
+    );
+  const doc = (await res.json()) as ExamDoc;
   if (!doc) return undefined;
-
-  // Restore image dataUrls from blobs
-  const restoredImages: ImageAsset[] = await Promise.all(
-    (doc.images || []).map(async img => {
-      const blob = img.blobKey ? await getImageBlob(img.blobKey) : undefined;
-      let dataUrl: string | undefined = undefined;
-      if (blob) {
-        dataUrl = URL.createObjectURL(blob);
-      }
-      return { ...img, dataUrl };
-    })
+  // In folder mode image dataUrl is the server URL string (no blob fetch).
+  const images: ImageAsset[] = (doc.images || []).map((img) => ({
+    ...img,
+    dataUrl:
+      img.blobKey || (img as any).sha
+        ? `/api/images/${img.blobKey || (img as any).sha}`
+        : undefined,
+  }));
+  const pageImages = (doc.source?.pageThumbKeys || []).map(
+    (k) => `/api/images/${k}`,
   );
-
-  // Restore page renders from thumb blobs when present (legacy docs keep pageImages).
-  let pageImages = doc.source?.pageImages;
-  if (!pageImages && doc.source?.pageThumbKeys && doc.source.pageThumbKeys.length > 0) {
-    const resolved: string[] = [];
-    for (const k of doc.source.pageThumbKeys) {
-      const blob = await getImageBlob(k);
-      resolved.push(blob ? URL.createObjectURL(blob) : '');
-    }
-    if (resolved.some(u => u)) pageImages = resolved;
-  }
-
-  return { ...doc, images: restoredImages, source: { ...doc.source, pageImages } };
+  return {
+    ...doc,
+    images,
+    source: {
+      ...doc.source,
+      pageImages: pageImages.length > 0 ? pageImages : doc.source?.pageImages,
+    },
+  };
 }
 
 export async function saveImageBlob(key: string, blob: Blob): Promise<void> {
-  if (!SAFE_STORAGE_KEY.test(key)) throw new Error('Invalid image storage key.');
-  if (!(blob instanceof Blob) || blob.size <= 0 || blob.size > MAX_STORED_IMAGE_BYTES) throw new Error('Image blob is empty or exceeds the 32 MiB storage limit.');
+  if (!SAFE_STORAGE_KEY.test(key))
+    throw new Error('Invalid image storage key.');
+  if (
+    !(blob instanceof Blob) ||
+    blob.size <= 0 ||
+    blob.size > MAX_STORED_IMAGE_BYTES
+  )
+    throw new Error('Image blob is empty or exceeds the 32 MiB storage limit.');
   const mime = blob.type || 'image/jpeg';
-  if (!ALLOWED_IMAGE_MIMES.has(mime)) throw new Error('Unsupported image MIME type.');
-  if (await isFolderMode()) {
-    const res = await fetch(`/api/images/${encodeURIComponent(key)}?mime=${encodeURIComponent(mime)}`, {
+  if (!ALLOWED_IMAGE_MIMES.has(mime))
+    throw new Error('Unsupported image MIME type.');
+
+  const res = await checkedFetch(
+    `/api/images/${encodeURIComponent(key)}?mime=${encodeURIComponent(mime)}`,
+    {
       method: 'PUT',
       body: blob,
-    });
-    if (!res.ok) throw new Error(`Failed to save image to folder storage (HTTP ${res.status})`);
-    return;
-  }
-  await set(`img:${key}`, blob);
+    },
+  );
+  if (!res.ok)
+    throw new Error(
+      `Failed to save image to folder storage (HTTP ${res.status})`,
+    );
+  return;
 }
 
 export async function getImageBlob(key: string): Promise<Blob | undefined> {
   if (!SAFE_STORAGE_KEY.test(key)) return undefined;
-  if (await isFolderMode()) {
-    try {
-      const res = await fetch(`/api/images/${encodeURIComponent(key)}`);
-      if (!res.ok) return undefined;
-      return await res.blob();
-    } catch {
-      return undefined;
-    }
-  }
-  return await get<Blob>(`img:${key}`);
-}
 
+  try {
+    const res = await fetch(`/api/images/${encodeURIComponent(key)}`);
+    if (!res.ok) return undefined;
+    return await res.blob();
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Exam Library: lightweight summary of a stored exam (no blob restoration).
@@ -561,52 +480,12 @@ export interface ExamSummary {
 
 /** Enumerate stored exams WITHOUT restoring image blobs, newest first. */
 export async function listExamSummaries(): Promise<ExamSummary[]> {
-  if (await isFolderMode()) {
-    const res = await fetch('/api/exams');
-    if (!res.ok) throw new Error(`Failed to list exams from folder storage (HTTP ${res.status})`);
-    return (await res.json()) as ExamSummary[];
-  }
-  const allKeys = await keys();
-  const examKeys = allKeys.filter(
-    (k): k is string => typeof k === 'string' && k.startsWith('exam:')
-  );
-  const docs = await Promise.all(examKeys.map(k => get<ExamDoc>(k)));
-  const summaries: ExamSummary[] = [];
-  for (const doc of docs) {
-    if (!doc || !SAFE_STORAGE_KEY.test(doc.id || '')) continue;
-    const usage = Array.isArray(doc.usage) ? doc.usage : [];
-    let health: ReturnType<typeof getExamHealth>;
-    try { health = getExamHealth(doc); } catch { health = { expectedCount: doc.questions?.length || 0, parsedCount: doc.questions?.length || 0, missing: [], duplicates: [], pointsParsed: 0, pointDeficit: 0, unplacedImages: [], unresolvedImageRefs: [], lowConfidenceCount: 0, coveragePercent: 0, state: 'amber', complete: false }; }
-    summaries.push({
-      id: doc.id,
-      displayName: getDisplayName(doc),
-      subject: doc.meta?.subject,
-      grade: doc.meta?.grade,
-      term: doc.meta?.term,
-      year: doc.meta?.year,
-      createdAt: doc.createdAt,
-      fileName: doc.source?.fileName || '',
-      pages: doc.source?.pages || 0,
-      questionCount: Array.isArray(doc.questions) ? doc.questions.length : 0,
-      expectedQuestionCount: health.expectedCount,
-      parsedQuestionCount: health.parsedCount,
-      coveragePercent: health.coveragePercent,
-      missingQuestionNos: health.missing,
-      duplicateQuestionNos: health.duplicates,
-      complete: health.complete,
-      sectionCount: Array.isArray(doc.sections) ? doc.sections.length : 0,
-      imageCount: Array.isArray(doc.images) ? doc.images.length : 0,
-      ocrUsed: Boolean(doc.source?.ocrUsed),
-      totalCostUsd: usage.reduce((acc, u) => acc + (u.costUsd || 0), 0),
-      totalTokens: usage.reduce((acc, u) => acc + (u.inputTokens || 0) + (u.outputTokens || 0), 0),
-    });
-  }
-  summaries.sort((a, b) => {
-    const ta = Date.parse(b.createdAt) || 0;
-    const tb = Date.parse(a.createdAt) || 0;
-    return ta - tb;
-  });
-  return summaries;
+  const res = await fetch('/api/exams');
+  if (!res.ok)
+    throw new Error(
+      `Failed to list exams from folder storage (HTTP ${res.status})`,
+    );
+  return (await res.json()) as ExamSummary[];
 }
 
 /**
@@ -616,102 +495,63 @@ export async function listExamSummaries(): Promise<ExamSummary[]> {
  */
 export async function deleteExam(id: string): Promise<void> {
   if (!SAFE_STORAGE_KEY.test(id)) throw new Error('Invalid exam storage id.');
-  if (await isFolderMode()) {
-    await fetch(`/api/exams/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    return;
-  }
-  const doc = await get<ExamDoc>(`exam:${id}`);
-  const ownBlobKeys = new Set<string>(
-    (doc?.images || []).map(img => img.blobKey).filter((k): k is string => Boolean(k))
-  );
-  for (const k of doc?.source?.pageThumbKeys || []) ownBlobKeys.add(k);
-  await del(`exam:${id}`);
-  if (ownBlobKeys.size === 0) return;
 
-  const allKeys = await keys();
-  const remainingExamKeys = allKeys.filter(
-    (k): k is string => typeof k === 'string' && k.startsWith('exam:')
-  );
-  const referenced = new Set<string>();
-  for (const k of remainingExamKeys) {
-    const other = await get<ExamDoc>(k);
-    for (const img of other?.images || []) {
-      if (img.blobKey) referenced.add(img.blobKey);
-    }
-    for (const tk of other?.source?.pageThumbKeys || []) referenced.add(tk);
-  }
-  for (const blobKey of ownBlobKeys) {
-    if (!referenced.has(blobKey)) {
-      await del(`img:${blobKey}`);
-    }
-  }
+  await checkedFetch(`/api/exams/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  return;
 }
 
 /** Delete only pipeline cache entries (cache:*); exams, blobs, and usage log are untouched. */
 export async function clearPipelineCaches(): Promise<void> {
-  if (await isFolderMode()) {
-    await fetch('/api/cache', { method: 'DELETE' });
-    return;
-  }
-  const allKeys = await keys();
-  for (const k of allKeys) {
-    if (typeof k === 'string' && k.startsWith('cache:')) {
-      await del(k);
-    }
-  }
+  await checkedFetch('/api/cache', { method: 'DELETE' });
+  return;
 }
 
 /**
  * Cache storage
  */
-export async function getPipelineCache<T>(cacheKey: string): Promise<T | undefined> {
+export async function getPipelineCache<T>(
+  cacheKey: string,
+): Promise<T | undefined> {
   if (!cacheKey || cacheKey.length > 2048) return undefined;
-  if (await isFolderMode()) {
-    try {
-      const res = await fetch(`/api/cache/${safeCacheSegment(cacheKey)}`);
-      if (!res.ok) return undefined;
-      return (await res.json()) as T;
-    } catch {
-      return undefined;
-    }
+
+  try {
+    const res = await fetch(
+      `/api/${cacheBucket(cacheKey)}/${safeCacheSegment(cacheKey)}`,
+    );
+    if (!res.ok) return undefined;
+    return (await res.json()) as T;
+  } catch {
+    return undefined;
   }
-  return await get<T>(`cache:${cacheKey}`);
 }
 
-export async function setPipelineCache<T>(cacheKey: string, value: T): Promise<void> {
-  if (!cacheKey || cacheKey.length > 2048) throw new Error('Invalid cache key.');
-  if (!validateJsonSize(value ?? null, MAX_STORED_CACHE_BYTES)) throw new Error('Pipeline cache entry exceeds the 20 MiB storage limit.');
-  if (await isFolderMode()) {
-    await fetch(`/api/cache/${safeCacheSegment(cacheKey)}`, {
+export async function setPipelineCache<T>(
+  cacheKey: string,
+  value: T,
+): Promise<void> {
+  if (!cacheKey || cacheKey.length > 2048)
+    throw new Error('Invalid cache key.');
+  if (!validateJsonSize(value ?? null, MAX_STORED_CACHE_BYTES))
+    throw new Error('Pipeline cache entry exceeds the 20 MiB storage limit.');
+
+  await checkedFetch(
+    `/api/${cacheBucket(cacheKey)}/${safeCacheSegment(cacheKey)}`,
+    {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(value ?? null),
-    });
-    return;
-  }
-  await set(`cache:${cacheKey}`, value);
+    },
+  );
+  return;
 }
 
 export async function clearAllCachesAndData(): Promise<void> {
-  if (await isFolderMode()) {
-    try {
-      const summaries = await listExamSummaries();
-      for (const s of summaries) {
-        await deleteExam(s.id);
-      }
-      await clearPipelineCaches();
-      await fetch('/api/usage', { method: 'DELETE' }).catch(() => undefined);
-    } catch {
-      // fall through to local cleanup
-    }
-    try { localStorage.removeItem(USAGE_STORAGE_KEY); } catch { /* ignore */ }
-    return;
-  }
-  const allKeys = await keys();
-  for (const k of allKeys) {
-    if (typeof k === 'string' && (k.startsWith('cache:') || k.startsWith('exam:') || k.startsWith('img:'))) {
-      await del(k);
-    }
-  }
-  clearUsageLog();
+  const summaries = await listExamSummaries();
+  for (const exam of summaries) await deleteExam(exam.id);
+  await clearPipelineCaches();
+  await checkedFetch('/api/storage/buckets/journals', { method: 'DELETE' });
+  await checkedFetch('/api/usage', { method: 'DELETE' });
+  usageMemory = [];
 }

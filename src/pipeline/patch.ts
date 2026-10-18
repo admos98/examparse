@@ -5,7 +5,18 @@
 import { LLMRequest, Question, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { T4_QUESTION_PATCH_SYSTEM } from './prompts';
-import { sliceSourceSpans } from './assemble';
+import { sliceSourceSpans, assembleAndValidateQuestions, SpanReferenceSchema } from './assemble';
+import { z } from 'zod';
+export const QuestionMergePatchSchema = z.object({
+  no: z.number().int().min(1).max(300).optional(), label: z.string().max(100).optional(),
+  parentId: z.string().max(128).nullable().optional(), sectionId: z.string().max(128).nullable().optional(),
+  confidence: z.number().finite().min(0).max(1).optional(), flags: z.array(z.string().max(200)).max(100).nullable().optional(),
+  points: z.number().finite().min(0).max(100000).nullable().optional(),
+  type: z.enum(['mcq', 'truefalse', 'short', 'long', 'fillblank', 'matching', 'multi', 'numeric', 'diagram', 'essay', 'unknown']).optional(),
+  spans: z.array(SpanReferenceSchema).min(1).max(500).optional(),
+  options: z.array(z.object({ key: z.string().max(30), spans: z.array(SpanReferenceSchema).max(100) }).strict()).max(30).nullable().optional(),
+  rewrites: z.array(z.object({ line: z.number().int().positive(), text: z.string().max(10000) }).strict()).max(100).nullable().optional(),
+}).strict();
 
 /**
  * Apply RFC 7386 JSON Merge Patch
@@ -16,6 +27,7 @@ export function applyMergePatch(target: any, patch: any): any {
   }
   const result = { ...target };
   for (const key of Object.keys(patch)) {
+    if (['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('Unsafe merge-patch key');
     const patchVal = patch[key];
     if (patchVal === null) {
       delete result[key];
@@ -100,30 +112,7 @@ export async function regenerateQuestionPatch(params: {
   const response = await LLMAdapter.execute(request);
   const patch: any = response.json || {};
 
-  // Compute patched object
-  const merged = applyMergePatch(questionSnapshot, patch);
-
-  // Re-slice stem with newly patched spans/rewrites
-  const newSpans = merged.spans || question.spans;
-  const newRewrites = merged.rewrites || question.rewrites;
-  const newStem = sliceSourceSpans(newSpans, sourceLines, newRewrites);
-
-  // Re-slice options text after patches
-  const rawOptions = merged.options !== undefined ? merged.options : question.options;
-  const newOptions = rawOptions?.map((opt: any) => ({
-    key: opt.key,
-    spans: opt.spans || [],
-    text: sliceSourceSpans(opt.spans || [], sourceLines),
-  }));
-
-  const patchedQuestion: Question = {
-    ...question,
-    ...merged,
-    spans: newSpans,
-    stem: newStem,
-    rewrites: newRewrites,
-    options: newOptions,
-  };
+  const patchedQuestion = applyValidatedQuestionPatch(question, patch, sourceLines);
 
   // Build readable diff summary
   const diffSummary: string[] = [];
@@ -139,4 +128,46 @@ export async function regenerateQuestionPatch(params: {
     diffSummary,
     usage: response.usage,
   };
+}
+
+/** Shared RFC 7386 validator for Step 4 and assistant. Derived text is always assembled locally. */
+export function applyValidatedQuestionPatch(question: Question, patch: unknown, sourceLines: SourceLine[], keyLines: number[] = []): Question {
+  const parsed = QuestionMergePatchSchema.parse(patch);
+  const merged = applyMergePatch(question, parsed);
+  const result = assembleAndValidateQuestions([{
+    id: merged.id, no: merged.no, label: merged.label, parentId: merged.parentId, sectionId: merged.sectionId,
+    spans: merged.spans, points: merged.points, type: merged.type, options: merged.options?.map((o: any) => ({ key: o.key, spans: o.spans })),
+    rewrites: merged.rewrites, images: merged.images, confidence: merged.confidence,
+    answer: merged.answer?.spans ? { spans: merged.answer.spans } : undefined,
+    tables: merged.tables?.map((t: any) => ({ spans: t.spans })),
+  }], sourceLines, undefined, { keyTerritoryLineNos: keyLines });
+  if (!result.questions[0] || result.failingQuestions.length) throw new Error(`Question patch refused: ${result.failingQuestions.flatMap(f => f.errors).join('; ') || 'invalid question'}`);
+  return { ...result.questions[0], answer: result.questions[0].answer || question.answer };
+}
+
+export const ExamMutationSchema = z.discriminatedUnion('name', [
+  z.object({ name: z.literal('assign_image'), imageId: z.string(), questionId: z.string(), role: z.enum(['stem', 'option', 'table', 'decoration']) }).strict(),
+  z.object({ name: z.literal('mark_image_decoration'), imageId: z.string(), reason: z.string().min(1).max(300) }).strict(),
+  z.object({ name: z.literal('delete_question'), questionId: z.string() }).strict(),
+  z.object({ name: z.literal('rename_exam'), value: z.string().min(1).max(200) }).strict(),
+  z.object({ name: z.literal('set_meta'), meta: z.object({ subject: z.string().max(200).optional(), grade: z.string().max(100).optional(), totalPoints: z.number().finite().min(0).max(100000).optional() }).strict() }).strict(),
+]);
+/** Shared pure exam-mutation funnel for human editing and registry tools. Persistence/versioning is outside it. */
+export function applyExamMutation(doc: import('../types').ExamDoc, input: z.infer<typeof ExamMutationSchema>): import('../types').ExamDoc {
+  const op = ExamMutationSchema.parse(input);
+  if ('questionId' in op && !doc.questions.some(q => q.id === op.questionId)) throw new Error('Question not found');
+  if ('imageId' in op && !doc.images.some(i => i.id === op.imageId)) throw new Error('Image not found');
+  switch (op.name) {
+    case 'rename_exam': return { ...doc, displayName: op.value, nameSource: 'manual' };
+    case 'set_meta': return { ...doc, meta: { ...doc.meta, ...op.meta } };
+    case 'assign_image': return { ...doc,
+      questions: doc.questions.map(q => ({ ...q, images: [...q.images.filter(i => i.imageId !== op.imageId), ...(q.id === op.questionId ? [{ imageId: op.imageId, role: op.role }] : [])] })),
+      images: doc.images.map(i => i.id === op.imageId ? { ...i, label: { ...i.label, kind: undefined, role: op.role, questionRef: op.questionId } } : i) };
+    case 'mark_image_decoration': return { ...doc,
+      questions: doc.questions.map(q => ({ ...q, images: q.images.filter(i => i.imageId !== op.imageId) })),
+      images: doc.images.map(i => i.id === op.imageId ? { ...i, label: { role: 'decoration', kind: 'decoration', reason: op.reason } } : i) };
+    case 'delete_question': return { ...doc,
+      questions: doc.questions.filter(q => q.id !== op.questionId).map(q => q.parentId === op.questionId ? { ...q, parentId: undefined } : q),
+      images: doc.images.map(i => i.label?.questionRef === op.questionId ? { ...i, label: { ...i.label, questionRef: undefined } } : i) };
+  }
 }

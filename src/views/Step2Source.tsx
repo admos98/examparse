@@ -12,6 +12,7 @@ import { ImageAsset, SourceLine } from '../types';
 import { getImageBlob } from '../store';
 
 interface Props {
+  diagnostics?: import('../pipeline/extractionQuality').ExtractionDiagnostics;
   lines: SourceLine[];
   pages: number;
   ocrUsed: boolean;
@@ -22,6 +23,7 @@ interface Props {
 }
 
 export const Step2Source: React.FC<Props> = ({
+  diagnostics,
   lines,
   pages,
   ocrUsed,
@@ -67,6 +69,11 @@ export const Step2Source: React.FC<Props> = ({
 
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-4">
+      {diagnostics && <div className="p-3 border rounded-xl text-xs space-y-1">
+        <p>Extraction: {diagnostics.pages} pages · lines/page {diagnostics.linesPerPage.join(', ')} · furniture {diagnostics.furnitureCount}</p>
+        <p>Images found/merged/dropped: {diagnostics.imagesFound}/{diagnostics.imagesMerged}/{diagnostics.imagesDropped} · OCR pages {diagnostics.ocrPages.join(', ') || 'none'} · suspect strips {diagnostics.suspectStripCount}</p>
+        {diagnostics.emptyPages.length > 0 && <p role="alert" className="text-red-600">EXTRACTION_PAGE_EMPTY (error): {diagnostics.emptyPages.join(', ')}. OCR has not produced text. Review import before parsing.</p>}
+      </div>}
       {/* Top Banner & Control Bar */}
       {ocrUsed && (
         <div className="p-3.5 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-300 flex items-center gap-2.5 text-xs">

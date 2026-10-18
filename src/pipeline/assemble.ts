@@ -5,7 +5,7 @@
  */
 import { z } from 'zod';
 import { ExamSection, Flag, LineSpan, Question, SourceLine } from '../types';
-import { normalizeDigits, parsePrintedNumberFromStem } from './quality';
+import { normalizeForMatching, matchingView, parsePrintedNumberFromStem } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
 
 export const SpanReferenceSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]);
@@ -70,7 +70,7 @@ export function sliceSourceSpans(
   for (const lineNo of spanLineNumbers(spans)) {
     const line = lineMap.get(lineNo);
     if (rewriteMap.has(lineNo)) output.push(rewriteMap.get(lineNo)!);
-    else if (line) output.push(line.text.replace(/^\[L\d+\]\s*/, ''));
+    else if (line && !line.furniture) output.push(line.text);
   }
   return output.join('\n');
 }
@@ -80,19 +80,27 @@ function sliceOptionUnion(options: any[], sourceLines: SourceLine[]): string {
   return sliceSourceSpans(allSpans, sourceLines);
 }
 
-type Marker = { start: number; end: number; key: string };
+type Marker = { start: number; end: number; key: string; display?: string };
 const LATIN = 'a-h';
 const PERSIAN_MARKERS = 'الف|ب|پ|ت|ث|ج|چ|ح|خ|د|ذ|ر|ز|ژ|س|ش|ص|ض|ط|ظ|ع|غ|ف|ق|ک|گ|ل|م|ن|و|ه|ی';
 const OPTION_MARKER = new RegExp(`(^|\\s)(?:\\(([${LATIN}])\\)|([${LATIN}])[).:]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:])(?=\\s|$)`, 'gim');
 
 function findOptionMarkers(text: string): Marker[] {
   const found: Marker[] = [];
+  const view = matchingView(text);
   OPTION_MARKER.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = OPTION_MARKER.exec(text))) {
+  while ((match = OPTION_MARKER.exec(view.text))) {
     const markerStart = match.index + (match[1] || '').length;
     const key = (match[2] || match[3] || match[4] || match[5] || '').toLowerCase();
-    found.push({ start: markerStart, end: OPTION_MARKER.lastIndex, key });
+    found.push({ start: view.originalOffset(markerStart), end: view.originalOffset(OPTION_MARKER.lastIndex), key });
+  }
+  if (found.length === 0) {
+    const pairs = [...view.text.matchAll(/(?:^|[\s/])(true|false|درست|نادرست)(?=\s|$|[).:/])/g)];
+    const keys = pairs.map(m => m[1]);
+    if ((keys.includes('true') && keys.includes('false')) || (keys.includes('درست') && keys.includes('نادرست'))) {
+      for (const m of pairs) { const start = m.index! + m[0].length - m[1].length; found.push({ start: view.originalOffset(start), end: view.originalOffset(start + m[1].length), key: m[1], display: text.slice(view.originalOffset(start), view.originalOffset(start + m[1].length)) }); }
+    }
   }
   return found;
 }
@@ -115,7 +123,8 @@ function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[
   if (markers.length !== options.length) return { options, failed: true };
   const segments = markers.map((marker, index) => {
     const next = markers[index + 1];
-    return text.slice(marker.end, next ? next.start : text.length).trim();
+    const body = text.slice(marker.end, next ? next.start : text.length).trim();
+    return marker.display && (!body || normalizeForMatching(body) === '/') ? marker.display : body;
   });
   const ordered = [...options].sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
   return {
@@ -125,7 +134,7 @@ function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[
 }
 
 function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
-  return new Map(sourceLines.map(line => [lineNoFromId(line.id), line.text.replace(/^\[L\d+\]\s*/, '')]));
+  return new Map(sourceLines.map(line => [lineNoFromId(line.id), line.furniture ? '' : line.text]));
 }
 
 function decontaminateStem(
@@ -154,7 +163,8 @@ function decontaminateStem(
 }
 
 function splitGroupedAnswer(text: string, questionNo: number): { text: string; unmatched: boolean } {
-  const normalized = normalizeDigits(text);
+  const view = matchingView(text);
+  const normalized = view.text;
   const matcher = /(^|\s)(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*)/g;
   const markers: Array<{ start: number; bodyStart: number; no: number }> = [];
   let m: RegExpExecArray | null;
@@ -167,7 +177,7 @@ function splitGroupedAnswer(text: string, questionNo: number): { text: string; u
   if (selectedIndex < 0) return { text, unmatched: true };
   const selected = markers[selectedIndex];
   const next = markers[selectedIndex + 1];
-  return { text: normalized.slice(selected.bodyStart, next ? next.start : normalized.length).trim(), unmatched: false };
+  return { text: text.slice(view.originalOffset(selected.bodyStart), next ? view.originalOffset(next.start) : text.length).trim(), unmatched: false };
 }
 
 function escapeHtmlCell(text: string): string {
@@ -262,7 +272,8 @@ export function assembleAndValidateQuestions(
   const lineIds = sourceLines.map(l => lineNoFromId(l.id)).filter(n => n > 0);
   const minLineId = lineIds.length ? lineIds.reduce((minimum, n) => Math.min(minimum, n), Infinity) : 1;
   const maxLineId = lineIds.length ? lineIds.reduce((maximum, n) => Math.max(maximum, n), 0) : sourceLines.length;
-  const keyLines = options.keyTerritoryLineNos instanceof Set ? options.keyTerritoryLineNos : new Set(options.keyTerritoryLineNos || []);
+  const keyLines = new Set(options.keyTerritoryLineNos || []);
+  sourceLines.filter(l => l.furniture).forEach(l => keyLines.add(lineNoFromId(l.id)));
   const allImageIds = options.imageIds ? new Set(options.imageIds) : null;
   const questionOverlap = new Set<string>();
 
@@ -324,7 +335,7 @@ export function assembleAndValidateQuestions(
     const numberingCorrected = printedNo !== undefined && printedNo !== originalNo;
     if (printedNo !== undefined) {
       no = printedNo;
-      if (numberingCorrected || normalizeDigits(label).replace(/[.)\s]/g, '') !== String(printedNo)) {
+      if (numberingCorrected || normalizeForMatching(label).replace(/[.)\s]/g, '') !== String(printedNo)) {
         label = String(printedNo);
         if (numberingCorrected) flags.push(flag('NUMBERING_CORRECTED', `Question numbering corrected locally: ${originalNo} → ${printedNo}.`, 'info', qId));
       }
@@ -457,32 +468,29 @@ export function assembleAndValidateQuestions(
 }
 
 function cleanSectionTitle(value: string | undefined): string {
-  return (value || '').trim()
-    .replace(/^\s*\d{1,3}\s*[.)-]?\s+/, '')
-    .replace(/\s+\d{1,3}\s*$/, '')
-    .replace(/[|¦\t]+/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .replace(/\s*[–—-]\s*(?:ردیف|نمره|points?|marks?).*$/i, '')
-    .trim();
+  const original = (value || '').trim(); const view = matchingView(original);
+  const start = /^\s*\d{1,3}\s*[.)-]?\s+/.exec(view.text)?.[0].length || 0;
+  const suffix = /\s+\d{1,3}\s*$|\s*-\s*(?:ردیف|نمره|points?|marks?).*$/i.exec(view.text);
+  return original.slice(view.originalOffset(start), suffix ? view.originalOffset(suffix.index) : original.length).replace(/[|¦\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
 }
 
 function parseSectionPoints(text: string): number | undefined {
-  const normalized = normalizeDigits(text);
+  const normalized = normalizeForMatching(text);
   const match = normalized.match(/(?:\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:نمره|points?|marks?)\s*[:：]?\s*(\d+(?:\.\d+)?))/i);
   const n = Number(match?.[1] || match?.[2]);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 function isHeaderOrRowLine(text: string): boolean {
-  const value = text.trim();
+  const value = normalizeForMatching(text).trim();
   return !value || /^(?:section|part|unit)\s+\d+\b/i.test(value) ||
     /^\d{1,3}\s+(?:listening|vocabulary|grammar|reading|writing)\b/i.test(value) ||
     /(?:ردیف|نمره|points?|marks?)/i.test(value) && value.length < 100 ||
-    /\t| {3,}/.test(value) || /^\d{1,3}\s*[|│]/.test(value);
+    /^\d{1,3}\s*[|│]/.test(value);
 }
 
 function isInstructionLine(text: string): boolean {
-  return /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|دستورالعمل|به سوالات|به پرسش|گزینه)/i.test(text.trim());
+  return /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|دستورالعمل|به سوالات|به پرسش|گزینه)/i.test(normalizeForMatching(text).trim());
 }
 
 function trimInstructions(instructions: string, title: string, allSectionTitles: string[]): { text: string; long: boolean } {
@@ -490,7 +498,7 @@ function trimInstructions(instructions: string, title: string, allSectionTitles:
   const kept: string[] = [];
   for (const line of lines) {
     const clean = line.trim();
-    if (kept.length > 0 && (/^\s*\d{1,3}\s*$/.test(clean) || allSectionTitles.some(t => t && t.toLowerCase() !== title.toLowerCase() && clean.toLowerCase().includes(t.toLowerCase())))) break;
+    if (kept.length > 0 && (/^\s*\d{1,3}\s*$/.test(normalizeForMatching(clean)) || allSectionTitles.some(t => t && normalizeForMatching(t) !== normalizeForMatching(title) && normalizeForMatching(clean).includes(normalizeForMatching(t))))) break;
     kept.push(line);
   }
   const text = kept.join('\n').trim();
@@ -515,12 +523,12 @@ export function assembleAndValidateSections(
     const spans = normalizedSpans(section?.spans);
     const id = String(section?.id || `sec_${index + 1}`);
     const indexValue = Number(section?.index) || index + 1;
-    const sectionLines = sourceLines.filter(line => spans.some(([start, end]) => lineNoFromId(line.id) >= start && lineNoFromId(line.id) <= end));
+    const sectionLines = sourceLines.filter(line => !line.furniture && spans.some(([start, end]) => lineNoFromId(line.id) >= start && lineNoFromId(line.id) <= end));
     const headerLines = sectionLines.slice(0, 12);
     const titleRaw = typeof section?.title === 'string' ? section.title : (typeof section?.kind === 'string' ? section.kind : '');
     let title = cleanSectionTitle(titleRaw);
-    if (!title || /^\d+$/.test(normalizeDigits(title))) {
-      const derived = headerLines.find(line => !isHeaderOrRowLine(line.text) && !/^[\s\d.():-]+$/.test(line.text));
+    if (!title || /^\d+$/.test(normalizeForMatching(title))) {
+      const derived = headerLines.find(line => !isHeaderOrRowLine(line.text) && !/^[\s\d.():-]+$/.test(normalizeForMatching(line.text)));
       title = derived ? cleanSectionTitle(derived.text) : `Section ${indexValue}`;
       flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
     }

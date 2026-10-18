@@ -32,13 +32,13 @@ export const Header: React.FC<Props> = ({
   onOpenLibrary,
 }) => {
   const [showUsagePopover, setShowUsagePopover] = useState(false);
-  const [storageChip, setStorageChip] = useState('Storage: Browser');
+  const [storageChip, setStorageChip] = useState('Storage: Checking…');
   useEffect(() => {
     let mounted = true;
     getStorageBackend()
       .then(info => {
         if (mounted) {
-          setStorageChip(info.mode === 'folder' ? `Storage: Folder (${info.dir || 'data'})` : 'Storage: Browser');
+          setStorageChip(info.mode === 'folder' ? `Storage: Folder (${info.dir || 'data'})` : 'Storage: Not configured');
         }
       })
       .catch(() => undefined);

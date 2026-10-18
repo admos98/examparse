@@ -3,21 +3,9 @@
  */
 
 const PERSIAN_DIGITS = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
-const ARABIC_DIGITS = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
-
-/**
- * Normalize Persian/Arabic digits to ASCII 0-9 for parsing and logic
- * Note: display keeps original digits
- */
-export function normalizeDigitsToAscii(str: string): string {
-  if (!str) return '';
-  let res = str;
-  for (let i = 0; i < 10; i++) {
-    res = res.replaceAll(PERSIAN_DIGITS[i], i.toString());
-    res = res.replaceAll(ARABIC_DIGITS[i], i.toString());
-  }
-  return res;
-}
+import { normalizeForMatching, matchingView } from '../pipeline/quality';
+/** @deprecated Matching uses the canonical normalizer. */
+export const normalizeDigitsToAscii = normalizeForMatching;
 
 /**
  * Format a number to Persian digits for display if direction is RTL
@@ -89,16 +77,18 @@ export function detectLanguageAndDirection(text: string): { language: string; di
  * 1. 1- 1) Q1 سؤال ۱ ۱) (۱) / sub: 1-1, 1.a, الف), a)
  */
 export function matchQuestionPattern(line: string): { isQuestion: boolean; label?: string; num?: number } | null {
-  const norm = normalizeDigitsToAscii(line).trim();
+  const view = matchingView(line.trim());
+  const norm = view.text;
 
   // Pattern: "1.", "1)", "1 -", "Q1.", "Question 1:", "سوال 1:"
   const m1 = norm.match(/^(?:(?:[Qq]uestion|[Qq]|[Ss]ؤال|سوال)\s*)?\(?(\d{1,3})\)?[\.\-\:\)]\s*/);
   if (m1) {
-    const originalMatch = line.trim().match(/^(?:(?:[Qq]uestion|[Qq]|[Ss]ؤال|سوال)\s*)?\(?([\d۰-۹٠-٩]{1,3})\)?[\.\-\:\)]\s*/);
+    const start = m1[0].indexOf(m1[1]);
+    const originalLabel = line.trim().slice(view.originalOffset(start), view.originalOffset(start + m1[1].length));
     return {
       isQuestion: true,
       num: parseInt(m1[1], 10),
-      label: originalMatch ? originalMatch[1] : m1[1],
+      label: originalLabel,
     };
   }
 
@@ -135,5 +125,5 @@ export function extractPointsPattern(line: string): number | undefined {
  * ____, ......, ----------
  */
 export function isFillBlankPattern(text: string): boolean {
-  return /_{3,}|\.{4,}|-{4,}/.test(text);
+  return /_{3,}|\.{4,}|-{4,}/.test(normalizeForMatching(text));
 }

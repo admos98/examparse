@@ -1,6 +1,6 @@
 /** Prompt templates & wire schemas. Structure responses use compact wire v2; all text is sliced locally. */
 
-export const PARSER_VERSION = 'v2.3';
+export const PARSER_VERSION = 'v2.5';
 export const PROMPT_VERSION = 't1-v5-wire-v2-t3-key-v1';
 
 export const T1_STRUCTURE_SYSTEM = `You are ExamStruct, a deterministic printed-exam span parser. Return compact JSON only: no spaces, no prose, no markdown fences. Do not copy stem text; output spans only. Structure wire format v2:

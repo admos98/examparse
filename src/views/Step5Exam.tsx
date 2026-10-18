@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Printer,
   Download,
@@ -17,12 +17,14 @@ import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { MAX_EXAM_JSON_BYTES, parseExamDocImport } from '../utils/validation';
 
 interface Props {
+  defaultExamMode?: 'exam' | 'review';
   doc: ExamDoc;
   onUpdateDoc: (updated: ExamDoc) => void;
 }
 
-export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
-  const [renderMode, setRenderMode] = useState<ExamRenderMode>('paper');
+export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }) => {
+  const [renderMode, setRenderMode] = useState<ExamRenderMode>(defaultExamMode === 'review' ? 'review' : 'paper');
+  useEffect(() => { setRenderMode(defaultExamMode === 'review' ? 'review' : 'paper'); }, [defaultExamMode]);
   const [copiedJson, setCopiedJson] = useState(false);
   const jsonInputRef = useRef<HTMLInputElement>(null);
 
@@ -37,7 +39,7 @@ export const Step5Exam: React.FC<Props> = ({ doc, onUpdateDoc }) => {
     exportExamJson(doc);
   };
 
-  // Import JSON to reconstruct exam view — re-links image dataUrls from IndexedDB by blobKey
+  // Import JSON to reconstruct exam view — re-links image dataUrls from the local folder by blobKey
   const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;

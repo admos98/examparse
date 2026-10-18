@@ -3,10 +3,10 @@
  */
 import { CostTable, UsageRecord } from '../types';
 
-const CALIBRATION_STORAGE_KEY = 'examparse_calibration_v1';
+
 
 /**
- * Per-provider calibration: chars-per-token running average, persisted in localStorage, clamped 1.0–6.0
+ * Per-provider calibration: chars-per-token running average, persisted in the folder cache, clamped 1.0–6.0
  */
 interface CalibrationEntry {
   totalChars: number;
@@ -14,31 +14,16 @@ interface CalibrationEntry {
   avg: number;
 }
 
-function loadCalibrationMap(): Record<string, CalibrationEntry> {
-  try {
-    const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+let calibrationMemory: Record<string, CalibrationEntry> = {};
+export async function hydrateCalibrationMap(): Promise<void> {
+  const res = await fetch('/api/cache/calibration');
+  calibrationMemory = res.ok ? await res.json() : {};
 }
-
+function loadCalibrationMap(): Record<string, CalibrationEntry> { return calibrationMemory; }
 function saveCalibrationMap(map: Record<string, CalibrationEntry>): void {
-  try {
-    localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(map));
-  } catch {
-    // ignore quota errors
-  }
-  // Write-through to folder storage when reachable (ignored in browser mode).
-  try {
-    void fetch('/api/cache/calibration', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(map),
-    }).catch(() => undefined);
-  } catch {
-    // ignore
-  }
+  calibrationMemory = map;
+  void fetch('/api/cache/calibration', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(map) })
+    .catch(() => console.warn('Calibration cache write unavailable; default estimates remain safe.'));
 }
 
 /**
@@ -51,7 +36,7 @@ export function getCalibration(providerKey: string = 'default'): number {
 
 /**
  * Update calibration ratio with actual observed API usage (computed from full sent text length: system + user prompt).
- * Persists per provider in localStorage, clamped 1.0–6.0.
+ * Persists per provider in the folder cache, clamped 1.0–6.0.
  */
 export function updateTokenCalibration(
   fullSentTextLength: number,

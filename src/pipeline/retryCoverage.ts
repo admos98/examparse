@@ -14,13 +14,14 @@ export async function retryMissingCoverage(
   settings: AppSettings,
   onProgress?: (message: string) => void,
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void,
+  agentBudgetId?: string,
 ): Promise<ExamDoc> {
   const expected = doc.source.expectedQuestionNos || enumerateExpectedQuestionNos(doc.source.lines).numbers;
   const before = evaluateCoverage(expected, doc.questions, doc.meta.totalPoints);
   if (before.missing.length === 0) return doc;
   const role = settings.roleMapping.fast;
   const provider = settings.providers.find(item => item.id === role.providerId) || settings.providers[0];
-  const providerConfig = { ...provider, model: role.model };
+  const providerConfig = { ...provider, model: role.model, agentBudgetId };
   const lines = doc.source.lines;
   const linesHash = await sha256(JSON.stringify(lines));
   let journalKey = await getPipelineCache<string>(`journalkey:${doc.fileHash}`);
@@ -84,7 +85,7 @@ export async function retryMissingCoverage(
   if (!coverage.pointsMatch) flags.push({ id: `flag_points_${coverage.pointDeficit}`, severity: 'warn' as const, code: 'POINTS_MISMATCH', message: `Points sum ${coverage.pointsParsed} does not match header ${doc.meta.totalPoints}; deficit ${coverage.pointDeficit}.` });
 
   const calls: UsageRecord[] = (result.callUsage || []).map(call => ({
-    ts: new Date().toISOString(), role: 'fast', provider: provider.name, model: role.model,
+    ts: new Date().toISOString(), role: agentBudgetId ? 'agent' : 'fast', provider: provider.name, model: role.model,
     inputTokens: call.inputTokens, outputTokens: call.outputTokens, cachedTokens: call.cachedTokens,
     costUsd: calculateActualCost(call.inputTokens, call.outputTokens, role.model, settings.costTable), label: call.label,
   }));
@@ -98,6 +99,7 @@ export async function retryMissingCoverage(
     usage: [...(doc.usage || []), ...calls],
     source: { ...doc.source, expectedQuestionNos: expected, keyTerritoryLineNos: doc.source.keyTerritoryLineNos || [...enumerateExpectedQuestionNos(lines).keyTerritory.lineNos] },
   };
-  await saveExamDoc(recovered);
+  // Agent persistence is performed once by its CAS/versioned mutation funnel.
+  if (!agentBudgetId) await saveExamDoc(recovered);
   return recovered;
 }

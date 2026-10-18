@@ -37,8 +37,8 @@ test('enumerates printed numbers before answer-key territory and normalizes digi
   assert.deepEqual(prose.numbers, [1, 2]);
   assert.equal(prose.keyTerritory.markerLine, undefined);
   const samePage = enumerateExpectedQuestionNos(makeLines(['1. First question', '2. Second question', 'Answer Key', '1. A']));
-  assert.deepEqual(samePage.numbers, [1, 2], 'the key heading must not erase preceding questions on the same page');
-  assert.deepEqual([...samePage.keyTerritory.lineNos], [3, 4]);
+  assert.deepEqual(samePage.numbers, [], 'early key heading starts territory at the page first line (A3 page-position rule)');
+  assert.deepEqual([...samePage.keyTerritory.lineNos], [1, 2, 3, 4]);
 });
 
 // (2) A shared OCR line with multiple option markers is split deterministically and removed from the stem.

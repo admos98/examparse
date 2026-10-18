@@ -13,6 +13,7 @@ export function extractionCacheKey(fileHash: string): string {
 }
 
 interface CachedExtraction {
+  diagnostics?: ExtractedDocument['diagnostics'];
   lines: ExtractedDocument['lines'];
   images: ExtractedDocument['images'];
   scannedPageIndices: number[];
@@ -48,6 +49,7 @@ export async function getOrExtractDocument(
       const pageThumbKeys = cached.pageThumbKeys || [];
       return {
         extracted: {
+          diagnostics: cached.diagnostics,
           lines: cached.lines,
           images: cached.images || [],
           scannedPageIndices: cached.scannedPageIndices || [],
@@ -72,6 +74,7 @@ export async function getOrExtractDocument(
 
   if (useCache) {
     const payload: CachedExtraction = {
+      diagnostics: withThumbs.diagnostics,
       lines: withThumbs.lines,
       // Image metas only (drop transient object URLs)
       images: (withThumbs.images || []).map(img => {

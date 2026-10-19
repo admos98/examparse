@@ -7,6 +7,11 @@ import { GoogleGenAI } from '@google/genai';
 import { LLMRequest, LLMResponse, getDisplayName } from './src/types';
 import { AppSettingsSchema, SAFE_STORAGE_KEY, isSensitiveCredentialName, validateExtraBodyJson, validateHeaders, validateJsonSize, validateProviderBaseUrl } from './src/utils/validation';
 import { getExamHealth, examContentRevision } from './src/pipeline/quality';
+import { BOOTSTRAP_PLAYBOOK } from './src/pipeline/memory/bootstrap';
+import { SHIPPED_SKILLS } from './src/pipeline/memory/shippedSkills';
+import { lintSkill, parseSkillFile, serializeSkill } from './src/pipeline/memory/lint';
+import { draftEligibleForActivation, evaluateSkillStaleness } from './src/pipeline/memory/skills';
+import { addProposal, applyCredit, expireCandidates, lessonIsSafe } from './src/pipeline/memory/playbook';
 
 dotenv.config();
 
@@ -24,6 +29,10 @@ let configuredDir: string | undefined = process.env.EXAMFORGE_DATA_DIR;
 if (!configuredDir) { try { configuredDir = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')).dir; } catch { /* first run */ } }
 let DATA_DIR = ''; let EXAMS_DIR = ''; let IMAGES_DIR = ''; let CACHE_DIR = ''; let JOURNALS_DIR = ''; let VERSIONS_DIR = ''; let MEMORY_DIR = '';
 let SETTINGS_FILE = ''; let USAGE_FILE = ''; let MONTHLY_USAGE_FILE = ''; let storageError = '';
+// early stubs for hoisting — real impl defined later
+let ensureMemoryDirs: () => void = () => {};
+let ensureBootstrapPlaybook: () => void = () => {};
+let ensureShippedSkills: () => void = () => {};
 function configureStorage(dir: string) {
   const base = path.resolve(dir);
   const buckets = ['exams', 'images', 'cache', 'journals', 'versions', 'memory'].map(name => path.join(base, name));
@@ -34,6 +43,7 @@ function configureStorage(dir: string) {
   }
   DATA_DIR = base; [EXAMS_DIR, IMAGES_DIR, CACHE_DIR, JOURNALS_DIR, VERSIONS_DIR, MEMORY_DIR] = buckets;
   SETTINGS_FILE = path.join(base, 'settings.json'); USAGE_FILE = path.join(base, 'usage.json'); MONTHLY_USAGE_FILE = path.join(base, 'usage-monthly.json'); storageError = '';
+  try { ensureMemoryDirs(); ensureBootstrapPlaybook(); ensureShippedSkills(); } catch {}
 }
 if (configuredDir) { try { configureStorage(configuredDir); } catch (error) { storageError = String(error); } }
 const SAFE_SEGMENT = /^[A-Za-z0-9_-]{1,128}$/;
@@ -157,6 +167,343 @@ function atomicWriteFile(file: string, data: string | Buffer): void {
 function atomicWriteJson(file: string, value: unknown): void {
   atomicWriteFile(file, JSON.stringify(value, null, 2));
 }
+/* ------------------------------------------------------------------ */
+/* Memory architecture (Parts A/B/C): runs.jsonl, playbook.json,       */
+/* memory/skills/*.md, memory-config.json, activity.jsonl              */
+/* ------------------------------------------------------------------ */
+const RUNS_FILE = () => path.join(MEMORY_DIR, 'runs.jsonl');
+const RUNS_ARCHIVE_FILE = () => path.join(MEMORY_DIR, 'runs-archive.jsonl');
+const PLAYBOOK_FILE = () => path.join(MEMORY_DIR, 'playbook.json');
+const SKILLS_DIR = () => path.join(MEMORY_DIR, 'skills');
+const MEMORY_CONFIG_FILE = () => path.join(MEMORY_DIR, 'memory-config.json');
+const ACTIVITY_FILE = () => path.join(MEMORY_DIR, 'activity.jsonl');
+const RUNS_CAP_LINES = 2000; // A1 — rotate at 2,000 lines into a plain .jsonl archive
+
+function readMemoryConfig(): { learningEnabled: boolean; reflectionEnabled: boolean } {
+  const stored = readJsonFile<any>(MEMORY_CONFIG_FILE(), null);
+  return { learningEnabled: stored?.learningEnabled !== false, reflectionEnabled: stored?.reflectionEnabled !== false };
+}
+function appendActivity(entry: Record<string, unknown>): void {
+  if (!MEMORY_DIR) return;
+  try {
+    ensureMemoryDirs();
+    fs.appendFileSync(ACTIVITY_FILE(), JSON.stringify({ ts: new Date().toISOString(), ...entry }).slice(0, 4000) + '\n');
+    // Keep the activity trail bounded (plain split, no compression deps).
+    const lines = fs.readFileSync(ACTIVITY_FILE(), 'utf8').split('\n').filter(Boolean);
+    if (lines.length > 500) fs.writeFileSync(ACTIVITY_FILE(), lines.slice(-500).join('\n') + '\n');
+  } catch { /* best-effort observability */ }
+}
+
+ensureMemoryDirs = () => {
+  if (!MEMORY_DIR) return;
+  try { fs.mkdirSync(MEMORY_DIR, { recursive: true }); fs.mkdirSync(SKILLS_DIR(), { recursive: true }); } catch { /* read-only data dir */ }
+};
+
+/** A2 — the playbook starts EMPTY except ≤5 hand-written bootstrap entries. */
+ensureBootstrapPlaybook = () => {
+  if (!MEMORY_DIR) return;
+  ensureMemoryDirs();
+  if (fs.existsSync(PLAYBOOK_FILE())) return;
+  atomicWriteJson(PLAYBOOK_FILE(), BOOTSTRAP_PLAYBOOK);
+  appendActivity({ type: 'playbook_bootstrap', message: `Seeded ${BOOTSTRAP_PLAYBOOK.entries.length} bootstrap lessons (status active, evidence 'bootstrap')` });
+};
+
+/** C2 — ship exactly 7 skills, written to memory/skills/{slug}.md on first run. */
+ensureShippedSkills = () => {
+  if (!MEMORY_DIR) return;
+  ensureMemoryDirs();
+  for (const skill of SHIPPED_SKILLS) {
+    const file = path.join(SKILLS_DIR(), `${skill.slug}.md`);
+    if (fs.existsSync(file)) continue;
+    const lint = lintSkill(skill.content, skill.slug);
+    if (!lint.ok) { console.warn(`Shipped skill ${skill.slug} failed its own linter: ${lint.errors.join('; ')}`); continue; }
+    atomicWriteFile(file, skill.content);
+  }
+};
+
+function readPlaybook(): any {
+  ensureBootstrapPlaybook();
+  const data = readJsonFile<any>(PLAYBOOK_FILE(), { version: 1, entries: [] });
+  return data && Array.isArray(data.entries) ? data : { version: 1, entries: [] };
+}
+function writePlaybook(playbook: any): void {
+  ensureMemoryDirs();
+  atomicWriteJson(PLAYBOOK_FILE(), { version: 1, entries: Array.isArray(playbook?.entries) ? playbook.entries : [] });
+}
+function readSkills(): Array<{ slug: string; content: string }> {
+  ensureMemoryDirs();
+  const dir = SKILLS_DIR();
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(name => name.endsWith('.md') && SAFE_SEGMENT.test(name.replace(/\.md$/, ''))).map(name => ({
+    slug: name.replace(/\.md$/, ''),
+    content: fs.readFileSync(path.join(dir, name), 'utf8'),
+  }));
+}
+function readRuns(): any[] {
+  try {
+    if (!fs.existsSync(RUNS_FILE())) return [];
+    return fs.readFileSync(RUNS_FILE(), 'utf8').split('\n').filter(Boolean)
+      .map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+/** A1 — append-only journal with rotation at 2,000 lines (plain .jsonl archive). */
+function appendRun(entry: any): void {
+  ensureMemoryDirs();
+  fs.appendFileSync(RUNS_FILE(), JSON.stringify(entry).slice(0, 20_000) + '\n');
+  const lines = fs.readFileSync(RUNS_FILE(), 'utf8').split('\n').filter(Boolean);
+  if (lines.length > RUNS_CAP_LINES) {
+    const archived = lines.slice(0, lines.length - RUNS_CAP_LINES);
+    fs.appendFileSync(RUNS_ARCHIVE_FILE(), archived.join('\n') + '\n');
+    fs.writeFileSync(RUNS_FILE(), lines.slice(-RUNS_CAP_LINES).join('\n') + '\n');
+  }
+}
+
+// --- Learning controls (B5) ---
+app.get('/api/memory/config', (_req, res) => {
+  if (!DATA_DIR) return res.json({ learningEnabled: true, reflectionEnabled: true });
+  return res.json(readMemoryConfig());
+});
+app.put('/api/memory/config', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  const body = req.body || {};
+  const next = { learningEnabled: body.learningEnabled !== false, reflectionEnabled: body.reflectionEnabled !== false };
+  ensureMemoryDirs();
+  atomicWriteJson(MEMORY_CONFIG_FILE(), next);
+  appendActivity({ type: 'config', message: `learning=${next.learningEnabled} reflection=${next.reflectionEnabled}` });
+  return res.json({ ok: true, config: next });
+});
+
+// --- Run journal (A1) ---
+app.get('/api/memory/runs', (_req, res) => {
+  if (!DATA_DIR) return res.json([]);
+  return res.json(readRuns());
+});
+app.post('/api/memory/runs', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  const entry = req.body;
+  if (!entry || typeof entry !== 'object' || typeof entry.jobId !== 'string' || entry.jobId.length > 128) return res.status(400).json({ error: 'Run journal entry requires a jobId.' });
+  if (!['pipeline', 'remediation', 'assistant'].includes(String(entry.kind))) return res.status(400).json({ error: 'Run kind must be pipeline, remediation or assistant.' });
+  appendRun(entry);
+  return res.json({ ok: true, lines: fs.existsSync(RUNS_FILE()) ? fs.readFileSync(RUNS_FILE(), 'utf8').split('\n').filter(Boolean).length : 0 });
+});
+
+// --- Playbook (A2/B2/B4) ---
+app.get('/api/memory/playbook', (_req, res) => {
+  if (!DATA_DIR) return res.json({ version: 1, entries: [] });
+  const playbook = readPlaybook();
+  // B2 — candidates with no matching job in 30 days expire silently.
+  const { playbook: expired, expired: ids } = expireCandidates(playbook);
+  if (ids.length) { writePlaybook(expired); appendActivity({ type: 'playbook_expired', message: `${ids.length} candidate lesson(s) expired after 30 days without a matching job` }); }
+  return res.json(expired);
+});
+app.put('/api/memory/playbook', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  if (!req.body || !Array.isArray(req.body.entries)) return res.status(400).json({ error: 'Playbook must be {version, entries[]}.' });
+  if (req.body.entries.length > 500) return res.status(400).json({ error: 'Playbook is limited to 500 entries.' });
+  for (const entry of req.body.entries) {
+    if (!entry || typeof entry.id !== 'string' || !SAFE_STORAGE_KEY.test(entry.id)) return res.status(400).json({ error: 'Invalid playbook entry id.' });
+    if (typeof entry.lesson !== 'string' || !entry.lesson.trim() || entry.lesson.length > 280) return res.status(400).json({ error: 'Lesson must be 1–280 characters.' });
+    if (!['candidate', 'active', 'demoted'].includes(String(entry.status))) return res.status(400).json({ error: 'Invalid playbook status.' });
+    if (!lessonIsSafe(entry.lesson).ok) return res.status(400).json({ error: 'Lesson rejected: credentials, endpoints or quoted source are not allowed.' });
+  }
+  if (!hasSafeJsonSize(res, req.body, 512 * 1024)) return;
+  writePlaybook(req.body);
+  appendActivity({ type: 'playbook_write', message: `Playbook saved with ${req.body.entries.length} entries (user edit)` });
+  return res.json({ ok: true, entries: req.body.entries.length });
+});
+
+/** B2 — deterministic credit/blame. The model proposes; this route decides. */
+app.post('/api/memory/credit', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  const matchedIds = Array.isArray(req.body?.matchedIds) ? req.body.matchedIds.filter((id: any) => typeof id === 'string').slice(0, 200) : null;
+  if (!matchedIds || typeof req.body?.success !== 'boolean') return res.status(400).json({ error: 'credit requires matchedIds[] and success:boolean.' });
+  const playbook = readPlaybook();
+  const { playbook: updated, transitions } = applyCredit(playbook, matchedIds, { success: req.body.success });
+  writePlaybook(updated);
+  for (const transition of transitions) {
+    appendActivity({
+      type: transition.to === 'active' ? 'playbook_promoted' : 'playbook_demoted',
+      message: `Playbook: ${transition.to === 'active' ? 'promoted' : 'demoted'} '${transition.lesson.slice(0, 60)}' (${transition.from} → ${transition.to}; ✓${transition.successes} ✗${transition.failures}, confidence ${transition.confidence.toFixed(2)})`,
+      entryId: transition.id,
+    });
+  }
+  return res.json({ ok: true, transitions, matched: matchedIds.length });
+});
+
+/** B1/B3 — reflection proposals land as candidates (playbook) or drafts (skills). */
+app.post('/api/memory/proposals', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  const proposal = req.body?.proposal;
+  if (!proposal || typeof proposal.lesson !== 'string' || !['playbook', 'skill'].includes(String(proposal.layer))) return res.status(400).json({ error: 'Proposal requires layer and lesson.' });
+  const evidenceRunIds = Array.isArray(proposal.evidenceRunIds) ? proposal.evidenceRunIds.filter((id: any) => typeof id === 'string').slice(0, 5) : [];
+  if (!evidenceRunIds.length) return res.status(400).json({ error: 'A proposal must cite at least one run id (evidence-gated).' });
+  // E3 — lessons are about PROCEDURE, never content/credentials/endpoints.
+  const sourceLines = Array.isArray(req.body?.sourceLines) ? req.body.sourceLines.filter((line: any) => typeof line === 'string').slice(0, 2000) : undefined;
+  const safety = lessonIsSafe(proposal.lesson, sourceLines);
+  if (!safety.ok) { appendActivity({ type: 'proposal_rejected', message: `${safety.reason}` }); return res.status(400).json({ error: `Proposal rejected: ${safety.reason}` }); }
+
+  if (proposal.layer === 'skill') {
+    const steps = Array.isArray(proposal.procedureSteps) ? proposal.procedureSteps.filter((step: any) => typeof step === 'string').slice(0, 6) : [];
+    if (!steps.length) return res.status(400).json({ error: 'A skill proposal needs 1–6 procedure steps.' });
+    const slug = `learned-${Date.now().toString(36)}`;
+    const content = serializeSkill({
+      name: proposal.lesson.slice(0, 60),
+      slug,
+      status: 'draft', // B3 — NEVER auto-activated
+      triggers: [String(proposal.scope?.docTrait || 'learned').slice(0, 40)],
+      appliesTo: { roles: [String(proposal.scope?.role || 'agent')] },
+      maxTokens: 900,
+      source: 'learned',
+      stats: { injected: 0, followed: 0, greenAfter: 0, redAfter: 0 },
+    }, steps.map((step: string, index: number) => `${index + 1}. ${step}`).join('\n'));
+    const lint = lintSkill(content, slug);
+    if (!lint.ok) { appendActivity({ type: 'proposal_rejected', message: `skill draft failed linter: ${lint.errors.join('; ')}` }); return res.status(400).json({ error: `Skill draft rejected: ${lint.errors.join('; ')}` }); }
+    ensureMemoryDirs();
+    atomicWriteFile(path.join(SKILLS_DIR(), `${slug}.md`), content);
+    appendActivity({ type: 'skill_draft', message: `Skill draft '${slug}' proposed from run ${evidenceRunIds[0]} (needs user activation or 3 matched jobs + 2 green)` });
+    return res.json({ ok: true, layer: 'skill', slug });
+  }
+
+  const playbook = readPlaybook();
+  const { playbook: updated, merged, entry } = addProposal(playbook, {
+    lesson: proposal.lesson,
+    scope: proposal.scope && typeof proposal.scope === 'object' ? proposal.scope : {},
+    kind: ['model-trait', 'doc-trait', 'strategy', 'user-pref'].includes(String(proposal.kind)) ? proposal.kind : 'strategy',
+    evidenceRunIds,
+  });
+  writePlaybook(updated);
+  appendActivity({
+    type: merged ? 'playbook_merged' : 'playbook_candidate',
+    message: merged
+      ? `Playbook: identical lesson merged into '${entry.id}' (evidence runs ${entry.evidence.runIds.length})`
+      : `Playbook: new candidate '${entry.lesson.slice(0, 60)}…' (confidence 0.30, evidence run ${evidenceRunIds[0]})`,
+    entryId: entry.id,
+  });
+  return res.json({ ok: true, layer: 'playbook', merged, entryId: entry.id });
+});
+
+// --- Skills (C1/C4/C5) ---
+app.get('/api/memory/skills', (_req, res) => {
+  if (!DATA_DIR) return res.json([]);
+  ensureShippedSkills();
+  return res.json(readSkills());
+});
+app.get('/api/memory/skills/:slug', (req, res) => {
+  if (!safeSegment(res, req.params.slug)) return;
+  const file = assertInsideDir(res, SKILLS_DIR(), path.join(SKILLS_DIR(), `${req.params.slug}.md`));
+  if (!file) return;
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'Skill not found' });
+  return res.json({ slug: req.params.slug, content: fs.readFileSync(file, 'utf8') });
+});
+app.put('/api/memory/skills/:slug', (req, res) => {
+  if (!safeSegment(res, req.params.slug)) return;
+  const file = assertInsideDir(res, SKILLS_DIR(), path.join(SKILLS_DIR(), `${req.params.slug}.md`));
+  if (!file) return;
+  const content = req.body?.content;
+  if (typeof content !== 'string' || !content.trim() || content.length > 64 * 1024) return res.status(400).json({ error: 'Skill content must be 1–64 KiB of Markdown.' });
+  // C1 — the local linter rejects over-budget or malformed skills with named errors.
+  const lint = lintSkill(content, req.params.slug);
+  if (!lint.ok) return res.status(400).json({ error: lint.errors.join('; '), errors: lint.errors });
+  ensureMemoryDirs();
+  atomicWriteFile(file, content);
+  appendActivity({ type: 'skill_saved', message: `Skill '${req.params.slug}' saved (${lint.tokens}/${lint.maxTokens} tokens, status ${lint.meta?.status}, source ${lint.meta?.source})` });
+  return res.json({ ok: true, tokens: lint.tokens, maxTokens: lint.maxTokens, status: lint.meta?.status });
+});
+app.delete('/api/memory/skills/:slug', (req, res) => {
+  if (!safeSegment(res, req.params.slug)) return;
+  const file = assertInsideDir(res, SKILLS_DIR(), path.join(SKILLS_DIR(), `${req.params.slug}.md`));
+  if (!file) return;
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+  appendActivity({ type: 'skill_deleted', message: `Skill '${req.params.slug}' deleted by user` });
+  return res.json({ ok: true });
+});
+
+/** C4 — lazy pruning (app boot + after each job) and B3(b) draft auto-activation. */
+app.post('/api/memory/prune', (req, res) => {
+  if (!DATA_DIR) return res.json({ ok: false, error: 'no storage' });
+  ensureShippedSkills();
+  const skills = readSkills();
+  const parsed = skills.map(skill => { try { return parseSkillFile(skill.content, skill.slug); } catch { return null; } }).filter(Boolean) as any[];
+  const triggerDomainOccurrences = (req.body?.triggerDomainOccurrences && typeof req.body.triggerDomainOccurrences === 'object') ? req.body.triggerDomainOccurrences : {};
+  const reports = evaluateSkillStaleness(parsed, { triggerDomainOccurrences });
+  const archived: string[] = [];
+  const badges: string[] = [];
+  for (const report of reports) {
+    const skill = skills.find(item => item.slug === report.slug);
+    if (!skill) continue;
+    if (report.action === 'archived') {
+      atomicWriteFile(path.join(SKILLS_DIR(), `${report.slug}.md`), skill.content.replace(/status:\s*\w+/, 'status: archived'));
+      archived.push(report.slug);
+      appendActivity({ type: 'skill_archived', message: `Skill '${report.slug}' auto-archived (learned): ${report.reason}` });
+    } else {
+      badges.push(report.slug); // C4 — shipped skills are never auto-archived; humans decide
+      appendActivity({ type: 'skill_stale_badge', message: `Skill '${report.slug}' (shipped) is stale — consider archiving: ${report.reason}` });
+    }
+  }
+  // B3(b) — draft auto-activation from draft-shadow evidence, with a one-time notice.
+  const activated: string[] = [];
+  const runs = readRuns();
+  for (const skill of parsed) {
+    if (skill.meta.status !== 'draft') continue;
+    const triggerMatches = runs.filter(run => Array.isArray(run?.guidance?.draftShadowSkills) && run.guidance.draftShadowSkills.includes(skill.meta.slug)).length
+      + (Number(skill.meta.stats?.injected) || 0);
+    if (!draftEligibleForActivation(skill, triggerMatches)) continue;
+    const file = skills.find(item => item.slug === skill.meta.slug);
+    if (!file) continue;
+    atomicWriteFile(path.join(SKILLS_DIR(), `${skill.meta.slug}.md`), file.content.replace(/status:\s*draft/, 'status: active'));
+    activated.push(skill.meta.slug);
+    appendActivity({ type: 'skill_activated', message: `New skill activated: ${skill.meta.name} (from ${triggerMatches} observed runs)` });
+  }
+  return res.json({ ok: true, archived, badges, activated });
+});
+
+// --- Activity (B4) ---
+app.get('/api/memory/activity', (_req, res) => {
+  if (!DATA_DIR) return res.json({ runs: [], activity: [] });
+  let activity: any[] = [];
+  try {
+    if (fs.existsSync(ACTIVITY_FILE())) {
+      activity = fs.readFileSync(ACTIVITY_FILE(), 'utf8').split('\n').filter(Boolean)
+        .map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    }
+  } catch { activity = []; }
+  return res.json({ runs: readRuns().slice(-50), activity: activity.slice(-100) });
+});
+app.post('/api/memory/activity', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  const type = typeof req.body?.type === 'string' ? req.body.type.slice(0, 60) : 'note';
+  appendActivity({ ...req.body, type });
+  return res.json({ ok: true });
+});
+
+/** B5 — erase all LEARNED memory. Per-exam dossiers (memory/{examId}.json) are kept. */
+app.post('/api/memory/erase', (_req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  let removedRuns = 0; let removedEntries = 0; let removedSkills = 0;
+  try { removedRuns = readRuns().length; } catch { /* ignore */ }
+  try { removedEntries = readPlaybook().entries.filter((entry: any) => !String(entry.id).startsWith('bootstrap_')).length; } catch { /* ignore */ }
+  for (const file of [RUNS_FILE(), RUNS_ARCHIVE_FILE(), ACTIVITY_FILE()]) if (fs.existsSync(file)) fs.unlinkSync(file);
+  for (const skill of readSkills()) {
+    if (skill.slug.startsWith('bootstrap')) continue;
+    const parsed = (() => { try { return parseSkillFile(skill.content, skill.slug); } catch { return null; } })();
+    // Learned drafts go; shipped + user-authored skills are the user's own work and stay.
+    if (parsed && parsed.meta.source === 'learned') {
+      const file = path.join(SKILLS_DIR(), `${skill.slug}.md`);
+      if (fs.existsSync(file)) { fs.unlinkSync(file); removedSkills++; }
+    }
+  }
+  writePlaybook({ version: 1, entries: BOOTSTRAP_PLAYBOOK.entries });
+  appendActivity({ type: 'memory_erased', message: `Erased learned memory: ${removedEntries} lessons, ${removedSkills} learned skills, ${removedRuns} run lines. Dossiers kept.` });
+  return res.json({ ok: true, removedEntries, removedSkills, removedRuns, dossiersKept: true });
+});
+
+// Per-exam dossier routes (#18). Registered AFTER the specific memory routes above so
+// /api/memory/runs|playbook|skills|config|activity are never shadowed by /api/memory/:id.
+app.get('/api/memory', (_req,res)=>{
+  if (!fs.existsSync(MEMORY_DIR)) return res.json([]);
+  const files = fs.readdirSync(MEMORY_DIR).filter(f=>f.endsWith('.json'));
+  return res.json(files.map(f=>f.replace(/\.json$/,'')));
+});
 app.get('/api/memory/:id', (req, res) => {
   if (!safeSegment(res, req.params.id)) return;
   const file = assertInsideDir(res, MEMORY_DIR, path.join(MEMORY_DIR, `${req.params.id}.json`)); if (!file) return;
@@ -175,11 +522,7 @@ app.delete('/api/memory/:id', (req,res)=>{
   if (fs.existsSync(file)) fs.unlinkSync(file);
   return res.json({ok:true});
 });
-app.get('/api/memory', (_req,res)=>{
-  if (!fs.existsSync(MEMORY_DIR)) return res.json([]);
-  const files = fs.readdirSync(MEMORY_DIR).filter(f=>f.endsWith('.json'));
-  return res.json(files.map(f=>f.replace(/\.json$/,'')));
-});
+
 // Global user memory
 app.get('/api/user-memory', (_req,res)=>{
   const file = path.join(DATA_DIR, 'user.json');

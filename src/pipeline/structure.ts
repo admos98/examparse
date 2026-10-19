@@ -28,6 +28,9 @@ export interface StructurePassResult {
   callUsage?: Array<{ label: string; inputTokens: number; outputTokens: number; cachedTokens?: number }>;
   /** True only if the (final) model response had json: null origin — such results must never be cached. */
   jsonNull?: boolean;
+  /** A4 — assembled memory guidance size for this job (0 with empty memory). */
+  guidanceTokens?: number;
+  guidanceDigest?: string;
 }
 
 const WIRE_TYPES: Record<string, string> = { m: 'mcq', f: 'truefalse', b: 'fillblank', s: 'short', l: 'long', a: 'matching', u: 'multi', n: 'numeric', d: 'diagram', '?': 'unknown' };
@@ -172,6 +175,60 @@ export interface StructurePassParams {
   existingRawQuestions?: any[];
   existingSections?: any[];
   existingMeta?: any;
+  /**
+   * D1 — memory guidance (playbook subset) assembled ONCE per job and inherited by
+   * every structure path (single/journal-resume/sectioned/chunked). Empty memory ⇒
+   * empty block ⇒ the prompt bytes are identical to the pre-memory behaviour (D4).
+   */
+  guidance?: StructureGuidance;
+  /** Reports the assembled guidance size so the bench/stage card can print it (A4). */
+  onGuidance?: (guidance: StructureGuidance) => void;
+  /** A4 hard cap for the playbook block (default 5,000 tokens). */
+  guidanceCapTokens?: number;
+}
+
+export interface StructureGuidance {
+  block: string;
+  tokens: number;
+  digest: string;
+  entries: number;
+  omitted: number;
+}
+
+const EMPTY_GUIDANCE: StructureGuidance = { block: '', tokens: 0, digest: 'Guidance: playbook 0 entries (0 tok).', entries: 0, omitted: 0 };
+
+/** THE guidance assembly point for the structure role (D1). Memoized per params object. */
+const guidanceCache = new WeakMap<object, StructureGuidance>();
+export async function resolveStructureGuidance(params: StructurePassParams): Promise<StructureGuidance> {
+  if (params.guidance) return params.guidance;
+  const cached = guidanceCache.get(params);
+  if (cached) { params.guidance = cached; return cached; }
+  let guidance = EMPTY_GUIDANCE;
+  try {
+    const { assemblePipelineGuidance } = await import('./memory/guidance');
+    const assembled = await assemblePipelineGuidance({
+      sourceLines: params.sourceLines,
+      images: params.images,
+      sections: params.existingSections,
+      languageHint: params.languageHint,
+      modelId: String(params.providerConfig?.model || ''),
+      role: 'fast',
+      capTokens: params.guidanceCapTokens,
+    });
+    guidance = { block: assembled.text, tokens: assembled.tokens, digest: assembled.digest, entries: assembled.includedCount, omitted: assembled.omittedCount };
+  } catch {
+    guidance = EMPTY_GUIDANCE; // memory is advisory: a failure never changes the parse
+  }
+  guidanceCache.set(params, guidance);
+  params.guidance = guidance;
+  params.onGuidance?.(guidance);
+  return guidance;
+}
+
+/** Structure system prompt + the delimited FIELD LESSONS block (empty ⇒ byte-identical). */
+export function structureSystemPrompt(params: Pick<StructurePassParams, 'guidance'>): string {
+  const block = params.guidance?.block;
+  return block ? `${T1_STRUCTURE_SYSTEM}\n${block}` : T1_STRUCTURE_SYSTEM;
 }
 
 export function coveredUntilLine(questions: any[]): number {
@@ -509,7 +566,7 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
   const budget = params.maxBudgetTokens || 16384;
   const maxOutputTokens = Math.min(budget, Math.max(2048, Math.ceil(Math.max(lines.length * 12, lines.reduce((s, l) => s + l.text.length, 0) / 3.2 * 0.3) * 1.25)));
   const label = phase.startsWith('recovery') ? `Structure Recovery ${phase}: ${plan.id}` : `Structure Section: ${plan.id} [${plan.index}/${allPlans.length}] ${plan.title}`;
-  const request: LLMRequest = { role: 'fast', system: T1_STRUCTURE_SYSTEM, text, jsonSchema: params.providerConfig?.kind === 'gemini' ? T1_GEMINI_SCHEMA : undefined, maxOutputTokens, label, providerConfig: params.providerConfig };
+  const request: LLMRequest = { role: 'fast', system: structureSystemPrompt(params), text, jsonSchema: params.providerConfig?.kind === 'gemini' ? T1_GEMINI_SCHEMA : undefined, maxOutputTokens, label, providerConfig: params.providerConfig };
   const response = await LLMAdapter.execute(request, {
     onDelta: (channel, full) => params.onLiveText?.(label, channel, full),
     onInfo: note => params.onLiveText?.(label, 'info', note),
@@ -527,6 +584,7 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
 }
 
 async function runSectionedStructurePass(params: StructurePassParams, options: { expected: number[]; lineByNumber: Map<number, number>; existing?: StructurePassResult; recoveryOnly?: number[] }): Promise<StructurePassResult> {
+  await resolveStructureGuidance(params);
   const expected = options.expected;
   const plans = makeSectionPlans(params.sourceLines, expected, options.lineByNumber);
   const budget = params.recoveryBudget || (params.recoveryBudget = { count: 0 });
@@ -640,13 +698,16 @@ async function runSectionedStructurePass(params: StructurePassParams, options: {
 }
 
 export async function runStructurePass(params: StructurePassParams): Promise<StructurePassResult> {
+  // D1 — ONE assembly point: every structure path below inherits params.guidance.
+  const guidance = await resolveStructureGuidance(params);
+  const stamp = (result: StructurePassResult): StructurePassResult => ({ ...result, guidanceTokens: guidance.tokens, guidanceDigest: guidance.digest });
   const expected = enumerateExpectedQuestionNos(params.sourceLines);
   const model = String(params.providerConfig?.model || '').toLowerCase();
   const weakModel = /(?:free|lite|mini|small|tiny|(?:^|[-_])(?:3|4|5|7|8|9)b(?:[-_]|$))/i.test(model) || Number(params.maxBudgetTokens || 0) > 0 && Number(params.maxBudgetTokens) < 8192;
   const forceSections = Boolean(params.forceSectionMode || weakModel || expected.numbers.length > 25 || params.sourceLines.length > 220 || params.recoveryOnlyNumbers?.length);
   if (forceSections) {
     const sectioned = await runSectionedStructurePass(params, { expected: expected.numbers, lineByNumber: expected.lineByNumber, recoveryOnly: params.recoveryOnlyNumbers });
-    return attachWireTokenAccounting(sectioned);
+    return stamp(attachWireTokenAccounting(sectioned));
   }
   const result = await runSingleStructurePass(params);
   const coverage = evaluateCoverage(expected.numbers, rawCoverageQuestions(result.rawQuestions, params.sourceLines), result.meta?.totalPoints);
@@ -655,16 +716,17 @@ export async function runStructurePass(params: StructurePassParams): Promise<Str
     const recovery = await runSectionedStructurePass({ ...params, recoveryBudget }, {
       expected: expected.numbers, lineByNumber: expected.lineByNumber, existing: result, recoveryOnly: coverage.missing,
     });
-    return attachWireTokenAccounting(recovery);
+    return stamp(attachWireTokenAccounting(recovery));
   }
   const coverageFlags = makeCoverageFlags(result.rawQuestions, params.sourceLines, expected.numbers, result.meta?.totalPoints);
   result.flags = [...(result.flags || []), ...coverageFlags];
   result.recoveryCalls = recoveryBudget.count;
   result.wireFormat ||= 'v2';
-  return attachWireTokenAccounting(result);
+  return stamp(attachWireTokenAccounting(result));
 }
 
 async function runSingleStructurePass(params: StructurePassParams): Promise<StructurePassResult> {
+  await resolveStructureGuidance(params);
   const { sourceLines, images, languageHint, latexEnabled, providerConfig, maxBudgetTokens } = params;
   const recoveryBudget = params.recoveryBudget || (params.recoveryBudget = { count: 0 });
   const consumeRecovery = () => { if (recoveryBudget.count >= 8) return false; recoveryBudget.count++; return true; };
@@ -703,7 +765,7 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
 
   const request: LLMRequest = {
     role: 'fast',
-    system: T1_STRUCTURE_SYSTEM,
+    system: structureSystemPrompt(params),
     text: userPrompt,
     jsonSchema: isGemini ? T1_GEMINI_SCHEMA : undefined,
     maxOutputTokens: baseCap,
@@ -942,6 +1004,7 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
 
 /** Sequential 80-line chunk fallback with overlap, session context, and bounded bisection. */
 async function runChunkedStructurePass(params: any, _fullLas: string, manifest: any[]): Promise<StructurePassResult> {
+  await resolveStructureGuidance(params);
   const { sourceLines, languageHint, latexEnabled, providerConfig } = params;
   const keyLines = enumerateExpectedQuestionNos(sourceLines).keyTerritory.lineNos;
   const isGemini = providerConfig?.kind === 'gemini';
@@ -984,7 +1047,7 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
     const inTokens = Math.ceil(lines.reduce((n,l)=>n+l.text.length,0) / 3.2);
     const est = Math.max(inTokens * .25, lines.length * 14);
     const cap = Math.min(budgetCap, Math.max(4096, Math.ceil(est * 1.25)));
-    const req: LLMRequest = { role: 'fast', system: T1_STRUCTURE_SYSTEM, text: base + schemaBlock, jsonSchema: isGemini ? T1_GEMINI_SCHEMA : undefined, maxOutputTokens: cap, label, providerConfig };
+    const req: LLMRequest = { role: 'fast', system: structureSystemPrompt(params), text: base + schemaBlock, jsonSchema: isGemini ? T1_GEMINI_SCHEMA : undefined, maxOutputTokens: cap, label, providerConfig };
     params.onProgress?.(`${label}: parsing source lines ${start}-${end} (attempt ${attempts + 1}).`);
     let liveOutput = '', liveReasoning = '', lastJournalWrite = 0;
     const opts = { onDelta: (channel: 'output'|'reasoning', fullText: string) => {

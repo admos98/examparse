@@ -7,6 +7,8 @@ import { calculateActualCost } from '../utils/budget';
 import { sha256 } from '../utils/hash';
 import { getPipelineCache, appendUsageRecord, saveExamDoc } from '../store';
 import { PARSER_VERSION } from './prompts';
+import { getExamHealth } from './quality';
+import { beginJob, endJob, type JobHandle } from './memory/harness';
 
 /** Journal-aware, local-only merge recovery for Step 4's Retry missing questions action. */
 export async function retryMissingCoverage(
@@ -27,6 +29,21 @@ export async function retryMissingCoverage(
   let journalKey = await getPipelineCache<string>(`journalkey:${doc.fileHash}`);
   if (!journalKey) journalKey = await sha256(`${doc.fileHash}:${linesHash}:${providerConfig.id}:${providerConfig.model}:${PARSER_VERSION}`);
 
+  // D3 — a remediation pipeline run is its own job: journaled, credited/blamed, reflected.
+  let job: JobHandle | undefined;
+  try {
+    job = await beginJob({
+      kind: 'remediation',
+      examId: doc.id,
+      sourceLines: lines,
+      images: doc.images,
+      sections: doc.sections,
+      languageHint: doc.meta.language,
+      modelId: role.model,
+      role: 'fast',
+    });
+  } catch { job = undefined; }
+
   const existingRawQuestions = doc.questions.map(question => ({
     id: question.id, label: question.label, no: question.no, parentId: question.parentId, sectionId: question.sectionId,
     spans: question.spans, points: question.points, type: question.type,
@@ -44,6 +61,7 @@ export async function retryMissingCoverage(
     providerConfig, maxBudgetTokens: settings.budget.maxOutputTokens, journalEnabled: settings.thrift.cacheEnabled, journalKey,
     forceSectionMode: true, recoveryOnlyNumbers: before.missing, existingRawQuestions,
     existingSections: doc.sections, existingMeta: meta, onProgress, onLiveText,
+    guidance: job ? { block: job.playbook.block, tokens: job.playbook.tokens, digest: job.playbook.digest, entries: job.playbook.included.length, omitted: job.playbook.omittedCount } : undefined,
   });
 
   const missingSet = new Set(before.missing);
@@ -101,5 +119,28 @@ export async function retryMissingCoverage(
   };
   // Agent persistence is performed once by its CAS/versioned mutation funnel.
   if (!agentBudgetId) await saveExamDoc(recovered);
+
+  if (job) {
+    try {
+      const finalHealth = getExamHealth(recovered);
+      job.ladderPath = ['L1 retry_missing_questions', ...(result.callUsage || []).map(call => String(call.label || 'recovery'))];
+      job.flagsRaised = flags.map(flag => String(flag?.code || '')).filter(Boolean);
+      await endJob(job, {
+        health: {
+          expected: finalHealth.expectedCount, parsed: finalHealth.parsedCount, missing: finalHealth.missing,
+          duplicates: finalHealth.duplicates, coveragePercent: finalHealth.coveragePercent, state: finalHealth.state,
+          complete: finalHealth.complete, pointsParsed: finalHealth.pointsParsed, pointsExpected: finalHealth.pointsExpected,
+        },
+        calls: calls.filter(call => !(call as any).isCachedHit).length,
+        tokens: {
+          input: calls.reduce((sum, call) => sum + (call.inputTokens || 0), 0),
+          output: calls.reduce((sum, call) => sum + (call.outputTokens || 0), 0),
+          cached: calls.reduce((sum, call) => sum + (call.cachedTokens || 0), 0),
+        },
+        costUsd: calls.reduce((sum, call) => sum + (call.costUsd || 0), 0),
+        settings,
+      });
+    } catch { /* advisory only (E1) */ }
+  }
   return recovered;
 }

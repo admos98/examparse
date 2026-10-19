@@ -17,6 +17,7 @@ import {
 import { AppSettings, ProviderConfig, ProviderKind } from '../types';
 import { applyTheme } from '../pipeline/agentTheme';
 import { StoragePanel } from './StoragePanel';
+import { MemoryPanel } from './MemoryPanel';
 import { LLMAdapter } from '../providers/adapter';
 import { clearAllCachesAndData, loadUsageLog } from '../store';
 import { buildDiagnostics, exportDiagnostics, diagnosticsFromUsage } from '../utils/diagnostics';
@@ -31,7 +32,7 @@ interface Props {
   onOpenExplainer: () => void;
 }
 
-type TabType = 'providers' | 'roles' | 'costs' | 'thrift' | 'budget' | 'document' | 'privacy' | 'diagnostics';
+type TabType = 'providers' | 'roles' | 'costs' | 'thrift' | 'budget' | 'document' | 'assistant' | 'privacy' | 'diagnostics';
 type ProbeResult = CapabilityRecord | { error: string };
 
 function probeModelForProvider(provider: ProviderConfig, settings: AppSettings, discoveredModels?: string[]): string {
@@ -60,7 +61,16 @@ const BackupPanel: React.FC = () => {
       const exams: Record<string,any> = {};
       for (const s of summaries) { const d = await ld(s.id); if(d) exams[s.id]=d; }
       const safeSettings = (()=>{ try { return JSON.parse(localStorage.getItem('examparse_settings')||'{}'); } catch { return {}; } })();
-      const buf = await createBackup({ exams, images:{}, dossiers:{}, settings: safeSettings });
+      // B5 — learned memory rides in the same zip (playbook, run journal, skills, config).
+      const memory = await (async () => {
+        const get = async (url:string) => { try { const res = await fetch(url); return res.ok ? await res.json() : null; } catch { return null; } };
+        const [playbook, runs, skills, config] = await Promise.all([
+          get('/api/memory/playbook'), get('/api/memory/runs'), get('/api/memory/skills'), get('/api/memory/config'),
+        ]);
+        const activityData = await get('/api/memory/activity');
+        return { playbook: playbook || undefined, runs: Array.isArray(runs) ? runs : [], skills: Array.isArray(skills) ? skills : [], config: config || undefined, activity: Array.isArray(activityData?.activity) ? activityData.activity : [] };
+      })();
+      const buf = await createBackup({ exams, images:{}, dossiers:{}, settings: safeSettings, memory });
       const blob = new Blob([buf as any], {type:'application/zip'});
       const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='examparse-backup.zip'; a.click(); URL.revokeObjectURL(url);
       setMsg('Backup downloaded');
@@ -74,7 +84,17 @@ const BackupPanel: React.FC = () => {
       const res = await restoreBackup(buf);
       const { saveExamDoc } = await import('../store');
       for (const [id, doc] of Object.entries(res.exams)) await saveExamDoc(doc as any);
-      setMsg(`Restored ${res.counts.exams} exams`);
+      // Restore learned memory (B5). Invalid skill files are rejected by the server linter.
+      const put = async (url:string, body:any) => { try { await fetch(url, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); } catch {} };
+      if (res.memory?.playbook) await put('/api/memory/playbook', res.memory.playbook);
+      if (res.memory?.config) await put('/api/memory/config', res.memory.config);
+      let skillsRestored = 0;
+      for (const skill of res.memory?.skills || []) {
+        const response = await fetch(`/api/memory/skills/${encodeURIComponent(skill.slug)}`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ content: skill.content }) });
+        if (response.ok) skillsRestored++;
+      }
+      for (const run of res.memory?.runs || []) { try { await fetch('/api/memory/runs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(run) }); } catch {} }
+      setMsg(`Restored ${res.counts.exams} exams, ${res.counts.playbookEntries} lessons, ${skillsRestored} skills, ${res.counts.memoryRuns} run lines`);
     } catch(err:any){ setMsg('Restore failed: '+(err?.message||'')); }
     e.target.value='';
   };
@@ -338,6 +358,16 @@ export const SettingsModal: React.FC<Props> = ({
               }`}
             >
               <FileCheck className="w-3.5 h-3.5" /> Document & Print
+            </button>
+            <button
+              onClick={() => setActiveTab('assistant')}
+              className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-medium text-left transition ${
+                activeTab === 'assistant'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'
+              }`}
+            >
+              <Database className="w-3.5 h-3.5" /> Assistant Memory
             </button>
             <button
               onClick={() => setActiveTab('privacy')}
@@ -847,6 +877,17 @@ export const SettingsModal: React.FC<Props> = ({
                     </select>
                   </div>
                 </div>
+              </div>
+            )}
+
+            {/* ASSISTANT MEMORY TAB (B4/B5/C5) */}
+            {activeTab === 'assistant' && (
+              <div className="space-y-4">
+                <div>
+                  <h3 className="font-semibold text-slate-900 dark:text-white text-sm">Assistant → Memory</h3>
+                  <p className="text-xs text-slate-500">Playbook (what the app learned), Skills (how it does things), Activity (raw evidence). All files live in your data folder under <span className="font-mono">memory/</span> as plain JSON/Markdown.</p>
+                </div>
+                <MemoryPanel fa={current.uiLanguage === 'fa'} />
               </div>
             )}
 

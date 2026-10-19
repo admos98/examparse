@@ -617,51 +617,111 @@ export function reassignImageIdsSequential(doc: ExamDoc): ExamDoc {
   // Also update image.label.questionRef if it references old id? No, it references question id, not image id
   return newDoc;
 }
-export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; fixed: boolean; duplicates: string[] } {
-  const seen = new Set<string>();
-  const duplicates: string[] = [];
-  for (const img of doc.images || []) {
-    if (seen.has(img.id)) duplicates.push(img.id);
-    else seen.add(img.id);
-  }
-  if (duplicates.length === 0) return { doc, fixed: false, duplicates: [] };
-  // Flag and locally rename later duplicates + rewrite refs
-  const flags = [...(doc.flags || [])];
-  flags.push({ id: `flag_image_duplicate_${Date.now()}`, code: 'IMAGE_ID_DUPLICATE', severity: 'error' as const, message: `Duplicate imageId(s) detected: ${[...new Set(duplicates)].join(', ')}. Renamed locally.` });
-  // Build mapping for duplicates: keep first occurrence, rename subsequent
-  const idCounts = new Map<string, number>();
-  const mapping = new Map<string, string>(); // but need per-occurrence mapping, not just id
-  const newImages: ImageAsset[] = [];
-  const seenFirst = new Set<string>();
-  for (const img of doc.images) {
-    if (!seenFirst.has(img.id)) {
-      seenFirst.add(img.id);
-      newImages.push(img);
-      idCounts.set(img.id, 1);
-    } else {
-      const count = (idCounts.get(img.id) || 1) + 1;
-      idCounts.set(img.id, count);
-      const newId = `${img.id}_dup${count}`;
-      // Need to ensure newId unique
-      let finalId = newId;
-      let dupIdx = count;
-      while (newImages.some(i=>i.id===finalId)) { dupIdx++; finalId = `${img.id}_dup${dupIdx}`; }
-      mapping.set(`${img.id}#${doc.images.indexOf(img)}`, finalId); // use index-based key
-      // Create new image with renamed id
-      newImages.push({ ...img, id: finalId });
-      // Also track mapping from old duplicate occurrence to newId for refs update
-      // We need to map oldId at that occurrence to newId
-      // But refs point to imageId, not occurrence. If there were duplicate ids, refs ambiguous.
-      // We will rewrite any question refs that pointed to duplicate id beyond first occurrence to newId if we can detect which occurrence they intended?
-      // For simplicity, we reassign sequentially after fixing duplicates to ensure global uniqueness
+interface RenamedImageOccurrence {
+  image: ImageAsset;
+  index: number;
+}
+
+function pageForImageReference(
+  question: Question,
+  anchorLine: number | undefined,
+  pageByLine: Map<number, number>
+): number | undefined {
+  const line = anchorLine ?? question.spans[0]?.[0];
+  return line === undefined ? undefined : pageByLine.get(line);
+}
+
+function imageLabelMatchesQuestion(image: ImageAsset, question: Question): boolean {
+  const reference = image.label?.questionRef;
+  return reference !== undefined && (
+    reference === question.id ||
+    reference === question.label ||
+    reference === String(question.no)
+  );
+}
+
+function chooseImageOccurrence(
+  occurrences: RenamedImageOccurrence[],
+  question: Question,
+  anchorLine: number | undefined,
+  pageByLine: Map<number, number>
+): RenamedImageOccurrence {
+  const referencePage = pageForImageReference(question, anchorLine, pageByLine);
+  const onReferencePage = referencePage === undefined
+    ? occurrences
+    : occurrences.filter(occurrence => occurrence.image.page === referencePage);
+  const pageCandidates = onReferencePage.length > 0 ? onReferencePage : occurrences;
+  const labelCandidates = pageCandidates.filter(occurrence => imageLabelMatchesQuestion(occurrence.image, question));
+  const candidates = labelCandidates.length > 0 ? labelCandidates : pageCandidates;
+  const targetLine = anchorLine ?? question.spans[0]?.[0];
+
+  return [...candidates].sort((left, right) => {
+    if (targetLine !== undefined) {
+      const leftDistance = Math.abs((left.image.anchorLine ?? targetLine) - targetLine);
+      const rightDistance = Math.abs((right.image.anchorLine ?? targetLine) - targetLine);
+      if (leftDistance !== rightDistance) return leftDistance - rightDistance;
     }
-  }
-  // For now, after renaming duplicates, reassign sequentially to ensure uniqueness and stable order
-  let fixedDoc = { ...doc, images: newImages, flags };
-  // Also need to handle refs: if questions referenced duplicate ids, they likely intended the occurrence on their page.
-  // We can reassign all ids sequentially to resolve, updating refs via sequential mapping
-  fixedDoc = reassignImageIdsSequential(fixedDoc);
-  return { doc: fixedDoc, fixed: true, duplicates };
+    return left.index - right.index;
+  })[0];
+}
+
+export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; fixed: boolean; duplicates: string[] } {
+  const occurrenceCounts = new Map<string, number>();
+  for (const image of doc.images) occurrenceCounts.set(image.id, (occurrenceCounts.get(image.id) || 0) + 1);
+  const duplicates = [...occurrenceCounts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([id]) => id);
+  if (duplicates.length === 0) return { doc, fixed: false, duplicates: [] };
+
+  const duplicateIds = new Set(duplicates);
+  const reservedIds = new Set(doc.images.map(image => image.id));
+  const nextOccurrenceById = new Map<string, number>();
+  const allocatedIds = new Set<string>();
+  const occurrencesByOriginalId = new Map<string, RenamedImageOccurrence[]>();
+
+  const images = doc.images.map((image, index) => {
+    const occurrence = (nextOccurrenceById.get(image.id) || 0) + 1;
+    nextOccurrenceById.set(image.id, occurrence);
+    let id = image.id;
+    if (duplicateIds.has(image.id) && occurrence > 1) {
+      let suffix = occurrence;
+      id = `${image.id}_dup${suffix}`;
+      while (reservedIds.has(id) || allocatedIds.has(id)) {
+        suffix += 1;
+        id = `${image.id}_dup${suffix}`;
+      }
+    }
+    allocatedIds.add(id);
+    const renamed = { ...image, id };
+    const occurrences = occurrencesByOriginalId.get(image.id) || [];
+    occurrences.push({ image: renamed, index });
+    occurrencesByOriginalId.set(image.id, occurrences);
+    return renamed;
+  });
+
+  const pageByLine = new Map(doc.source.lines.map(line => [lineNoFromId(line.id), line.page]));
+  const questions = doc.questions.map(question => ({
+    ...question,
+    images: question.images.map(reference => {
+      if (!duplicateIds.has(reference.imageId)) return reference;
+      const occurrences = occurrencesByOriginalId.get(reference.imageId);
+      if (!occurrences?.length) return reference;
+      const image = chooseImageOccurrence(occurrences, question, reference.anchorLine, pageByLine);
+      return { ...reference, imageId: image.image.id };
+    }),
+  }));
+
+  const flags: Flag[] = [
+    ...doc.flags,
+    {
+      id: `flag_image_duplicate_${duplicates.map(id => id.replace(/[^A-Za-z0-9_-]/g, '_')).join('_')}`,
+      code: 'IMAGE_ID_DUPLICATE',
+      severity: 'warn',
+      message: `Duplicate imageId(s) detected: ${duplicates.join(', ')}. Renamed with page-aware question-reference updates.`,
+    },
+  ];
+
+  return { doc: { ...doc, images, questions, flags }, fixed: true, duplicates };
 }
 
 /** Convert legacy/imported table HTML into inert cell strings (no attributes or raw markup survive). */

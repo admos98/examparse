@@ -428,7 +428,10 @@ function responseTripwires(data: any, plan: SectionPlan, sourceLines: SourceLine
     const stem = shortSourceText(q?.spans, sourceLines);
     const enumerated = [...stem.matchAll(/\((\d{1,3})\)/g)].map(m=>Number(m[1])).filter(n=>n>=1&&n<=300);
     if (enumerated.length >= 2) {
-      const hasChildren = questions.some(c=> c.g !== undefined && Number(c.g) === rawQuestionNumber(q, sourceLines) || c.parentId && c.parentId === q.id);
+      const hasChildren = questions.some((candidate: { g?: unknown; parentId?: unknown }) =>
+        (candidate.g !== undefined && Number(candidate.g) === rawQuestionNumber(q, sourceLines)) ||
+        (candidate.parentId !== undefined && candidate.parentId === q.id)
+      );
       // Check if parent enumerates its own number plus others and has no children
       if (!hasChildren && enumerated.length >= 2) {
         tripwires.push(`group parent ${rawQuestionNumber(q, sourceLines) || q.n} enumerates ${enumerated.join(',')} but has no children`);

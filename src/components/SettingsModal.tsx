@@ -20,7 +20,7 @@ import { StoragePanel } from './StoragePanel';
 import { LLMAdapter } from '../providers/adapter';
 import { clearAllCachesAndData, loadUsageLog } from '../store';
 import { buildDiagnostics, exportDiagnostics, diagnosticsFromUsage } from '../utils/diagnostics';
-import { runProbe, saveProbeRecord, probeCostEstimate } from '../pipeline/probe';
+import { CapabilityRecord, getProbeRecord, ProbeProviderConfig, runProbe, saveProbeRecord, probeCostEstimate } from '../pipeline/probe';
 import { MAX_SETTINGS_JSON_BYTES, redactSettingsForExport, validateAppSettings, validateProviderBaseUrl, validateHeaders } from '../utils/validation';
 
 interface Props {
@@ -32,6 +32,23 @@ interface Props {
 }
 
 type TabType = 'providers' | 'roles' | 'costs' | 'thrift' | 'budget' | 'document' | 'privacy' | 'diagnostics';
+type ProbeResult = CapabilityRecord | { error: string };
+
+function probeModelForProvider(provider: ProviderConfig, settings: AppSettings, discoveredModels?: string[]): string {
+  const roleModels = [
+    settings.roleMapping.fast,
+    settings.roleMapping.standard,
+    settings.roleMapping.escalation,
+    settings.roleMapping.vision,
+    settings.roleMapping.agent,
+  ];
+  const configured = roleModels.find(selection => selection?.providerId === provider.id);
+  return configured?.model || discoveredModels?.[0] || 'default-model';
+}
+
+function probeProviderConfig(provider: ProviderConfig, settings: AppSettings, discoveredModels?: string[]): ProbeProviderConfig {
+  return { ...provider, model: probeModelForProvider(provider, settings, discoveredModels) };
+}
 
 const BackupPanel: React.FC = () => {
   const [msg, setMsg] = useState<string|null>(null);
@@ -114,9 +131,19 @@ export const SettingsModal: React.FC<Props> = ({
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
   const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
+  const [probeResults, setProbeResults] = useState<Record<string, ProbeResult>>({});
   const [clearSuccess, setClearSuccess] = useState(false);
 
-  useEffect(() => { if (isOpen) setCurrent(settings); }, [isOpen]);
+  useEffect(() => {
+    if (!isOpen) return;
+    setCurrent(settings);
+    let cancelled = false;
+    void Promise.all(settings.providers.map(async provider => {
+      const record = await getProbeRecord(provider.id, probeModelForProvider(provider, settings));
+      if (record && !cancelled) setProbeResults(previous => ({ ...previous, [provider.id]: record }));
+    }));
+    return () => { cancelled = true; };
+  }, [isOpen, settings]);
   if (!isOpen) return null;
 
   const handleUpdateProvider = (id: string, updates: Partial<ProviderConfig>) => {
@@ -175,15 +202,20 @@ export const SettingsModal: React.FC<Props> = ({
     const models = await LLMAdapter.fetchModels(provider);
     setAvailableModels(prev => ({ ...prev, [provider.id]: models }));
   };
-  const [probeResults, setProbeResults] = useState<Record<string, any>>({});
   const handleProbe = async (provider: ProviderConfig) => {
     setTestingId(`probe-${provider.id}`);
     try {
-      const rec = await runProbe(provider, (req)=> LLMAdapter.dispatch(req, provider));
-      await saveProbeRecord(rec);
-      setProbeResults(prev=> ({...prev, [provider.id]: rec}));
-    } catch(e:any){ setProbeResults(prev=> ({...prev, [provider.id]: {error:e?.message}})); }
-    setTestingId(null);
+      const configuredProvider = probeProviderConfig(provider, current, availableModels[provider.id]);
+      // Use the adapter's normal one-shot execution path, exactly like pipeline calls.
+      const record = await runProbe(configuredProvider, request => LLMAdapter.execute(request));
+      await saveProbeRecord(record);
+      setProbeResults(previous => ({ ...previous, [provider.id]: record }));
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Probe failed';
+      setProbeResults(previous => ({ ...previous, [provider.id]: { error: message } }));
+    } finally {
+      setTestingId(null);
+    }
   };
 
   const handleClearCache = async () => {
@@ -351,6 +383,9 @@ export const SettingsModal: React.FC<Props> = ({
                   {current.providers.map(p => {
                     const test = testResults[p.id];
                     const models = availableModels[p.id];
+                    const probeModel = probeModelForProvider(p, current, models);
+                    const probeEstimate = probeCostEstimate(probeModel, current.costTable);
+                    const probe = probeResults[p.id];
 
                     return (
                       <div
@@ -454,8 +489,23 @@ export const SettingsModal: React.FC<Props> = ({
                             >
                               Fetch Models
                             </button>
-                            <button onClick={()=> handleProbe(p)} disabled={testingId===`probe-${p.id}`} className="px-2.5 py-1 rounded-lg border text-[11px]">Probe {probeCostEstimate()}</button>
-                            {probeResults[p.id] && <span className="text-[11px] text-slate-500">{probeResults[p.id].error ? `Probe: ${probeResults[p.id].error}` : `v2 ${probeResults[p.id].wireV2Ok ? 'ok':'no'} · sse ${probeResults[p.id].sse?'yes':'no'}`}</span>}
+                            <button
+                              onClick={() => handleProbe(p)}
+                              disabled={testingId === `probe-${p.id}`}
+                              className="px-2.5 py-1 rounded-lg border text-[11px]"
+                            >
+                              {testingId === `probe-${p.id}` ? 'Probing…' : `Probe ${probeEstimate}`}
+                            </button>
+                            <span className="text-[10px] text-slate-500" title={`Model: ${probeModel}`}>
+                              Estimated before run: {probeEstimate}
+                            </span>
+                            {probe && (
+                              <span className="text-[11px] text-slate-500">
+                                {'error' in probe
+                                  ? `Probe: ${probe.error}`
+                                  : `SSE ${probe.sse ? 'yes' : 'no'} · reasoning ${probe.reasoningChannel ? 'yes' : 'no'} · wire v2 ${probe.wireV2Ok ? 'yes' : 'no'} · tool calls ${probe.toolCalls ? 'yes' : 'no'} · max out ≈${probe.approxMaxOut}`}
+                              </span>
+                            )}
                           </div>
 
                           {test && (

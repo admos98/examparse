@@ -9,7 +9,7 @@ import { tagFurniture, extractionDiagnostics } from './extractionQuality';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
 import { labelImagesBatched } from './vision';
-import { assembleAndValidateQuestions, assembleAndValidateSections, sliceSourceSpans } from './assemble';
+import { assembleAndValidateQuestions, assembleAndValidateSections, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
 import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, parsePrintedNumberFromStem } from './quality';
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
@@ -484,11 +484,6 @@ export async function runFullPipeline(
   });
 
   const totalDeclaredPoints = structureData.meta?.totalPoints;
-  // C5: validate image IDs uniqueness
-  try {
-    const { validateAndFixDuplicateImageIds } = await import('./assemble');
-    await validateAndFixDuplicateImageIds(updatedImages);
-  } catch {}
   const unresolvedImageIds = updatedImages.filter(img => !img.dataUrl).map(img => img.id);
   const assembled = assembleAndValidateQuestions(
     structureData.rawQuestions || [],
@@ -725,7 +720,7 @@ export async function runFullPipeline(
   const diagnostics = extractionDiagnostics(workingLines, extracted.pages, updatedImages,
     extracted.scannedPageIndices.filter(page => workingLines.some(line => line.page === page)), extracted.diagnostics);
   for (const page of diagnostics.emptyPages) allFlags.push({ id: `extraction_empty_${page}`, code: 'EXTRACTION_PAGE_EMPTY', severity: 'error', message: `Page ${page} has no extracted or OCR text. Review import.` });
-  const examDoc: ExamDoc = {
+  let examDoc: ExamDoc = {
     id: examId,
     fileHash,
     createdAt: new Date().toISOString(),
@@ -760,6 +755,10 @@ export async function runFullPipeline(
     flags: allFlags,
     usage: usageRecords,
   };
+
+  // C5: resolve extraction collisions only after assembly, when source-page context
+  // can safely rewrite question references as well as image metadata and flags.
+  examDoc = validateAndFixDuplicateImageIds(examDoc).doc;
 
   await saveExamDoc(examDoc);
   return examDoc;

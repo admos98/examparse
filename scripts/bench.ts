@@ -3,13 +3,64 @@ import fs from 'fs';
 import path from 'path';
 import { performance } from 'perf_hooks';
 import { assembleAndValidateQuestions, assembleAndValidateSections } from '../src/pipeline/assemble';
-import { enumerateExpectedQuestionNos, evaluateCoverage, getExamHealth } from '../src/pipeline/quality';
+import { enumerateExpectedQuestionNos, evaluateCoverage, getExamHealth, parsePrintedNumberFromStem } from '../src/pipeline/quality';
 import { computeQualityScore } from '../src/utils/qualityScore';
 import { expandWireV2 } from '../src/pipeline/structure';
 
 const fixturesDir = path.join(process.cwd(), 'test/fixtures/golden');
 const thresholdsPath = path.join(fixturesDir, 'thresholds.json');
 const thresholds = JSON.parse(fs.readFileSync(thresholdsPath, 'utf8'));
+
+type PointsRange = readonly [number, number];
+
+function pointsRange(value: unknown, fixtureId: string): PointsRange {
+  if (!Array.isArray(value) || value.length !== 2 || !value.every(item => typeof item === 'number' && Number.isFinite(item))) {
+    throw new Error(`${fixtureId}: pointsPercent must be an inclusive [min, max] range.`);
+  }
+  const range: PointsRange = [value[0], value[1]];
+  if (range[0] < 0 || range[1] < range[0]) throw new Error(`${fixtureId}: invalid pointsPercent range [${range.join(', ')}].`);
+  return range;
+}
+
+function rawQuestionIdentity(question: any, sourceLines: any[]): string | undefined {
+  const spans = Array.isArray(question?.spans) ? question.spans : [];
+  const firstSpan = spans.find((span: unknown) => Array.isArray(span) && Number.isFinite(Number(span[0])));
+  const firstLine = firstSpan ? Number(firstSpan[0]) : undefined;
+  const sourceText = firstLine === undefined
+    ? undefined
+    : sourceLines.find(line => Number(String(line.id).replace(/\D/g, '')) === firstLine)?.text;
+  const printedNumber = parsePrintedNumberFromStem(sourceText);
+  const declaredNumber = Number(question?.no ?? question?.n);
+  const number = printedNumber ?? declaredNumber;
+  if (!Number.isInteger(number) || number < 1 || number > 300 || firstLine === undefined) return undefined;
+  return `${number}@${firstLine}`;
+}
+
+function staysOutsideKeyTerritory(question: any, keyLineNos: Set<number>): boolean {
+  const spans = Array.isArray(question?.spans) ? question.spans : [];
+  return spans.some((span: unknown) => {
+    if (!Array.isArray(span) || span.length < 2) return false;
+    const start = Number(span[0]);
+    const end = Number(span[1]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) return false;
+    for (let line = start; line <= end; line++) if (!keyLineNos.has(line)) return true;
+    return false;
+  });
+}
+
+/** Match the structure pass's exact printed-number/span merge so retries cannot inflate points. */
+function mergeRawQuestions(existing: any[], additions: any[], sourceLines: any[], keyLineNos: Set<number>): any[] {
+  const merged = [...existing];
+  const seen = new Set(existing.map(question => rawQuestionIdentity(question, sourceLines)).filter((key): key is string => Boolean(key)));
+  for (const question of additions) {
+    if (!staysOutsideKeyTerritory(question, keyLineNos)) continue;
+    const key = rawQuestionIdentity(question, sourceLines);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    merged.push(question);
+  }
+  return merged;
+}
 
 function countOptionBlobs(doc:any): number {
   let c=0;
@@ -51,7 +102,7 @@ async function runFixture(id:string){
     // Expand v2
     const expanded = expandWireV2(wire);
     const qs = expanded.questions || expanded.q || [];
-    rawQuestions.push(...qs);
+    rawQuestions = mergeRawQuestions(rawQuestions, qs, sourceLines, enumerated.keyTerritory.lineNos);
     if (expanded.sections) sections.push(...expanded.sections);
     if (expanded.meta) meta = { ...meta, ...expanded.meta };
     if (expanded.m) meta = { ...meta, ...expanded.m };
@@ -142,7 +193,8 @@ async function main(){
     results.push(r);
     const thr = thresholds[id];
     const covOk = r.coverage >= thr.coveragePercent;
-    const ptsOk = r.pointsPercent >= thr.pointsPercent;
+    const [pointsMin, pointsMax] = pointsRange(thr.pointsPercent, id);
+    const ptsOk = r.pointsPercent >= pointsMin && r.pointsPercent <= pointsMax;
     const blobOk = r.optionBlobs <= thr.maxOptionBlob;
     const phantomOk = r.phantomMissing <= (thr.maxPhantomMissing ?? 0);
     const callsOk = r.structureCalls <= thr.maxStructureCalls;
@@ -161,7 +213,8 @@ async function main(){
     if (!ok) {
       const reasons:string[] = [];
       if (!covOk) reasons.push(`coverage ${r.coverage.toFixed(1)} < ${thr.coveragePercent}`);
-      if (!ptsOk) reasons.push(`points ${r.pointsPercent} < ${thr.pointsPercent}`);
+      if (r.pointsPercent < pointsMin) reasons.push(`points ${r.pointsPercent} < ${pointsMin}`);
+      if (r.pointsPercent > pointsMax) reasons.push(`points ${r.pointsPercent} > ${pointsMax}`);
       if (!blobOk) reasons.push(`optBlob ${r.optionBlobs} > ${thr.maxOptionBlob}`);
       if (!phantomOk) reasons.push(`phantom ${r.phantomMissing} > ${thr.maxPhantomMissing}`);
       if (!callsOk) reasons.push(`calls ${r.structureCalls} > ${thr.maxStructureCalls}`);

@@ -241,3 +241,101 @@ test(
     }
   },
 );
+
+test(
+  'memory server: D3 correction sweep blames matched lessons once per closed 10-minute window',
+  { timeout: 60_000 },
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'examparse-correction-test-'));
+    const dataDir = path.join(root, 'data');
+    const memoryDir = path.join(dataDir, 'memory');
+    const listener = net.createServer();
+    listener.listen(0, '127.0.0.1');
+    await once(listener, 'listening');
+    const port = (listener.address() as net.AddressInfo).port;
+    await new Promise<void>(r => listener.close(() => r()));
+    const child = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        NODE_ENV: 'production',
+        PORT: String(port),
+        EXAMFORGE_DATA_DIR: '',
+        EXAMPARSE_CONFIG_FILE: path.join(root, 'config.json'),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let output = '';
+        const timeout = setTimeout(() => reject(new Error(`Server startup timed out: ${output}`)), 20_000);
+        child.stdout.on('data', chunk => {
+          output += String(chunk);
+          if (output.includes('ExamParse server running')) { clearTimeout(timeout); resolve(); }
+        });
+        child.on('exit', code => { clearTimeout(timeout); reject(new Error(`Server exited ${code}: ${output}`)); });
+        child.stderr.on('data', chunk => { output += String(chunk); });
+      });
+      const base = `http://127.0.0.1:${port}`;
+      const request = async (url: string, method = 'GET', body?: unknown) => {
+        const res = await fetch(base + url, {
+          method,
+          headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        let json: any = null;
+        try { json = await res.json(); } catch { /* non-JSON */ }
+        return { status: res.status, json };
+      };
+      assert.equal((await request('/api/storage/config', 'POST', { dir: dataDir })).status, 200);
+
+      // An active lesson that already carries ONE consecutive failure.
+      const lesson = {
+        id: 'lesson_1', kind: 'strategy', scope: {},
+        lesson: 'Always double-check page two before reporting missing numbers.',
+        status: 'active', confidence: 0.6,
+        evidence: { runIds: ['r1'], successes: 3, failures: 0, consecutiveFailures: 1, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString() },
+      };
+      assert.equal((await request('/api/memory/playbook', 'PUT', { version: 1, entries: [lesson] })).status, 200);
+
+      // Job ended 11 minutes ago (window closed) and the user saved 2 versions inside it.
+      const end = Date.now() - 11 * 60 * 1000;
+      const endTs = new Date(end).toISOString();
+      await fs.writeFile(
+        path.join(dataDir, 'versions', 'exam_c1.json'),
+        JSON.stringify([
+          { id: 'v1', ts: new Date(end + 2 * 60 * 1000).toISOString() },
+          { id: 'v2', ts: new Date(end + 5 * 60 * 1000).toISOString() },
+        ]),
+      );
+      const posted = await request('/api/memory/runs', 'POST', {
+        jobId: 'job_c1', kind: 'remediation', examId: 'exam_c1',
+        baselineTs: endTs, baselineRevision: 'rev_1', matchedIds: ['lesson_1'],
+        outcome: { health: { state: 'green', expected: 5, parsed: 5, missing: [], coveragePercent: 100 } },
+      });
+      assert.equal(posted.status, 200);
+
+      // The sweep ran during the append: 2 unledgered in-window versions ⇒ 1 blame ⇒ 2 consecutive failures ⇒ demoted.
+      const blamed = await request('/api/memory/playbook');
+      const entry = blamed.json.entries.find((item: any) => item.id === 'lesson_1');
+      assert.equal(entry.status, 'demoted', 'a corrected job blames its matched lessons');
+      assert.equal(entry.evidence.failures, 1);
+      assert.equal(entry.evidence.consecutiveFailures, 2);
+      const checks = JSON.parse(await fs.readFile(path.join(memoryDir, 'correction-checks.json'), 'utf8'));
+      assert.equal(checks['job_c1'], 2);
+
+      // Idempotent: another append re-runs the sweep but never blames job_c1 twice.
+      assert.equal((await request('/api/memory/runs', 'POST', { jobId: 'job_c2', kind: 'pipeline', outcome: { health: { state: 'green' } } })).status, 200);
+      const again = await request('/api/memory/playbook');
+      assert.equal(again.json.entries.find((item: any) => item.id === 'lesson_1').evidence.failures, 1, 'blame applied at most once per job');
+
+      // The correction is ledgered.
+      const activity = await request('/api/memory/activity');
+      assert.ok(activity.json.activity.some((item: any) => item.type === 'user_correction' && item.jobId === 'job_c1'));
+      console.log('D3 sweep: window closed after 11 min, 2 in-window versions, 0 ledger entries → 2 corrections → lesson_1 demoted once (idempotent)');
+    } finally {
+      child.kill('SIGKILL');
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);

@@ -12,6 +12,7 @@ import { SHIPPED_SKILLS } from './src/pipeline/memory/shippedSkills';
 import { lintSkill, parseSkillFile, serializeSkill } from './src/pipeline/memory/lint';
 import { draftEligibleForActivation, evaluateSkillStaleness } from './src/pipeline/memory/skills';
 import { addProposal, applyCredit, expireCandidates, lessonIsSafe } from './src/pipeline/memory/playbook';
+import { countUserCorrections, USER_CORRECTION_WINDOW_MS } from './src/pipeline/memory/harness';
 
 dotenv.config();
 
@@ -177,6 +178,7 @@ const PLAYBOOK_FILE = () => path.join(MEMORY_DIR, 'playbook.json');
 const SKILLS_DIR = () => path.join(MEMORY_DIR, 'skills');
 const MEMORY_CONFIG_FILE = () => path.join(MEMORY_DIR, 'memory-config.json');
 const ACTIVITY_FILE = () => path.join(MEMORY_DIR, 'activity.jsonl');
+const CORRECTION_CHECKS_FILE = () => path.join(MEMORY_DIR, 'correction-checks.json');
 const RUNS_CAP_LINES = 2000; // A1 — rotate at 2,000 lines into a plain .jsonl archive
 
 function readMemoryConfig(): { learningEnabled: boolean; reflectionEnabled: boolean } {
@@ -256,6 +258,49 @@ function appendRun(entry: any): void {
     fs.appendFileSync(RUNS_ARCHIVE_FILE(), archived.join('\n') + '\n');
     fs.writeFileSync(RUNS_FILE(), lines.slice(-RUNS_CAP_LINES).join('\n') + '\n');
   }
+  sweepUserCorrections();
+}
+
+/** D3 — delayed user-correction sweep. After each journal append, any recent job whose
+ * 10-minute window has CLOSED and was not checked yet is scored: stored exam versions
+ * inside (jobEnd, jobEnd+10min] minus assistant ledger entries in the same window =
+ * user corrections (human edits are not ledgered). Corrections > 0 blame the matched
+ * playbook ids recorded on the journal line. Checked job ids are remembered in a plain
+ * JSON file so blame is applied at most once per job. */
+function sweepUserCorrections(): void {
+  if (!MEMORY_DIR) return;
+  try {
+    const now = Date.now();
+    const runs = readRuns().slice(-100);
+    const checks = readJsonFile<Record<string, number>>(CORRECTION_CHECKS_FILE(), {});
+    let dirty = false;
+    for (const run of runs) {
+      const examId = String(run?.examId || '');
+      const endTs = String(run?.baselineTs || '');
+      if (!run?.jobId || !SAFE_SEGMENT.test(examId)) continue;
+      const end = Date.parse(endTs);
+      if (!Number.isFinite(end) || now < end + USER_CORRECTION_WINDOW_MS) continue; // window still open
+      if (checks[run.jobId] !== undefined) continue; // already scored
+      const versions = readJsonFile<any[]>(path.join(VERSIONS_DIR, `${examId}.json`), []);
+      const dossier = readJsonFile<any>(path.join(MEMORY_DIR, `${examId}.json`), null);
+      const corrections = countUserCorrections({ jobEndTs: endTs, versions, ledgerEntries: dossier?.ledger || [] });
+      checks[run.jobId] = corrections;
+      dirty = true;
+      if (corrections > 0 && Array.isArray(run.matchedIds) && run.matchedIds.length) {
+        const { playbook, transitions } = applyCredit(readPlaybook(), run.matchedIds, { success: false });
+        writePlaybook(playbook);
+        appendActivity({
+          type: 'user_correction', jobId: run.jobId,
+          message: `${corrections} user correction(s) within 10 minutes after job ${run.jobId} — blamed ${run.matchedIds.length} matched lesson(s)${transitions.length ? ` (${transitions.map((t: any) => `${t.from}→${t.to}`).join(', ')})` : ''}`,
+        });
+      }
+    }
+    if (dirty) {
+      const keys = Object.keys(checks);
+      if (keys.length > 500) for (const key of keys.slice(0, keys.length - 500)) delete checks[key];
+      atomicWriteJson(CORRECTION_CHECKS_FILE(), checks);
+    }
+  } catch { /* best-effort heuristic — never fails a journal write */ }
 }
 
 // --- Learning controls (B5) ---
@@ -482,7 +527,7 @@ app.post('/api/memory/erase', (_req, res) => {
   let removedRuns = 0; let removedEntries = 0; let removedSkills = 0;
   try { removedRuns = readRuns().length; } catch { /* ignore */ }
   try { removedEntries = readPlaybook().entries.filter((entry: any) => !String(entry.id).startsWith('bootstrap_')).length; } catch { /* ignore */ }
-  for (const file of [RUNS_FILE(), RUNS_ARCHIVE_FILE(), ACTIVITY_FILE()]) if (fs.existsSync(file)) fs.unlinkSync(file);
+  for (const file of [RUNS_FILE(), RUNS_ARCHIVE_FILE(), ACTIVITY_FILE(), CORRECTION_CHECKS_FILE()]) if (fs.existsSync(file)) fs.unlinkSync(file);
   for (const skill of readSkills()) {
     if (skill.slug.startsWith('bootstrap')) continue;
     const parsed = (() => { try { return parseSkillFile(skill.content, skill.slug); } catch { return null; } })();

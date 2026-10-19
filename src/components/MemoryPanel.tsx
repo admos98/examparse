@@ -190,14 +190,22 @@ export const MemoryPanel: React.FC<Props> = ({ readOnly = false, fa = false }) =
         <div className="space-y-3">
           {!readOnly && (
             <div className="flex flex-wrap gap-2">
-              <button className="px-3 py-1.5 rounded-lg border bg-blue-600 text-white" onClick={() => setEditing({ slug: `user-${Date.now().toString(36)}`, content: SKILL_TEMPLATE, isNew: true, activateNow: false })}>{t('New skill', 'مهارت جدید')}</button>
+              <button className="px-3 py-1.5 rounded-lg border bg-blue-600 text-white" onClick={() => {
+                const slug = `user-${Date.now().toString(36)}`;
+                // Keep frontmatter slug == file slug, or the linter (rightly) rejects the save.
+                setEditing({ slug, content: SKILL_TEMPLATE.replace(/^slug:.*$/m, `slug: ${slug}`), isNew: true, activateNow: false });
+              }}>{t('New skill', 'مهارت جدید')}</button>
               <label className="px-3 py-1.5 rounded-lg border cursor-pointer">
                 {t('Import .md', 'وارد کردن .md')}
                 <input type="file" accept=".md,text/markdown" className="hidden" onChange={async e => {
                   const file = e.target.files?.[0]; if (!file) return;
                   const content = await file.text();
-                  const slug = file.name.replace(/\.md$/i, '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 60) || `imported-${Date.now().toString(36)}`;
-                  setEditing({ slug, content, isNew: true, activateNow: false });
+                  // Prefer the file's own frontmatter slug; fall back to the sanitized file name
+                  // and rewrite the slug line so frontmatter and file name never disagree.
+                  const frontSlug = (content.match(/^slug:\s*([a-z0-9][a-z0-9-]{0,63})\s*$/m) || [])[1];
+                  const slug = frontSlug || file.name.replace(/\.md$/i, '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || `imported-${Date.now().toString(36)}`;
+                  const imported = frontSlug ? content : content.replace(/^slug:.*$/m, `slug: ${slug}`);
+                  setEditing({ slug, content: imported, isNew: true, activateNow: false });
                   e.target.value = '';
                 }} />
               </label>
@@ -254,7 +262,16 @@ export const MemoryPanel: React.FC<Props> = ({ readOnly = false, fa = false }) =
                   {!readOnly && (
                     <div className="flex flex-wrap gap-2 pt-1">
                       <button className="px-2 py-1 rounded border" onClick={() => setEditing({ slug: item.slug, content: item.content, isNew: false, activateNow: false })}>{t('Edit', 'ویرایش')}</button>
-                      <button className="px-2 py-1 rounded border" onClick={() => setEditing({ slug: `${item.slug}-copy`, content: item.content.replace(/slug:\s*[\w-]+/, `slug: ${item.slug}-copy`), isNew: true, activateNow: false })}>{t('Duplicate', 'کپی')}</button>
+                      <button className="px-2 py-1 rounded border" onClick={() => {
+                        // A duplicate is the user's own work: own slug, zeroed stats, source user
+                        // (so it can be deleted and participates in learned-skill pruning).
+                        const copySlug = `${item.slug}-copy`.slice(0, 64);
+                        const copy = item.content
+                          .replace(/^slug:.*$/m, `slug: ${copySlug}`)
+                          .replace(/^source:.*$/m, 'source: user')
+                          .replace(/^stats:.*$/m, 'stats: {"injected": 0, "followed": 0, "greenAfter": 0, "redAfter": 0}');
+                        setEditing({ slug: copySlug, content: copy, isNew: true, activateNow: false });
+                      }}>{t('Duplicate', 'کپی')}</button>
                       <button className="px-2 py-1 rounded border" onClick={() => {
                         const blob = new Blob([item.content], { type: 'text/markdown' });
                         const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${item.slug}.md`; a.click(); URL.revokeObjectURL(url);

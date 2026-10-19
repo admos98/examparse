@@ -16,7 +16,8 @@ import {
 import { SHIPPED_SKILLS } from '../src/pipeline/memory/shippedSkills';
 import { deriveDocTraits } from '../src/pipeline/memory/docTraits';
 import { estimateTokens } from '../src/pipeline/memory/tokens';
-import { endJob, type JobHandle } from '../src/pipeline/memory/harness';
+import { beginJob, endJob, type JobHandle } from '../src/pipeline/memory/harness';
+import type { PlaybookFile } from '../src/pipeline/memory/types';
 import { createBackup, restoreBackup } from '../src/utils/backup';
 
 /* ------------------------------------------------------------------ */
@@ -367,4 +368,64 @@ test('A4 skill caps are constants and the estimator is the documented chars/4 cl
   const ctx: SkillSelectionCtx = { userMessage: 'missing questions answer key images sections weak model verify repair', roles: ['agent'], docTraits: miniTraits };
   const sel = selectSkillsFromPool(pool, ctx);
   assert.ok(sel.selected.length <= 3 && sel.totalTokens <= 3000);
+});
+
+/* ------------------------------------------------------------------ */
+/* A4 regression — beginJob applies the right playbook cap per surface  */
+/* ------------------------------------------------------------------ */
+test('A4 beginJob caps: assistant playbook ≤1,500 tok, pipeline playbook ≤5,000 tok', async () => {
+  const fatEntries = Array.from({ length: 40 }, (_, i) => ({
+    id: `fat_${i}`, kind: 'strategy' as const, scope: {},
+    lesson: `Lesson ${i}: ` + 'x'.repeat(268),
+    status: 'active' as const, confidence: 0.7,
+    evidence: { runIds: ['r'], successes: 1, failures: 0, firstSeen: '2026-01-01T00:00:00.000Z', lastSeen: '2026-10-01T00:00:00.000Z' },
+  }));
+  const file: PlaybookFile = { version: 1, entries: fatEntries } as PlaybookFile;
+  const mock = installFetchMock([
+    ['/api/memory/config', () => ({ learningEnabled: true, reflectionEnabled: true })],
+    ['/api/memory/playbook', () => file],
+    ['/api/memory/skills', () => []],
+    ['/api/memory/runs', () => []],
+  ]);
+  try {
+    const assistant = await beginJob({ kind: 'assistant', userMessage: 'fix missing questions', role: 'agent' });
+    assert.ok(assistant.playbook.tokens > 0);
+    assert.ok(assistant.playbook.tokens <= 1500, `assistant playbook ${assistant.playbook.tokens} tok must be ≤1,500`);
+    const pipeline = await beginJob({ kind: 'pipeline', role: 'fast' });
+    assert.ok(pipeline.playbook.tokens <= 5000, `pipeline playbook ${pipeline.playbook.tokens} tok must be ≤5,000`);
+    assert.ok(pipeline.playbook.tokens > assistant.playbook.tokens, 'the pipeline budget is the larger one');
+    console.log(`A4 beginJob: assistant ${assistant.playbook.tokens} tok ≤1500; pipeline ${pipeline.playbook.tokens} tok ≤5000`);
+  } finally { mock.restore(); }
+});
+
+/* ------------------------------------------------------------------ */
+/* B1 — every-10th-clean-job sampling reads the journal streak          */
+/* ------------------------------------------------------------------ */
+test('B1 sampling: a clean job completes the 10-streak from the journal → interesting + reflection scheduled', async () => {
+  const cleanRuns = Array.from({ length: 9 }, (_, i) => ({
+    jobId: `job_c${i}`, kind: 'pipeline',
+    outcome: { health: { state: 'green', missing: [] } }, ladderPath: [], flagsRaised: [], userCorrections: 0,
+  }));
+  const posted: any[] = [];
+  const mock = installFetchMock([
+    ['/api/memory/config', () => ({ learningEnabled: true, reflectionEnabled: false })],
+    ['/api/memory/runs', (init: any) => { if (init?.body) posted.push(JSON.parse(String(init.body))); return cleanRuns; }],
+    ['/api/memory/skills', () => []],
+    ['/api/memory/activity', () => ({ ok: true })],
+  ]);
+  try {
+    const handle: JobHandle = {
+      jobId: 'job_c10', kind: 'pipeline', startedAt: Date.now(), docTraits: miniTraits, models: {},
+      matchedPlaybookIds: [], playbook: { block: '', tokens: 0, included: [], omittedCount: 0, omittedIds: [], digest: 'd' },
+      skills: [], skillsBlock: '', guidanceTokens: 0, ladderPath: [], flagsRaised: [],
+    };
+    const result = await endJob(handle, {
+      health: { state: 'green', missing: [], expected: 3, parsed: 3, coveragePercent: 100 },
+      calls: 1, tokens: { input: 10, output: 5 }, costUsd: 0, learningEnabled: true,
+    });
+    assert.equal(result.interesting, true, 'the 10th consecutive clean job is interesting');
+    assert.ok(result.reasons.some(reason => reason.includes('every 10th clean job (#10)')), `reasons: ${result.reasons}`);
+    assert.equal(result.reflectionScheduled, true);
+    assert.equal(posted.length, 1, 'the journal line is appended exactly once');
+  } finally { mock.restore(); }
 });

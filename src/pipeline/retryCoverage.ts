@@ -1,7 +1,7 @@
 import { AppSettings, ExamDoc, UsageRecord } from '../types';
 import { runStructurePass } from './structure';
 import { assembleAndValidateQuestions, assembleAndValidateSections } from './assemble';
-import { computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, parsePrintedNumberFromStem } from './quality';
+import { computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, parsePrintedNumberFromStem, examContentRevision } from './quality';
 import { sliceSourceSpans } from './assemble';
 import { calculateActualCost } from '../utils/budget';
 import { sha256 } from '../utils/hash';
@@ -139,6 +139,8 @@ export async function retryMissingCoverage(
         },
         costUsd: calls.reduce((sum, call) => sum + (call.costUsd || 0), 0),
         settings,
+        sourceLines: lines.slice(0, 500).map((line: any) => String(line?.text || '')),
+        baselineRevision: examContentRevision(recovered),
       });
     } catch { /* advisory only (E1) */ }
   }

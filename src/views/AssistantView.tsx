@@ -315,6 +315,23 @@ export function AssistantView({
       if (!monthly.ok) throw new AgentOperationError("folderUsage");
       monthlySpend =
         (await monthly.json())[new Date().toISOString().slice(0, 7)] || 0;
+      /** B1 — one soft-cap computation, shared by readOnly() and the reflection gate. */
+      const softCapExhausted = (): boolean => {
+        const cap = settingsRef.current.assistantMonthlySoftCapUsd;
+        if (cap === undefined) return false;
+        return (
+          monthlySpend +
+            loadUsageLog()
+              .filter(
+                (u) =>
+                  u.role === "agent" &&
+                  !baselineUsage.has(JSON.stringify(u)) &&
+                  u.ts.slice(0, 7) === new Date().toISOString().slice(0, 7),
+              )
+              .reduce((n, u) => n + (u.costUsd || 0), 0) >=
+            cap
+        );
+      };
       // D2/D3 — assistant turn = one memory job. Guidance is assembled locally and
       // bounded (state ≤1,200 B + playbook ≤1,500 tok + skills ≤3,000 tok / ≤3 skills).
       const turnDoc = docRef.current;
@@ -390,6 +407,7 @@ export function AssistantView({
                 transcriptSummary: info.transcriptSummary,
                 baselineRevision: info.baselineRevision,
                 settings: settingsRef.current,
+                monthlyCapExhausted: softCapExhausted(),
                 reflection: {
                   settings: settingsRef.current,
                   sourceLines: (docRef.current.source?.lines || []).slice(0, 500).map(line => line.text),
@@ -418,23 +436,7 @@ export function AssistantView({
                   u.role === "agent" && !baselineUsage.has(JSON.stringify(u)),
               )
               .reduce((n, u) => n + (u.costUsd || 0), 0),
-          readOnly: () => {
-            const s = settingsRef.current;
-            const cap = s.assistantMonthlySoftCapUsd;
-            return (
-              cap !== undefined &&
-              monthlySpend +
-                loadUsageLog()
-                  .filter(
-                    (u) =>
-                      u.role === "agent" &&
-                      !baselineUsage.has(JSON.stringify(u)) &&
-                      u.ts.slice(0, 7) === new Date().toISOString().slice(0, 7),
-                  )
-                  .reduce((n, u) => n + (u.costUsd || 0), 0) >=
-                cap
-            );
-          },
+          readOnly: () => softCapExhausted(),
           model:
             configured && provider
               ? async (system, text) => {

@@ -43,8 +43,8 @@ export interface ReflectionDeps {
   loadConfig?: () => Promise<{ learningEnabled: boolean; reflectionEnabled: boolean }>;
   /** Proposal sink (defaults to POST /api/memory/proposals). */
   submitProposal?: (proposal: ReflectionProposal, jobId: string) => Promise<void>;
-  /** Usage sink for the "Reflection" label. */
-  logUsage?: (record: { label: string; inputTokens: number; outputTokens: number }) => void;
+  /** Usage sink for the "Reflection" label (provider/model/costUsd when known). */
+  logUsage?: (record: { label: string; inputTokens: number; outputTokens: number; costUsd?: number; provider?: string; model?: string }) => void;
   /** Activity sink (failures logged silently, B4). */
   logActivity?: (entry: Record<string, unknown>) => void;
   /** Source lines of the job's doc, when available, for the E3 quote check. */
@@ -64,7 +64,7 @@ export interface ReflectionResult {
   proposals: ReflectionProposal[];
   rejected: number;
   skipReason?: ReflectionSkipReason;
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: { inputTokens: number; outputTokens: number; costUsd?: number };
 }
 
 /** Compact, ≤2,000-token reflection input. NEVER raw source text (B1). */
@@ -127,29 +127,41 @@ export function parseReflectionOutput(raw: unknown, rawText?: string): Reflectio
   return parseReflectionOutputDetailed(raw, rawText).valid;
 }
 
-async function defaultSubmitProposal(proposal: ReflectionProposal): Promise<void> {
-  try {
-    await fetch('/api/memory/proposals', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proposal }),
-    });
-  } catch { /* offline */ }
+async function defaultSubmitProposal(proposal: ReflectionProposal, sourceLines?: string[]): Promise<void> {
+  const res = await fetch('/api/memory/proposals', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(sourceLines?.length ? { proposal, sourceLines: sourceLines.slice(0, 2000) } : { proposal }),
+  });
+  // A server-side rejection (E3, missing evidence, failed linter) must count as rejected.
+  if (!res.ok) throw new Error(`proposal rejected by server (${res.status})`);
 }
 
-async function defaultModel(request: { system: string; text: string; maxOutputTokens: number; label: string }, settings?: any): Promise<{ json: unknown; rawText: string; usage?: { inputTokens: number; outputTokens: number } }> {
+async function defaultModel(request: { system: string; text: string; maxOutputTokens: number; label: string }, settings?: any): Promise<{ json: unknown; rawText: string; usage?: { inputTokens: number; outputTokens: number; costUsd?: number; provider?: string; model?: string } }> {
   const { LLMAdapter } = await import('../../providers/adapter');
+  const { calculateActualCost } = await import('../../utils/budget');
   // Cheapest configured non-reasoning model preferred: the 'fast' role mapping.
   const role = settings?.roleMapping?.fast;
   const provider = settings?.providers?.find((p: any) => p.id === role?.providerId) || settings?.providers?.[0];
   if (!provider) throw new Error('no provider configured');
-  return LLMAdapter.execute({
+  const model = role?.model || provider.model || 'gemini-2.5-flash-lite';
+  const response: any = await LLMAdapter.execute({
     role: 'fast',
     system: request.system,
     text: request.text,
     maxOutputTokens: request.maxOutputTokens,
     label: request.label,
-    providerConfig: { ...provider, model: role?.model || provider.model || 'gemini-2.5-flash-lite', disableReasoning: true, structuredOutputs: true },
-  }) as any;
+    providerConfig: { ...provider, model, disableReasoning: true, structuredOutputs: true },
+  });
+  const inputTokens = response?.usage?.inputTokens || 0;
+  const outputTokens = response?.usage?.outputTokens || 0;
+  return {
+    json: response?.json, rawText: response?.rawText ?? '',
+    usage: {
+      inputTokens, outputTokens,
+      costUsd: calculateActualCost(inputTokens, outputTokens, model, settings?.costTable || {}),
+      provider: String(provider.name || provider.id || 'unknown'), model,
+    },
+  };
 }
 
 /** B1 — the single reflection entry point. Fire-and-forget from job completion (D3). */
@@ -164,7 +176,7 @@ export async function maybeReflect(entry: RunJournalEntry, deps: ReflectionDeps 
   if (!deps.model && !(typeof fetch === 'function')) return skip('no-model');
 
   const input = buildReflectionInput(entry, deps.transcriptSummary);
-  let response: { json: unknown; rawText: string; usage?: { inputTokens: number; outputTokens: number } };
+  let response: { json: unknown; rawText: string; usage?: { inputTokens: number; outputTokens: number; costUsd?: number; provider?: string; model?: string } };
   try {
     response = deps.model
       ? await deps.model({ system: REFLECTION_SYSTEM, text: input, maxOutputTokens: REFLECTION_MAX_OUTPUT_TOKENS, label: 'Reflection' })
@@ -173,7 +185,7 @@ export async function maybeReflect(entry: RunJournalEntry, deps: ReflectionDeps 
     deps.logActivity?.({ type: 'reflection_error', jobId: entry.jobId, message: String(error?.message || error).slice(0, 200), ts: new Date().toISOString() });
     return skip('no-model');
   }
-  deps.logUsage?.({ label: 'Reflection', inputTokens: response.usage?.inputTokens || 0, outputTokens: response.usage?.outputTokens || 0 });
+  deps.logUsage?.({ label: 'Reflection', inputTokens: response.usage?.inputTokens || 0, outputTokens: response.usage?.outputTokens || 0, costUsd: response.usage?.costUsd, provider: response.usage?.provider, model: response.usage?.model });
 
   const { valid: parsed, rejected: schemaRejected } = parseReflectionOutputDetailed(response.json, response.rawText);
   const accepted: ReflectionProposal[] = [];
@@ -185,14 +197,16 @@ export async function maybeReflect(entry: RunJournalEntry, deps: ReflectionDeps 
     if (proposal.layer === 'skill' && !(proposal.procedureSteps?.length)) { rejected++; continue; }
     // Force procedure-shaped lessons into the skill layer (A3).
     const normalized: ReflectionProposal = { ...proposal, evidenceRunIds: [...new Set([...proposal.evidenceRunIds, entry.jobId])].slice(0, 5) };
-    accepted.push(normalized);
-    try { await (deps.submitProposal ? deps.submitProposal(normalized, entry.jobId) : defaultSubmitProposal(normalized)); } catch { rejected++; }
+    try {
+      await (deps.submitProposal ? deps.submitProposal(normalized, entry.jobId) : defaultSubmitProposal(normalized, deps.sourceLines));
+      accepted.push(normalized);
+    } catch { rejected++; }
   }
   if (!parsed.length && typeof response.rawText === 'string' && response.rawText.trim() && !response.rawText.includes('{')) {
     deps.logActivity?.({ type: 'reflection_invalid_output', jobId: entry.jobId, ts: new Date().toISOString() });
-    return { called: true, proposals: [], rejected, skipReason: 'invalid-output', usage: { inputTokens: response.usage?.inputTokens || 0, outputTokens: response.usage?.outputTokens || 0 } };
+    return { called: true, proposals: [], rejected, skipReason: 'invalid-output', usage: { inputTokens: response.usage?.inputTokens || 0, outputTokens: response.usage?.outputTokens || 0, costUsd: response.usage?.costUsd } };
   }
-  return { called: true, proposals: accepted, rejected, usage: { inputTokens: response.usage?.inputTokens || 0, outputTokens: response.usage?.outputTokens || 0 } };
+  return { called: true, proposals: accepted, rejected, usage: { inputTokens: response.usage?.inputTokens || 0, outputTokens: response.usage?.outputTokens || 0, costUsd: response.usage?.costUsd } };
 }
 
 /** D3 — fire-and-forget; never blocks the UI; failures logged silently to Activity. */

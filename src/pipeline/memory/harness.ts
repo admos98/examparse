@@ -9,14 +9,15 @@
 import { estimateTokens } from './tokens';
 import { deriveDocTraits } from './docTraits';
 import {
-  loadMemoryConfig, loadPlaybook, matchedEntryIds, postCredit, logActivity, selectPlaybookEntries,
+  ASSISTANT_PLAYBOOK_CAP, PLAYBOOK_CAP_TOKENS, loadMemoryConfig, loadPlaybook, matchedEntryIds,
+  postCredit, logActivity, selectPlaybookEntries,
   type PlaybookCtx, type PlaybookInjection,
 } from './playbook';
 import {
   applySkillOutcome, evaluateSkillStaleness, formatSkillsForInjection, loadSkills, saveSkill,
   selectSkillsFromPool, type ParsedSkill, type SkillSelectionCtx,
 } from './skills';
-import { appendRunEntry, buildRunEntry, jobIsInteresting, makeJobId, type RunJournalEntry } from './runs';
+import { appendRunEntry, buildRunEntry, jobIsInteresting, loadRuns, makeJobId, type RunJournalEntry } from './runs';
 import { serializeSkill } from './lint';
 import { scheduleReflection, type ReflectionDeps } from './reflection';
 import { guidanceDigestLine } from './guidance';
@@ -74,7 +75,12 @@ export async function beginJob(params: BeginJobParams): Promise<JobHandle> {
     languageHint: params.languageHint,
   });
   const models: Record<string, string> = params.models || (params.modelId ? { [params.role || 'fast']: params.modelId } : {});
-  const ctx: PlaybookCtx = { modelId: params.modelId, docTraits, role: params.role || (params.kind === 'assistant' ? 'agent' : 'fast'), capTokens: params.capTokens };
+  // A4 — the assistant rides a re-budgeted cap (playbook ≤1,500 tok); pipeline calls use the full ≤5,000.
+  const ctx: PlaybookCtx = {
+    modelId: params.modelId, docTraits,
+    role: params.role || (params.kind === 'assistant' ? 'agent' : 'fast'),
+    capTokens: params.capTokens ?? (params.kind === 'assistant' ? ASSISTANT_PLAYBOOK_CAP : PLAYBOOK_CAP_TOKENS),
+  };
 
   const config = await loadMemoryConfig().catch(() => ({ learningEnabled: true, reflectionEnabled: true }));
   let playbook: PlaybookInjection = { block: '', tokens: 0, included: [], omittedCount: 0, omittedIds: [], digest: 'Guidance: playbook 0 entries (0 tok).' };
@@ -104,6 +110,21 @@ export async function beginJob(params: BeginJobParams): Promise<JobHandle> {
   };
 }
 
+/** B1 — reflection cost lands in the usage log under the label "Reflection". */
+async function defaultReflectionUsageLogger(record: { label: string; inputTokens: number; outputTokens: number; costUsd?: number; provider?: string; model?: string }): Promise<void> {
+  try {
+    await fetch('/api/usage', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ts: new Date().toISOString(), role: 'fast',
+        provider: record.provider || 'unknown', model: record.model || 'unknown',
+        inputTokens: record.inputTokens, outputTokens: record.outputTokens,
+        costUsd: record.costUsd || 0, label: record.label,
+      }),
+    });
+  } catch { /* offline — usage logging is best-effort */ }
+}
+
 export interface EndJobParams {
   health: any;
   calls: number;
@@ -117,6 +138,12 @@ export interface EndJobParams {
   transcriptSummary?: string;
   cleanJobIndex?: number;
   baselineRevision?: string;
+  /** Source text lines (strings) for the E3 ≥12-word quote check during reflection. Never persisted. */
+  sourceLines?: string[];
+  /** B1 — the monthly soft cap is exhausted: reflection must not run. */
+  monthlyCapExhausted?: boolean;
+  /** Usage sink for the "Reflection" label (defaults to POST /api/usage). */
+  logUsage?: (record: { label: string; inputTokens: number; outputTokens: number; costUsd?: number; provider?: string; model?: string }) => void;
   /** Reflection deps (model injection for tests/bench). */
   reflection?: ReflectionDeps;
   settings?: any;
@@ -152,6 +179,9 @@ export async function endJob(handle: JobHandle, params: EndJobParams): Promise<E
     costUsd: params.costUsd, wallMs, ladderPath, flagsRaised, userCorrections: params.userCorrections || 0,
   });
   if (params.baselineRevision) { entry.baselineRevision = params.baselineRevision; entry.baselineTs = new Date().toISOString(); }
+  // B2/D3 — the ids credited/blamed for this job ride in the journal line itself so the
+  // server's delayed correction sweep can blame them after the 10-minute window closes.
+  if (handle.matchedPlaybookIds.length) entry.matchedIds = handle.matchedPlaybookIds.slice(0, 50);
   // B5 — record exactly which guidance rode along, incl. draft-shadow skills (B3(b) reads this).
   entry.guidance = {
     playbookEntries: handle.playbook.included.length,
@@ -163,9 +193,32 @@ export async function endJob(handle: JobHandle, params: EndJobParams): Promise<E
   };
 
   const learningEnabled = params.learningEnabled ?? (await loadMemoryConfig().catch(() => ({ learningEnabled: true })).then(cfg => cfg.learningEnabled));
+  // B1 — "every 10th clean job" sampling: when nothing else makes this job interesting,
+  // count the trailing streak of clean jobs in the journal (this job is not appended yet).
+  let cleanJobIndex = params.cleanJobIndex;
+  const preliminary = jobIsInteresting({
+    ladderPath, healthState: entry.outcome.health.state, flagsRaised,
+    userCorrections: entry.userCorrections, toolRefused: params.toolRefused,
+  });
+  if (!preliminary.interesting && cleanJobIndex === undefined && learningEnabled) {
+    try {
+      const recent = await loadRuns(2000);
+      let streak = 0;
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const run: any = recent[i];
+        const wasClean = !jobIsInteresting({
+          ladderPath: run?.ladderPath || [], healthState: String(run?.outcome?.health?.state || 'amber'),
+          flagsRaised: run?.flagsRaised || [], userCorrections: Number(run?.userCorrections) || 0,
+        }).interesting;
+        if (!wasClean) break;
+        streak++;
+      }
+      cleanJobIndex = streak + 1;
+    } catch { /* offline: no sampling */ }
+  }
   const interesting = jobIsInteresting({
     ladderPath, healthState: entry.outcome.health.state, flagsRaised,
-    userCorrections: entry.userCorrections, cleanJobIndex: params.cleanJobIndex, toolRefused: params.toolRefused,
+    userCorrections: entry.userCorrections, cleanJobIndex, toolRefused: params.toolRefused,
   });
   const result: EndJobResult = {
     entry, credited: false, transitions: [], pruned: [],
@@ -213,6 +266,9 @@ export async function endJob(handle: JobHandle, params: EndJobParams): Promise<E
       isCacheHit: params.isCacheHit,
       interesting: true,
       transcriptSummary: params.transcriptSummary,
+      sourceLines: params.reflection?.sourceLines || params.sourceLines,
+      monthlyCapExhausted: params.monthlyCapExhausted ?? params.reflection?.monthlyCapExhausted,
+      logUsage: params.reflection?.logUsage || params.logUsage || defaultReflectionUsageLogger,
       logActivity: params.reflection?.logActivity || (record => { void logActivity(record); }),
     });
     result.reflectionScheduled = true;

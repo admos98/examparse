@@ -228,6 +228,15 @@ export function statePack(
     while (new TextEncoder().encode(JSON.stringify(pack)).length > 1200 && pack.dossier?.ledger?.length) pack.dossier.ledger.pop();
     while (new TextEncoder().encode(JSON.stringify(pack)).length > 1200 && pack.dossier?.sections?.length) pack.dossier.sections.pop();
   }
+  // A4 law — the 1,200-byte bound is HARD. Pathological packs (huge missing lists,
+  // notes, task blobs) shed optional enrichments, then fall back to a minimal pack.
+  const byteSize = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+  if (byteSize(pack) > 1200) { delete pack.task; delete pack.dossier; }
+  if (byteSize(pack) > 1200) { delete pack.history; delete pack.sections; pack.user = ""; pack.meta = ""; }
+  if (byteSize(pack) > 1200) {
+    const minimal: any = { id: pack.id, health: { state: pack.health?.state }, ...(pack.guidance ? { guidance: pack.guidance } : {}) };
+    return byteSize(minimal) <= 1200 ? JSON.stringify(minimal) : JSON.stringify({ id: pack.id, health: { state: pack.health?.state } });
+  }
   return JSON.stringify(pack);
 }
 export interface AgentEvent {

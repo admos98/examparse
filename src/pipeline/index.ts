@@ -820,6 +820,7 @@ export async function runFullPipeline(
         isCacheHit,
         settings,
         baselineRevision: examContentRevisionLocal(examDoc),
+        sourceLines: workingLines.slice(0, 500).map((line: any) => String(line?.text || '')),
       });
       onStageUpdate({
         id: 'structure', name: 'Structure Pass', status: structureStatus as any,

@@ -33,6 +33,8 @@ export interface RunJournalEntry {
   /** D3 baseline for the 10-minute user-correction window. */
   baselineRevision?: string;
   baselineTs?: string;
+  /** Playbook entry ids matched BEFORE the job — blamed retroactively by the D3 correction sweep. */
+  matchedIds?: string[];
   /** Which guidance was actually injected (B5 inspectability). */
   guidance?: { playbookEntries: number; playbookTokens: number; skills: string[]; skillsTokens: number; omittedByCap: number; draftShadowSkills?: string[] };
 }

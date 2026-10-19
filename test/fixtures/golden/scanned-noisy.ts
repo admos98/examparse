@@ -1,5 +1,5 @@
 import type { SourceLine } from '../../../src/types';
-const makeLines = (texts: string[], page=1): SourceLine[] => texts.map((t,i)=>({ id:`L${String(i+1).padStart(4,'0')}`, page, text:t }));
+const makeLines = (texts: string[]): SourceLine[] => texts.map((t, i) => ({ id:`L${String(i + 1).padStart(4, '0')}`, page: i < 11 ? 1 : 2, text: t }));
 export const fixture = {
   id: 'scanned-noisy',
   description: 'Scanned OCR noisy: tatweel, ZWNJ, broken words',

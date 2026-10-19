@@ -230,7 +230,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       execute: ({ numbers }) => {
         const doc = ctx.getDoc();
         const enumRes = enumerateExpectedQuestionNos(doc.source.lines);
-        const result = numbers.map(n=>{
+        const result = numbers.map((n: number)=>{
           const expectedLine = enumRes.lineByNumber.get(n);
           const lineText = expectedLine ? doc.source.lines.find(l=> lineNumber(l)===expectedLine)?.text : undefined;
           // Neighbouring parsed

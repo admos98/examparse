@@ -253,6 +253,9 @@ function summarizeStoredExam(doc: any): any {
     imageCount: Array.isArray(doc.images) ? doc.images.length : 0,
     ocrUsed: Boolean(doc.source?.ocrUsed),
     qualityScore,
+    coveragePercent: health.coveragePercent,
+    missingQuestionNos: health.missing,
+    duplicateQuestionNos: health.duplicates,
     totalCostUsd: usage.reduce((a: number, u: any) => a + (u.costUsd || 0), 0),
     totalTokens: usage.reduce((a: number, u: any) => a + (u.inputTokens || 0) + (u.outputTokens || 0), 0),
   };

@@ -70,7 +70,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
     // Group images (including duplicate child references) render once beneath the parent only.
     const groupRefs = depth === 0 ? [q, ...descendants(q, children)].flatMap(item => item.images || []) : [];
     const groupImages = depth === 0 ? renderImages([...new Map(groupRefs.map(ref => [ref.imageId, ref])).values()]) : null;
-    return <article key={q.id} className={`space-y-2 pb-3 border-b border-slate-200/80 last:border-0 ${depth ? 'ml-6 pl-3 border-l-2 border-slate-300 text-[0.92em]' : ''}`} style={{ breakInside: 'avoid' }}>
+    return <article key={q.id} data-qid={q.id} data-no={String(q.no)} className={`question space-y-2 pb-3 border-b border-slate-200/80 last:border-0 ${depth ? 'ml-6 pl-3 border-l-2 border-slate-300 text-[0.92em]' : ''}`} style={{ breakInside: 'avoid' }}>
       <div className="flex items-start justify-between gap-3 text-xs leading-relaxed">
         <div className="flex items-start gap-2">
           <span className="font-bold text-slate-900 text-sm font-mono shrink-0">{nestedLabel}</span>

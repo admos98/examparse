@@ -42,7 +42,8 @@ const BackupPanel: React.FC = () => {
       const summaries = await lis();
       const exams: Record<string,any> = {};
       for (const s of summaries) { const d = await ld(s.id); if(d) exams[s.id]=d; }
-      const buf = await createBackup({ exams, images:{}, dossiers:{}, settings: JSON.parse(localStorage.getItem('examparse_settings')||'{}') });
+      const safeSettings = (()=>{ try { return JSON.parse(localStorage.getItem('examparse_settings')||'{}'); } catch { return {}; } })();
+      const buf = await createBackup({ exams, images:{}, dossiers:{}, settings: safeSettings });
       const blob = new Blob([buf as any], {type:'application/zip'});
       const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='examparse-backup.zip'; a.click(); URL.revokeObjectURL(url);
       setMsg('Backup downloaded');

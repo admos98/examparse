@@ -218,11 +218,10 @@ export const LibraryView: React.FC<Props> = ({
   // F3 multi-exam picker + library-scope QA (dossiers only, All exams)
   const [libraryQuery, setLibraryQuery] = useState('');
   const [libraryAnswer, setLibraryAnswer] = useState<string | null>(null);
-  const [libraryScope, setLibraryScope] = useState<'all'|'filtered'>('all');
-  const handleLibraryQuery = async () => {
+  const handleLibraryQuery = () => {
     const q = libraryQuery.trim(); if (!q) return;
-    // Build minimal dossiers from summaries (dossier contract: no source text)
-    const dossiers: any[] = summaries.map(s=> ({ identity:{title:s.displayName}, healthSnapshot:{ state: s.complete ? 'green':'red', unplacedImages: s.imageCount - s.questionCount, missingNumbers: s.missingQuestionNos }}));
+    // Minimal dossiers from summaries — no model source text, no keys; respects F3 contract
+    const dossiers: any[] = summaries.map(s=> ({ identity:{title:s.displayName}, healthSnapshot:{ state: s.complete ? 'green':'red', unplacedImages: (s as any).unplacedImages ?? 0, missingNumbers: s.missingQuestionNos?.length ?? 0 }}));
     const ans = answerLibraryQuestion(q, dossiers as any);
     setLibraryAnswer(ans);
   };
@@ -261,15 +260,11 @@ export const LibraryView: React.FC<Props> = ({
           </button>
         </div>
 
-        {/* Library-scope QA (F3) */}
+        {/* Library-scope QA (F3) — dossiers only, no raw PDF text; All exams / scoped */}
         <div className="flex flex-wrap items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3 text-xs">
-          <select value={libraryScope} onChange={e=> setLibraryScope(e.target.value as any)} className="px-2 py-1 rounded border text-xs">
-            <option value="all">All exams</option>
-            <option value="filtered">Filtered</option>
-          </select>
-          <input type="text" value={libraryQuery} onChange={e=> setLibraryQuery(e.target.value)} onKeyDown={e=> e.key==='Enter' && handleLibraryQuery()} placeholder='Try “which exams are incomplete?”' className="flex-1 min-w-[180px] px-2 py-1 rounded border text-xs" />
-          <button onClick={handleLibraryQuery} className="px-3 py-1 rounded bg-blue-600 text-white text-xs">Ask library</button>
-          {libraryAnswer && <div className="w-full mt-2 p-2 rounded bg-slate-50 dark:bg-slate-800 text-xs">{libraryAnswer} <button onClick={()=> setLibraryAnswer(null)} className="ml-2 underline">dismiss</button></div>}
+          <input type="text" value={libraryQuery} onChange={e=> setLibraryQuery(e.target.value)} onKeyDown={e=> e.key==='Enter' && handleLibraryQuery()} placeholder='Try “which exams are incomplete?” or “list exams”' className="flex-[250px] px-2 py-1 rounded border text-xs" aria-label="Ask library" />
+          <button onClick={handleLibraryQuery} className="px-3 py-1 rounded bg-blue-600 text-white text-xs shrink-0">Ask library</button>
+          {libraryAnswer && <div role="status" className="w-full mt-2 p-2 rounded bg-slate-50 dark:bg-slate-800 text-xs">{libraryAnswer} <button onClick={()=> setLibraryAnswer(null)} className="ml-2 underline">dismiss</button></div>}
         </div>
 
         {/* Toolbar */}

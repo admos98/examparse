@@ -4,8 +4,15 @@ import { getExamHealth } from '../pipeline/quality';
 import { computeQualityScore, qualityColor } from '../utils/qualityScore';
 
 export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onExplainScore?: (filter?: string)=>void }> = ({ doc, className = '', onExplainScore }) => {
-  const health = getExamHealth(doc);
-  const quality = computeQualityScore(doc);
+  // getExamHealth throws if doc is incomplete (e.g. missing source.lines) — degrade to partial instead of white-screen
+  let health: ReturnType<typeof getExamHealth>;
+  try { health = getExamHealth(doc); } catch {
+    health = { expectedCount: doc.questions?.length || 0, parsedCount: doc.questions?.length || 0, missing:[], duplicates:[], pointsParsed:0, pointDeficit:0, unplacedImages:[], unresolvedImageRefs:[], lowConfidenceCount:0, coveragePercent: doc.questions?.length ? 100 : 0, state:'amber', complete:false } as any;
+  }
+  let quality: ReturnType<typeof computeQualityScore>;
+  try { quality = computeQualityScore(doc); } catch {
+    quality = { total:0, coverage:0, points:0, optionsCleanliness:0, imagePlacement:0, numbering:0, confidence:0, passage:0, details:{ coveragePercent:0, pointDeficit:0, optionBlobCount:0, unplacedImages:0, duplicateNumbers:0, missingNumbers:0, lowConfidenceCount:0, passageMissing:false } } as any;
+  }
   const [showBreakdown, setShowBreakdown] = useState(false);
   const colors = health.state === 'green'
     ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-200'

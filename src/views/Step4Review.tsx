@@ -439,18 +439,19 @@ export const Step4Review: React.FC<Props> = ({
         ))}</div>;
       })()}
       {scoreExplain && <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-3 text-xs flex items-center justify-between"><span>{scoreExplain}</span><button onClick={()=> setScoreExplain(null)} className="text-slate-400 hover:text-slate-600"><X className="w-4 h-4" /></button></div>}
-      {/* Bulk ops bar (D2) */}
+      {/* Bulk ops bar (D2) — confirm destructive */}
       {selectedIds.size>0 && (
-        <div className="flex flex-wrap items-center gap-2 p-2 rounded-xl border bg-blue-50 dark:bg-blue-950/30 text-xs">
+        <div role="toolbar" aria-label="Bulk actions" className="flex flex-wrap items-center gap-2 p-2 rounded-xl border bg-blue-50 dark:bg-blue-950/30 text-xs">
           <span className="font-semibold">{selectedIds.size} selected</span>
-          <input type="number" value={bulkPts} onChange={e=> setBulkPts(Number(e.target.value))} className="w-16 px-1 py-0.5 rounded border text-xs" />
+          <label className="flex items-center gap-1">Points <input type="number" min={0} max={50} step={1} value={bulkPts} onChange={e=> setBulkPts(Number(e.target.value))} className="w-16 px-1 py-0.5 rounded border text-xs" /></label>
           <button onClick={()=> { const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'setPoints', points:bulkPts}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); }} className="px-2 py-1 rounded bg-blue-600 text-white text-xs">Set points</button>
-          <button onClick={()=> { const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'delete'}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); setSelectedIds(new Set()); }} className="px-2 py-1 rounded bg-red-600 text-white text-xs">Delete</button>
+          <button onClick={()=> { if(!confirm(`Delete ${selectedIds.size} question(s)?`)) return; const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'delete'}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); setSelectedIds(new Set()); }} className="px-2 py-1 rounded bg-red-600 text-white text-xs">Delete</button>
           <button onClick={()=> { const exp=exportSelected(examDoc, [...selectedIds]); const blob=new Blob([JSON.stringify(exp.json,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='selected.json'; a.click(); URL.revokeObjectURL(url); }} className="px-2 py-1 rounded border text-xs">Export selected</button>
-          {undoSnapshot && <button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs">Undo</button>}
+          {undoSnapshot && <button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs font-semibold">Undo</button>}
           <button onClick={()=> setSelectedIds(new Set())} className="px-2 py-1 rounded border text-xs">Clear</button>
         </div>
       )}
+      {undoSnapshot && selectedIds.size===0 && <div className="text-xs flex items-center gap-2"><span>Bulk change applied.</span><button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs font-semibold">Undo</button></div>}
       {health.missing.length > 0 && (
         <div className="rounded-2xl border border-red-300 bg-red-50 p-4 text-xs text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
           <div className="flex flex-wrap items-center justify-between gap-3">

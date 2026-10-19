@@ -1,0 +1,11 @@
+{
+  "_comment": "Loosening a threshold requires editing it visibly in the diff — that's the point. All values are minimums unless noted.",
+  "iranian-rtl": { "coveragePercent": 84, "pointsPercent": 5, "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 4000, "maxWallMs": 2000 },
+  "english-mcq": { "coveragePercent": 90, "pointsPercent": 95, "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 2, "maxOutputTokens": 3000, "maxWallMs": 1500 },
+  "scanned-noisy": { "coveragePercent": 90, "pointsPercent": 0, "maxOptionBlob": 1, "maxPhantomMissing": 1, "maxStructureCalls": 3, "maxOutputTokens": 5000, "maxWallMs": 2500 },
+  "two-column": { "coveragePercent": 90, "pointsPercent": 95, "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 3500, "maxWallMs": 2000 },
+  "image-heavy": { "coveragePercent": 90, "pointsPercent": 0, "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 4500, "maxWallMs": 2500, "maxUnplacedImages": 5 },
+  "giant-120": { "coveragePercent": 90, "pointsPercent": 90, "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 5, "maxOutputTokens": 15000, "maxWallMs": 5000 },
+  "separate-keyfile": { "coveragePercent": 95, "pointsPercent": 100, "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 4000, "maxWallMs": 2000 },
+  "pathological-model": { "coveragePercent": 85, "pointsPercent": 85, "maxOptionBlob": 1, "maxPhantomMissing": 0, "maxStructureCalls": 4, "maxOutputTokens": 6000, "maxWallMs": 3000 }
+}

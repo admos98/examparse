@@ -14,7 +14,7 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // Up to 50MB for batched image payloads
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb', strict: false }));
 
 /* ------------------------------------------------------------------ */
 /* Folder-backed storage (A)                                           */
@@ -22,17 +22,17 @@ app.use(express.json({ limit: '50mb' }));
 const CONFIG_FILE = process.env.EXAMPARSE_CONFIG_FILE || path.join(process.cwd(), '.examparse-storage.json');
 let configuredDir: string | undefined = process.env.EXAMFORGE_DATA_DIR;
 if (!configuredDir) { try { configuredDir = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')).dir; } catch { /* first run */ } }
-let DATA_DIR = ''; let EXAMS_DIR = ''; let IMAGES_DIR = ''; let CACHE_DIR = ''; let JOURNALS_DIR = ''; let VERSIONS_DIR = '';
+let DATA_DIR = ''; let EXAMS_DIR = ''; let IMAGES_DIR = ''; let CACHE_DIR = ''; let JOURNALS_DIR = ''; let VERSIONS_DIR = ''; let MEMORY_DIR = '';
 let SETTINGS_FILE = ''; let USAGE_FILE = ''; let MONTHLY_USAGE_FILE = ''; let storageError = '';
 function configureStorage(dir: string) {
   const base = path.resolve(dir);
-  const buckets = ['exams', 'images', 'cache', 'journals', 'versions'].map(name => path.join(base, name));
+  const buckets = ['exams', 'images', 'cache', 'journals', 'versions', 'memory'].map(name => path.join(base, name));
   fs.mkdirSync(base, { recursive: true }); fs.accessSync(base, fs.constants.R_OK | fs.constants.W_OK);
   for (const bucket of buckets) {
     if (fs.existsSync(bucket) && fs.lstatSync(bucket).isSymbolicLink()) throw new Error('Storage buckets must not be symlinks.');
     fs.mkdirSync(bucket, { recursive: true });
   }
-  DATA_DIR = base; [EXAMS_DIR, IMAGES_DIR, CACHE_DIR, JOURNALS_DIR, VERSIONS_DIR] = buckets;
+  DATA_DIR = base; [EXAMS_DIR, IMAGES_DIR, CACHE_DIR, JOURNALS_DIR, VERSIONS_DIR, MEMORY_DIR] = buckets;
   SETTINGS_FILE = path.join(base, 'settings.json'); USAGE_FILE = path.join(base, 'usage.json'); MONTHLY_USAGE_FILE = path.join(base, 'usage-monthly.json'); storageError = '';
 }
 if (configuredDir) { try { configureStorage(configuredDir); } catch (error) { storageError = String(error); } }
@@ -157,6 +157,41 @@ function atomicWriteFile(file: string, data: string | Buffer): void {
 function atomicWriteJson(file: string, value: unknown): void {
   atomicWriteFile(file, JSON.stringify(value, null, 2));
 }
+app.get('/api/memory/:id', (req, res) => {
+  if (!safeSegment(res, req.params.id)) return;
+  const file = assertInsideDir(res, MEMORY_DIR, path.join(MEMORY_DIR, `${req.params.id}.json`)); if (!file) return;
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'Memory not found' });
+  return res.json(readJsonFile(file, null));
+});
+app.put('/api/memory/:id', (req,res)=>{
+  if (!safeSegment(res, req.params.id)) return;
+  const file = assertInsideDir(res, MEMORY_DIR, path.join(MEMORY_DIR, `${req.params.id}.json`)); if (!file) return;
+  if (!hasSafeJsonSize(res, req.body, 32768)) return;
+  atomicWriteJson(file, req.body); return res.json({ok:true});
+});
+app.delete('/api/memory/:id', (req,res)=>{
+  if (!safeSegment(res, req.params.id)) return;
+  const file = assertInsideDir(res, MEMORY_DIR, path.join(MEMORY_DIR, `${req.params.id}.json`)); if (!file) return;
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+  return res.json({ok:true});
+});
+app.get('/api/memory', (_req,res)=>{
+  if (!fs.existsSync(MEMORY_DIR)) return res.json([]);
+  const files = fs.readdirSync(MEMORY_DIR).filter(f=>f.endsWith('.json'));
+  return res.json(files.map(f=>f.replace(/\.json$/,'')));
+});
+// Global user memory
+app.get('/api/user-memory', (_req,res)=>{
+  const file = path.join(DATA_DIR, 'user.json');
+  if (!fs.existsSync(file)) return res.json({ preferences:{}, facts:[] });
+  return res.json(readJsonFile(file, {preferences:{},facts:[]}));
+});
+app.put('/api/user-memory', (req,res)=>{
+  const file = path.join(DATA_DIR, 'user.json');
+  if (!hasSafeJsonSize(res, req.body, 8192)) return;
+  atomicWriteJson(file, req.body); return res.json({ok:true});
+});
+
 function dirStats(dir: string): number {
   let total = 0;
   if (!fs.existsSync(dir)) return 0;
@@ -225,7 +260,7 @@ app.delete('/api/agent-lock/:id', (req, res) => {
 });
 
 app.get('/api/storage/stats', (_req, res) => res.json({ dir: DATA_DIR, buckets: Object.fromEntries([
-  ['exams', EXAMS_DIR], ['images', IMAGES_DIR], ['cache', CACHE_DIR], ['journals', JOURNALS_DIR], ['usage', USAGE_FILE],
+  ['exams', EXAMS_DIR], ['images', IMAGES_DIR], ['cache', CACHE_DIR], ['journals', JOURNALS_DIR], ['memory', MEMORY_DIR], ['usage', USAGE_FILE],
 ].map(([name, file]) => [name, { bytes: fs.existsSync(file) ? fs.statSync(file).isDirectory() ? dirStats(file) : fs.statSync(file).size + (name === 'usage' && fs.existsSync(MONTHLY_USAGE_FILE) ? fs.statSync(MONTHLY_USAGE_FILE).size : 0) : 0,
   count: fs.existsSync(file) ? fs.statSync(file).isDirectory() ? fs.readdirSync(file).length : readJsonFile<any[]>(file, []).length : 0 }])) }));
 app.delete('/api/storage/buckets/:bucket', (req, res) => {

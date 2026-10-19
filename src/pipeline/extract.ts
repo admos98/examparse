@@ -328,7 +328,8 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           }
         }
 
-        const assetId = `img_${String(images.length + pageAssets.length + 1).padStart(3, '0')}`;
+        // A1: allocate from ONE monotonically increasing counter across whole document
+        const assetId = `img_${String(images.length + pageAssets.length + 1).padStart(3, '0')}`; // global counter via images.length ensures uniqueness; reassignment after merging guarantees (page,y,x) order
 
         // Find nearest source line by y-coordinate on this page
         const pageLines = lines.filter(l => l.page === pageNum);
@@ -410,6 +411,24 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
       const { _blob: _discard, ...serializable } = finalAsset;
       images.push(serializable);
     }
+  }
+
+  // A1: after fragment merging reassign ids sequentially in (page,y,x) order
+  if (images.length > 1) {
+    const sorted = [...images].sort((a,b)=>{
+      if (a.page !== b.page) return a.page - b.page;
+      const ay = (a as any).y ?? a.bbox?.y ?? 0;
+      const by = (b as any).y ?? b.bbox?.y ?? 0;
+      if (ay !== by) return ay - by;
+      return (a.bbox?.x ?? 0) - (b.bbox?.x ?? 0);
+    });
+    const mapping = new Map<string,string>();
+    sorted.forEach((img, idx)=> mapping.set(img.id, `img_${String(idx+1).padStart(3,'0')}`));
+    for (const img of images) {
+      const newId = mapping.get(img.id);
+      if (newId) img.id = newId;
+    }
+    // Note: question images refs don't exist yet at extraction time; vision hints updated later via same mapping if needed
   }
 
   return {

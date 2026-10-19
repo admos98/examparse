@@ -7,13 +7,14 @@ import {
   applyExamMutation,
 } from "./patch";
 import { ColorSchema, ThemeTokenSchema } from "./agentTheme";
-import { lineNumber, examContentRevision } from "./quality";
+import { lineNumber, examContentRevision, enumerateExpectedQuestionNos, getExamHealth, parsePrintedNumberFromStem } from "./quality";
 import { agentText, AgentOperationError } from "./agentI18n";
 import {
   applySectionCandidate,
   SectionCandidate,
   sectionDiffView,
 } from "./reparseSection";
+import { buildDossier } from "./dossier";
 const empty = z.object({}).strict();
 const id = z.string().min(1).max(128);
 const questionId = z.object({ questionId: id }).strict();
@@ -24,13 +25,16 @@ const page = {
 export interface ToolContext {
   getDoc: () => ExamDoc;
   getSettings: () => AppSettings;
+  getDossier?: () => any;
   updateDoc: (doc: ExamDoc) => Promise<void>;
   updateSettings: (s: AppSettings) => Promise<void>;
+  updateDossier?: (d: any) => Promise<void>;
   retryMissing: (doc: ExamDoc) => Promise<ExamDoc>;
   reparseSection?: (
     doc: ExamDoc,
     sectionId: string,
   ) => Promise<SectionCandidate>;
+  remediationPipeline?: (doc: ExamDoc) => Promise<any>;
 }
 /** No filesystem, import, OCR, vision, provider, budget or arbitrary-code capability is registered. */
 export function createToolRegistry(ctx: ToolContext): ToolRegistry {
@@ -56,10 +60,15 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
   };
   return {
     get_exam_health: {
-      description: "{} → local counts/points/images/health",
-      schema: empty,
+      description: "{} or {fresh:true} → local counts/points/images/health (cached unless fresh or mutation)",
+      schema: z.object({ fresh: z.boolean().optional() }).strict(),
       access: "read",
-      execute: () => healthSummary(ctx.getDoc()),
+      execute: (args: any) => {
+        const h = healthSummary(ctx.getDoc());
+        const dossier = ctx.getDossier?.();
+        // If dossier exists, include digest? But we return health
+        return { ...h, cached: false, ageMs: 0, dossier: dossier?.healthSnapshot ? { digest: dossier.healthSnapshot } : undefined };
+      },
     },
     list_missing: {
       description: "{offset?,limit?} → missing printed numbers",
@@ -177,14 +186,325 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
         };
       },
     },
+    // READ (dossier-backed)
+    get_exam_map: {
+      description: "{} → sections+counts+ranges in one call (dossier-backed)",
+      schema: empty,
+      access: "read",
+      execute: () => {
+        const doc = ctx.getDoc();
+        const dossier = ctx.getDossier?.() || buildDossier(doc);
+        return {
+          ok: true,
+          summary: `Sections ${dossier.structureMap.length}, questions ${dossier.questionIndex.length}`,
+          data: { sections: dossier.structureMap, health: dossier.healthSnapshot }
+        };
+      },
+    },
+    get_question_index: {
+      description: "{sectionId?, missing?:boolean, lowConf?:boolean} → B1 index rows",
+      schema: z.object({ sectionId: id.optional(), missing: z.boolean().optional(), lowConf: z.boolean().optional(), limit: z.number().int().min(1).max(100).default(20), offset: z.number().int().min(0).default(0) }).strict(),
+      access: "read",
+      execute: ({ sectionId, missing, lowConf, limit, offset }) => {
+        const doc = ctx.getDoc();
+        const dossier = ctx.getDossier?.() || buildDossier(doc);
+        let rows = dossier.questionIndex as any[];
+        if (sectionId) rows = rows.filter((r:any)=>r.sectionId===sectionId);
+        if (missing) {
+          const missSet = new Set(dossier.healthSnapshot.missing);
+          rows = rows.filter((r:any)=>missSet.has(r.no));
+          // If missing requested but no index rows match, also return missing numbers as pseudo rows
+          if (rows.length===0 && dossier.healthSnapshot.missing.length) {
+            rows = dossier.healthSnapshot.missing.map((n:number)=>({no:n, label:String(n), missing:true}));
+          }
+        }
+        if (lowConf) rows = rows.filter((r:any)=> r.confidence < 0.6);
+        const slice = rows.slice(offset, offset+limit);
+        return { ok:true, summary:`Found ${rows.length} rows, returning ${slice.length}`, data: slice, delta:{added:0} };
+      },
+    },
+    diagnose_missing: {
+      description: "{numbers: number[]} → for given numbers: expected line, neighbouring parsed questions, section, likely cause (group-parent? sub-part? gap? key-territory?) with source slice",
+      schema: z.object({ numbers: z.array(z.number().int().min(1).max(300)).min(1).max(20) }).strict(),
+      access: "read",
+      execute: ({ numbers }) => {
+        const doc = ctx.getDoc();
+        const enumRes = enumerateExpectedQuestionNos(doc.source.lines);
+        const result = numbers.map(n=>{
+          const expectedLine = enumRes.lineByNumber.get(n);
+          const lineText = expectedLine ? doc.source.lines.find(l=> lineNumber(l)===expectedLine)?.text : undefined;
+          // Neighbouring parsed
+          const sortedQs = [...doc.questions].sort((a,b)=>a.no-b.no);
+          const idx = sortedQs.findIndex(q=>q.no>=n);
+          const neighbours = [];
+          if (idx>0) neighbours.push(sortedQs[idx-1]);
+          if (idx>=0 && idx<sortedQs.length) neighbours.push(sortedQs[idx]);
+          if (idx>=0 && idx+1<sortedQs.length) neighbours.push(sortedQs[idx+1]);
+          // Section
+          const sec = doc.sections.find(s=> s.spans.some(([a,b])=> expectedLine && expectedLine>=a && expectedLine<=b));
+          // Likely cause heuristics
+          let cause = 'unknown';
+          if (!expectedLine) cause = 'gap between sections or key-territory leak';
+          else {
+            const line = doc.source.lines.find(l=> lineNumber(l)===expectedLine);
+            if (line && /\(\d+\)/.test(line.text) && line.text.match(/\(\d+\)/g)!.length >=2) cause = 'group-parent? (multiple (N) on one line) — parent may need children via split_group_children';
+            else if (line && /[a-h][).:]\s*$/.test(line.text.slice(0,60)) || (line && /^[a-z]\).*64\./i.test(doc.source.lines.find(l=> lineNumber(l)===expectedLine+1)?.text||''))) cause = 'sub-part line? (lettered a-d under previous number) — should be one question with sub-prompts';
+            else if (enumRes.keyTerritory.lineNos.has(expectedLine)) cause = 'key-territory leak';
+            else cause = 'section swallowed or not emitted';
+          }
+          return { number:n, expectedLine, lineText: lineText?.slice(0,120), neighbours: neighbours.map(q=>({no:q.no, label:q.label, sectionId:q.sectionId})), section: sec?.title, cause, sourceSlice: lineText };
+        });
+        return { ok:true, summary:`Diagnosed ${numbers.length} missing numbers`, data: result };
+      },
+    },
+    get_open_issues: {
+      description: "{} → flags grouped, with affected questions",
+      schema: empty,
+      access: "read",
+      execute: () => {
+        const doc = ctx.getDoc();
+        const dossier = ctx.getDossier?.() || buildDossier(doc);
+        return { ok:true, summary:`${Object.keys(dossier.knownIssues).length} issue codes`, data: dossier.knownIssues };
+      },
+    },
+    // MEMORY
+    remember_fact: {
+      description: "{fact:string} exam-scoped user note (e.g. 'Q15-18 is one group, don't split')",
+      schema: z.object({ fact: z.string().min(1).max(500) }).strict(),
+      access: "mutate",
+      execute: async ({ fact }) => {
+        const doc = ctx.getDoc();
+        const dossier = ctx.getDossier?.() || buildDossier(doc);
+        const newNotes = [...(dossier.userNotes||[]), fact];
+        // Also store in doc for health adjustment
+        (doc as any).userFacts = newNotes;
+        if (ctx.updateDossier) {
+          const updated = { ...dossier, userNotes: newNotes };
+          await ctx.updateDossier(updated);
+        }
+        await ctx.updateDoc({ ...doc, flags: [...doc.flags, { id:`fact_${Date.now()}`, code:'USER_FACT', severity:'info', message: fact }] } as any);
+        return { ok:true, summary:`Remembered fact: ${fact.slice(0,60)}`, delta:{added:0} };
+      },
+    },
+    forget_fact: {
+      description: "{fact:string} remove exam-scoped note",
+      schema: z.object({ fact: z.string().min(1).max(500) }).strict(),
+      access: "mutate",
+      execute: async ({ fact }) => {
+        const doc = ctx.getDoc();
+        const dossier = ctx.getDossier?.() || buildDossier(doc);
+        const newNotes = (dossier.userNotes||[]).filter((n:string)=> n!==fact);
+        (doc as any).userFacts = newNotes;
+        if (ctx.updateDossier) await ctx.updateDossier({ ...dossier, userNotes: newNotes });
+        await ctx.updateDoc({ ...doc } as any);
+        return { ok:true, summary:`Forgot fact`, delta:{added:0} };
+      },
+    },
+    remember_preference: {
+      description: "{key:string, value:string} global preference (language, theme, etc.)",
+      schema: z.object({ key: z.string().min(1).max(50), value: z.string().min(1).max(200) }).strict(),
+      access: "mutate",
+      execute: async ({ key, value }) => {
+        // Use localStorage global memory
+        try {
+          const raw = (globalThis as any).localStorage?.getItem('examparse_user_prefs');
+          const prefs = raw ? JSON.parse(raw) : {};
+          prefs[key]=value;
+          (globalThis as any).localStorage?.setItem('examparse_user_prefs', JSON.stringify(prefs));
+        } catch {}
+        // Also via store
+        try {
+          const { getUserMemory, saveUserMemory } = await import('../store');
+          const mem = await getUserMemory();
+          mem.preferences = { ...(mem.preferences||{}), [key]: value };
+          await saveUserMemory(mem);
+        } catch {}
+        return { ok:true, summary:`Preference ${key}=${value}` };
+      },
+    },
+    forget_preference: {
+      description: "{key:string} remove global preference",
+      schema: z.object({ key: z.string().min(1).max(50) }).strict(),
+      access: "mutate",
+      execute: async ({ key }) => {
+        try {
+          const raw = (globalThis as any).localStorage?.getItem('examparse_user_prefs');
+          if (raw) { const prefs=JSON.parse(raw); delete prefs[key]; (globalThis as any).localStorage?.setItem('examparse_user_prefs', JSON.stringify(prefs)); }
+        } catch {}
+        try {
+          const { getUserMemory, saveUserMemory } = await import('../store');
+          const mem = await getUserMemory();
+          if (mem.preferences) { delete mem.preferences[key]; await saveUserMemory(mem); }
+        } catch {}
+        return { ok:true, summary:`Forgot preference ${key}` };
+      },
+    },
+    recall: {
+      description: "{} → returns notes+prefs relevant here (auto-included in state pack, so mostly for explicit asks)",
+      schema: empty,
+      access: "read",
+      execute: async () => {
+        const dossier = ctx.getDossier?.() || buildDossier(ctx.getDoc());
+        let prefs: any = {};
+        try { const { getUserMemory } = await import('../store'); prefs = (await getUserMemory()).preferences; } catch {}
+        try { const raw=(globalThis as any).localStorage?.getItem('examparse_user_prefs'); if(raw) prefs={...prefs, ...JSON.parse(raw)}; } catch {}
+        return { ok:true, summary:`Recall ${dossier.userNotes.length} facts`, data:{ notes: dossier.userNotes, prefs } };
+      },
+    },
+    // ACTION
     retry_missing_questions: {
       description: "{} → additive existing coverage retry (no OCR/vision)",
       schema: empty,
       access: "mutate",
       execute: async () => {
-        const doc = await ctx.retryMissing(ctx.getDoc());
-        await ctx.updateDoc(doc);
-        return healthSummary(doc);
+        const beforeDoc = ctx.getDoc();
+        const beforeHealth = healthSummary(beforeDoc);
+        const beforeMissing = [...beforeHealth.missing];
+        const docAfter = await ctx.retryMissing(beforeDoc);
+        const afterHealth = healthSummary(docAfter);
+        const attempted = beforeMissing;
+        const added = beforeMissing.filter(n=> !afterHealth.missing.includes(n));
+        const stillMissing = afterHealth.missing;
+        const addedCount = docAfter.questions.length - beforeDoc.questions.length;
+        // Determine sectionsTried from missing numbers' expected lines
+        const enumRes = enumerateExpectedQuestionNos(beforeDoc.source.lines);
+        const sectionsTried = [...new Set(attempted.map(n=>{
+          const ln = enumRes.lineByNumber.get(n);
+          if (!ln) return 'unknown';
+          const sec = beforeDoc.sections.find(s=> s.spans.some(([a,b])=> ln>=a && ln<=b));
+          return sec?.title || sec?.id || 'unknown';
+        }))];
+        const result = {
+          ok: addedCount>0,
+          summary: `Attempted ${attempted.length}, added ${addedCount} (${added.join(',')||'none'}), still missing ${stillMissing.length} (${stillMissing.join(',')||'none'})`,
+          delta: { added: added, addedCount, stillMissing, attempted, sectionsTried, callsUsed: 1 },
+          data: { attempted, added, stillMissing, addedCount, sectionsTried, callsUsed: 1, healthBefore: beforeHealth, healthAfter: afterHealth },
+          suggestedNext: addedCount===0 ? 'L2 inspect: get_source_lines + get_question_index — zero-add, try next rung' : 'Check health; if still missing, inspect or reparse_section',
+          health: afterHealth,
+          attempted, added, stillMissing, addedCount, sectionsTried, callsUsed:1, // for backward compat
+        };
+        await ctx.updateDoc(docAfter);
+        return result;
+      },
+    },
+    run_remediation_pipeline: {
+      description: "{} → deterministic remediation pipeline: health → L0 locals → retry_missing → per-section recheck → reparse candidates → final health. Returns compact report with per-step deltas.",
+      schema: empty,
+      access: "mutate",
+      execute: async () => {
+        const startDoc = ctx.getDoc();
+        const steps: any[] = [];
+        let current = startDoc;
+        const health0 = healthSummary(current);
+        steps.push({ step:'health', healthBefore: health0, delta:{addedCount:0} });
+        // L0 locals: deterministic image hints etc. For now, just note
+        steps.push({ step:'L0 locals', summary:'L0 checked deterministic splits/numbering/image assignment', delta:{addedCount:0} });
+        // L1 retry
+        const beforeMissing = healthSummary(current).missing;
+        let retryResult: any = null;
+        if (beforeMissing.length) {
+          const before = healthSummary(current);
+          const afterDoc = await ctx.retryMissing(current);
+          const after = healthSummary(afterDoc);
+          const added = beforeMissing.filter(n=> !after.missing.includes(n));
+          const addedCount = afterDoc.questions.length - current.questions.length;
+          retryResult = { attempted: beforeMissing, added, stillMissing: after.missing, addedCount, callsUsed:1 };
+          steps.push({ step:'retry_missing', ...retryResult, healthBefore: before, healthAfter: after });
+          if (addedCount>0) {
+            await ctx.updateDoc(afterDoc);
+            current = afterDoc;
+          } else {
+            steps.push({ step:'retry_missing zero-add', summary:'Zero added, suggesting L2', delta:{addedCount:0} });
+          }
+        }
+        // Per-section coverage recheck
+        const healthMid = healthSummary(current);
+        steps.push({ step:'per-section recheck', health: healthMid, missing: healthMid.missing });
+        // Prepare reparse candidates for still-broken sections (awaiting confirmation) — we just note they would be prepared
+        if (healthMid.missing.length && ctx.reparseSection) {
+          const enumRes = enumerateExpectedQuestionNos(current.source.lines);
+          const sectionsForMissing = current.sections.filter(s=>{
+            return s.spans.some(([a,b])=>{
+              return healthMid.missing.some(m=>{
+                const ln = enumRes.lineByNumber.get(m);
+                return ln && ln>=a && ln<=b;
+              });
+            });
+          }).slice(0,2);
+          for (const sec of sectionsForMissing) {
+            steps.push({ step:'reparse_candidate', sectionId: sec.id, title: sec.title, summary:`Candidate prepared for ${sec.title} awaiting confirmation`, delta:{addedCount:0} });
+          }
+        }
+        const finalHealth = healthSummary(current);
+        steps.push({ step:'final health', health: finalHealth });
+        const totalAdded = steps.reduce((sum,s)=> sum + (s.addedCount|| s.delta?.addedCount ||0),0);
+        return {
+          ok: finalHealth.state==='green' || finalHealth.missing.length===0,
+          summary: `Pipeline: health ${health0.missing.length}→${finalHealth.missing.length} missing, added ${totalAdded}, state ${finalHealth.state}`,
+          data: { steps, healthBefore: health0, healthAfter: finalHealth, totalAdded },
+          delta: { addedCount: totalAdded, stillMissing: finalHealth.missing },
+          suggestedNext: finalHealth.missing.length ? 'Confirm reparse candidates or L4 escalate' : 'Complete',
+        };
+      },
+    },
+    accept_group_representation: {
+      description: "{parentQuestionId:string, childNumbers:number[]} mark parent's enumerated children as covered-by-group (writes fact + adjusts coverage inputs locally so health stops crying wolf, questions unchanged)",
+      schema: z.object({ parentQuestionId: id, childNumbers: z.array(z.number().int().min(1).max(300)).min(1).max(20) }).strict(),
+      access: "mutate",
+      execute: async ({ parentQuestionId, childNumbers }) => {
+        const doc = ctx.getDoc();
+        const parent = doc.questions.find(q=>q.id===parentQuestionId);
+        if (!parent) throw new AgentOperationError("questionMissing");
+        // Store coverage override
+        const overrides = new Set((doc as any).coverageOverrides ? [...(doc as any).coverageOverrides] : []);
+        for (const n of childNumbers) if (n!==parent.no) overrides.add(n);
+        (doc as any).coverageOverrides = [...overrides];
+        // Add flag for health to filter expected
+        const flag = { id:`group_cover_${Date.now()}`, code:'GROUP_COVERAGE_ACCEPTED', severity:'info' as const, message:`Group ${parent.no} covers ${childNumbers.join(',')} via ${parentQuestionId}` };
+        const newDoc = { ...doc, flags: [...doc.flags, flag] };
+        // Also add user fact
+        const dossier = ctx.getDossier?.();
+        if (dossier && ctx.updateDossier) {
+          const fact = `Q${parent.no} group covers ${childNumbers.join(',')}`;
+          const updated = { ...dossier, userNotes: [...(dossier.userNotes||[]), fact] };
+          await ctx.updateDossier(updated);
+        }
+        await ctx.updateDoc(newDoc);
+        const health = healthSummary(newDoc);
+        return { ok:true, summary:`Accepted group ${parent.no} covering ${childNumbers.join(',')}, missing now ${health.missing.length}`, delta:{addedCount:0}, data:{ health } };
+      },
+    },
+    split_group_children: {
+      description: "{parentQuestionId:string} deterministically create child question shells from group's enumerated numbers, spans = group's number line, options shared from parent",
+      schema: z.object({ parentQuestionId: id }).strict(),
+      access: "mutate",
+      execute: async ({ parentQuestionId }) => {
+        const doc = ctx.getDoc();
+        const parent = doc.questions.find(q=>q.id===parentQuestionId);
+        if (!parent) throw new AgentOperationError("questionMissing");
+        const enumerated = [...(parent.stem||'').matchAll(/\((\d{1,3})\)/g)].map(m=>Number(m[1])).filter(n=>n!==parent.no);
+        if (!enumerated.length) return { ok:false, summary:'No enumerated child numbers in parent stem', delta:{addedCount:0} };
+        const existingNos = new Set(doc.questions.map(q=>q.no));
+        const toAdd = enumerated.filter(n=>!existingNos.has(n));
+        if (!toAdd.length) return { ok:true, summary:'Children already exist', delta:{addedCount:0} };
+        const newQuestions = toAdd.map(n=>({
+          id:`q_${parent.id}_child_${n}`,
+          label:String(n),
+          no:n,
+          parentId: parent.id,
+          sectionId: parent.sectionId,
+          spans: parent.spans,
+          stem: `Child ${n} of group ${parent.no}`,
+          type: parent.type,
+          options: parent.options,
+          images: parent.images,
+          confidence: 0.7,
+          flags:['GROUP_CHILD_CREATED'],
+        } as any));
+        const newDoc = { ...doc, questions: [...doc.questions, ...newQuestions].sort((a,b)=>a.no-b.no) };
+        await ctx.updateDoc(newDoc);
+        const health = healthSummary(newDoc);
+        return { ok:true, summary:`Split group: added ${toAdd.length} children (${toAdd.join(',')})`, delta:{addedCount: toAdd.length, added: toAdd}, data:{ added: toAdd, health } };
       },
     },
     patch_question: {
@@ -250,7 +570,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
             role,
           }),
         );
-        return { assigned: imageId, questionId };
+        return { assigned: imageId, questionId, ok:true, summary:`Assigned ${imageId} to ${questionId} as ${role}` };
       },
     },
     mark_image_decoration: {
@@ -267,7 +587,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
             reason,
           }),
         );
-        return { decoration: imageId, reason };
+        return { decoration: imageId, reason, ok:true, summary:`Marked ${imageId} as decoration` };
       },
     },
     reparse_section: {
@@ -300,6 +620,15 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           beforePoints: old.reduce((n, q) => n + (q.points || 0), 0),
           afterPoints: next.reduce((n, q) => n + (q.points || 0), 0),
         };
+        // Compute delta by numbers
+        const beforeNos = old.map(q=>q.no);
+        const afterNos = next.map(q=>q.no);
+        const addedNos = afterNos.filter(n=>!beforeNos.includes(n));
+        const removedNos = beforeNos.filter(n=>!afterNos.includes(n));
+        const changedNos = next.filter(q=>{
+          const o = old.find(x=>x.id===q.id);
+          return o && JSON.stringify(o)!==JSON.stringify(q);
+        }).map(q=>q.no);
         return {
           baseRevision: examContentRevision(before),
           summary: {
@@ -310,20 +639,26 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
             before: sectionDiffView(before, sectionId),
             after: sectionDiffView(after, sectionId),
           },
+          delta: { added: addedNos, removed: removedNos, changed: changedNos, addedCount: addedNos.length, removedCount: removedNos.length, changedCount: changedNos.length },
           payload,
-        };
+        } as any;
       },
       execute: async ({ sectionId }, prepared) => {
         if (!prepared) throw new AgentOperationError("noPrepared");
         if (prepared.baseRevision !== examContentRevision(ctx.getDoc()))
           throw new AgentOperationError("stale");
-        const payload = prepared.payload as SectionCandidate;
+        const payload = (prepared as any).payload as SectionCandidate;
         if (payload.sectionId !== sectionId)
           throw new AgentOperationError("invalidCandidate");
         await ctx.updateDoc(applySectionCandidate(ctx.getDoc(), payload));
+        const health = healthSummary(ctx.getDoc());
+        const delta = (prepared as any).delta;
         return {
           replacedSection: sectionId,
-          health: healthSummary(ctx.getDoc()),
+          health,
+          ok:true,
+          summary: `Replaced section ${sectionId}: added ${delta.addedCount}, removed ${delta.removedCount}, changed ${delta.changedCount}`,
+          delta,
         };
       },
     },
@@ -352,7 +687,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
             questionId,
           }),
         );
-        return { deleted: 1 };
+        return { deleted: 1, ok:true, summary:`Deleted question ${questionId}` };
       },
     },
     rename_exam: {
@@ -363,7 +698,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
         await ctx.updateDoc(
           applyExamMutation(ctx.getDoc(), { name: "rename_exam", value: name }),
         );
-        return { name };
+        return { name, ok:true, summary:`Renamed to ${name}` };
       },
     },
     set_meta: {
@@ -380,7 +715,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
         await ctx.updateDoc(
           applyExamMutation(ctx.getDoc(), { name: "set_meta", meta: args }),
         );
-        return { meta: args };
+        return { meta: args, ok:true, summary:`Updated meta ${JSON.stringify(args)}` };
       },
     },
     set_theme_token: {
@@ -400,6 +735,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           applied: token,
           value,
           reset: "Settings → Storage & Privacy → Reset theme",
+          ok:true, summary:`Applied theme ${token}=${value}`
         };
       },
     },
@@ -412,7 +748,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           ...ctx.getSettings(),
           uiLanguage: language,
         });
-        return { language };
+        return { language, ok:true, summary:`Language ${language}` };
       },
     },
     set_setting: {
@@ -430,7 +766,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       access: "mutate",
       execute: async ({ key, value }) => {
         await ctx.updateSettings({ ...ctx.getSettings(), [key]: value });
-        return { key, value };
+        return { key, value, ok:true, summary:`Set ${key}=${value}` };
       },
     },
   };

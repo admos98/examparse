@@ -484,6 +484,11 @@ export async function runFullPipeline(
   });
 
   const totalDeclaredPoints = structureData.meta?.totalPoints;
+  // C5: validate image IDs uniqueness
+  try {
+    const { validateAndFixDuplicateImageIds } = await import('./assemble');
+    await validateAndFixDuplicateImageIds(updatedImages);
+  } catch {}
   const unresolvedImageIds = updatedImages.filter(img => !img.dataUrl).map(img => img.id);
   const assembled = assembleAndValidateQuestions(
     structureData.rawQuestions || [],

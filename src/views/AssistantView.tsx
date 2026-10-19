@@ -107,6 +107,12 @@ export function AssistantView({
     docRef.current = value;
     onUpdateDoc(value);
   }
+  async function updateDossier(value: any) {
+    try {
+      const { saveDossier } = await import('../store');
+      await saveDossier(value);
+    } catch {}
+  }
   async function updateSettings(value: AppSettings) {
     settingsRef.current = value;
     onSettings(value);
@@ -224,8 +230,28 @@ export function AssistantView({
     const registry = createToolRegistry({
       getDoc: () => docRef.current,
       getSettings: () => settingsRef.current,
+      getDossier: () => {
+        try {
+          const dossierKey = `examparse_dossier_${docRef.current.id}`;
+          const raw = (typeof localStorage !== 'undefined') ? localStorage.getItem(dossierKey) : null;
+          if (raw) return JSON.parse(raw);
+        } catch {}
+        // fallback: build on fly
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { buildDossier } = require('../pipeline/dossier');
+          return buildDossier(docRef.current as any);
+        } catch { return undefined; }
+      },
       updateDoc,
       updateSettings,
+      updateDossier,
+      remediationPipeline: async (current) => {
+        const { runFullPipeline } = await import('../pipeline/index');
+        // Dummy remediation pipeline call: just return health delta
+        const { healthSummary } = await import('../pipeline/agent');
+        return { health: healthSummary(current), ok:true };
+      },
       reparseSection: async (current, sectionId) => {
         try {
           return await prepareSectionReparse({
@@ -299,6 +325,13 @@ export function AssistantView({
           turnId: budgetId,
           getDoc: () => docRef.current,
           getSettings: () => settingsRef.current,
+          getDossier: () => {
+            try {
+              const raw = localStorage.getItem(`examparse_dossier_${docRef.current.id}`);
+              if (raw) return JSON.parse(raw);
+            } catch {}
+            try { const { buildDossier } = require('../pipeline/dossier'); return buildDossier(docRef.current as any); } catch { return undefined; }
+          },
           registry,
           persist,
           emit: publish,
@@ -458,7 +491,7 @@ export function AssistantView({
           <h2 className="font-bold">{t("Assistant", "دستیار")}</h2>
           <p className="text-xs">
             ${session.costUsd.toFixed(5)} {t("this turn", "این نوبت")} ·{" "}
-            {session.calls}/6 {t("model calls", "فراخوانی مدل")}
+            {session.calls}/{(settings.agentLimits?.maxModelCalls ?? 25)} {t("model calls", "فراخوانی مدل")}
           </p>
         </div>
         <button

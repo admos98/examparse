@@ -4,8 +4,8 @@
  * fresh, cached, resumed, chunked, patched, and imported documents.
  */
 import { z } from 'zod';
-import { ExamSection, Flag, LineSpan, Question, SourceLine } from '../types';
-import { normalizeForMatching, matchingView, parsePrintedNumberFromStem } from './quality';
+import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine } from '../types';
+import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
 
 export const SpanReferenceSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]);
@@ -359,6 +359,10 @@ export function assembleAndValidateQuestions(
     const currentLines = new Set(spanLineNumbers([...spans, ...rawOptions.flatMap(option => option.spans), ...assembledTables.flatMap(table => table.spans)]));
     let overlaps = false;
     for (const other of questions) {
+      // E3: same-parent siblings legitimately share spans — waive overlap
+      const sameParentSiblings = raw.parentId && other.parentId && raw.parentId === other.parentId;
+      const isParentChild = (raw.parentId && other.id === raw.parentId) || (other.parentId && other.parentId === qId);
+      if (sameParentSiblings || isParentChild) continue;
       const otherLines = new Set(spanLineNumbers([...other.spans, ...(other.options || []).flatMap(option => option.spans), ...(other.tables || []).flatMap(table => table.spans)]));
       if ([...currentLines].some(line => otherLines.has(line))) {
         overlaps = true;
@@ -375,7 +379,9 @@ export function assembleAndValidateQuestions(
     if (optionSplitFailed) confidence -= 0.3;
     if (numberingCorrected) confidence -= 0.2;
     if (answer && flags.some(f => f.code === 'ANSWER_SEGMENT_UNMATCHED' && f.questionId === qId)) confidence -= 0.15;
-    if (overlaps) confidence -= 0.2;
+    // E3: waive overlap penalty when parentId set and same-parent siblings share spans
+    const shouldPenalizeOverlap = overlaps && !(raw.parentId);
+    if (shouldPenalizeOverlap) confidence -= 0.2;
     if (unknownImageRefs.length) confidence -= 0.2;
     if ((raw.type || 'unknown') !== 'fillblank' && stem.trim().length < 8) confidence -= 0.3;
     confidence = Math.max(0.05, Math.min(0.98, confidence));
@@ -527,10 +533,38 @@ export function assembleAndValidateSections(
     const headerLines = sectionLines.slice(0, 12);
     const titleRaw = typeof section?.title === 'string' ? section.title : (typeof section?.kind === 'string' ? section.kind : '');
     let title = cleanSectionTitle(titleRaw);
-    if (!title || /^\d+$/.test(normalizeForMatching(title))) {
-      const derived = headerLines.find(line => !isHeaderOrRowLine(line.text) && !/^[\s\d.():-]+$/.test(normalizeForMatching(line.text)));
-      title = derived ? cleanSectionTitle(derived.text) : `Section ${indexValue}`;
+    const genericTitles = new Set(['question group', 'section', 'part', 'page', 'question']);
+    const normalizedTitle = normalizeForMatching(title);
+    const isGeneric = genericTitles.has(normalizedTitle) || /^question group\s*\d*$/i.test(title) || /^section\s*\d*$/i.test(title) || /^part\s*\d*$/i.test(title);
+    // A2: generic titles forbidden when header-derived title exists within ±3 lines of section start
+    const allHeaders = detectSectionHeaders(sourceLines);
+    const sectionStartLine = spans.length ? Math.min(...spans.map(s=>s[0])) : 0;
+    const nearbyHeader = allHeaders.find(h => Math.abs(h.headerLine - sectionStartLine) <= 3);
+    if (isGeneric && nearbyHeader) {
+      title = nearbyHeader.title;
       flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
+    } else if (!title || /^\d+$/.test(normalizeForMatching(title)) || isGeneric) {
+      const derived = headerLines.find(line => !isHeaderOrRowLine(line.text) && !/^[\s\d.():-]+$/.test(normalizeForMatching(line.text)));
+      if (derived) {
+        title = cleanSectionTitle(derived.text);
+        flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
+      } else if (nearbyHeader) {
+        title = nearbyHeader.title;
+        flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
+      } else if (isGeneric) {
+        // Keep generic but flag as derived from fallback
+        flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
+      } else {
+        title = `Section ${indexValue}`;
+        flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
+      }
+    } else if (nearbyHeader && normalizeForMatching(title) !== normalizeForMatching(nearbyHeader.title)) {
+      // Even if title is not generic but nearby header exists and title doesn't match, prefer header if within ±3 and title generic-like? For now keep original but ensure flag if we replace
+      // This handles case where model invented bucket while header exists
+      if (isGeneric) {
+        title = nearbyHeader.title;
+        flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
+      }
     }
     const firstQ = firstQuestionLine(id);
     const preQuestion = sectionLines.filter(line => lineNoFromId(line.id) < firstQ);
@@ -552,6 +586,82 @@ export function assembleAndValidateSections(
     return { id, index: indexValue, title, instructions: trimmed.text || undefined, points, passage: storedPassage, spans };
   });
   return { sections: provisional, flags };
+}
+
+/** A1: Image ID uniqueness — reassign sequentially in (page, y, x) order, updating refs. */
+export function reassignImageIdsSequential(doc: ExamDoc): ExamDoc {
+  if (!doc.images || doc.images.length === 0) return doc;
+  // Sort by page, y, x
+  const sorted = [...doc.images].sort((a,b)=>{
+    if (a.page !== b.page) return a.page - b.page;
+    const ay = (a as any).y ?? a.bbox?.y ?? 0;
+    const by = (b as any).y ?? b.bbox?.y ?? 0;
+    if (ay !== by) return ay - by;
+    const ax = a.bbox?.x ?? 0;
+    const bx = b.bbox?.x ?? 0;
+    return ax - bx;
+  });
+  const mapping = new Map<string,string>();
+  sorted.forEach((img, idx)=>{
+    const newId = `img_${String(idx+1).padStart(3,'0')}`;
+    mapping.set(img.id, newId);
+  });
+  const newImages = doc.images.map(img=> ({ ...img, id: mapping.get(img.id) || img.id }));
+  const newQuestions = doc.questions.map(q=> ({
+    ...q,
+    images: q.images.map(ref=> ({ ...ref, imageId: mapping.get(ref.imageId) || ref.imageId }))
+  }));
+  // Also need to update vision labels hints? But we handle via mapping
+  // Update image labels where relevant? Keep as is but id changed
+  const newDoc = { ...doc, images: newImages, questions: newQuestions };
+  // Also update image.label.questionRef if it references old id? No, it references question id, not image id
+  return newDoc;
+}
+export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; fixed: boolean; duplicates: string[] } {
+  const seen = new Set<string>();
+  const duplicates: string[] = [];
+  for (const img of doc.images || []) {
+    if (seen.has(img.id)) duplicates.push(img.id);
+    else seen.add(img.id);
+  }
+  if (duplicates.length === 0) return { doc, fixed: false, duplicates: [] };
+  // Flag and locally rename later duplicates + rewrite refs
+  const flags = [...(doc.flags || [])];
+  flags.push({ id: `flag_image_duplicate_${Date.now()}`, code: 'IMAGE_ID_DUPLICATE', severity: 'error' as const, message: `Duplicate imageId(s) detected: ${[...new Set(duplicates)].join(', ')}. Renamed locally.` });
+  // Build mapping for duplicates: keep first occurrence, rename subsequent
+  const idCounts = new Map<string, number>();
+  const mapping = new Map<string, string>(); // but need per-occurrence mapping, not just id
+  const newImages: ImageAsset[] = [];
+  const seenFirst = new Set<string>();
+  for (const img of doc.images) {
+    if (!seenFirst.has(img.id)) {
+      seenFirst.add(img.id);
+      newImages.push(img);
+      idCounts.set(img.id, 1);
+    } else {
+      const count = (idCounts.get(img.id) || 1) + 1;
+      idCounts.set(img.id, count);
+      const newId = `${img.id}_dup${count}`;
+      // Need to ensure newId unique
+      let finalId = newId;
+      let dupIdx = count;
+      while (newImages.some(i=>i.id===finalId)) { dupIdx++; finalId = `${img.id}_dup${dupIdx}`; }
+      mapping.set(`${img.id}#${doc.images.indexOf(img)}`, finalId); // use index-based key
+      // Create new image with renamed id
+      newImages.push({ ...img, id: finalId });
+      // Also track mapping from old duplicate occurrence to newId for refs update
+      // We need to map oldId at that occurrence to newId
+      // But refs point to imageId, not occurrence. If there were duplicate ids, refs ambiguous.
+      // We will rewrite any question refs that pointed to duplicate id beyond first occurrence to newId if we can detect which occurrence they intended?
+      // For simplicity, we reassign sequentially after fixing duplicates to ensure global uniqueness
+    }
+  }
+  // For now, after renaming duplicates, reassign sequentially to ensure uniqueness and stable order
+  let fixedDoc = { ...doc, images: newImages, flags };
+  // Also need to handle refs: if questions referenced duplicate ids, they likely intended the occurrence on their page.
+  // We can reassign all ids sequentially to resolve, updating refs via sequential mapping
+  fixedDoc = reassignImageIdsSequential(fixedDoc);
+  return { doc: fixedDoc, fixed: true, duplicates };
 }
 
 /** Convert legacy/imported table HTML into inert cell strings (no attributes or raw markup survive). */

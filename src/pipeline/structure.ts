@@ -7,7 +7,7 @@ import { LLMAdapter } from '../providers/adapter';
 import { T1_GEMINI_SCHEMA, T1_STRUCTURE_SYSTEM } from './prompts';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { appendJournalCall, loadJournal, markJournalComplete } from './journal';
-import { evaluateCoverage, enumerateExpectedQuestionNos, normalizeForMatching, matchingView, parsePrintedNumberFromStem } from './quality';
+import { evaluateCoverage, enumerateExpectedQuestionNos, normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
 
 
 export interface StructurePassResult {
@@ -217,9 +217,20 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
     const title = line.furniture ? undefined : isSectionHeading(line.text);
     return title ? [{ index, title, line: Number(line.id.replace(/\D/g, '')) }] : [];
   });
-  let boundaries: Array<{ start: number; end: number; title: string }> = [];
-  // Section vocabulary is a title HINT only; geometry/enumeration determines bounded work windows.
-  if (expectedNumbers.length > 25) {
+  const headerCandidates = detectSectionHeaders(sourceLines);
+  let boundaries: Array<{ start: number; end: number; title: string; kind?: string }> = [];
+  if (headerCandidates.length >= 3) {
+    const maxLine = Number(sorted[sorted.length - 1].id.replace(/\D/g, '')) || 1;
+    const minLine = Number(sorted[0].id.replace(/\D/g, '')) || 1;
+    for (let i=0;i<headerCandidates.length;i++) {
+      const h = headerCandidates[i];
+      const start = h.headerLine;
+      const end = i+1 < headerCandidates.length ? (headerCandidates[i+1].headerLine - 1) : maxLine;
+      boundaries.push({ start, end, title: h.title, kind: h.kind });
+    }
+    const firstQuestionLine = Math.min(...expectedNumbers.map(n => expectedLineByNo.get(n) || Infinity));
+    if (Number.isFinite(firstQuestionLine) && firstQuestionLine < boundaries[0].start) boundaries[0].start = minLine;
+  } else if (expectedNumbers.length > 25) {
     const ordered = [...expectedNumbers].sort((a, b) => a - b);
     const groups: number[][] = [];
     for (let i = 0; i < ordered.length; i += 25) groups.push(ordered.slice(i, i + 25));
@@ -229,7 +240,6 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
       title: `Question group ${i + 1}`,
     }));
   } else {
-    // Layout fallback: use printed pages, then 80-line chunks. This avoids an unbounded mega-call.
     const pages = [...new Set(sorted.map(line => line.page))];
     if (pages.length > 1) {
       boundaries = pages.map(page => {
@@ -243,7 +253,7 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
       }
     }
   }
-  if (boundaries.length > 1) {
+  if (boundaries.length > 1 && headerCandidates.length < 3) {
     const firstQuestionLine = Math.min(...expectedNumbers.map(n => expectedLineByNo.get(n) || Infinity));
     if (Number.isFinite(firstQuestionLine) && firstQuestionLine < boundaries[0].start) boundaries[0].start = Number(sorted[0].id.replace(/\D/g, '')) || 1;
   }
@@ -253,7 +263,9 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
       const nLine = expectedLineByNo.get(n) || -1;
       return nLine >= boundary.start && nLine <= boundary.end;
     });
-    return { id, index: index + 1, title: headings.find(h => h.line >= boundary.start && h.line <= boundary.end)?.title || boundary.title, start: boundary.start, end: boundary.end, expected };
+    const headingTitle = headings.find(h => h.line >= boundary.start && h.line <= boundary.end)?.title;
+    const title = (boundary as any).kind ? boundary.title : (headingTitle || boundary.title);
+    return { id, index: index + 1, title, start: boundary.start, end: boundary.end, expected };
   }).filter(plan => plan.end >= plan.start);
 }
 
@@ -368,7 +380,19 @@ function formatLas(sourceLines: SourceLine[], keyLines: Set<number>): string {
 }
 
 async function parseStructureResponse(response: any): Promise<any> {
+  // E1: planAck handling — if model returns planAck, unwrap it as harmless ack (section plan accepted)
+  try {
+    const raw = response?.rawText || (response?.json ? JSON.stringify(response.json) : '');
+    if (typeof raw === 'string' && raw.includes('planAck')) {
+      let parsed:any=null;
+      try { parsed = response?.json || JSON.parse(raw); } catch {}
+      if (parsed && parsed.planAck) return { planAck: parsed.planAck, _isAck:true, sections:[], questions:[] };
+      // Also handle v2 wrapper containing planAck
+      if (parsed && parsed.sections && parsed.questions === undefined && parsed.planAck) return { planAck: parsed.planAck, _isAck:true, sections:[], questions:[] };
+    }
+  } catch {}
   let data: any = unwrapStructureData(response?.json);
+  if (((data as any)?._isAck)) return data;
   if ((!Array.isArray(data?.questions) || data.questions.length === 0) && typeof response?.rawText === 'string' && response.rawText.includes('{')) {
     let parsed: any = null;
     try { parsed = JSON.parse(response.rawText); } catch { parsed = repairTruncatedJson(response.rawText); }
@@ -378,6 +402,7 @@ async function parseStructureResponse(response: any): Promise<any> {
 }
 
 function responseTripwires(data: any, plan: SectionPlan, sourceLines: SourceLine[], keyLines: Set<number>): string[] {
+  if ((data as any)?._isAck) return [];
   const tripwires: string[] = [];
   const questions = Array.isArray(data?.questions) ? data.questions : [];
   const seen = new Set<number>();
@@ -398,6 +423,18 @@ function responseTripwires(data: any, plan: SectionPlan, sourceLines: SourceLine
   const missing = plan.expected.filter(n => !emitted.includes(n));
   if (missing.length) tripwires.push(`missing questions ${missing.join(',')}`);
   if (duplicates) tripwires.push('duplicate question numbers');
+  // A3: Group parent without children tripwire: stem contains (15)(16) enumerations but no children
+  for (const q of questions) {
+    const stem = shortSourceText(q?.spans, sourceLines);
+    const enumerated = [...stem.matchAll(/\((\d{1,3})\)/g)].map(m=>Number(m[1])).filter(n=>n>=1&&n<=300);
+    if (enumerated.length >= 2) {
+      const hasChildren = questions.some(c=> c.g !== undefined && Number(c.g) === rawQuestionNumber(q, sourceLines) || c.parentId && c.parentId === q.id);
+      // Check if parent enumerates its own number plus others and has no children
+      if (!hasChildren && enumerated.length >= 2) {
+        tripwires.push(`group parent ${rawQuestionNumber(q, sourceLines) || q.n} enumerates ${enumerated.join(',')} but has no children`);
+      }
+    }
+  }
   if (outOfBounds) tripwires.push('spans outside source bounds');
   if (keyQuestionSpan) tripwires.push('question spans in key territory');
   if (undeclaredSection) tripwires.push('undeclared section ids');
@@ -420,6 +457,7 @@ function clipSpansBeforeKey(spans: any, sourceMin: number, sourceMax: number, ke
 }
 
 function sanitizeRawSectionQuestions(data: any, plan: SectionPlan, sourceLines: SourceLine[], keyLines: Set<number>): any[] {
+  if ((data as any)?._isAck) return [];
   const bounds = sourceLines.reduce((range, line) => {
     const n = Number(line.id.replace(/\D/g, '')) || 0;
     return { min: Math.min(range.min, n || Infinity), max: Math.max(range.max, n) };

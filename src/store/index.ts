@@ -103,6 +103,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxUsdPerRun: 0.25, // default hard cap
     maxOutputTokens: 16384,
   },
+  agentLimits: {
+    maxModelCalls: 6,
+    maxToolExecutions: 12,
+  },
   document: {
     defaultLanguage: 'auto',
     paperSize: 'A4',
@@ -257,6 +261,7 @@ export function loadSettings(): AppSettings {
       thrift: { ...DEFAULT_SETTINGS.thrift, ...(parsed.thrift || {}) },
       budget: { ...DEFAULT_SETTINGS.budget, ...(parsed.budget || {}) },
       document: { ...DEFAULT_SETTINGS.document, ...(parsed.document || {}) },
+      agentLimits: { maxModelCalls: 25, maxToolExecutions: 60, ...DEFAULT_SETTINGS.agentLimits, ...(parsed.agentLimits || {}) },
     };
     return validateAppSettings(merged);
   } catch {
@@ -377,6 +382,8 @@ export async function saveExamDoc(
     throw new Error(
       `Failed to save exam to folder storage (HTTP ${res.status})`,
     );
+  // B2: dossier maintenance is deterministic, rebuilt incrementally on save
+  try { await rebuildDossier(doc); } catch {}
   return;
 }
 
@@ -474,6 +481,7 @@ export interface ExamSummary {
   sectionCount: number;
   imageCount: number;
   ocrUsed: boolean;
+  qualityScore: number;
   totalCostUsd: number;
   totalTokens: number;
 }
@@ -545,6 +553,53 @@ export async function setPipelineCache<T>(
     },
   );
   return;
+}
+
+
+// ===== B: Dossier & Memory =====
+export async function getDossier(examId: string): Promise<any | undefined> {
+  if (!examId) return undefined;
+  try {
+    const res = await fetch(`/api/memory/${encodeURIComponent(examId)}`);
+    if (!res.ok) return undefined;
+    return await res.json();
+  } catch { return undefined; }
+}
+export async function saveDossier(dossier: any): Promise<void> {
+  if (!dossier?.identity?.id) return;
+  await checkedFetch(`/api/memory/${encodeURIComponent(dossier.identity.id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dossier),
+  });
+}
+export async function deleteDossier(examId: string): Promise<void> {
+  try { await checkedFetch(`/api/memory/${encodeURIComponent(examId)}`, { method: 'DELETE' }); } catch {}
+}
+export async function rebuildDossier(doc: any): Promise<any> {
+  const { buildDossier } = await import('../pipeline/dossier');
+  let existing: any;
+  try { existing = await getDossier(doc.id); } catch {}
+  const dossier = buildDossier(doc, existing);
+  // Enforce ≤4KB: if over, trim ledger/notes
+  let bytes = new TextEncoder().encode(JSON.stringify(dossier)).length;
+  while (bytes > 4096 && dossier.ledger.length) { dossier.ledger.shift(); bytes = new TextEncoder().encode(JSON.stringify(dossier)).length; }
+  while (bytes > 4096 && dossier.userNotes.length) { dossier.userNotes.shift(); bytes = new TextEncoder().encode(JSON.stringify(dossier)).length; }
+  await saveDossier(dossier);
+  return dossier;
+}
+export async function getUserMemory(): Promise<any> {
+  try { const res = await fetch('/api/user-memory'); if (!res.ok) return { preferences:{}, facts:[] }; return await res.json(); } catch { return { preferences:{}, facts:[] }; }
+}
+export async function saveUserMemory(mem: any): Promise<void> {
+  await checkedFetch('/api/user-memory', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(mem)});
+}
+export async function appendLedgerEntry(examId: string, entry: any): Promise<void> {
+  let dossier = await getDossier(examId);
+  if (!dossier) return;
+  const { addLedgerEntry } = await import('../pipeline/dossier');
+  dossier = addLedgerEntry(dossier, entry);
+  await saveDossier(dossier);
 }
 
 export async function clearAllCachesAndData(): Promise<void> {

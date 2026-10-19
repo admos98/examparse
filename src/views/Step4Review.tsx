@@ -24,8 +24,11 @@ import { regenerateQuestionPatch } from '../pipeline/patch';
 import { saveExamDoc } from '../store';
 import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { getExamHealth } from '../pipeline/quality';
+import { applyBulk, exportSelected } from '../pipeline/bulkOps';
 import { retryMissingCoverage } from '../pipeline/retryCoverage';
 import { buildQuestionTree } from '../utils/questionTree';
+import { computeSuggestions } from '../pipeline/suggestions';
+import { computeQualityScore } from '../utils/qualityScore';
 
 interface Props {
   examDoc: ExamDoc;
@@ -61,6 +64,11 @@ export const Step4Review: React.FC<Props> = ({
   const [retryProgress, setRetryProgress] = useState('');
   const [coverageError, setCoverageError] = useState<string | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [dismissedChips, setDismissedChips] = useState<Set<string>>(new Set());
+  const [scoreExplain, setScoreExplain] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkPts, setBulkPts] = useState(2);
+  const [undoSnapshot, setUndoSnapshot] = useState<string | null>(null);
 
   // Group questions by section
   const sections = examDoc.sections.length > 0 ? examDoc.sections : [{ id: 'sec_default', index: 1, title: 'General Section', spans: [] }];
@@ -414,7 +422,36 @@ export const Step4Review: React.FC<Props> = ({
         </div>
       </div>
 
-      <ExamHealthBanner doc={examDoc} />
+      <ExamHealthBanner doc={examDoc} onExplainScore={(f)=> { if(f) setFilterType(f); setScoreExplain('Quality score: coverage 30 + points 15 + options 15 + images 15 + numbering 10 + confidence 10 + passage 5'); }} />
+      {/* Proactive suggestions (F1): silent-by-default, dismissible, ≤3 chips */}
+      {(() => {
+        const chips = computeSuggestions(examDoc).filter(c=> !dismissedChips.has(c.id));
+        if (chips.length===0) return null;
+        return <div className="flex flex-wrap gap-2">{chips.map(c=> (
+          <span key={c.id} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs">
+            <button onClick={()=> {
+              if (c.id==='missing') handleRetryMissingCoverage();
+              else if (c.id==='unplaced') setShowImageManager(true);
+              else if (c.id==='quality') setScoreExplain((()=>{ const q=computeQualityScore(examDoc); return `Coverage ${q.coverage}/30, Points ${q.points}/15, Options ${q.optionsCleanliness}/15, Images ${q.imagePlacement}/15, Numbering ${q.numbering}/10, Confidence ${q.confidence}/10, Passage ${q.passage}/5 = Total ${q.total}/100`; })());
+            }} className="font-medium hover:underline cursor-pointer">{c.label}</button>
+            <button onClick={()=> setDismissedChips(s=> new Set([...s, c.id]))} className="opacity-80 hover:opacity-100 cursor-pointer"><X className="w-3 h-3" /></button>
+          </span>
+        ))}</div>;
+      })()}
+      {scoreExplain && <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-3 text-xs flex items-center justify-between"><span>{scoreExplain}</span><button onClick={()=> setScoreExplain(null)} className="text-slate-400 hover:text-slate-600"><X className="w-4 h-4" /></button></div>}
+      {/* Bulk ops bar (D2) — confirm destructive */}
+      {selectedIds.size>0 && (
+        <div role="toolbar" aria-label="Bulk actions" className="flex flex-wrap items-center gap-2 p-2 rounded-xl border bg-blue-50 dark:bg-blue-950/30 text-xs">
+          <span className="font-semibold">{selectedIds.size} selected</span>
+          <label className="flex items-center gap-1">Points <input type="number" min={0} max={50} step={1} value={bulkPts} onChange={e=> setBulkPts(Number(e.target.value))} className="w-16 px-1 py-0.5 rounded border text-xs" /></label>
+          <button onClick={()=> { const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'setPoints', points:bulkPts}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); }} className="px-2 py-1 rounded bg-blue-600 text-white text-xs">Set points</button>
+          <button onClick={()=> { if(!confirm(`Delete ${selectedIds.size} question(s)?`)) return; const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'delete'}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); setSelectedIds(new Set()); }} className="px-2 py-1 rounded bg-red-600 text-white text-xs">Delete</button>
+          <button onClick={()=> { const exp=exportSelected(examDoc, [...selectedIds]); const blob=new Blob([JSON.stringify(exp.json,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='selected.json'; a.click(); URL.revokeObjectURL(url); }} className="px-2 py-1 rounded border text-xs">Export selected</button>
+          {undoSnapshot && <button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs font-semibold">Undo</button>}
+          <button onClick={()=> setSelectedIds(new Set())} className="px-2 py-1 rounded border text-xs">Clear</button>
+        </div>
+      )}
+      {undoSnapshot && selectedIds.size===0 && <div className="text-xs flex items-center gap-2"><span>Bulk change applied.</span><button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs font-semibold">Undo</button></div>}
       {health.missing.length > 0 && (
         <div className="rounded-2xl border border-red-300 bg-red-50 p-4 text-xs text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -610,6 +647,7 @@ export const Step4Review: React.FC<Props> = ({
                       {/* Question Header Row */}
                       <div className="flex items-center justify-between gap-3 text-xs">
                         <div className="flex items-center gap-2">
+                          <input type="checkbox" checked={selectedIds.has(q.id)} onChange={e=> setSelectedIds(s=> { const n=new Set(s); if(e.target.checked) n.add(q.id); else n.delete(q.id); return n; })} className="w-3.5 h-3.5" />
                           <span className="w-7 h-7 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 font-bold flex items-center justify-center font-mono">
                             {q.label}
                           </span>

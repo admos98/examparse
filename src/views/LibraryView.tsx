@@ -28,6 +28,8 @@ import {
   saveExamDoc,
 } from '../store';
 import { duplicateExamDoc, exportExamJson } from '../utils/examExport';
+import { answerLibraryQuestion } from '../pipeline/multiExamChat';
+import { createBackup, restoreBackup } from '../utils/backup';
 
 interface Props {
   isOpen: boolean;
@@ -39,7 +41,7 @@ interface Props {
   onGoToImport: () => void;
 }
 
-type SortMode = 'newest' | 'oldest' | 'name';
+type SortMode = 'newest' | 'oldest' | 'name' | 'quality-desc' | 'quality-asc';
 
 export const LibraryView: React.FC<Props> = ({
   isOpen,
@@ -55,6 +57,7 @@ export const LibraryView: React.FC<Props> = ({
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<SortMode>('newest');
+  const [qualityFilter, setQualityFilter] = useState<'all' | 'needs-review' | 'good'>('all');
   const [storageMb, setStorageMb] = useState<number | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -103,9 +106,15 @@ export const LibraryView: React.FC<Props> = ({
     }
   }, [isOpen, refresh]);
 
+  const qualityLabel = (score: number) => {
+    if (score >= 80) return { text: `${score}`, cls: 'bg-emerald-500 text-white', label: 'good' };
+    if (score >= 50) return { text: `${score}`, cls: 'bg-amber-500 text-white', label: 'review' };
+    return { text: `${score}`, cls: 'bg-red-500 text-white', label: 'poor' };
+  };
+
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const filtered = q
+    let filtered = q
       ? summaries.filter(s =>
           [s.displayName, s.subject || '', s.grade || '', s.fileName]
             .join(' ')
@@ -113,6 +122,12 @@ export const LibraryView: React.FC<Props> = ({
             .includes(q)
         )
       : [...summaries];
+    if (qualityFilter !== 'all') {
+      filtered = filtered.filter(s => {
+        const sc = (s as any).qualityScore ?? 0;
+        return qualityFilter === 'needs-review' ? sc < 80 : sc >= 80;
+      });
+    }
     switch (sort) {
       case 'oldest':
         filtered.sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
@@ -120,11 +135,17 @@ export const LibraryView: React.FC<Props> = ({
       case 'name':
         filtered.sort((a, b) => a.displayName.localeCompare(b.displayName));
         break;
+      case 'quality-desc':
+        filtered.sort((a, b) => ((b as any).qualityScore ?? 0) - ((a as any).qualityScore ?? 0));
+        break;
+      case 'quality-asc':
+        filtered.sort((a, b) => ((a as any).qualityScore ?? 0) - ((b as any).qualityScore ?? 0));
+        break;
       default:
         filtered.sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0));
     }
     return filtered;
-  }, [summaries, search, sort]);
+  }, [summaries, search, sort, qualityFilter]);
 
   const handleOpen = async (summary: ExamSummary) => {
     const doc = await loadExamDoc(summary.id);
@@ -194,6 +215,17 @@ export const LibraryView: React.FC<Props> = ({
     await refreshStorage();
   };
 
+  // F3 multi-exam picker + library-scope QA (dossiers only, All exams)
+  const [libraryQuery, setLibraryQuery] = useState('');
+  const [libraryAnswer, setLibraryAnswer] = useState<string | null>(null);
+  const handleLibraryQuery = () => {
+    const q = libraryQuery.trim(); if (!q) return;
+    // Minimal dossiers from summaries — no model source text, no keys; respects F3 contract
+    const dossiers: any[] = summaries.map(s=> ({ identity:{title:s.displayName}, healthSnapshot:{ state: s.complete ? 'green':'red', unplacedImages: (s as any).unplacedImages ?? 0, missingNumbers: s.missingQuestionNos?.length ?? 0 }}));
+    const ans = answerLibraryQuestion(q, dossiers as any);
+    setLibraryAnswer(ans);
+  };
+
   if (!isOpen) return null;
 
   const formatDate = (iso: string) => {
@@ -228,6 +260,13 @@ export const LibraryView: React.FC<Props> = ({
           </button>
         </div>
 
+        {/* Library-scope QA (F3) — dossiers only, no raw PDF text; All exams / scoped */}
+        <div className="flex flex-wrap items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3 text-xs">
+          <input type="text" value={libraryQuery} onChange={e=> setLibraryQuery(e.target.value)} onKeyDown={e=> e.key==='Enter' && handleLibraryQuery()} placeholder='Try “which exams are incomplete?” or “list exams”' className="flex-[250px] px-2 py-1 rounded border text-xs" aria-label="Ask library" />
+          <button onClick={handleLibraryQuery} className="px-3 py-1 rounded bg-blue-600 text-white text-xs shrink-0">Ask library</button>
+          {libraryAnswer && <div role="status" className="w-full mt-2 p-2 rounded bg-slate-50 dark:bg-slate-800 text-xs">{libraryAnswer} <button onClick={()=> setLibraryAnswer(null)} className="ml-2 underline">dismiss</button></div>}
+        </div>
+
         {/* Toolbar */}
         <div className="flex flex-wrap items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3">
           <div className="flex items-center gap-2 flex-1 min-w-[200px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950">
@@ -249,6 +288,18 @@ export const LibraryView: React.FC<Props> = ({
             <option value="newest">Newest first</option>
             <option value="oldest">Oldest first</option>
             <option value="name">Name (A–Z)</option>
+            <option value="quality-desc">Quality ↑</option>
+            <option value="quality-asc">Quality ↓</option>
+          </select>
+          <select
+            value={qualityFilter}
+            onChange={e => setQualityFilter(e.target.value as any)}
+            className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-xs"
+            title="Filter by quality"
+          >
+            <option value="all">All quality</option>
+            <option value="needs-review">Needs review (&lt;80)</option>
+            <option value="good">Good (≥80)</option>
           </select>
           <button
             onClick={handleClearCaches}
@@ -303,6 +354,7 @@ export const LibraryView: React.FC<Props> = ({
               const summaryCoverage = Number.isFinite(s.coveragePercent) ? s.coveragePercent : 0;
               const summaryMissing = Array.isArray(s.missingQuestionNos) ? s.missingQuestionNos : [];
               const summaryDuplicates = Array.isArray(s.duplicateQuestionNos) ? s.duplicateQuestionNos : [];
+              const q = qualityLabel((s as any).qualityScore ?? 0);
               return (
                 <div
                   key={s.id}
@@ -353,11 +405,14 @@ export const LibraryView: React.FC<Props> = ({
                         {s.fileName}
                       </div>
                     </div>
-                    {s.ocrUsed && (
-                      <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 shrink-0">
-                        <ScanText className="w-3 h-3" /> OCR
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${q.cls}`} title="Local quality score (never a gate)">Q {q.text}</span>
+                      {s.ocrUsed && (
+                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 shrink-0">
+                          <ScanText className="w-3 h-3" /> OCR
+                        </span>
+                      )}
+                    </div>
                   </div>
 
                   {chips.length > 0 && (

@@ -18,7 +18,9 @@ import { AppSettings, ProviderConfig, ProviderKind } from '../types';
 import { applyTheme } from '../pipeline/agentTheme';
 import { StoragePanel } from './StoragePanel';
 import { LLMAdapter } from '../providers/adapter';
-import { clearAllCachesAndData } from '../store';
+import { clearAllCachesAndData, loadUsageLog } from '../store';
+import { buildDiagnostics, exportDiagnostics, diagnosticsFromUsage } from '../utils/diagnostics';
+import { runProbe, saveProbeRecord, probeCostEstimate } from '../pipeline/probe';
 import { MAX_SETTINGS_JSON_BYTES, redactSettingsForExport, validateAppSettings, validateProviderBaseUrl, validateHeaders } from '../utils/validation';
 
 interface Props {
@@ -29,7 +31,76 @@ interface Props {
   onOpenExplainer: () => void;
 }
 
-type TabType = 'providers' | 'roles' | 'costs' | 'thrift' | 'budget' | 'document' | 'privacy';
+type TabType = 'providers' | 'roles' | 'costs' | 'thrift' | 'budget' | 'document' | 'privacy' | 'diagnostics';
+
+const BackupPanel: React.FC = () => {
+  const [msg, setMsg] = useState<string|null>(null);
+  const handleBackup = async () => {
+    try {
+      const { createBackup } = await import('../utils/backup');
+      const { listExamSummaries: lis, loadExamDoc: ld } = await import('../store');
+      const summaries = await lis();
+      const exams: Record<string,any> = {};
+      for (const s of summaries) { const d = await ld(s.id); if(d) exams[s.id]=d; }
+      const safeSettings = (()=>{ try { return JSON.parse(localStorage.getItem('examparse_settings')||'{}'); } catch { return {}; } })();
+      const buf = await createBackup({ exams, images:{}, dossiers:{}, settings: safeSettings });
+      const blob = new Blob([buf as any], {type:'application/zip'});
+      const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='examparse-backup.zip'; a.click(); URL.revokeObjectURL(url);
+      setMsg('Backup downloaded');
+    } catch(e:any){ setMsg('Backup failed: '+(e?.message||'')); }
+  };
+  const handleRestore = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file=e.target.files?.[0]; if(!file) return;
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const { restoreBackup } = await import('../utils/backup');
+      const res = await restoreBackup(buf);
+      const { saveExamDoc } = await import('../store');
+      for (const [id, doc] of Object.entries(res.exams)) await saveExamDoc(doc as any);
+      setMsg(`Restored ${res.counts.exams} exams`);
+    } catch(err:any){ setMsg('Restore failed: '+(err?.message||'')); }
+    e.target.value='';
+  };
+  return <div className="p-3 rounded-xl border bg-white dark:bg-slate-900 flex flex-wrap items-center gap-2 text-xs">
+    <button onClick={handleBackup} className="px-3 py-1.5 rounded-lg border text-xs">Create backup (.zip)</button>
+    <label className="px-3 py-1.5 rounded-lg border text-xs cursor-pointer">Restore backup <input type="file" accept=".zip" onChange={handleRestore} className="hidden" /></label>
+    {msg && <span className="text-slate-500">{msg}</span>}
+  </div>;
+};
+
+const DiagnosticsPanel: React.FC = () => {
+  const [diag, setDiag] = useState<any>(null);
+  useEffect(()=> {
+    const usage = loadUsageLog();
+    const runs = diagnosticsFromUsage(usage as any);
+    const d = buildDiagnostics(runs, {});
+    setDiag(d);
+  }, []);
+  if (!diag) return <div className="text-xs text-slate-400">Loading diagnostics…</div>;
+  const handleExport = () => {
+    const json = exportDiagnostics(diag);
+    const blob = new Blob([json], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download='examparse-diagnostics.json'; a.click(); URL.revokeObjectURL(url);
+  };
+  return <div className="space-y-3">
+    <div className="text-[11px] text-slate-500">Generated: {diag.generatedAt} · {diag.runs.length} run(s)</div>
+    <div className="overflow-auto max-h-72 border rounded-lg">
+      <table className="w-full text-xs">
+        <thead className="bg-slate-50 dark:bg-slate-800 sticky top-0"><tr><th className="p-1.5 text-left">Exam</th><th className="p-1.5">Calls</th><th className="p-1.5">Tokens</th><th className="p-1.5">Cost</th><th className="p-1.5">Outcome</th></tr></thead>
+        <tbody>{diag.runs.map((r:any, i:number)=> <tr key={i} className="border-t"><td className="p-1.5 truncate max-w-[160px]">{r.examName}</td><td className="p-1.5 text-center">{r.calls}</td><td className="p-1.5 text-center">{r.tokens}</td><td className="p-1.5 text-center">${Number(r.cost).toFixed(4)}</td><td className="p-1.5 text-center">{r.outcome}</td></tr>)}
+        {diag.runs.length===0 && <tr><td colSpan={5} className="p-4 text-center text-slate-400">No runs yet</td></tr>}</tbody>
+      </table>
+    </div>
+    {Object.keys(diag.providerErrorTaxonomy||{}).length>0 && (
+      <div className="p-2 rounded border bg-amber-50 dark:bg-amber-950/20 text-xs">
+        <div className="font-semibold">Provider error taxonomy</div>
+        <div className="font-mono text-[11px]">{Object.entries(diag.providerErrorTaxonomy).map(([k,v])=> `${k}: ${v}`).join(' · ')}</div>
+      </div>
+    )}
+    <button onClick={handleExport} className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs flex items-center gap-1.5"><Download className="w-3.5 h-3.5" /> Export Diagnostics (JSON)</button>
+  </div>;
+};
 
 export const SettingsModal: React.FC<Props> = ({
   isOpen,
@@ -103,6 +174,16 @@ export const SettingsModal: React.FC<Props> = ({
   const handleFetchModels = async (provider: ProviderConfig) => {
     const models = await LLMAdapter.fetchModels(provider);
     setAvailableModels(prev => ({ ...prev, [provider.id]: models }));
+  };
+  const [probeResults, setProbeResults] = useState<Record<string, any>>({});
+  const handleProbe = async (provider: ProviderConfig) => {
+    setTestingId(`probe-${provider.id}`);
+    try {
+      const rec = await runProbe(provider, (req)=> LLMAdapter.dispatch(req, provider));
+      await saveProbeRecord(rec);
+      setProbeResults(prev=> ({...prev, [provider.id]: rec}));
+    } catch(e:any){ setProbeResults(prev=> ({...prev, [provider.id]: {error:e?.message}})); }
+    setTestingId(null);
   };
 
   const handleClearCache = async () => {
@@ -236,6 +317,16 @@ export const SettingsModal: React.FC<Props> = ({
             >
               <Database className="w-3.5 h-3.5" /> Storage & Privacy
             </button>
+            <button
+              onClick={() => setActiveTab('diagnostics')}
+              className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-medium text-left transition ${
+                activeTab === 'diagnostics'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'
+              }`}
+            >
+              <FileCheck className="w-3.5 h-3.5" /> Diagnostics
+            </button>
           </div>
 
           {/* Tab Content Panel */}
@@ -363,6 +454,8 @@ export const SettingsModal: React.FC<Props> = ({
                             >
                               Fetch Models
                             </button>
+                            <button onClick={()=> handleProbe(p)} disabled={testingId===`probe-${p.id}`} className="px-2.5 py-1 rounded-lg border text-[11px]">Probe {probeCostEstimate()}</button>
+                            {probeResults[p.id] && <span className="text-[11px] text-slate-500">{probeResults[p.id].error ? `Probe: ${probeResults[p.id].error}` : `v2 ${probeResults[p.id].wireV2Ok ? 'ok':'no'} · sse ${probeResults[p.id].sse?'yes':'no'}`}</span>}
                           </div>
 
                           {test && (
@@ -707,9 +800,20 @@ export const SettingsModal: React.FC<Props> = ({
               </div>
             )}
 
+            {/* DIAGNOSTICS TAB (E2) */}
+            {activeTab === 'diagnostics' && (
+              <div className="space-y-4">
+                <div>
+                  <h3 className="font-semibold text-slate-900 dark:text-white text-sm">Diagnostics (last 50 runs)</h3>
+                  <p className="text-xs text-slate-500">Local-only observability — no keys or source text. Use <b>Export Diagnostics</b> to share with support.</p>
+                </div>
+                <DiagnosticsPanel />
+              </div>
+            )}
             {/* PRIVACY & DATA TAB */}
             {activeTab === 'privacy' && (
               <div className="space-y-6"><StoragePanel />
+                <BackupPanel />
                 <label className="block text-xs">Assistant monthly soft cap (USD)
                   <input type="number" min="0" step="0.1" placeholder="No soft cap" className="border rounded p-2 ml-2" value={current.assistantMonthlySoftCapUsd ?? ''} onChange={e => setCurrent(s => ({ ...s, assistantMonthlySoftCapUsd: e.target.value === '' ? undefined : Number(e.target.value) }))} />
                 </label>

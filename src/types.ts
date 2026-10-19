@@ -284,6 +284,7 @@ export interface AppSettings {
   uiLanguage?: 'fa' | 'en';
   defaultExamMode?: 'exam' | 'review';
   livePanel?: boolean;
+  agentLimits?: { maxModelCalls?: number; maxToolExecutions?: number };
 }
 
 /**

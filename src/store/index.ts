@@ -481,6 +481,7 @@ export interface ExamSummary {
   sectionCount: number;
   imageCount: number;
   ocrUsed: boolean;
+  qualityScore: number;
   totalCostUsd: number;
   totalTokens: number;
 }

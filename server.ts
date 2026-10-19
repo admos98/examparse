@@ -210,6 +210,28 @@ function summarizeStoredExam(doc: any): any {
   const usage = Array.isArray(doc?.usage) ? doc.usage : [];
   let health: ReturnType<typeof getExamHealth>;
   try { health = getExamHealth(doc); } catch { health = { expectedCount: doc?.questions?.length || 0, parsedCount: doc?.questions?.length || 0, missing: [], duplicates: [], pointsParsed: 0, pointDeficit: 0, unplacedImages: [], unresolvedImageRefs: [], lowConfidenceCount: 0, coveragePercent: 0, state: 'amber', complete: false }; }
+  // Compute qualityScore inline (same weights as src/utils/qualityScore.ts to avoid circular import)
+  let qualityScore = 0;
+  try {
+    const expected = health.expectedCount || 0;
+    const parsed = health.parsedCount || 0;
+    const coverage = expected > 0 ? Math.min(1, parsed / expected) : (parsed > 0 ? 1 : 0);
+    const covScore = Math.round(coverage * 30);
+    const pointsExpected = (health as any).pointsExpected;
+    let ptsScore = 15;
+    if (pointsExpected != null && pointsExpected > 0) { const def = Math.abs((health as any).pointDeficit || 0); ptsScore = Math.max(0, Math.round(15 - (def / pointsExpected) * 15 * 2)); }
+    const qs = Array.isArray(doc.questions) ? doc.questions : [];
+    let blobCount = 0; for (const q of qs) { if (Array.isArray(q.options) && q.options.length === 0 && q.text && /[a-d]\s*[\).]/.test(q.text)) blobCount++; }
+    const optScore = Math.max(0, 15 - Math.min(15, blobCount * 3));
+    const unplaced = (health as any).unplacedImages?.length || 0;
+    const imgScore = Math.max(0, 15 - unplaced * 5);
+    const dupCount = health.duplicates?.length || 0;
+    const numScore = Math.max(0, 10 - dupCount * 5);
+    const low = health.lowConfidenceCount || 0;
+    const confScore = Math.max(0, 10 - low * 2);
+    let passScore = 5; for (const q of qs) { if (q.text && /passage|reading.*text|listen/i.test(q.text) && (!q.sourceLineIds || q.sourceLineIds.length === 0)) { passScore = 0; break; } }
+    qualityScore = Math.max(0, Math.min(100, covScore + ptsScore + optScore + imgScore + numScore + confScore + passScore));
+  } catch { qualityScore = 0; }
   return {
     id: doc.id,
     displayName: getDisplayName(doc),
@@ -230,6 +252,7 @@ function summarizeStoredExam(doc: any): any {
     sectionCount: Array.isArray(doc.sections) ? doc.sections.length : 0,
     imageCount: Array.isArray(doc.images) ? doc.images.length : 0,
     ocrUsed: Boolean(doc.source?.ocrUsed),
+    qualityScore,
     totalCostUsd: usage.reduce((a: number, u: any) => a + (u.costUsd || 0), 0),
     totalTokens: usage.reduce((a: number, u: any) => a + (u.inputTokens || 0) + (u.outputTokens || 0), 0),
   };

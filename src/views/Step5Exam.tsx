@@ -15,6 +15,7 @@ import { saveExamDoc, getImageBlob } from '../store';
 import { duplicateExamDoc, exportExamJson, confirmPartialExport } from '../utils/examExport';
 import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { MAX_EXAM_JSON_BYTES, parseExamDocImport } from '../utils/validation';
+import { printStyles, checkPrintLayout } from '../utils/printCheck';
 
 interface Props {
   defaultExamMode?: 'exam' | 'review';
@@ -28,9 +29,32 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }
   const [copiedJson, setCopiedJson] = useState(false);
   const jsonInputRef = useRef<HTMLInputElement>(null);
 
+  const [printRisks, setPrintRisks] = useState<ReturnType<typeof checkPrintLayout>>([]);
+  const printAreaRef = useRef<HTMLDivElement>(null);
+  // Inject print stylesheet once
+  useEffect(() => {
+    const id = 'examparse-print-styles';
+    if (!document.getElementById(id)) {
+      const el = document.createElement('style');
+      el.id = id; el.textContent = printStyles;
+      document.head.appendChild(el);
+    }
+  }, []);
+  // Check layout on mount + mode change
+  useEffect(() => {
+    const t = setTimeout(()=> setPrintRisks(checkPrintLayout(printAreaRef.current || undefined)), 300);
+    return ()=> clearTimeout(t);
+  }, [doc, renderMode]);
+
   // Trigger browser print dialog for A4 output
   const handlePrint = () => {
     if (!confirmPartialExport(doc, 'Print / Save PDF')) return;
+    // iframe split check: warn if questions would be cut
+    const risks = checkPrintLayout(printAreaRef.current || undefined);
+    if (risks.length > 0) {
+      const ok = confirm(`${risks.length} question(s) may be split across pages. Continue to Print anyway?`);
+      if (!ok) return;
+    }
     window.print();
   };
 
@@ -197,8 +221,13 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }
         </div>
       </div>
 
+      {printRisks.length>0 && (
+        <div className="max-w-5xl mx-auto p-2 rounded bg-amber-50 border border-amber-300 text-xs text-amber-800 print:hidden">
+          Print check: {printRisks.length} question(s) may split across pages — <button onClick={handlePrint} className="underline font-semibold">Print anyway</button>
+        </div>
+      )}
       {/* Rendered Printable Exam Container */}
-      <div id="printable-exam-area" className="w-full overflow-x-auto pb-10">
+      <div id="printable-exam-area" ref={printAreaRef} className="w-full overflow-x-auto pb-10">
         <DeterministicRenderer doc={doc} mode={renderMode} />
       </div>
     </div>

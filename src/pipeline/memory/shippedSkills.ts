@@ -16,15 +16,15 @@ stats: {injected: 0, followed: 0, greenAfter: 0, redAfter: 0}
 ---
 # Verify and Repair Exam — D5 Loop
 
-1. Call get_exam_health (fresh:true if after mutation). State expected/parsed/missing/points.
+1. ONE reply, batched reads: get_exam_health + list_missing + get_question_index (+ get_source_lines) — leading reads run in parallel; each costs 0.25 of a tool execution.
 2. If amber/red, run deterministic L0 checks locally — option splits, numbering, image assignment.
 3. Call retry_missing_questions (L1) when missing>0; report attempted/added/stillMissing.
-4. For remaining missing, call diagnose_missing + get_source_lines around expected line; decide cause (group/sub-part/section/key).
+4. For remaining missing, call diagnose_missing {numbers}: it returns an actionQueue the harness executor runs BEFORE your next turn (split_group_children / accept_group_representation locally; reparse_section stops at the confirm card). Read its single delta report; do not repeat what it ran.
 5. If section swallowed or tripwired, prepare reparse_section for affected section; show exact diff; await user Confirm.
 6. Never claim green unless health is green; quote before/after numbers.
 
-What NOT to do: full reparse before retry; invent numbers; skip confirmation.
-Example: missing 29 → retry adds 12 → 17 remain → diagnose → reparse 2 sections → green.
+What NOT to do: one read per turn; full reparse before retry; invent numbers; skip confirmation; re-plan a rung the brief lists as done.
+Example: missing 29 → retry adds 12 → 17 remain → diagnose → executor splits 2 groups (+10) → reparse 1 section → green.
 `,
 },
 {
@@ -43,7 +43,7 @@ stats: {injected: 0, followed: 0, greenAfter: 0, redAfter: 0}
 
 L0 deterministic locals (0 calls): option/answer splits, numbering hygiene, image reassignment — harness runs before your first call.
 L1 retry_missing_questions (1 call, additive): when coverage gap exists. Zero-add → bump to next rung.
-L2 inspect: get_source_lines around missing numbers' expected lines + get_question_index — diagnose WHY (group? sub-part? section swallowed? key-territory leak?).
+L2 inspect: diagnose_missing {numbers} (+ get_source_lines/get_question_index in the SAME reply) — diagnose WHY (group? sub-part? section swallowed? key-territory leak?). Its actionQueue is executed by the harness; you get one delta report.
 L3 reparse_section: candidate+confirm for affected section only; show delta {added, removed, changed}.
 L4 escalate: state what's missing, what was tried (ledger), two options (accept partial / reparse with escalation model).
 

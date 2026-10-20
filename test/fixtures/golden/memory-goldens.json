@@ -128,7 +128,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "english-mcq": {
@@ -137,7 +137,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "scanned-noisy": {
@@ -146,7 +146,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "two-column": {
@@ -155,7 +155,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "image-heavy": {
@@ -164,7 +164,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "giant-120": {
@@ -173,7 +173,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "separate-keyfile": {
@@ -182,7 +182,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "pathological-model": {
@@ -191,7 +191,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "gauntlet-lazy": {
@@ -200,7 +200,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     }
   },

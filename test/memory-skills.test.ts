@@ -273,7 +273,7 @@ test('E4-2 skill-selection golden: shipped pool + fixed contexts → exact slug 
     health: { state: 'amber', missing: [] },
     docTraits: miniTraits, roles: ['agent'],
   };
-  const goldenA = { selected: ['image-placement', 'missing-questions-triage', 'answer-key-handling'], totalTokens: 600, omitted: 2 };
+  const goldenA = { selected: ['image-placement', 'missing-questions-triage', 'answer-key-handling'], totalTokens: 620, omitted: 2 }; // E1/E2: triage skill teaches batching + executor (+20 tok)
   const goldenB = { selected: ['answer-key-handling', 'image-placement', 'missing-questions-triage'] };
   for (const run of [1, 2]) {
     const a = selectSkillsFromPool(pool, ctxA);

@@ -720,6 +720,20 @@ export function AssistantView({
       </div>
       <div className="p-4 border-t space-y-2">
         <div className="flex flex-wrap gap-2 text-xs">
+          {health.state !== "green" && (
+            <button
+              // E6 — deterministic pipeline + canonical executor queue, zero model calls (works without a provider).
+              disabled={busy || !ready || Boolean(session.pending)}
+              className="border rounded-[6px] p-2 font-medium"
+              title={t(
+                "Runs the local remediation pipeline and the diagnosis queue — no model calls.",
+                "خط لوله‌ی ترمیم محلی و صف تشخیص را اجرا می‌کند — بدون فراخوانی مدل.",
+              )}
+              onClick={() => void run(t("Fix it", "درستش کن"))}
+            >
+              {t("Fix it", "درستش کن")}
+            </button>
+          )}
           {health.missing.length > 0 && (
             <button
               disabled={busy || !ready || Boolean(session.pending)}

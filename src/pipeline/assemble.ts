@@ -32,9 +32,26 @@ export const RawQuestionSchema = z.object({
   fullStem: z.never().optional(),
 });
 
+const lineNoCache = new Map<string, number>();
 export function lineNoFromId(id: string): number {
+  const cached = lineNoCache.get(id);
+  if (cached !== undefined) return cached;
   const n = Number(id.replace(/\D/g, ''));
-  return Number.isFinite(n) ? n : 0;
+  const value = Number.isFinite(n) ? n : 0;
+  if (lineNoCache.size < 100_000) lineNoCache.set(id, value);
+  return value;
+}
+/**
+ * Per-assembly line index. Scoped to one assembleAndValidateQuestions call (set/cleared there),
+ * so in-place tag edits between calls can never serve stale text; outside a call the helpers
+ * fall back to building the map per invocation.
+ */
+let activeLineIndex: { lines: SourceLine[]; byNo: Map<number, SourceLine>; text: Map<number, string> } | null = null;
+function lineIndexFor(sourceLines: SourceLine[]): { byNo: Map<number, SourceLine>; text: Map<number, string> } {
+  if (activeLineIndex && activeLineIndex.lines === sourceLines) return activeLineIndex;
+  const byNo = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
+  const text = new Map(sourceLines.map(line => [lineNoFromId(line.id), line.furniture || isContentJunk(line) ? '' : line.text]));
+  return { byNo, text };
 }
 
 export function normalizedSpans(spans: unknown): LineSpan[] {
@@ -67,7 +84,7 @@ export function sliceSourceSpans(
   rewrites?: { line: number; text: string }[]
 ): string {
   if (!spans || spans.length === 0) return '';
-  const lineMap = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
+  const lineMap = lineIndexFor(sourceLines).byNo;
   const rewriteMap = new Map<number, string>((rewrites || []).map(rewrite => [rewrite.line, rewrite.text]));
   const output: string[] = [];
   for (const lineNo of spanLineNumbers(spans)) {
@@ -138,7 +155,7 @@ function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[
 }
 
 function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
-  return new Map(sourceLines.map(line => [lineNoFromId(line.id), line.furniture || isContentJunk(line) ? '' : line.text]));
+  return new Map(lineIndexFor(sourceLines).text);
 }
 
 function decontaminateStem(
@@ -291,6 +308,21 @@ function isSubset(a: Question, b: Question): boolean {
 }
 
 export function assembleAndValidateQuestions(
+  rawQuestions: any[],
+  sourceLines: SourceLine[],
+  totalDeclaredPoints?: number,
+  options: AssembleOptions = {}
+): AssembleResult {
+  const previousIndex = activeLineIndex;
+  const built = lineIndexFor(sourceLines);
+  activeLineIndex = { lines: sourceLines, byNo: built.byNo, text: built.text };
+  try {
+    return assembleAndValidateQuestionsInner(rawQuestions, sourceLines, totalDeclaredPoints, options);
+  } finally {
+    activeLineIndex = previousIndex;
+  }
+}
+function assembleAndValidateQuestionsInner(
   rawQuestions: any[],
   sourceLines: SourceLine[],
   totalDeclaredPoints?: number,

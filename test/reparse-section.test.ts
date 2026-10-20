@@ -552,6 +552,6 @@ test("tool-bound turn does not spend calls preparing a candidate it could not su
   assert.ok(h.preparations <= 1, `preparations ${h.preparations} should be 0 or 1 with dedup`);
   assert.ok(s.pending === undefined || s.pending?.name === 'reparse_section');
   assert.equal(h.snapshots.length, 0);
-  assert.ok(s.executions <= 13);
+  assert.ok((s.weightedExecutions ?? s.executions) <= 13);
   assert.ok(s.events.at(-1)!.text.includes('Bounds reached') || s.events.at(-1)!.text.includes('Replace section') || s.events.some(e=>e.text.includes('Bounds reached')));
 });

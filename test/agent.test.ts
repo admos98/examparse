@@ -335,8 +335,10 @@ test('soft cap is read-only and hard bounds stop at ≤6 model and ≤12 tool ex
   reads.runtime.getSettings().agentLimits = { maxModelCalls: 6, maxToolExecutions: 12 };
   const rs = newAgentSession(reads.doc.id);
   await runAgentTurn(reads.runtime, rs, 'check');
-  assert.ok(rs.executions <= 12);
+  // E3 — reads are budgeted at READ_WEIGHT (0.25); the raw count may exceed the bound.
+  assert.ok((rs.weightedExecutions ?? rs.executions) <= 12);
   assert.ok(reads.calls <= 6);
+  assert.ok(rs.events.filter((e) => e.kind === 'tool').length >= 20, 'batched reads all executed');
 });
 test('one turn per exam lock and human edit during model call pauses without overwriting', async () => {
   let release!: (r: LLMResponse) => void;

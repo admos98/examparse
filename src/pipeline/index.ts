@@ -411,6 +411,9 @@ export async function runFullPipeline(
           guidance: structureGuidance,
           parallelSections: settings.parallelSections ?? 3,
           onNode: node => { onLiveText?.('structure', `node ${node.id}`, 'info', `${node.label || node.id}: ${node.status}${node.error ? ` — ${node.error}` : ''}`); callbacks.onNodeUpdate?.(node); },
+          // D — sections >40% [GARBLED?] go once to the escalation model (≤2 per pass).
+          escalationProviderConfig: (() => { const sel = settings.roleMapping.escalation; const prov = sel && settings.providers.find(p => p.id === sel.providerId); return prov ? { ...prov, model: sel.model } : undefined; })(),
+          garbledEscalationBudget: { count: 0, max: 2 },
         });
       } catch (err: any) {
         onStageUpdate({
@@ -669,6 +672,9 @@ export async function runFullPipeline(
       finalQuestions = repairRes.repairedQuestions;
       if (repairRes.rejectedCount) allFlags.push({ id: `flag_repair_rejected_${allFlags.length + 1}`, severity: 'error', code: 'REPAIR_SPAN_REJECTED', message: `${repairRes.rejectedCount} repaired question(s) were excluded because no safe question spans remained outside answer-key territory.` });
       if (repairRes.restrictedCount) allFlags.push({ id: `flag_repair_restricted_${allFlags.length + 1}`, severity: 'warn', code: 'REPAIR_SPAN_RESTRICTED', message: `${repairRes.restrictedCount} repaired item(s) had unsafe or answer-key spans clipped locally; review the remaining source anchors.` });
+      // D — rewrite fence on the repair channel (same rules as the structure pass).
+      if (repairRes.rewritesRejected) allFlags.push({ id: `flag_repair_rewrite_rejected_${allFlags.length + 1}`, severity: 'info', code: 'REWRITE_REJECTED', message: `${repairRes.rewritesRejected} repair rewrite(s) rejected by the fence (not locally garbled, carried digits/markers, outside spans, >140 chars or key territory); original text kept.` });
+      if (repairRes.rewritesApplied) allFlags.push({ id: `flag_repair_rewrite_applied_${allFlags.length + 1}`, severity: 'info', code: 'REWRITE_APPLIED', message: `${repairRes.rewritesApplied} garbled line(s) rendered from repair rewrites; originals retained for one-click revert in Step 4.` });
 
       // Merge shapeMismatch flag from repair
       if (repairRes.shapeMismatch) {

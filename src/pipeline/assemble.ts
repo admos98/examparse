@@ -479,6 +479,8 @@ function assembleAndValidateQuestionsInner(
     if (optionSplitFailed && !questionFlags.includes('OPTION_SPLIT_FAILED')) questionFlags.push('OPTION_SPLIT_FAILED');
     if (unknownImageRefs.length) questionFlags.push('IMAGE_REFERENCE_UNRESOLVED');
     if (overlaps) questionFlags.push('SPAN_OVERLAP');
+    if (absorbedByKey.has(gapKey) && !questionFlags.includes('GAP_ABSORBED')) questionFlags.push('GAP_ABSORBED');
+    if (acceptedRewrites.length && !questionFlags.includes('REWRITE_APPLIED')) questionFlags.push('REWRITE_APPLIED');
     if (confidence < 0.6 && !questionFlags.includes('LOW_CONFIDENCE')) questionFlags.push('LOW_CONFIDENCE');
     if (confidence < 0.6) flags.push(flag('LOW_CONFIDENCE', `Question ${label} confidence calibrated to ${(confidence * 100).toFixed(0)}%.`, 'info', qId));
     if (unknownImageRefs.length) flags.push(flag('IMAGE_REFERENCE_UNRESOLVED', `Question ${label} references unresolved image(s): ${unknownImageRefs.map((i: any) => i.imageId).join(', ')}.`, 'warn', qId));

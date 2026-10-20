@@ -193,3 +193,25 @@ test('F3 — CLEANUP_AI_SKIPPED: shape-mismatch replies (after one retry) fall b
   assert.ok(printed.every((l) => l.tag !== 'junk'), 'no printed-number or option line is junk');
   console.log(`cleanup fences: judged ${junkAll.stats.judged}, junk ${junkAll.stats.junk}, suspect ${junkAll.stats.suspect}, fence-saved ${junkAll.stats.fenceSaved}`);
 });
+
+test('D — rewrite fence: only locally garbled, digit-free, in-span, non-key lines ≤140 chars; garbled-ratio routing threshold', async () => {
+  const { rewriteRejection, REWRITE_MAX_CHARS } = await import('../src/pipeline/assemble');
+  const { sectionGarbledRatio, GARBLED_ESCALATION_RATIO } = await import('../src/pipeline/structure');
+  const garbled: SourceLine = { id: 'L0010', page: 1, text: 'th�e c�at s�at o�n t�he m�at', garbled: true };
+  const clean: SourceLine = { id: 'L0011', page: 1, text: 'The cat sat on the mat' };
+  const numbered: SourceLine = { id: 'L0012', page: 1, text: '12. th�e c�at', garbled: true };
+  const key: SourceLine = { id: 'L0013', page: 1, text: 'k�ey l�ine', garbled: true, tag: 'key' };
+  const allowed = new Set([10, 11, 12, 13]);
+  assert.equal(rewriteRejection({ line: 10, text: 'the cat sat on the mat' }, garbled, new Set(), allowed), undefined, 'garbled line accepted');
+  assert.match(rewriteRejection({ line: 11, text: 'anything' }, clean, new Set(), allowed)!, /not locally garbled/);
+  assert.match(rewriteRejection({ line: 12, text: 'the cat' }, numbered, new Set(), allowed)!, /printed number|digits/);
+  assert.match(rewriteRejection({ line: 13, text: 'key line' }, key, new Set(), allowed)!, /key territory/);
+  assert.match(rewriteRejection({ line: 10, text: 'x'.repeat(REWRITE_MAX_CHARS + 1) }, garbled, new Set(), allowed)!, /longer than 140/);
+  assert.match(rewriteRejection({ line: 10, text: 'the cat sat on 2 mats' }, garbled, new Set(), allowed)!, /introduces digits/);
+  assert.match(rewriteRejection({ line: 10, text: 'ok' }, garbled, new Set(), new Set([99]))!, /outside question spans/);
+  assert.match(rewriteRejection({ line: 10, text: 'ok' }, garbled, new Set([10]), allowed)!, /key territory/);
+  const lines: SourceLine[] = [garbled, clean, numbered, { id: 'L0014', page: 1, text: 'w�rd', garbled: true }, { id: 'L0015', page: 1, text: '3', tag: 'pagenum' }];
+  assert.equal(sectionGarbledRatio(lines), 3 / 4, 'page numbers excluded from the denominator');
+  assert.ok(sectionGarbledRatio(lines) > GARBLED_ESCALATION_RATIO);
+  assert.equal(sectionGarbledRatio([clean]), 0);
+});

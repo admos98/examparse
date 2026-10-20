@@ -198,6 +198,9 @@ export interface StructurePassParams {
   onGuidance?: (guidance: StructureGuidance) => void;
   /** A4 hard cap for the playbook block (default 5,000 tokens). */
   guidanceCapTokens?: number;
+  /** D — escalation model for sections whose lines are >40% locally garbled (one routed call per section, ≤2 per pass). */
+  escalationProviderConfig?: any;
+  garbledEscalationBudget?: { count: number; max: number };
 }
 
 export interface StructureGuidance {
@@ -560,12 +563,28 @@ function sanitizeRawSectionQuestions(data: any, plan: SectionPlan, sourceLines: 
   });
 }
 
-async function runSectionCall(params: StructurePassParams, plan: SectionPlan, allPlans: SectionPlan[], targetNumbers: number[], phase: string, priorQuestions: any[], priorSections: any[]): Promise<{ questions: any[]; sections: any[]; meta: any; usage: any; rawText: string; label: string; attempts: number; tripwires: string[] }> {
+/** D — share of a section's content lines the local readability pass marked [GARBLED?]. */
+export function sectionGarbledRatio(lines: SourceLine[]): number {
+  const content = lines.filter(line => !line.furniture && line.tag !== 'pagenum' && line.tag !== 'junk' && line.tag !== 'key' && line.text.trim());
+  if (!content.length) return 0;
+  return content.filter(line => line.garbled).length / content.length;
+}
+export const GARBLED_ESCALATION_RATIO = 0.4;
+
+async function runSectionCall(params: StructurePassParams, plan: SectionPlan, allPlans: SectionPlan[], targetNumbers: number[], phase: string, priorQuestions: any[], priorSections: any[]): Promise<{ questions: any[]; sections: any[]; meta: any; usage: any; rawText: string; label: string; attempts: number; tripwires: string[]; escalated?: boolean; garbledRatio?: number }> {
   const keyLines = enumerateExpectedQuestionNos(params.sourceLines).keyTerritory.lineNos;
   const sectionLines = params.sourceLines.filter(line => {
     const n = Number(line.id.replace(/\D/g, ''));
     return n >= plan.start && n <= plan.end;
   });
+  // D — a mostly-garbled section is routed ONCE to the escalation model (budgeted), never silently.
+  const garbledRatio = sectionGarbledRatio(sectionLines);
+  const escalationBudget = params.garbledEscalationBudget;
+  const escalate = Boolean(params.escalationProviderConfig) && garbledRatio > GARBLED_ESCALATION_RATIO && !phase.startsWith('recovery') && !phase.includes('hint')
+    && Boolean(escalationBudget) && escalationBudget!.count < escalationBudget!.max
+    && String(params.escalationProviderConfig?.model || '') !== String(params.providerConfig?.model || '');
+  if (escalate) escalationBudget!.count++;
+  const providerConfig = escalate ? params.escalationProviderConfig : params.providerConfig;
   const normalizedTargets = targetNumbers.map(String);
   const keyAnswerLines = params.sourceLines.filter(line => keyLines.has(Number(line.id.replace(/\D/g, ''))));
   const relevantKeyLines = keyAnswerLines.length <= 160 || !targetNumbers.length
@@ -581,8 +600,8 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
   const text = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: params.latexEnabled, languageHint: params.languageHint || null })}\n${sessionMemory}${rangeText}${retryHint}\nSECTION ${plan.index}/${allPlans.length} ${plan.title} (${plan.start}-${plan.end})\nIMAGE MANIFEST: ${JSON.stringify(manifest)}\nSOURCE:\n${las}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}`;
   const budget = params.maxBudgetTokens || 16384;
   const maxOutputTokens = Math.min(budget, Math.max(2048, Math.ceil(Math.max(lines.length * 12, lines.reduce((s, l) => s + l.text.length, 0) / 3.2 * 0.3) * 1.25)));
-  const label = phase.startsWith('recovery') ? `Structure Recovery ${phase}: ${plan.id}` : `Structure Section: ${plan.id} [${plan.index}/${allPlans.length}] ${plan.title}`;
-  const request: LLMRequest = { role: 'fast', system: structureSystemPrompt(params), text, jsonSchema: params.providerConfig?.kind === 'gemini' ? T1_GEMINI_SCHEMA : undefined, maxOutputTokens, label, providerConfig: params.providerConfig };
+  const label = `${phase.startsWith('recovery') ? `Structure Recovery ${phase}: ${plan.id}` : `Structure Section: ${plan.id} [${plan.index}/${allPlans.length}] ${plan.title}`}${escalate ? ' (garbled → escalation model)' : ''}`;
+  const request: LLMRequest = { role: escalate ? 'escalation' : 'fast', system: structureSystemPrompt(params), text, jsonSchema: providerConfig?.kind === 'gemini' ? T1_GEMINI_SCHEMA : undefined, maxOutputTokens, label, providerConfig };
   const response = await LLMAdapter.execute(request, {
     onDelta: (channel, full) => params.onLiveText?.(label, channel, full),
     onInfo: note => params.onLiveText?.(label, 'info', note),
@@ -596,7 +615,7 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
   let sections = Array.isArray(data?.sections) ? data.sections.map((s: any) => ({ ...s, id: plan.id, index: plan.index, spans: Array.isArray(s.spans) ? s.spans : [] })) : [];
   if (!sections.length) sections = [{ id: plan.id, index: plan.index, spans: [[plan.start, plan.end]], kind: plan.title }];
   const totalPoints = data?.meta?.totalPoints;
-  return { questions, sections, meta: data?.meta || {}, usage: response.usage, rawText: response.rawText, label, attempts: 1, tripwires };
+  return { questions, sections, meta: data?.meta || {}, usage: response.usage, rawText: response.rawText, label, attempts: 1, tripwires, escalated: escalate, garbledRatio };
 }
 
 async function runSectionedStructurePass(params: StructurePassParams, options: { expected: number[]; lineByNumber: Map<number, number>; existing?: StructurePassResult; recoveryOnly?: number[] }): Promise<StructurePassResult> {
@@ -647,6 +666,8 @@ async function runSectionedStructurePass(params: StructurePassParams, options: {
     inputTokens += result.usage.inputTokens || 0; outputTokens += result.usage.outputTokens || 0; cachedTokens += result.usage.cachedTokens || 0;
     callUsage.push({ label: result.label, inputTokens: result.usage.inputTokens || 0, outputTokens: result.usage.outputTokens || 0, cachedTokens: result.usage.cachedTokens || 0 });
     let chosen = result;
+    if (result.escalated) flags.push({ code: 'SECTION_GARBLED_ESCALATED', severity: 'info', message: `${plan.title}: ${Math.round((result.garbledRatio || 0) * 100)}% of lines are locally garbled (>${Math.round(GARBLED_ESCALATION_RATIO * 100)}%); this section was routed once to the escalation model.` });
+    else if ((result.garbledRatio || 0) > GARBLED_ESCALATION_RATIO) flags.push({ code: 'SECTION_GARBLED', severity: 'warn', message: `${plan.title}: ${Math.round((result.garbledRatio || 0) * 100)}% of lines are locally garbled; escalation budget exhausted or no escalation model — review the [GARBLED?] lines in Step 2.` });
     // G2: reject a badly malformed response and make exactly one corrective re-request.
     if (result.tripwires.length >= 3 && budget.count < 8 && (recoveryAttemptsBySection.get(plan.id) || 0) < 2) {
       flags.push({ code: 'STRUCTURE_TRIPWIRES_RETRY', severity: 'warn', message: `${plan.title}: rejected output with ${result.tripwires.length} tripwires; corrective retry requested.` });

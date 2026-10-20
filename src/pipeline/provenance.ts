@@ -4,7 +4,7 @@ import type { ExamDoc, Question } from '../types';
 import type { CriticVerdict } from './critic';
 import { estimateTokens } from './memory/tokens';
 
-export interface TransformRecord { kind: 'option-split' | 'answer-split' | 'numbering' | 'image-merge' | 'consensus' | 'critic' | 'patch' | 'manual'; detail: string; ts: string }
+export interface TransformRecord { kind: 'option-split' | 'answer-split' | 'numbering' | 'image-merge' | 'consensus' | 'critic' | 'patch' | 'manual' | 'rewrite' | 'gap-completion'; detail: string; ts: string }
 export interface QuestionTrace {
   questionId: string; no: number;
   origin: { callLabel: string; model: string; wireFormat?: string; journalResumed: boolean };
@@ -35,7 +35,20 @@ export function buildTrace(params: {
 
 /** Trace for every question in a doc (100% coverage on goldens is test-asserted). */
 export function tracesForDoc(doc: ExamDoc, origin: QuestionTrace['origin'], extras?: Record<string, Partial<QuestionTrace>>): QuestionTrace[] {
-  return (doc.questions || []).map(q => buildTrace({ question: q, origin, ...(extras?.[q.id] || {}) }));
+  return (doc.questions || []).map(q => buildTrace({ question: q, origin, ...(extras?.[q.id] || {}), transforms: [...localTransforms(doc, q), ...((extras?.[q.id] as any)?.transforms || [])] }));
+}
+
+/** D — deterministic transforms recoverable from the question itself: applied rewrites and gap-completed spans. */
+export function localTransforms(doc: ExamDoc, q: Question): TransformRecord[] {
+  const out: TransformRecord[] = [];
+  const ts = doc.createdAt || new Date().toISOString();
+  const byNo = new Map((doc.source?.lines || []).map(l => [Number(String(l.id).replace(/\D/g, '')), l.text]));
+  for (const r of q.rewrites || []) {
+    const original = byNo.get(r.line);
+    out.push({ kind: 'rewrite', detail: `L${String(r.line).padStart(4, '0')} [GARBLED?] rendered from rewrite: “${(original || '').slice(0, 60)}” ⮕ “${r.text.slice(0, 60)}” (original retained; revert in Step 4)`, ts });
+  }
+  if ((q.flags || []).includes('GAP_ABSORBED')) out.push({ kind: 'gap-completion', detail: 'Unowned lines after the model\'s span were absorbed locally (B2); printed numbers, headers and key lines were never crossed.', ts });
+  return out;
 }
 
 /** Plain-language bilingual timeline (EN + FA), for the Step 4 "Trace" disclosure. */

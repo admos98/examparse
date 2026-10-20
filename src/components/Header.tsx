@@ -1,18 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import {
-  FileText,
-  Zap,
-  Settings,
-  HelpCircle,
-  Database,
-  TrendingDown,
-  ChevronDown,
-  Sparkles,
-  FolderOpen,
-} from 'lucide-react';
+import { FileText, Zap, Settings, HelpCircle, Database, ChevronDown, FolderOpen, Moon, Sun, Command } from 'lucide-react';
 import { ExamDoc, UsageRecord, getDisplayName } from '../types';
 import { summarizeUsage } from '../utils/budget';
 import { getStorageBackend, loadSettings } from '../store';
+import { getExamHealth } from '../pipeline/quality';
+import { computeQualityScore } from '../utils/qualityScore';
+import { Button, Badge, Stat, Kbd } from '../design/primitives';
+import { UiLanguage, uiText } from '../design/i18n';
 
 interface Props {
   activeDoc: ExamDoc | null;
@@ -21,6 +15,12 @@ interface Props {
   onOpenExplainer: () => void;
   onLoadDemo: () => void;
   onOpenLibrary: () => void;
+  onOpenPalette?: () => void;
+  onShortcutHelp?: () => void;
+  onToggleTheme?: () => void;
+  themeMode?: 'system' | 'light' | 'dark';
+  language?: UiLanguage;
+  contextTitle?: string;
 }
 
 export const Header: React.FC<Props> = ({
@@ -30,168 +30,79 @@ export const Header: React.FC<Props> = ({
   onOpenExplainer,
   onLoadDemo,
   onOpenLibrary,
+  onOpenPalette,
+  onShortcutHelp,
+  onToggleTheme,
+  themeMode = 'system',
+  language,
+  contextTitle,
 }) => {
   const [showUsagePopover, setShowUsagePopover] = useState(false);
-  const [storageChip, setStorageChip] = useState('Storage: Checking…');
+  const [storageChip, setStorageChip] = useState('');
+  const [systemDark, setSystemDark] = useState(false);
   useEffect(() => {
     let mounted = true;
-    getStorageBackend()
-      .then(info => {
-        if (mounted) {
-          setStorageChip(info.mode === 'folder' ? `Storage: Folder (${info.dir || 'data'})` : 'Storage: Not configured');
-        }
-      })
-      .catch(() => undefined);
+    getStorageBackend().then(info => {
+      if (mounted) setStorageChip(info.mode === 'folder' ? (info.dir || 'local folder') : 'not configured');
+    }).catch(() => undefined);
     return () => { mounted = false; };
   }, []);
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const sync = () => setSystemDark(media.matches);
+    sync();
+    media.addEventListener?.('change', sync);
+    return () => media.removeEventListener?.('change', sync);
+  }, []);
+  const t = (en: string, fa: string) => uiText(language, en, fa);
   const settings = loadSettings();
   const summary = summarizeUsage(usageRecords, settings.costTable);
+  let health: ReturnType<typeof getExamHealth> | null = null;
+  let quality: ReturnType<typeof computeQualityScore> | null = null;
+  try { if (activeDoc) { health = getExamHealth(activeDoc); quality = computeQualityScore(activeDoc); } } catch { /* incomplete drafts still render safely */ }
+  const isDark = themeMode === 'dark' || (themeMode === 'system' && systemDark);
+  const themeLabel = isDark ? t('Use light theme', 'استفاده از پوسته روشن') : t('Use dark theme', 'استفاده از پوسته تیره');
 
-  return (
-    <header className="h-14 border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md px-4 flex items-center justify-between z-30 sticky top-0">
-      {/* Brand & Active Document */}
-      <div className="flex items-center gap-3">
-        <div className="flex items-center gap-2 font-bold text-slate-900 dark:text-white tracking-tight text-base">
-          <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-blue-500 text-white flex items-center justify-center shadow-xs">
-            <FileText className="w-4 h-4" />
-          </div>
-          <span>ExamParse</span>
-          <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
-            zero-waste
-          </span>
-          <span
-            className="hidden md:inline text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-500/10 text-slate-500 dark:text-slate-400 border border-slate-500/20 max-w-[260px] truncate"
-            title={storageChip}
-          >
-            {storageChip}
-          </span>
+  return <header className="ep-context-header print:hidden">
+    <div className="min-w-0 flex items-center gap-12">
+      <div className="min-w-0">
+        <h1 id="view-context-heading" tabIndex={-1} className="ep-context-title truncate">{contextTitle || (activeDoc ? getDisplayName(activeDoc) : 'ExamParse')}</h1>
+        <div className="flex min-w-0 flex-wrap items-center gap-2 ep-caption">
+          {activeDoc && <><span className="truncate max-w-64" title={getDisplayName(activeDoc)}>{getDisplayName(activeDoc)}</span><span aria-hidden="true">·</span><span className="ep-mono">{activeDoc.source.pages} {t('pages', 'صفحه')}</span>{activeDoc.source.ocrUsed && <Badge tone="warn">OCR</Badge>}</>}
+          <span className="hidden md:inline truncate" title={storageChip}>{t('Folder', 'پوشه')}: {storageChip || t('checking', 'در حال بررسی')}</span>
         </div>
+      </div>
+      {activeDoc && health && quality && <div className="hidden xl:flex items-center gap-6 border-inline-start border-[var(--rule)] ps-4">
+        <Stat label={t('Questions', 'سؤال')} value={`${health.parsedCount}/${health.expectedCount}`} />
+        <Stat label={t('Points', 'نمره')} value={health.pointsExpected === undefined ? String(health.pointsParsed) : `${health.pointsParsed}/${health.pointsExpected}`} />
+        <Stat label={t('Quality', 'کیفیت')} value={quality.total} />
+      </div>}
+    </div>
 
-        {activeDoc && (
-          <div className="hidden sm:flex items-center gap-2 pl-3 border-l border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
-            <span className="font-medium text-slate-900 dark:text-slate-200 max-w-[200px] truncate" title={getDisplayName(activeDoc)}>
-              {getDisplayName(activeDoc)}
-            </span>
-            <span className="text-slate-400">•</span>
-            <span>{activeDoc.source.pages} page(s)</span>
-            {activeDoc.source.ocrUsed && (
-              <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-600 border border-amber-500/20">
-                OCR
-              </span>
-            )}
+    <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+      <Button size="sm" variant="ghost" aria-label={t('Open command palette', 'باز کردن فرمان‌ها')} onClick={onOpenPalette} title={t('Command palette', 'فرمان‌ها')}><Command size={16} /><span className="hidden lg:inline">{t('Commands', 'فرمان‌ها')}</span><Kbd className="hidden xl:inline-flex">⌘K</Kbd></Button>
+      <div className="relative">
+        <Button size="sm" variant="ghost" aria-expanded={showUsagePopover} onClick={() => setShowUsagePopover(value => !value)} title={t('Token and cost summary', 'خلاصه توکن و هزینه')}>
+          <Zap size={15} /><span className="ep-mono">{summary.totalTokens > 0 ? `${(summary.totalTokens / 1000).toFixed(1)}k` : '0'} {t('tokens', 'توکن')}</span><span className="ep-mono">${summary.totalCostUsd.toFixed(4)}</span><ChevronDown size={14} />
+        </Button>
+        {showUsagePopover && <section className="ep-card absolute end-0 top-full z-50 mt-2 w-72 p-4 text-[length:var(--type-12)]" aria-label={t('Session accounting', 'گزارش نشست')}>
+          <div className="flex items-center justify-between border-b border-[var(--rule)] pb-2"><strong>{t('Session accounting', 'گزارش نشست')}</strong><span className="ep-mono">{summary.callCount} {t('calls', 'فراخوانی')}</span></div>
+          <div className="space-y-2 py-3 ep-muted">
+            <div className="flex justify-between"><span>{t('Input tokens', 'توکن ورودی')}</span><span className="ep-mono">{summary.totalInputTokens.toLocaleString()}</span></div>
+            <div className="flex justify-between"><span>{t('Output tokens', 'توکن خروجی')}</span><span className="ep-mono">{summary.totalOutputTokens.toLocaleString()}</span></div>
+            <div className="flex justify-between"><span><Database size={13} className="inline" /> {t('Cache hits', 'برخوردهای حافظه نهان')}</span><span className="ep-mono">{summary.cacheHitCount}</span></div>
+            <div className="flex justify-between border-t border-[var(--rule)] pt-2"><span>{t('Total spent', 'هزینه کل')}</span><span className="ep-mono">${summary.totalCostUsd.toFixed(5)}</span></div>
+            <div className="flex justify-between"><span>{t('Saved by cache', 'صرفه‌جویی حافظه نهان')}</span><span className="ep-mono">${summary.totalSavedUsd.toFixed(5)}</span></div>
           </div>
-        )}
+          <Button size="sm" variant="ghost" onClick={() => setShowUsagePopover(false)}>{t('Close', 'بستن')}</Button>
+        </section>}
       </div>
-
-      {/* Usage Meter & Actions */}
-      <div className="flex items-center gap-2 sm:gap-3">
-        {/* Persistent Usage Meter */}
-        <div className="relative">
-          <button
-            onClick={() => setShowUsagePopover(!showUsagePopover)}
-            className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700/80 border border-slate-200 dark:border-slate-700/50 transition cursor-pointer text-xs"
-            title="Click for detailed token & cost breakdown"
-          >
-            <div className="flex items-center gap-1.5 text-slate-700 dark:text-slate-300 font-medium">
-              <Zap className="w-3.5 h-3.5 text-amber-500 fill-amber-500" />
-              <span>{summary.totalTokens > 0 ? `${(summary.totalTokens / 1000).toFixed(1)}k` : '0'} tokens</span>
-            </div>
-            <span className="text-slate-300 dark:text-slate-600">•</span>
-            <div className="text-emerald-600 dark:text-emerald-400 font-semibold font-mono">
-              ${summary.totalCostUsd.toFixed(4)}
-            </div>
-
-            {summary.totalSavedUsd > 0 && (
-              <div className="hidden md:flex items-center gap-1 text-[11px] text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/40 px-1.5 py-0.5 rounded-md border border-purple-200 dark:border-purple-800/50">
-                <TrendingDown className="w-3 h-3" />
-                <span>Saved ${(summary.totalSavedUsd).toFixed(4)}</span>
-              </div>
-            )}
-            <ChevronDown className="w-3 h-3 text-slate-400" />
-          </button>
-
-          {/* Usage Details Popover */}
-          {showUsagePopover && (
-            <div className="absolute right-0 mt-2 w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xl p-4 text-xs z-50 animate-in fade-in zoom-in-95">
-              <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
-                <span className="font-semibold text-slate-900 dark:text-white">Session API Accounting</span>
-                <span className="text-[10px] text-slate-400">{summary.callCount} calls total</span>
-              </div>
-              <div className="py-2.5 space-y-1.5 text-slate-600 dark:text-slate-300">
-                <div className="flex justify-between">
-                  <span>Input Tokens:</span>
-                  <span className="font-mono">{summary.totalInputTokens.toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Output Tokens:</span>
-                  <span className="font-mono">{summary.totalOutputTokens.toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between text-purple-600 dark:text-purple-400">
-                  <span className="flex items-center gap-1">
-                    <Database className="w-3 h-3" /> Cache Hits:
-                  </span>
-                  <span className="font-mono">{summary.cacheHitCount} calls</span>
-                </div>
-                <div className="flex justify-between text-emerald-600 dark:text-emerald-400 pt-1 border-t border-slate-100 dark:border-slate-800 font-medium">
-                  <span>Total Spent:</span>
-                  <span className="font-mono font-bold">${summary.totalCostUsd.toFixed(5)}</span>
-                </div>
-                <div className="flex justify-between text-purple-600 dark:text-purple-400 font-medium">
-                  <span>Est. Saved by Cache:</span>
-                  <span className="font-mono font-bold">${summary.totalSavedUsd.toFixed(5)}</span>
-                </div>
-              </div>
-              <div className="pt-2 border-t border-slate-100 dark:border-slate-800 text-[10px] text-slate-400 flex justify-between items-center">
-                <span>Hard budget stop: ${settings.budget.maxUsdPerRun}</span>
-                <button
-                  onClick={() => setShowUsagePopover(false)}
-                  className="text-blue-500 hover:underline"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Exam Library Button */}
-        <button
-          onClick={onOpenLibrary}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700/80 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700/50 text-xs font-medium transition cursor-pointer"
-          title="Open the exam library"
-        >
-          <FolderOpen className="w-3.5 h-3.5" />
-          <span>Library</span>
-        </button>
-
-        {/* Demo Exam Button */}
-        <button
-          onClick={onLoadDemo}
-          className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/60 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800/60 text-xs font-medium transition cursor-pointer"
-          title="Load Physics & Math Demo Exam"
-        >
-          <Sparkles className="w-3.5 h-3.5" />
-          <span>Demo Exam</span>
-        </button>
-
-        {/* Cost Explainer Info */}
-        <button
-          onClick={onOpenExplainer}
-          className="p-2 text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-          title="Explain Token Savings"
-        >
-          <HelpCircle className="w-4 h-4" />
-        </button>
-
-        {/* Settings Gear */}
-        <button
-          onClick={onOpenSettings}
-          className="p-2 text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-          title="Settings & Provider Config"
-        >
-          <Settings className="w-4 h-4" />
-        </button>
-      </div>
-    </header>
-  );
+      <Button size="sm" variant="ghost" onClick={onOpenLibrary} aria-label={t('Library', 'کتابخانه')}><FolderOpen size={16} /><span className="hidden md:inline">{t('Library', 'کتابخانه')}</span></Button>
+      <Button size="sm" variant="ghost" className="hidden lg:inline-flex" onClick={onLoadDemo} title={t('Load the built-in physics and math exam', 'بارگذاری آزمون نمونه فیزیک و ریاضی')}><FileText size={15} /><span>{t('Demo', 'نمونه')}</span></Button>
+      <Button size="sm" variant="ghost" onClick={onToggleTheme} aria-label={themeLabel} title={themeLabel}>{isDark ? <Sun size={16} /> : <Moon size={16} />}</Button>
+      <Button size="sm" variant="ghost" onClick={onShortcutHelp} aria-label={t('Keyboard shortcuts', 'میانبرهای صفحه‌کلید')} title={t('Keyboard shortcuts', 'میانبرهای صفحه‌کلید')}><HelpCircle size={16} /></Button>
+      <Button size="sm" variant="ghost" onClick={onOpenSettings} aria-label={t('Settings & Provider Config', 'تنظیمات و پیکربندی ارائه‌دهنده')} title={t('Settings & Provider Config', 'تنظیمات و پیکربندی ارائه‌دهنده')}><Settings size={16} /></Button>
+    </div>
+  </header>;
 };

@@ -377,8 +377,7 @@ test('imports normalize safe blobs, reject invalid spans, and exports redact pro
   (globalThis as any).window = { confirm: (message: string) => { confirmationMessages.push(message); return false; } };
   try {
     for (const action of ['Print / Save PDF', 'Export DOCX', 'Export']) assert.equal(confirmPartialExport(partial, action), false);
-    assert.equal(confirmationMessages.length, 3);
-    assert.ok(confirmationMessages.every(message => /PARTIAL/.test(message)));
+    assert.equal(confirmationMessages.length, 0, 'incomplete exports must be routed through an in-product confirmation, never window.confirm');
   } finally { if (originalWindow === undefined) delete (globalThis as any).window; else (globalThis as any).window = originalWindow; }
 
   const empty = { ...partial, source: { ...partial.source, expectedQuestionNos: [] }, meta: { language: 'en', direction: 'ltr' }, questions: [] } as ExamDoc;

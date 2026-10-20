@@ -28,7 +28,9 @@ import {
   loadExamDoc,
   saveExamDoc,
 } from '../store';
-import { duplicateExamDoc, exportExamJson } from '../utils/examExport';
+import { duplicateExamDoc, exportExamJson, partialExportIssues } from '../utils/examExport';
+import { ConfirmCard, Modal } from '../design/primitives';
+import { loadSettings } from '../store';
 import { answerLibraryQuestion } from '../pipeline/multiExamChat';
 import { createBackup, restoreBackup } from '../utils/backup';
 
@@ -63,6 +65,7 @@ export const LibraryView: React.FC<Props> = ({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [pendingDelete, setPendingDelete] = useState<ExamSummary | null>(null);
+  const [pendingExport, setPendingExport] = useState<ExamDoc | null>(null);
   const [cacheCleared, setCacheCleared] = useState(false);
   const [storageMode, setStorageMode] = useState<{ mode: string; dir?: string }>({ mode: 'unavailable' });
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -118,9 +121,9 @@ export const LibraryView: React.FC<Props> = ({
   }, [isOpen, refresh]);
 
   const qualityLabel = (score: number) => {
-    if (score >= 80) return { text: `${score}`, cls: 'bg-emerald-500 text-white', label: 'good' };
-    if (score >= 50) return { text: `${score}`, cls: 'bg-amber-500 text-white', label: 'review' };
-    return { text: `${score}`, cls: 'bg-red-500 text-white', label: 'poor' };
+    if (score >= 80) return { text: `${score}`, cls: 'border-[var(--ok)] bg-[var(--ok-soft)] text-[var(--ok)]', label: 'good' };
+    if (score >= 50) return { text: `${score}`, cls: 'border-[var(--warn)] bg-[var(--warn-soft)] text-[var(--warn-ink)]', label: 'review' };
+    return { text: `${score}`, cls: 'border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]', label: 'poor' };
   };
 
   const visible = useMemo(() => {
@@ -207,7 +210,17 @@ export const LibraryView: React.FC<Props> = ({
       setErrorMsg('That exam could not be loaded for export.');
       return;
     }
+    if (partialExportIssues(doc).length) {
+      setPendingExport(doc);
+      return;
+    }
     exportExamJson(doc);
+  };
+
+  const confirmPendingExport = () => {
+    if (!pendingExport) return;
+    exportExamJson(pendingExport);
+    setPendingExport(null);
   };
 
   const confirmDelete = async () => {
@@ -238,6 +251,8 @@ export const LibraryView: React.FC<Props> = ({
   };
 
   if (!isOpen) return null;
+  const fa = loadSettings().uiLanguage === 'fa';
+  const pendingExportIssues = pendingExport ? partialExportIssues(pendingExport) : [];
 
   const formatDate = (iso: string) => {
     const d = new Date(iso);
@@ -245,17 +260,18 @@ export const LibraryView: React.FC<Props> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-50 dark:bg-[#090d16] text-slate-900 dark:text-slate-100 overflow-y-auto">
+    <Modal open={isOpen} onClose={onClose} title={fa ? 'کتابخانه آزمون' : 'Exam Library'} labelledBy="exam-library-title" className="ep-library-window" backdropClassName="ep-library-backdrop">
+      <div className="h-full overflow-y-auto bg-[var(--paper)] text-[var(--ink)]">
       <div className="max-w-5xl mx-auto py-6 px-4 space-y-5">
         {/* Header */}
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-blue-600 text-white">
+            <div className="p-2.5 rounded-[10px] bg-[var(--accent)] text-[var(--on-accent)]">
               <FolderOpen className="w-5 h-5" />
             </div>
             <div>
-              <h1 className="text-lg font-bold">Exam Library</h1>
-              <p className="text-xs text-slate-500">
+              <h1 id="exam-library-title" className="text-lg font-bold">{fa ? 'کتابخانه آزمون' : 'Exam Library'}</h1>
+              <p className="text-xs text-[var(--ink-2)]">
                 {summaries.length} exam(s) stored locally
                 {storageMb !== null ? ` · ${storageMb.toFixed(1)} MB used` : ''} ·{' '}
                 {storageMode.mode === 'folder' ? `Storage: Folder (${storageMode.dir || 'data'})` : 'Storage: Folder unavailable'}
@@ -263,9 +279,11 @@ export const LibraryView: React.FC<Props> = ({
             </div>
           </div>
           <button
+            type="button"
+            aria-label={fa ? 'بستن کتابخانه' : 'Close library'}
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800"
-            title="Close library"
+            className="p-2 text-[var(--ink-2)] hover:text-[var(--ink-2)]  rounded-[6px] hover:bg-[var(--paper)] "
+            title={fa ? 'بستن کتابخانه' : 'Close library'}
           >
             <X className="w-5 h-5" />
           </button>
@@ -277,44 +295,44 @@ export const LibraryView: React.FC<Props> = ({
           const alarm = regressionAlarm(engineHealth.coverages);
           const lastBench = engineHealth.livebench[engineHealth.livebench.length - 1];
           return (<>
-            <div className="flex flex-wrap gap-x-4 gap-y-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl px-3 py-2 text-[11px] text-slate-600 dark:text-slate-300">
+            <div className="flex flex-wrap gap-x-4 gap-y-1 bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] px-3 py-2 text-[length:var(--type-12)] text-[var(--ink-2)] ">
               <span>Engine health:</span>
               <span>Last live bench: {lastBench ? `${lastBench.modelId} · ${lastBench.meanCoverage}% coverage · ${new Date(lastBench.ts).toLocaleDateString()}` : 'not benchmarked'}</span>
               <span>Offline bench: PASS (merge gate — run npm run bench)</span>
               <span>Clean-rate trend: {trend.recent !== null ? `last 20 jobs ${trend.recent}% vs prior 20 ${trend.prior ?? '—'}% (n=${trend.n})` : 'insufficient jobs yet'}</span>
             </div>
             {alarm.alarm && !alarmDismissed && (
-              <div role="alert" className="flex items-center gap-2 bg-amber-50 dark:bg-amber-950 border border-amber-300 rounded-2xl px-3 py-2 text-xs text-amber-900 dark:text-amber-100">
+              <div role="alert" className="flex items-center gap-2 bg-[var(--warn-soft)]  border border-[var(--warn)] rounded-[10px] px-3 py-2 text-xs text-[var(--warn-ink)] ">
                 <span>{alarm.message}</span>
-                <button onClick={() => setAlarmDismissed(true)} className="ml-auto underline shrink-0">Dismiss</button>
+                <button onClick={() => setAlarmDismissed(true)} className="ms-auto underline shrink-0">Dismiss</button>
               </div>
             )}
           </>);
         })()}
 
         {/* Library-scope QA (F3) — dossiers only, no raw PDF text; All exams / scoped */}
-        <div className="flex flex-wrap items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3 text-xs">
-          <input type="text" value={libraryQuery} onChange={e=> setLibraryQuery(e.target.value)} onKeyDown={e=> e.key==='Enter' && handleLibraryQuery()} placeholder='Try “which exams are incomplete?” or “list exams”' className="flex-[250px] px-2 py-1 rounded border text-xs" aria-label="Ask library" />
-          <button onClick={handleLibraryQuery} className="px-3 py-1 rounded bg-blue-600 text-white text-xs shrink-0">Ask library</button>
-          {libraryAnswer && <div role="status" className="w-full mt-2 p-2 rounded bg-slate-50 dark:bg-slate-800 text-xs">{libraryAnswer} <button onClick={()=> setLibraryAnswer(null)} className="ml-2 underline">dismiss</button></div>}
+        <div className="flex flex-wrap items-center gap-2 bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-3 text-xs">
+          <input type="text" value={libraryQuery} onChange={e=> setLibraryQuery(e.target.value)} onKeyDown={e=> e.key==='Enter' && handleLibraryQuery()} placeholder='Try “which exams are incomplete?” or “list exams”' className="flex-[250px] px-2 py-1 rounded-[6px] border text-xs" aria-label="Ask library" />
+          <button onClick={handleLibraryQuery} className="px-3 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] text-xs shrink-0">Ask library</button>
+          {libraryAnswer && <div role="status" className="w-full mt-2 p-2 rounded-[6px] bg-[var(--paper)]  text-xs">{libraryAnswer} <button onClick={()=> setLibraryAnswer(null)} className="ms-2 underline">dismiss</button></div>}
         </div>
 
         {/* Toolbar */}
-        <div className="flex flex-wrap items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3">
-          <div className="flex items-center gap-2 flex-1 min-w-[200px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950">
-            <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+        <div className="flex flex-wrap items-center gap-2 bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-3">
+          <div className="flex items-center gap-2 flex-1 min-w-[200px] px-2.5 py-1.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] ">
+            <Search className="w-3.5 h-3.5 text-[var(--ink-2)] shrink-0" />
             <input
               type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search name, subject, grade, or file name…"
-              className="w-full bg-transparent outline-hidden text-xs text-slate-900 dark:text-slate-200"
+              className="w-full bg-transparent outline-hidden text-xs text-[var(--ink)] "
             />
           </div>
           <select
             value={sort}
             onChange={e => setSort(e.target.value as SortMode)}
-            className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-xs"
+            className="px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper-raised)]  text-xs"
             title="Sort exams"
           >
             <option value="newest">Newest first</option>
@@ -326,7 +344,7 @@ export const LibraryView: React.FC<Props> = ({
           <select
             value={qualityFilter}
             onChange={e => setQualityFilter(e.target.value as any)}
-            className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-xs"
+            className="px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper-raised)]  text-xs"
             title="Filter by quality"
           >
             <option value="all">All quality</option>
@@ -335,24 +353,24 @@ export const LibraryView: React.FC<Props> = ({
           </select>
           <button
             onClick={handleClearCaches}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition text-xs font-medium"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition text-xs font-medium"
             title="Delete cached pipeline stage results (exams are kept)"
           >
-            <Database className="w-3.5 h-3.5 text-purple-500" />
+            <Database className="w-3.5 h-3.5 text-[var(--accent-ink)]" />
             <span>{cacheCleared ? 'Caches cleared!' : 'Clear pipeline caches'}</span>
           </button>
         </div>
 
-        <div className="p-3 text-xs border rounded-xl">
+        <div className="p-3 text-xs border rounded-[10px]">
           {legacyNotice && <p>Old browser-stored exams are read-only from this version; export them from Library if needed. <button className="underline" onClick={() => { localStorage.setItem('examparse_legacy_notice_seen', '1'); setLegacyNotice(false); }}>Dismiss</button></p>}
-          <button className="underline ml-2" onClick={async () => {
+          <button className="underline ms-2" onClick={async () => {
             try { const { exportLegacyExams } = await import('../store/legacy'); await exportLegacyExams(); }
             catch (error) { setErrorMsg(String(error)); }
           }}>Export old browser exams (read-only)</button>
         </div>
 
         {errorMsg && (
-          <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 text-xs flex items-center gap-2">
+          <div className="p-3 rounded-[10px] bg-[var(--danger-soft)] border border-[var(--danger)] text-[var(--danger)]  text-xs flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>{errorMsg}</span>
           </div>
@@ -360,23 +378,23 @@ export const LibraryView: React.FC<Props> = ({
 
         {/* List */}
         {loading ? (
-          <div className="text-center text-xs text-slate-500 py-16">Loading library…</div>
+          <div className="text-center text-xs text-[var(--ink-2)] py-16">Loading library…</div>
         ) : summaries.length === 0 ? (
-          <div className="text-center py-16 space-y-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl">
-            <FileText className="w-10 h-10 mx-auto text-slate-300 dark:text-slate-600" />
-            <p className="text-sm font-medium text-slate-700 dark:text-slate-300">No exams stored yet</p>
-            <p className="text-xs text-slate-500 max-w-sm mx-auto">
+          <div className="text-center py-16 space-y-3 bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px]">
+            <FileText className="w-10 h-10 mx-auto text-[var(--ink-2)] " />
+            <p className="text-sm font-medium text-[var(--ink)] ">No exams stored yet</p>
+            <p className="text-xs text-[var(--ink-2)] max-w-sm mx-auto">
               Import an exam paper at Step 1 and run the analysis — every analyzed exam is saved here automatically.
             </p>
             <button
               onClick={onGoToImport}
-              className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium transition"
+              className="px-4 py-2 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent)] text-[var(--on-accent)] text-xs font-medium transition"
             >
               Go to Step 1 — Import
             </button>
           </div>
         ) : visible.length === 0 ? (
-          <div className="text-center text-xs text-slate-500 py-16">No exams match “{search}”.</div>
+          <div className="text-center text-xs text-[var(--ink-2)] py-16">No exams match “{search}”.</div>
         ) : (
           <div className="space-y-3">
             {visible.map(s => {
@@ -390,7 +408,7 @@ export const LibraryView: React.FC<Props> = ({
               return (
                 <div
                   key={s.id}
-                  className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-2.5"
+                  className="p-4 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper-raised)]  space-y-2.5"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
@@ -405,42 +423,42 @@ export const LibraryView: React.FC<Props> = ({
                               if (e.key === 'Enter') commitRename(s);
                               if (e.key === 'Escape') setRenamingId(null);
                             }}
-                            className="px-2.5 py-1.5 rounded-lg border border-blue-400 bg-white dark:bg-slate-950 text-sm font-semibold w-72 max-w-full"
+                            className="px-2.5 py-1.5 rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)]  text-sm font-semibold w-72 max-w-full"
                           />
                           <button
                             onClick={() => commitRename(s)}
-                            className="p-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700"
+                            className="p-1.5 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] hover:bg-[var(--accent)]"
                             title="Save name"
                           >
                             <Check className="w-3.5 h-3.5" />
                           </button>
                           <button
                             onClick={() => setRenamingId(null)}
-                            className="p-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                            className="p-1.5 rounded-[6px] border border-[var(--rule-strong)]  hover:bg-[var(--paper)] "
                             title="Cancel rename"
                           >
                             <X className="w-3.5 h-3.5" />
                           </button>
                         </div>
                       ) : (
-                        <div className="font-semibold text-base text-slate-900 dark:text-white truncate">
+                        <div className="font-semibold text-base text-[var(--ink)]  truncate">
                           {s.displayName}
-                          {s.complete !== true && <span title={`Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`} className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/30 align-middle">PARTIAL — {s.parsedQuestionCount ?? s.questionCount}/{s.expectedQuestionCount ?? '?'}</span>}
+                          {s.complete !== true && <span title={`Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`} className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)] align-middle">PARTIAL — {s.parsedQuestionCount ?? s.questionCount}/{s.expectedQuestionCount ?? '?'}</span>}
                           {isActive && (
-                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 align-middle">
+                            <span className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)] align-middle">
                               open
                             </span>
                           )}
                         </div>
                       )}
-                      <div className="text-[11px] text-slate-400 truncate" title={s.fileName}>
+                      <div className="text-[length:var(--type-12)] text-[var(--ink-2)] truncate" title={s.fileName}>
                         {s.fileName}
                       </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${q.cls}`} title="Local quality score (never a gate)">Q {q.text}</span>
+                      <span className={`px-2 py-0.5 rounded-[6px] border text-[length:var(--type-12)] font-bold ${q.cls}`} title="Local quality score (never a gate)">Q {q.text}</span>
                       {s.ocrUsed && (
-                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 shrink-0">
+                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)] shrink-0">
                           <ScanText className="w-3 h-3" /> OCR
                         </span>
                       )}
@@ -452,7 +470,7 @@ export const LibraryView: React.FC<Props> = ({
                       {chips.map((chip, i) => (
                         <span
                           key={i}
-                          className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700"
+                          className="text-[length:var(--type-12)] px-2 py-0.5 rounded-[10px] bg-[var(--paper)]  text-[var(--ink-2)]  border border-[var(--rule)] "
                         >
                           {chip}
                         </span>
@@ -461,44 +479,44 @@ export const LibraryView: React.FC<Props> = ({
                   )}
 
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-[11px] text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
+                    <div className="text-[length:var(--type-12)] text-[var(--ink-2)] flex flex-wrap gap-x-3 gap-y-1">
                       <span>{s.pages} pages</span>
                       <span>{s.questionCount} questions</span>
                       <span>{s.imageCount} images</span>
                       <span>{s.sectionCount} sections</span>
                       <span title={s.createdAt}>{formatDate(s.createdAt)}</span>
-                      <span className="font-mono text-emerald-600 dark:text-emerald-400">
+                      <span className="font-mono text-[var(--ok)] ">
                         ${s.totalCostUsd.toFixed(4)} lifetime · {s.totalTokens.toLocaleString()} toks
                       </span>
                     </div>
-                    <div className="flex items-center gap-1.5 text-[11px]">
+                    <div className="flex items-center gap-1.5 text-[length:var(--type-12)]">
                       <button
                         onClick={() => handleOpen(s)}
-                        className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium transition"
+                        className="px-3 py-1.5 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent)] text-[var(--on-accent)] font-medium transition"
                       >
                         Open
                       </button>
                       <button
                         onClick={() => startRename(s)}
-                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"
                       >
                         <Pencil className="w-3 h-3" /> Rename
                       </button>
                       <button
                         onClick={() => handleDuplicate(s)}
-                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"
                       >
                         <Copy className="w-3 h-3" /> Duplicate
                       </button>
                       <button
                         onClick={() => handleExport(s)}
-                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"
                       >
                         <Download className="w-3 h-3" /> Export JSON
                       </button>
                       <button
                         onClick={() => setPendingDelete(s)}
-                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-300 dark:border-red-900/50 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition"
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--danger)]  text-[var(--danger)]  hover:bg-[var(--danger-soft)]  transition"
                       >
                         <Trash2 className="w-3 h-3" /> Delete
                       </button>
@@ -511,39 +529,29 @@ export const LibraryView: React.FC<Props> = ({
         )}
       </div>
 
-      {/* Delete confirmation dialog */}
-      {pendingDelete && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
-            <div className="flex items-start gap-3">
-              <div className="p-2 rounded-xl bg-red-500/10 text-red-500 shrink-0">
-                <AlertTriangle className="w-5 h-5" />
-              </div>
-              <div>
-                <h2 className="text-sm font-bold text-slate-900 dark:text-white">Delete this exam?</h2>
-                <p className="text-xs text-slate-500 mt-1">
-                  “{pendingDelete.displayName}” ({pendingDelete.fileName}) will be permanently deleted,
-                  along with any image files no other exam uses. This cannot be undone. Your global usage log is not affected.
-                </p>
-              </div>
-            </div>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setPendingDelete(null)}
-                className="px-4 py-2 rounded-xl text-xs font-medium text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 transition"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmDelete}
-                className="px-4 py-2 rounded-xl text-xs font-medium bg-red-600 hover:bg-red-700 text-white transition"
-              >
-                Delete exam
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
+      <Modal open={Boolean(pendingDelete)} onClose={() => setPendingDelete(null)} title={fa ? 'حذف آزمون' : 'Delete exam'}>
+        {pendingDelete && <div className="p-4"><ConfirmCard
+          title={fa ? 'این آزمون حذف شود؟' : 'Delete this exam?'}
+          description={fa ? `«${pendingDelete.displayName}» به‌همراه فایل‌های تصویریِ بدون استفاده حذف می‌شود. این کار بازگشت‌پذیر نیست؛ گزارش مصرف کلی دست‌نخورده می‌ماند.` : `“${pendingDelete.displayName}” and image files no other exam uses will be permanently deleted. This cannot be undone. The global usage log is not affected.`}
+          confirmLabel={fa ? 'حذف آزمون' : 'Delete exam'}
+          cancelLabel={fa ? 'لغو' : 'Cancel'}
+          danger
+          onConfirm={() => void confirmDelete()}
+          onCancel={() => setPendingDelete(null)}
+        /></div>}
+      </Modal>
+      <Modal open={Boolean(pendingExport)} onClose={() => setPendingExport(null)} title={fa ? 'تأیید خروجی آزمون ناقص' : 'Confirm partial exam export'}>
+        {pendingExport && <div className="p-4"><ConfirmCard
+          title={fa ? 'آزمون ناقص است' : 'This exam is partial'}
+          description={fa ? `موارد نیازمند بررسی: ${pendingExportIssues.length}. با خروجی همین وضعیت ادامه دهید؟` : `Items to review: ${pendingExportIssues.join('; ')}. Export this state anyway?`}
+          confirmLabel={fa ? 'خروجی بگیر' : 'Export anyway'}
+          cancelLabel={fa ? 'لغو' : 'Cancel'}
+          danger
+          onConfirm={confirmPendingExport}
+          onCancel={() => setPendingExport(null)}
+        /></div>}
+      </Modal>
+      </div>
+    </Modal>
   );
 };

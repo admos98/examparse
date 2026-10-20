@@ -25,6 +25,7 @@ import { prepareSectionReparse } from "../pipeline/reparseSection";
 import { assistantError, AgentOperationError } from "../pipeline/agentI18n";
 import { beginJob, endJob, guidanceSummary, type JobHandle } from "../pipeline/memory/harness";
 import { MemoryPanel } from "../components/MemoryPanel";
+import { Modal } from "../design/primitives";
 
 type UndoState = Pick<
   ExamDoc,
@@ -555,20 +556,23 @@ export function AssistantView({
       );
     }
   }, [ready, verifyOnOpen]);
-  return (
+  const content = (
     <section
+      id={mode === 'page' ? 'main-content' : undefined}
+      role={mode === 'page' ? 'main' : undefined}
+      tabIndex={mode === 'page' ? -1 : undefined}
       aria-label={t("Exam assistant", "دستیار آزمون")}
       data-assistant-mode={mode}
       className={
         mode === "panel"
-          ? "fixed right-0 top-0 bottom-0 w-full sm:w-[480px] z-50 bg-white dark:bg-slate-950 border-l shadow-2xl flex flex-col"
-          : "max-w-5xl mx-auto w-full border rounded-2xl bg-white dark:bg-slate-950 flex flex-col h-[calc(100dvh-9rem)] min-h-[500px]"
+          ? "flex h-full flex-col"
+          : "max-w-5xl mx-auto w-full border rounded-[10px] bg-[var(--paper-raised)]  flex flex-col h-[calc(100dvh-9rem)] min-h-[500px]"
       }
       dir={fa ? "rtl" : "ltr"}
     >
       <header className="p-4 border-b flex justify-between items-center">
         <div>
-          <h2 className="font-bold">{t("Assistant", "دستیار")}</h2>
+          <h2 id="assistant-panel-title" className="font-bold">{t("Assistant", "دستیار")}</h2>
           <p className="text-xs">
             ${session.costUsd.toFixed(5)} {t("this turn", "این نوبت")} ·{" "}
             {session.calls}/{(settings.agentLimits?.maxModelCalls ?? 25)} {t("model calls", "فراخوانی مدل")}
@@ -577,7 +581,7 @@ export function AssistantView({
         <button
           disabled={busy}
           onClick={onClose}
-          className="p-2 border rounded"
+          className="p-2 border rounded-[6px]"
         >
           {mode === "page"
             ? t("Back to exam", "بازگشت به آزمون")
@@ -585,13 +589,13 @@ export function AssistantView({
         </button>
       </header>
       <div className="flex-1 overflow-auto p-4 space-y-3" aria-live="polite">
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-[var(--ink-2)]">
           {t(
             "Chats send only the summaries and slices you ask about to your configured model — your files stay in the local folder.",
             "گفت‌وگو فقط خلاصه‌ها و بخش‌هایی را که می‌خواهید به مدل تنظیم‌شده می‌فرستد — فایل‌ها در پوشه محلی می‌مانند.",
           )}
         </p>
-        <details className="text-xs border rounded-xl p-2">
+        <details className="text-xs border rounded-[10px] p-2">
           <summary className="cursor-pointer font-medium">
             {t("Memory (read-only)", "حافظه (فقط خواندنی)")}
             {session.guidanceDigest ? ` — ${session.guidanceDigest}` : ""}
@@ -603,7 +607,7 @@ export function AssistantView({
         {session.events.map((event) => (
           <div
             key={event.id}
-            className={`p-3 rounded-xl text-xs whitespace-pre-wrap break-words border ${event.kind === "user" ? "bg-blue-50 dark:bg-slate-800" : event.kind === "error" ? "border-red-400" : ""}`}
+            className={`p-3 rounded-[10px] text-xs whitespace-pre-wrap break-words border ${event.kind === "user" ? "bg-[var(--paper)] " : event.kind === "error" ? "border-[var(--danger)]" : ""}`}
           >
             {event.tool && (
               <b>
@@ -631,7 +635,7 @@ export function AssistantView({
           </div>
         ))}
         {session.pending && !busy && (
-          <div className="border border-amber-500 p-3 rounded-xl text-xs">
+          <div className="border border-[var(--warn)] p-3 rounded-[10px] text-xs">
             <p>
               {t(
                 "Only the action shown above will execute. Verify the exact question/count.",
@@ -639,7 +643,7 @@ export function AssistantView({
               )}
             </p>
             {session.prepared && (
-              <p className="my-2 text-slate-500">
+              <p className="my-2 text-[var(--ink-2)]">
                 {t(
                   "Preparation usage is already logged. Cancel discards the candidate, not the usage audit.",
                   "مصرف آماده‌سازی ثبت شده است. لغو فقط نسخه پیشنهادی را کنار می‌گذارد، نه گزارش مصرف را.",
@@ -647,7 +651,7 @@ export function AssistantView({
               </p>
             )}
             {session.prepared && (
-              <details className="my-3 border rounded p-2" open>
+              <details className="my-3 border rounded-[6px] p-2" open>
                 <summary>
                   {t(
                     "Exact section diff — all fields, before / after",
@@ -664,7 +668,7 @@ export function AssistantView({
                       </h3>
                       <pre
                         dir="ltr"
-                        className="text-[11px] whitespace-pre-wrap break-words max-h-96 overflow-auto bg-slate-50 dark:bg-slate-900 p-2"
+                        className="text-[length:var(--type-12)] whitespace-pre-wrap break-words max-h-96 overflow-auto bg-[var(--paper)]  p-2"
                       >
                         {JSON.stringify(session.prepared!.diff[side], null, 2)}
                       </pre>
@@ -674,7 +678,7 @@ export function AssistantView({
               </details>
             )}
             <button
-              className="border p-2 mr-2"
+              className="border p-2 me-2"
               onClick={() => {
                 const s = sessionRef.current;
                 s.confirmed = true;
@@ -709,7 +713,7 @@ export function AssistantView({
         {stream && <p className="text-xs whitespace-pre-wrap">{stream}</p>}
         {busy && <p>{t("Assistant is working…", "دستیار در حال کار است…")}</p>}
         {error && (
-          <p role="alert" className="text-red-600 text-xs">
+          <p role="alert" className="text-[var(--danger)] text-xs">
             {error}
           </p>
         )}
@@ -719,7 +723,7 @@ export function AssistantView({
           {health.missing.length > 0 && (
             <button
               disabled={busy || !ready || Boolean(session.pending)}
-              className="border rounded p-2"
+              className="border rounded-[6px] p-2"
               onClick={() =>
                 void run(
                   t(
@@ -738,7 +742,7 @@ export function AssistantView({
           {health.unplacedImages > 0 && (
             <button
               disabled={busy || !ready || Boolean(session.pending)}
-              className="border rounded p-2"
+              className="border rounded-[6px] p-2"
               onClick={() =>
                 void run(
                   t("Place the orphan images", "تصاویر بی‌جایگاه را قرار بده"),
@@ -750,7 +754,7 @@ export function AssistantView({
           )}
           <button
             disabled={busy || !ready || Boolean(session.pending)}
-            className="border rounded p-2"
+            className="border rounded-[6px] p-2"
             onClick={() =>
               void run(
                 t(
@@ -786,12 +790,12 @@ export function AssistantView({
             disabled={busy || !ready || !configured || Boolean(session.pending)}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            className="min-w-0 flex-1 border rounded-xl p-3 text-sm"
+            className="min-w-0 flex-1 border rounded-[6px] p-3 text-sm"
             placeholder={t("Ask about this exam…", "درباره آزمون بپرسید…")}
           />
           <button
             disabled={busy || !configured || !ready || Boolean(session.pending)}
-            className="border rounded-xl p-3"
+            className="border rounded-[6px] p-3"
           >
             {t("Send", "ارسال")}
           </button>
@@ -799,4 +803,7 @@ export function AssistantView({
       </div>
     </section>
   );
+  return mode === "panel"
+    ? <Modal open onClose={onClose} title={t("Assistant", "دستیار")} labelledBy="assistant-panel-title" className="ep-assistant-panel" backdropClassName="ep-assistant-backdrop">{content}</Modal>
+    : content;
 }

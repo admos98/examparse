@@ -46,25 +46,27 @@ export function buildExportDoc(doc: ExamDoc): any {
   });
 }
 
-/** Never silently export an incomplete exam; native confirmation works for every export surface. */
-export function confirmPartialExport(doc: ExamDoc, action = 'export'): boolean {
+/** Return factual completeness findings so the calling view can use ConfirmCard instead of a native dialog. */
+export function partialExportIssues(doc: ExamDoc): string[] {
   const health = getExamHealth(doc);
-  if (health.complete) return true;
-  const issues = [
+  if (health.complete) return [];
+  return [
     health.missing.length ? `missing questions: ${health.missing.join(', ')}` : '',
     health.duplicates.length ? `duplicate question numbers: ${health.duplicates.join(', ')}` : '',
     health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51 ? `points deficit: ${health.pointDeficit}` : '',
     health.unplacedImages.length ? `${health.unplacedImages.length} unplaced image(s)` : '',
     health.unresolvedImageRefs.length ? `${health.unresolvedImageRefs.length} unresolved image reference(s)` : '',
     (health.parentLinkIssueCount || 0) ? `${health.parentLinkIssueCount} invalid nested-question link(s)` : '',
-  ].filter(Boolean).join('; ') || 'integrity checks need review';
-  if (typeof window === 'undefined' || typeof window.confirm !== 'function') return false;
-  return window.confirm(`This exam is PARTIAL (${issues}). ${action} it anyway?`);
+  ].filter(Boolean);
+}
+
+/** Backwards-compatible pure predicate; it never opens a browser dialog. */
+export function confirmPartialExport(doc: ExamDoc, _action = 'export'): boolean {
+  return partialExportIssues(doc).length === 0;
 }
 
 /** Download an ExamDoc as `<displayName>_structured.json` (filesystem-sanitized). */
 export function exportExamJson(doc: ExamDoc): void {
-  if (!confirmPartialExport(doc, 'Export')) return;
   const jsonStr = JSON.stringify(buildExportDoc(doc), null, 2);
   const blob = new Blob([jsonStr], { type: 'application/json' });
   const url = URL.createObjectURL(blob);

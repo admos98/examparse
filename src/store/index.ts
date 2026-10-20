@@ -112,6 +112,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     paperSize: 'A4',
     fontSize: 'medium',
   },
+  themeMode: 'system',
 };
 
 export interface StorageBackendInfo {

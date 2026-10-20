@@ -292,6 +292,8 @@ export interface AppSettings {
   /** 2C: consensus toggle (default ON only when a distinct consensus model exists). */
   consensusEnabled?: boolean;
   themeTokens?: Partial<Record<'primary' | 'background' | 'foreground', string>>;
+  /** Manual light/dark override; system follows prefers-color-scheme. */
+  themeMode?: 'system' | 'light' | 'dark';
   uiLanguage?: 'fa' | 'en';
   defaultExamMode?: 'exam' | 'review';
   livePanel?: boolean;

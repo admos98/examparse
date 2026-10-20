@@ -93,6 +93,7 @@ export const AppSettingsSchema = z.object({
   agentLimits: z.object({ maxModelCalls: z.number().int().min(1).max(100).optional(), maxToolExecutions: z.number().int().min(1).max(200).optional() }).optional(),
   assistantMonthlySoftCapUsd: z.number().finite().nonnegative().optional(),
   uiLanguage: z.enum(['fa', 'en']).optional(),
+  themeMode: z.enum(['system', 'light', 'dark']).optional(),
   defaultExamMode: z.enum(['exam', 'review']).optional(), livePanel: z.boolean().optional(),
   themeTokens: z.object({ primary: z.string().max(80).optional(), background: z.string().max(80).optional(), foreground: z.string().max(80).optional() }).strict().optional(),
   document: z.object({ defaultLanguage: z.enum(['auto', 'ltr', 'rtl']), paperSize: z.enum(['A4', 'Letter']), fontSize: z.enum(['small', 'medium', 'large']) }),

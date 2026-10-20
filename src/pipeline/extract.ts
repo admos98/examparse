@@ -2,7 +2,6 @@
  * Stage 1: Document Extraction Pipeline (§6.1)
  * Extracts text lines, line coordinates, and embedded images from PDF, DOCX, TXT, MD, and image scans.
  */
-import * as pdfjsLib from 'pdfjs-dist';
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
 import { ImageAsset, SourceLine } from '../types';
@@ -12,15 +11,8 @@ import { normalizeForMatching, parsePrintedNumberFromStem } from './quality';
 import { columnSegments, tagFurniture, extractionDiagnostics, ExtractionDiagnostics } from './extractionQuality';
 import { isSuspectStrip, mergeAdjacentImageGeometry, materializeMergedCrop } from './imageGeometry';
 
-// Configure pdfjs worker in Vite
-try {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
-    import.meta.url
-  ).toString();
-} catch {
-  console.warn('PDF.js worker setup fallback; continuing with main-thread PDF extraction.');
-}
+// #21: pdfjs-dist is loaded lazily inside extractPdf() only, so importing the
+// pipeline graph never evaluates pdf.mjs (keeps non-PDF paths and tests light).
 
 export interface ExtractedDocument {
   lines: SourceLine[];
@@ -61,6 +53,15 @@ export async function extractDocument(file: File): Promise<ExtractedDocument> {
  * PDF Extraction with layout-aware line sorting, direction, columns & embedded image extraction
  */
 async function extractPdf(file: File): Promise<ExtractedDocument> {
+  const pdfjsLib = await import('pdfjs-dist');
+  try {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+      'pdfjs-dist/build/pdf.worker.min.mjs',
+      import.meta.url
+    ).toString();
+  } catch {
+    console.warn('PDF.js worker setup fallback; continuing with main-thread PDF extraction.');
+  }
   const arrayBuffer = await file.arrayBuffer();
   const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
   const pdf = await loadingTask.promise;

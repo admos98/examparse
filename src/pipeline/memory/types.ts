@@ -31,6 +31,8 @@ export interface RunJournalEntry {
   flagsRaised: string[];
   userCorrections: number;
   /** D3 baseline for the 10-minute user-correction window. */
+  /** 2D: verifier defect count for this run (scoreboard evidence). */
+  verifierDefects?: number;
   baselineRevision?: string;
   baselineTs?: string;
   /** Playbook entry ids matched BEFORE the job — blamed retroactively by the D3 correction sweep. */

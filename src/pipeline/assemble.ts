@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine } from '../types';
 import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
+import { validateSemantic, semanticConfidenceDeduction, semanticIssuesFor } from './semanticValidators';
 
 export const SpanReferenceSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]);
 export const RawQuestionSchema = z.object({
@@ -212,6 +213,8 @@ export interface AssembleOptions {
   keyTerritoryLineNos?: number[] | Set<number>;
   imageIds?: string[];
   unresolvedImageIds?: string[];
+  /** 2A: assembled sections enable PASSAGE-ATTACHMENT / SECTION-CONTAINMENT validators. */
+  sections?: ExamSection[];
 }
 
 function flag(code: string, message: string, severity: Flag['severity'], questionId?: string, id = `flag_${code}_${questionId || 'doc'}`): Flag {
@@ -463,6 +466,17 @@ export function assembleAndValidateQuestions(
     ));
   }
   questions.sort((a, b) => a.no - b.no || Number(Boolean(a.parentId)) - Number(Boolean(b.parentId)) || a.id.localeCompare(b.id));
+
+  // 2A semantic validators (pure, 0 calls) — inside the single assembly funnel so
+  // fresh/resumed/chunked/imported documents are all checked identically.
+  for (const issue of validateSemantic(questions, options.sections || [])) {
+    flags.push(flag(issue.code, issue.message, issue.severity, issue.questionId));
+    const q = questions.find(item => item.id === issue.questionId);
+    if (q) {
+      if (!q.flags?.includes(issue.code)) q.flags = [...(q.flags || []), issue.code];
+      if (issue.severity === 'warn') q.confidence = Math.max(0.05, q.confidence - semanticConfidenceDeduction([issue]));
+    }
+  }
 
   if (totalDeclaredPoints !== undefined && totalDeclaredPoints > 0) {
     const sum = questions.reduce((acc, question) => acc + (question.points || 0), 0);

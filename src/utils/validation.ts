@@ -86,7 +86,7 @@ const providerSchema = z.object({
 });
 export const AppSettingsSchema = z.object({
   providers: z.array(providerSchema).min(1).max(50),
-  roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional() }),
+  roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional(), critic: selection.optional(), consensus: selection.optional() }),
   costTable: z.record(z.string(), z.object({ inputCostPerMillion: z.number().finite().nonnegative(), outputCostPerMillion: z.number().finite().nonnegative() })),
   thrift: z.object({ latexNormalization: z.boolean(), maxImagesPerVisionCall: z.number().int().min(1).max(64), imageMaxLongEdge: z.number().int().min(64).max(8192), jpegQuality: z.number().int().min(1).max(100), cacheEnabled: z.boolean() }),
   budget: z.object({ maxUsdPerRun: z.number().finite().nonnegative(), maxOutputTokens: z.number().int().min(256).max(65_536) }),

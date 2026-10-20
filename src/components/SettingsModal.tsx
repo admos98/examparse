@@ -23,6 +23,8 @@ import { clearAllCachesAndData, loadUsageLog } from '../store';
 import { buildDiagnostics, exportDiagnostics, diagnosticsFromUsage } from '../utils/diagnostics';
 import { CapabilityRecord, getProbeRecord, ProbeProviderConfig, runProbe, saveProbeRecord, probeCostEstimate } from '../pipeline/probe';
 import { MAX_SETTINGS_JSON_BYTES, redactSettingsForExport, validateAppSettings, validateProviderBaseUrl, validateHeaders } from '../utils/validation';
+import { buildScoreboard, leaderFor, docTraitBucket, bucketKey } from '../pipeline/scoreboard';
+import { estimateLiveBench, liveBenchGate, diffScorecards } from '../pipeline/liveBench';
 
 interface Props {
   isOpen: boolean;
@@ -147,6 +149,60 @@ export const SettingsModal: React.FC<Props> = ({
   onOpenExplainer,
 }) => {
   const [activeTab, setActiveTab] = useState<TabType>('providers');
+  const [sbRows, setSbRows] = useState<any[]>([]);
+  const [sbBucket, setSbBucket] = useState('');
+  const [benchMsg, setBenchMsg] = useState('');
+  useEffect(() => {
+    if (!isOpen) return;
+    (async () => {
+      try {
+        const res = await fetch('/api/memory/runs');
+        const runs = res.ok ? await res.json() : [];
+        if (Array.isArray(runs) && runs.length) {
+          setSbRows(buildScoreboard(runs));
+          setSbBucket(bucketKey(docTraitBucket(runs[runs.length - 1].docTraits || {})));
+        }
+      } catch { /* offline — no leader hints */ }
+    })();
+  }, [isOpen]);
+
+  const runLiveBench = async () => {
+    // 2G: estimate first, explicit confirm BEFORE any call; declining = 0 calls.
+    const fastRate = (current.costTable as any)?.[current.roleMapping.fast.model];
+    const rate = { input: Number(fastRate?.inputCostPerMillion) || 1, output: Number(fastRate?.outputCostPerMillion) || 2 };
+    const est = estimateLiveBench([
+      { id: 'english-mcq', structureCalls: 1, estInputTokens: 4000, estOutputTokens: 1200 },
+      { id: 'scanned-noisy', structureCalls: 1, estInputTokens: 3000, estOutputTokens: 900 },
+    ], rate);
+    const model = current.roleMapping.fast.model;
+    const confirmed = window.confirm(`Benchmark this change? Run golden SOURCE docs (english-mcq, scanned-noisy) through the REAL configured provider for model "${model}".\n≈${est.calls} structure call(s) (+vision/OCR if triggered), est $${est.estCostUsd.toFixed(4)}. Declining makes 0 calls.`);
+    if (!liveBenchGate(confirmed).allowed) { setBenchMsg('Live bench declined — 0 calls made.'); return; }
+    setBenchMsg('Live bench running against the configured provider…');
+    try {
+      const { fixture: english } = await import('../../test/fixtures/golden/english-mcq');
+      const { fixture: scanned } = await import('../../test/fixtures/golden/scanned-noisy');
+      const { runFullPipeline } = await import('../pipeline/index');
+      const { getExamHealth } = await import('../pipeline/quality');
+      const results: any[] = [];
+      for (const fx of [english, scanned] as any[]) {
+        const text = (fx.sourceLines || []).map((l: any) => l.text).join('\n');
+        const file = new File([text], `${fx.id}.txt`, { type: 'text/plain' });
+        const doc: any = await runFullPipeline(file, current, { onStageUpdate: () => undefined });
+        const h = getExamHealth(doc);
+        results.push({ id: fx.id, coveragePercent: h.coveragePercent, quality: h.coveragePercent, calls: (doc.usage || []).filter((u: any) => !u.isCachedHit).length });
+      }
+      const prevRes = await fetch('/api/memory/livebench');
+      const prevAll = prevRes.ok ? await prevRes.json() : [];
+      const prev = Array.isArray(prevAll) ? prevAll[prevAll.length - 1] : null;
+      const card = { ts: new Date().toISOString(), role: 'fast', modelId: model, fixtures: results, meanCoverage: Math.round(results.reduce((a, r) => a + r.coveragePercent, 0) / Math.max(1, results.length)), meanQuality: Math.round(results.reduce((a, r) => a + r.quality, 0) / Math.max(1, results.length)), totalCalls: results.reduce((a, r) => a + r.calls, 0), costUsd: est.estCostUsd };
+      await fetch('/api/memory/livebench', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(card) });
+      const deltas = diffScorecards(prev, card as any).map(d => `${d.fixture}: coverage ${d.coverageDelta >= 0 ? '+' : ''}${d.coverageDelta}pts`).join(' · ');
+      setBenchMsg(`Live bench stored for ${model}. ${prev ? `Old-vs-new — ${deltas}` : 'First scorecard (no previous run to diff).'}`);
+    } catch (err: any) {
+      setBenchMsg(`Live bench failed (no scorecard stored): ${String(err?.message || err).slice(0, 160)}`);
+    }
+  };
+
   const [current, setCurrent] = useState<AppSettings>(settings);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
@@ -567,7 +623,7 @@ export const SettingsModal: React.FC<Props> = ({
                 </div>
 
                 <div className="space-y-4">
-                  {(['fast', 'standard', 'escalation', 'vision', 'agent'] as const).map(role => {
+                  {(['fast', 'standard', 'escalation', 'vision', 'agent', 'critic', 'consensus'] as const).map(role => {
                     const sel = current.roleMapping[role] || current.roleMapping.fast;
                     const labelMap: Record<string, string> = {
                       agent: 'Assistant (defaults to Fast until configured)',
@@ -575,6 +631,8 @@ export const SettingsModal: React.FC<Props> = ({
                       standard: 'Standard (General questions)',
                       escalation: 'Escalation (Repair failing items & ambiguity)',
                       vision: 'Vision (Image manifest labeling & OCR)',
+                      critic: 'Critic (2B adversarial verifier — defaults to Escalation)',
+                      consensus: 'Consensus (2C second parse of hard sections — defaults to Escalation; same as Structure = skipped)',
                     };
 
                     return (
@@ -582,6 +640,19 @@ export const SettingsModal: React.FC<Props> = ({
                         <div className="font-medium text-xs text-slate-900 dark:text-white">
                           {labelMap[role]}
                         </div>
+                        {(() => {
+                          const sbRole = role === 'agent' ? 'fast' : role;
+                          const leader = sbBucket ? leaderFor(sbRows as any, sbRole, sbBucket) : null;
+                          const row = sbRows.find(r => r.role === sbRole && r.bucket === sbBucket);
+                          if (!sbRows.length) return null;
+                          if (!leader) return <div className="text-[11px] text-slate-500">Scoreboard ({sbBucket}): insufficient data (n&lt;3) — no leader claimed.</div>;
+                          return (
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-600 dark:text-slate-300">
+                              <span>Bucket leader for the latest doc ({sbBucket}): <b>{leader.modelId}</b> — clean-rate {(leader.cleanCoverageRate * 100).toFixed(0)}%, {leader.meanDefectsPerExam} defects/exam, ${leader.meanCostPerCleanQuestion}/clean Q (n={leader.jobs})</span>
+                              <button className="px-2 py-0.5 rounded border" onClick={() => setCurrent(prev => ({ ...prev, roleMapping: { ...prev.roleMapping, [role]: { providerId: prev.providers.find(p => p.name) ? (prev.providers.find(p => (Object.values(prev.roleMapping) as any[]).some((m: any) => m?.model === leader.modelId))?.id || prev.providers[0]?.id || sel.providerId) : sel.providerId, model: leader.modelId } } }))}>Use</button>
+                            </div>
+                          );
+                        })()}
                         <div className="grid grid-cols-2 gap-3 text-xs">
                           <div>
                             <label className="block text-[11px] text-slate-500 mb-1">Provider</label>
@@ -626,6 +697,23 @@ export const SettingsModal: React.FC<Props> = ({
                       </div>
                     );
                   })}
+                </div>
+
+                {/* 2E/2C pipeline controls + 2G live bench */}
+                <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 space-y-3 text-xs">
+                  <div className="font-medium text-slate-900 dark:text-white">Pipeline concurrency & consensus</div>
+                  <label className="flex items-center gap-2">Parallel sections (1–6)
+                    <input type="number" min={1} max={6} value={current.parallelSections ?? 3} onChange={e => setCurrent(prev => ({ ...prev, parallelSections: Math.max(1, Math.min(6, Number(e.target.value) || 3)) }))} className="w-16 px-2 py-1 rounded border bg-white dark:bg-slate-950" />
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={current.consensusEnabled !== false} onChange={e => setCurrent(prev => ({ ...prev, consensusEnabled: e.target.checked }))} />
+                    Consensus on hard sections (default ON only when a distinct consensus model exists — never surprise spend)
+                  </label>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button onClick={runLiveBench} className="px-3 py-1.5 rounded-lg bg-blue-600 text-white">Benchmark this change</button>
+                    <span className="text-slate-500">Runs golden sources through the real configured provider after you confirm the estimate. Never auto-runs.</span>
+                  </div>
+                  {benchMsg && <div role="status" className="p-2 rounded bg-white dark:bg-slate-950 border">{benchMsg}</div>}
                 </div>
               </div>
             )}

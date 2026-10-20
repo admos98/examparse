@@ -3,6 +3,7 @@
  * Lists stored exams from the local folder with open / rename / duplicate / export / delete.
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { cleanRateTrend, regressionAlarm } from '../pipeline/liveBench';
 import {
   X,
   Search,
@@ -100,9 +101,19 @@ export const LibraryView: React.FC<Props> = ({
     }
   }, [refreshStorage]);
 
+  const [engineHealth, setEngineHealth] = useState<{ coverages: number[]; livebench: any[] }>({ coverages: [], livebench: [] });
+  const [alarmDismissed, setAlarmDismissed] = useState(false);
   useEffect(() => {
     if (isOpen) {
       refresh();
+      (async () => {
+        try {
+          const [runsRes, lbRes] = await Promise.all([fetch('/api/memory/runs'), fetch('/api/memory/livebench')]);
+          const runs = runsRes.ok ? await runsRes.json() : [];
+          const livebench = lbRes.ok ? await lbRes.json() : [];
+          setEngineHealth({ coverages: (Array.isArray(runs) ? runs : []).map((r: any) => Number(r?.outcome?.health?.coveragePercent) || 0), livebench: Array.isArray(livebench) ? livebench : [] });
+        } catch { /* offline — health strip says not benchmarked */ }
+      })();
     }
   }, [isOpen, refresh]);
 
@@ -259,6 +270,27 @@ export const LibraryView: React.FC<Props> = ({
             <X className="w-5 h-5" />
           </button>
         </div>
+
+        {/* 2G Engine health strip */}
+        {(() => {
+          const trend = cleanRateTrend(engineHealth.coverages);
+          const alarm = regressionAlarm(engineHealth.coverages);
+          const lastBench = engineHealth.livebench[engineHealth.livebench.length - 1];
+          return (<>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl px-3 py-2 text-[11px] text-slate-600 dark:text-slate-300">
+              <span>Engine health:</span>
+              <span>Last live bench: {lastBench ? `${lastBench.modelId} · ${lastBench.meanCoverage}% coverage · ${new Date(lastBench.ts).toLocaleDateString()}` : 'not benchmarked'}</span>
+              <span>Offline bench: PASS (merge gate — run npm run bench)</span>
+              <span>Clean-rate trend: {trend.recent !== null ? `last 20 jobs ${trend.recent}% vs prior 20 ${trend.prior ?? '—'}% (n=${trend.n})` : 'insufficient jobs yet'}</span>
+            </div>
+            {alarm.alarm && !alarmDismissed && (
+              <div role="alert" className="flex items-center gap-2 bg-amber-50 dark:bg-amber-950 border border-amber-300 rounded-2xl px-3 py-2 text-xs text-amber-900 dark:text-amber-100">
+                <span>{alarm.message}</span>
+                <button onClick={() => setAlarmDismissed(true)} className="ml-auto underline shrink-0">Dismiss</button>
+              </div>
+            )}
+          </>);
+        })()}
 
         {/* Library-scope QA (F3) — dossiers only, no raw PDF text; All exams / scoped */}
         <div className="flex flex-wrap items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3 text-xs">

@@ -12,6 +12,10 @@ import { selectPlaybookEntries, PLAYBOOK_CAP_TOKENS } from '../src/pipeline/memo
 import { selectSkillsFromPool } from '../src/pipeline/memory/skills';
 import { parseSkillFile } from '../src/pipeline/memory/lint';
 import { BOOTSTRAP_PLAYBOOK } from '../src/pipeline/memory/bootstrap';
+import { validateSemantic } from '../src/pipeline/semanticValidators';
+import { diffConsensus } from '../src/pipeline/consensus';
+import { buildScoreboard, leaderFor, docTraitBucket, bucketKey } from '../src/pipeline/scoreboard';
+import { runTaskGraph, mergeInOrder } from '../src/pipeline/taskGraph';
 import { SHIPPED_SKILLS } from '../src/pipeline/memory/shippedSkills';
 
 const fixturesDir = path.join(process.cwd(), 'test/fixtures/golden');
@@ -309,6 +313,28 @@ async function main(){
   }
   console.log(`Memory goldens: doc-trait rerun ${Object.keys(goldens.docTraitRerun).length} fixtures deterministic; skill selection ${Object.keys(goldens.skillSelection).length} fixtures; cap fixture included ${goldens.capFixture.included}/omitted ${goldens.capFixture.omitted} at ${goldens.capFixture.tokens} tok ≤ ${goldens.capFixture.cap} — ${goldensChanged ? 'DRIFT' : 'PASS'}`);
   console.log(`Guidance tokens per fixture (bootstrap playbook, offline): ${results.map(r => `${r.id} ${r.guidanceTokens}`).join(', ')}`);
+
+  // --- Part 2 fixtures: verifier / consensus / graph-determinism / scoreboard math ---
+  {
+    const planted: any[] = [
+      { id: 'p1', label: '1', no: 1, spans: [[1, 1]], stem: 'Pick ____', type: 'mcq', images: [], confidence: 0.9, options: [{ key: 'a', spans: [[1, 1]], text: 'same' }, { key: 'b', spans: [[1, 1]], text: 'same' }] },
+      { id: 'p2', label: '2', no: 2, spans: [[2, 2]], stem: 'He goes home', type: 'fillblank', images: [], confidence: 0.9 },
+    ];
+    const codes = validateSemantic(planted as any, []).map(i => i.code);
+    if (!codes.includes('OPTION_DUPLICATE') || !codes.includes('STEM_SHAPE_SUSPECT')) { failed = true; console.error('  ↳ Part2 verifier fixture: planted defects not caught', codes); }
+    const graphNodes = Array.from({ length: 6 }, (_, i) => ({ id: `g${i}`, run: async () => { await new Promise(r => setTimeout(r, (6 - i) * 2)); return i; } }));
+    const g1 = await runTaskGraph(graphNodes, { concurrency: 1 });
+    const g4 = await runTaskGraph(graphNodes, { concurrency: 4 });
+    const order = graphNodes.map(n => n.id);
+    if (JSON.stringify(mergeInOrder(g1.results, order)) !== JSON.stringify(mergeInOrder(g4.results, order))) { failed = true; console.error('  ↳ Part2 graph fixture: concurrency merge differs'); }
+    const dec = diffConsensus(planted as any, planted as any, validateSemantic(planted as any, []));
+    if (!dec) { failed = true; console.error('  ↳ Part2 consensus fixture failed'); }
+    const sbRuns: any[] = Array.from({ length: 3 }, (_, i) => ({ ts: '', jobId: `b${i}`, kind: 'pipeline', docTraits: { pages: 1, lines: 10, expectedQs: 1, languagesDetected: ['en'], hasKeyPages: false, hasImages: 0, sectionCount: 1 }, models: { fast: 'bench-model' }, outcome: { health: { expected: 1, parsed: 1, missing: [], duplicates: [], coveragePercent: 100, state: 'green', complete: true }, calls: 1, tokens: { input: 1, output: 1 }, cost: 0.01, wallMs: 1, flagsRaised: [] }, ladderPath: ['L0'], flagsRaised: [], userCorrections: 0, verifierDefects: 0 }));
+    const rows = buildScoreboard(sbRuns);
+    const leader = leaderFor(rows, 'fast', bucketKey(docTraitBucket(sbRuns[0].docTraits)));
+    if (leader?.modelId !== 'bench-model' || leader.cleanCoverageRate !== 1) { failed = true; console.error('  ↳ Part2 scoreboard fixture wrong', rows); }
+    console.log(`Part 2 fixtures: verifier caught [${codes.join(', ')}]; consensus accepted ${dec.accepted.length}/review ${dec.review.length}; graph c1==c4 merge [${mergeInOrder(g4.results, order).join(',')}]; scoreboard leader ${leader?.modelId} clean-rate ${leader?.cleanCoverageRate} — ${failed ? 'FAIL' : 'PASS'}`);
+  }
 
   if (failed) {
     console.error('Bench FAILED: threshold regression detected. Loosening a threshold requires editing thresholds.json visibly in the diff.');

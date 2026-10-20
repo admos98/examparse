@@ -29,6 +29,7 @@ import { retryMissingCoverage } from '../pipeline/retryCoverage';
 import { buildQuestionTree } from '../utils/questionTree';
 import { computeSuggestions } from '../pipeline/suggestions';
 import { computeQualityScore } from '../utils/qualityScore';
+import { traceTimeline } from '../pipeline/provenance';
 
 interface Props {
   examDoc: ExamDoc;
@@ -525,6 +526,38 @@ export const Step4Review: React.FC<Props> = ({
           </div>
         </div>
       )}
+
+      {/* 2F Provenance — per-question Trace disclosure + 2B critic verdict badges */}
+      {(((examDoc as any).traces?.length || Object.keys((examDoc as any).verdicts || {}).length) ? (
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-2 text-xs">
+          <div className="font-bold text-slate-900 dark:text-white">Provenance — Trace & Critic verdicts</div>
+          <div className="space-y-1.5">
+            {examDoc.questions.map(q => {
+              const trace = ((examDoc as any).traces || []).find((t: any) => t.questionId === q.id);
+              const verdicts = ((examDoc as any).verdicts || {})[q.id] || [];
+              if (!trace && !verdicts.length) return null;
+              return (
+                <details key={q.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                  <summary className="cursor-pointer font-medium text-slate-800 dark:text-slate-100">
+                    Trace — Q{q.no}
+                    {verdicts.map((v: any, i: number) => (
+                      <span key={i} className={`ml-2 text-[9px] font-mono px-1.5 py-0.5 rounded uppercase ${v.verdict === 'defect' ? 'bg-red-500/10 text-red-600' : 'bg-emerald-500/10 text-emerald-600'}`}>critic: {v.verdict}{v.defectKind ? ` · ${v.defectKind}` : ''} → {v.suggestedAction}</span>
+                    ))}
+                  </summary>
+                  {trace ? traceTimeline(trace).map((line: any, i: number) => (
+                    <div key={i} className="mt-1.5 text-slate-600 dark:text-slate-300">
+                      <div>{line.en}</div>
+                      <div dir="rtl" className="text-slate-500">{line.fa}</div>
+                    </div>
+                  )) : <div className="mt-1.5 text-slate-500">No trace recorded for this question.</div>}
+                  {verdicts.map((v: any, i: number) => <div key={`v${i}`} className="mt-1 text-slate-500">Critic note: {v.note}</div>)}
+                  {q.spans?.length ? <div className="mt-1 text-slate-400">Source: lines {q.spans.map((sp: any) => `${sp[0]}–${sp[1]}`).join(', ')} (Step 2)</div> : null}
+                </details>
+              );
+            })}
+          </div>
+        </div>
+      ) : null)}
 
       {/* Local Image Manager Modal / Panel */}
       {showImageManager && (

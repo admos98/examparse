@@ -111,7 +111,7 @@ export interface Flag {
 
 export interface UsageRecord {
   ts: string;
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus';
   provider: string;
   model: string;
   inputTokens: number;
@@ -164,6 +164,10 @@ export interface ExamDoc {
   };
   flags: Flag[];
   usage: UsageRecord[];
+  /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */
+  guidanceTokens?: number;
+  verdicts?: Record<string, any[]>;
+  traces?: any[];
 }
 
 /** Strip a trailing file extension, e.g. "exam.pdf" -> "exam". */
@@ -244,6 +248,9 @@ export interface RoleMapping {
   escalation: RoleModelSelection;
   vision: RoleModelSelection;
   agent?: RoleModelSelection;
+  /** 2B/2C: optional roles; defaults — critic→escalation, consensus→distinct model else escalation. */
+  critic?: RoleModelSelection;
+  consensus?: RoleModelSelection;
 }
 
 export interface CostRate {
@@ -280,6 +287,10 @@ export interface AppSettings {
   budget: BudgetSettings;
   document: DocSettings;
   assistantMonthlySoftCapUsd?: number;
+  /** 2E: bounded section parallelism (1–6, default 3). */
+  parallelSections?: number;
+  /** 2C: consensus toggle (default ON only when a distinct consensus model exists). */
+  consensusEnabled?: boolean;
   themeTokens?: Partial<Record<'primary' | 'background' | 'foreground', string>>;
   uiLanguage?: 'fa' | 'en';
   defaultExamMode?: 'exam' | 'review';
@@ -291,7 +302,7 @@ export interface AppSettings {
  * LLM Request & Response Abstraction (§7)
  */
 export interface LLMRequest {
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus';
   system: string;
   text: string;
   images?: {

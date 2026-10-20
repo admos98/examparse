@@ -12,7 +12,7 @@ import {
 import { ExamDoc, ImageAsset, getDisplayName, sanitizeFileName } from '../types';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
 import { saveExamDoc, getImageBlob } from '../store';
-import { duplicateExamDoc, exportExamJson, confirmPartialExport } from '../utils/examExport';
+import { duplicateExamDoc, exportExamJson, confirmPartialExport, parseReportForDoc } from '../utils/examExport';
 import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { MAX_EXAM_JSON_BYTES, parseExamDocImport } from '../utils/validation';
 import { printStyles, checkPrintLayout } from '../utils/printCheck';
@@ -30,6 +30,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }
   const jsonInputRef = useRef<HTMLInputElement>(null);
 
   const [printRisks, setPrintRisks] = useState<ReturnType<typeof checkPrintLayout>>([]);
+  const [showReport, setShowReport] = useState(false);
   const printAreaRef = useRef<HTMLDivElement>(null);
   // Inject print stylesheet once
   useEffect(() => {
@@ -168,6 +169,20 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }
           >
             Review (Anchors & Flags)
           </button>
+        </div>
+
+        {/* 2F Parse report (optional, print-friendly) */}
+        <div className="mb-3 print:block">
+          <button onClick={() => setShowReport(v => !v)} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 print:hidden">{showReport ? 'Hide' : 'Show'} Parse report</button>
+          {showReport && (() => { const r = parseReportForDoc(doc); return (
+            <div className="mt-2 p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs space-y-1 print:border-none">
+              <div className="font-bold">Parse report — {doc.id}</div>
+              <div>Models: {Object.entries(r.models).map(([k, v]) => `${k}: ${v}`).join(' · ') || '—'}</div>
+              <div>Calls: {r.calls} · Tokens: {r.tokens.input} in / {r.tokens.output} out · Cost: ${r.cost.toFixed(4)}</div>
+              <div>Coverage after: {r.coverageAfter ?? '—'}% · Consensus sections: {r.consensusSections.length} · Critic: {r.critic.calls} call(s), {r.critic.defects} defect(s), {r.critic.ok} ok</div>
+              <div>Memory injected — playbook: [{r.memory.playbookIds.join(', ') || 'none'}] · skills: [{r.memory.skillIds.join(', ') || 'none'}] · guidance {r.memory.guidanceTokens} tok</div>
+              <div>Config hash: {r.configHash} · Generated: {r.generatedAt} · The JSON export embeds this report as a receipt (no keys).</div>
+            </div> ); })()}
         </div>
 
         {/* Export & Print Action Buttons */}

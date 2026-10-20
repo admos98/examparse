@@ -165,6 +165,7 @@ export interface ExamDoc {
   flags: Flag[];
   usage: UsageRecord[];
   /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */
+  guidanceTokens?: number;
   verdicts?: Record<string, any[]>;
   traces?: any[];
 }

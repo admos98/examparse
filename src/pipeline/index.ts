@@ -823,6 +823,7 @@ export async function runFullPipeline(
       } : null;
       const criticRun = await runCritic(queue, caller);
       criticSummary = { calls: criticRun.calls, defects: criticRun.verdicts.filter(v => v.verdict === 'defect').length, ok: criticRun.verdicts.filter(v => v.verdict === 'ok').length };
+      onStageUpdate({ id: 'assemble', name: 'Assemble & Validate', status: 'completed', message: `Critic: ${criticSummary.calls} batched call(s) on ${queue.length} evidence-flagged question(s) — ${criticSummary.defects} defect(s), ${criticSummary.ok} ok${criticRun.degraded ? ' (unconfigured: queued for review, 0 calls)' : ''}. Consensus sections: ${consensusSectionsRun.length}.` });
       verdictStore = recordVerdicts(verdictStore, criticRun.verdicts);
       for (const v of criticRun.verdicts) {
         const q = finalQuestions.find(item => item.id === v.questionId);
@@ -928,6 +929,7 @@ export async function runFullPipeline(
     },
     flags: allFlags,
     usage: usageRecords,
+    guidanceTokens: Number(structureData.guidanceTokens) || 0,
     verdicts: verdictStore,
     traces: tracesForDoc({ id: examId, questions: finalQuestions } as any, { callLabel: 'Structure Pass', model: structProviderConfig.model, journalResumed: Boolean(structureData.isCachedHit) }),
   };

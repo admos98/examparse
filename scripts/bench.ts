@@ -6,6 +6,13 @@ import { assembleAndValidateQuestions, assembleAndValidateSections } from '../sr
 import { enumerateExpectedQuestionNos, evaluateCoverage, getExamHealth, parsePrintedNumberFromStem } from '../src/pipeline/quality';
 import { computeQualityScore } from '../src/utils/qualityScore';
 import { expandWireV2 } from '../src/pipeline/structure';
+import { deriveDocTraits } from '../src/pipeline/memory/docTraits';
+import { assemblePipelineGuidanceFrom } from '../src/pipeline/memory/guidance';
+import { selectPlaybookEntries, PLAYBOOK_CAP_TOKENS } from '../src/pipeline/memory/playbook';
+import { selectSkillsFromPool } from '../src/pipeline/memory/skills';
+import { parseSkillFile } from '../src/pipeline/memory/lint';
+import { BOOTSTRAP_PLAYBOOK } from '../src/pipeline/memory/bootstrap';
+import { SHIPPED_SKILLS } from '../src/pipeline/memory/shippedSkills';
 
 const fixturesDir = path.join(process.cwd(), 'test/fixtures/golden');
 const thresholdsPath = path.join(fixturesDir, 'thresholds.json');
@@ -83,6 +90,10 @@ async function runFixture(id:string){
   const fixture = mod.fixture || mod.default;
   const start = performance.now();
   const sourceLines = fixture.sourceLines;
+  const docTraits = deriveDocTraits({
+    sourceLines, images: fixture.mockImages || [], sections: [], pages: 5,
+    languageHint: fixture.expected?.language,
+  });
   const enumerated = enumerateExpectedQuestionNos(sourceLines);
   const expectedNumbers = enumerated.numbers;
   // Simulate structure responses -> collect rawQuestions
@@ -158,10 +169,19 @@ async function runFixture(id:string){
   const optionBlobs = countOptionBlobs(doc);
   const phantomMissing = fixture.expected.phantomMissing?.length || 0; // for now 0
   const quality = computeQualityScore(doc);
+  // D1/A4 — measure the guidance the pipeline structure prompt would carry for this
+  // document (offline: the cold-start bootstrap playbook, no fetch, no model calls).
+  const guidance = assemblePipelineGuidanceFrom(BOOTSTRAP_PLAYBOOK, {
+    sourceLines, images: finalImages, sections: finalSections, pages: 5, role: 'fast', docTraits,
+  });
   const wallMs = Math.round(performance.now() - start);
 
   return {
     id,
+    docTraits,
+    guidanceTokens: guidance.tokens,
+    guidanceIncluded: guidance.includedCount,
+    guidanceOmitted: guidance.omittedCount,
     coverage,
     pointsPercent,
     optionBlobs,
@@ -183,8 +203,8 @@ async function main(){
     process.exit(1);
   }
   console.log(`\nGolden Benchmark — ${ids.length} fixtures (mock transport, offline)\n`);
-  console.log(`| Fixture            | Coverage | Points | OptBlob | Phantom | Calls | Tokens | Wall ms | Quality | Status |`);
-  console.log(`|--------------------|----------|--------|---------|---------|-------|--------|---------|---------|--------|`);
+  console.log(`| Fixture            | Coverage | Points | OptBlob | Phantom | Calls | Tokens | Guidance | Wall ms | Quality | Status |`);
+  console.log(`|--------------------|----------|--------|---------|---------|-------|--------|----------|---------|---------|--------|`);
 
   let failed = false;
   const results:any[] = [];
@@ -208,7 +228,7 @@ async function main(){
     const ok = covOk && ptsOk && blobOk && phantomOk && callsOk && tokensOk && wallOk && imageOk;
     if (!ok) failed = true;
     const status = ok ? 'PASS' : 'FAIL';
-    const line = `| ${id.padEnd(18)} | ${String(r.coverage.toFixed(1)+'%').padStart(8)} | ${String(r.pointsPercent+'%').padStart(6)} | ${String(r.optionBlobs).padStart(7)} | ${String(r.phantomMissing).padStart(7)} | ${String(r.structureCalls).padStart(5)} | ${String(r.outputTokens).padStart(6)} | ${String(r.wallMs).padStart(7)} | ${String(r.quality).padStart(7)} | ${status.padEnd(6)} |`;
+    const line = `| ${id.padEnd(18)} | ${String(r.coverage.toFixed(1)+'%').padStart(8)} | ${String(r.pointsPercent+'%').padStart(6)} | ${String(r.optionBlobs).padStart(7)} | ${String(r.phantomMissing).padStart(7)} | ${String(r.structureCalls).padStart(5)} | ${String(r.outputTokens).padStart(6)} | ${String(r.guidanceTokens+' tok').padStart(8)} | ${String(r.wallMs).padStart(7)} | ${String(r.quality).padStart(7)} | ${status.padEnd(6)} |`;
     console.log(line);
     if (!ok) {
       const reasons:string[] = [];
@@ -235,6 +255,60 @@ async function main(){
     console.log(` ${r.id}: total ${q.total} [cov ${q.coverage} pts ${q.points} opt ${q.optionsCleanliness} img ${q.imagePlacement} num ${q.numbering} conf ${q.confidence} pass ${q.passage}]`);
   }
   console.log('');
+
+  // --- E4 memory goldens (offline, deterministic) ---
+  const memoryGoldensPath = path.join(fixturesDir, 'memory-goldens.json');
+  const goldens: any = { docTraitRerun: {}, skillSelection: {}, capFixture: {} };
+  const skillPool = SHIPPED_SKILLS.map(skill => parseSkillFile(skill.content, skill.slug));
+  for (const r of results) {
+    // (1) doc-trait rerun: same input ⇒ byte-identical traits, twice.
+    const rerunA = deriveDocTraits({ sourceLines: r.doc.source.lines, images: r.doc.images, sections: r.doc.sections, pages: 5 });
+    const rerunB = deriveDocTraits({ sourceLines: r.doc.source.lines, images: r.doc.images, sections: r.doc.sections, pages: 5 });
+    if (JSON.stringify(rerunA) !== JSON.stringify(rerunB)) { failed = true; console.error(`  ↳ memory golden ${r.id}: doc-trait rerun is NOT deterministic`); }
+    goldens.docTraitRerun[r.id] = rerunA;
+    // (2) skill selection: fixed pool + fixture context ⇒ exact slug order.
+    const selection = selectSkillsFromPool(skillPool, {
+      userMessage: 'check this exam and repair what is missing',
+      health: { state: r.health.state, missing: (r.health.missing || []).slice(0, 10), unplacedImages: (r.health.unplacedImages || []).length ?? 0 },
+      docTraits: r.docTraits, roles: ['agent'],
+    });
+    goldens.skillSelection[r.id] = { selected: selection.selected.map(item => item.skill.meta.slug), totalTokens: selection.totalTokens, omitted: selection.omitted };
+  }
+  // (3) cap fixture: 50 fat entries ⇒ injection stays ≤5,000 tokens with honest counts.
+  const fatEntries = Array.from({ length: 50 }, (_, i) => ({
+    id: `fat_${String(i).padStart(2, '0')}`, kind: 'strategy' as const, scope: {},
+    lesson: `Lesson ${i}: `.padEnd(280, 'procedure detail. '),
+    status: 'active' as const, confidence: 0.5 + (i % 5) / 10,
+    evidence: { runIds: [`run_${i}`], successes: i % 4, failures: 0, firstSeen: '2026-01-01T00:00:00.000Z', lastSeen: '2026-10-01T00:00:00.000Z' },
+  }));
+  const capped = selectPlaybookEntries({ version: 1, entries: fatEntries }, { role: 'fast', capTokens: PLAYBOOK_CAP_TOKENS });
+  goldens.capFixture = { included: capped.included.length, omitted: capped.omittedCount, tokens: capped.tokens, cap: PLAYBOOK_CAP_TOKENS };
+  if (capped.tokens > PLAYBOOK_CAP_TOKENS) { failed = true; console.error(`  ↳ memory golden capFixture: ${capped.tokens} tok > ${PLAYBOOK_CAP_TOKENS} cap`); }
+  if (capped.included.length + capped.omittedCount !== 50) { failed = true; console.error('  ↳ memory golden capFixture: included + omitted != 50'); }
+
+  let goldensChanged = false;
+  if (fs.existsSync(memoryGoldensPath)) {
+    const previous = JSON.parse(fs.readFileSync(memoryGoldensPath, 'utf8'));
+    if (JSON.stringify(previous) !== JSON.stringify(goldens)) {
+      goldensChanged = true; failed = true;
+      console.error('  ↳ memory goldens DRIFTED — inspect the diff and update test/fixtures/golden/memory-goldens.json visibly if intended.');
+      for (const section of ['docTraitRerun', 'skillSelection', 'capFixture'] as const) {
+        if (JSON.stringify(previous[section]) !== JSON.stringify(goldens[section])) {
+          console.error(`    changed section: ${section}`);
+          for (const key of Object.keys(goldens[section])) {
+            if (JSON.stringify(previous[section]?.[key]) !== JSON.stringify(goldens[section][key])) {
+              console.error(`      ${key}: was ${JSON.stringify(previous[section]?.[key])} now ${JSON.stringify(goldens[section][key])}`);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    fs.writeFileSync(memoryGoldensPath, JSON.stringify(goldens, null, 2) + '\n');
+    console.log(`Memory goldens: created ${memoryGoldensPath} (first run)`);
+  }
+  console.log(`Memory goldens: doc-trait rerun ${Object.keys(goldens.docTraitRerun).length} fixtures deterministic; skill selection ${Object.keys(goldens.skillSelection).length} fixtures; cap fixture included ${goldens.capFixture.included}/omitted ${goldens.capFixture.omitted} at ${goldens.capFixture.tokens} tok ≤ ${goldens.capFixture.cap} — ${goldensChanged ? 'DRIFT' : 'PASS'}`);
+  console.log(`Guidance tokens per fixture (bootstrap playbook, offline): ${results.map(r => `${r.id} ${r.guidanceTokens}`).join(', ')}`);
 
   if (failed) {
     console.error('Bench FAILED: threshold regression detected. Loosening a threshold requires editing thresholds.json visibly in the diff.');

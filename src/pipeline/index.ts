@@ -18,6 +18,8 @@ import { appendUsageRecord, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, set
 import { calculateActualCost, updateTokenCalibration } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 import { PARSER_VERSION } from './prompts';
+import { getExamHealth } from './quality';
+import { beginJob, endJob, guidanceSummary, type JobHandle } from './memory/harness';
 
 export interface PipelineCallbacks {
   onStageUpdate: (stage: StageStatus) => void;
@@ -262,6 +264,26 @@ export async function runFullPipeline(
   const structRole = settings.roleMapping.fast;
   const structProvider = settings.providers.find(p => p.id === structRole.providerId) || settings.providers[0];
   const structProviderConfig = { ...structProvider, model: structRole.model };
+
+  // D1/D3 — ONE memory job per pipeline parse. Advisory only (E1): deterministic gates
+  // below are unchanged whether or not any lesson was injected.
+  const jobStartedAt = Date.now();
+  let job: JobHandle | undefined;
+  try {
+    job = await beginJob({
+      kind: 'pipeline',
+      sourceLines: workingLines,
+      images: extracted.images,
+      pages: extracted.pages,
+      languageHint: language,
+      modelId: structRole.model,
+      models: Object.fromEntries(Object.entries(settings.roleMapping).map(([role, sel]) => [role, sel?.model || ''])),
+      role: 'fast',
+    });
+  } catch { job = undefined; }
+  const structureGuidance = job
+    ? { block: job.playbook.block, tokens: job.playbook.tokens, digest: job.playbook.digest, entries: job.playbook.included.length, omitted: job.playbook.omittedCount }
+    : undefined;
   const journalKey = await sha256(`${fileHash}:${await sha256(JSON.stringify(workingLines))}:${structProviderConfig.id}:${structProviderConfig.model}:${PARSER_VERSION}`);
   if (cacheEnabled) {
     try { await setPipelineCache(`journalkey:${fileHash}`, journalKey); } catch { /* attempt-history pointer is best-effort */ }
@@ -326,6 +348,7 @@ export async function runFullPipeline(
           forceSectionMode: structRole.model.toLowerCase().includes('free') || settings.budget.maxOutputTokens < 8192,
           onProgress: message => onStageUpdate({ id: 'structure', name: 'Structure Pass', status: 'running', message }),
           onLiveText: (label, channel, fullText) => onLiveText?.('structure', label, channel, fullText),
+          guidance: structureGuidance,
         });
       } catch (err: any) {
         onStageUpdate({
@@ -685,7 +708,8 @@ export async function runFullPipeline(
 
   const pointsSummary = `${coverage.pointsParsed}${totalDeclaredPoints !== undefined ? ` of ${totalDeclaredPoints}` : ''}`;
   const missingSummary = coverage.missing.length ? `missing ${coverage.missing.join(', ')}` : 'missing none';
-  const structureSummary = `Expected ${expectedQuestionNos.length} questions · parsed ${coverage.parsedNumbers.length} · ${missingSummary} · points ${pointsSummary} · attempts ${structureData.attempts || 0} · recovery calls used ${structureData.recoveryCalls || 0}.`;
+  const guidanceNote = structureData.guidanceTokens ? ` · guidance tokens ${structureData.guidanceTokens}` : ' · guidance tokens 0';
+  const structureSummary = `Expected ${expectedQuestionNos.length} questions · parsed ${coverage.parsedNumbers.length} · ${missingSummary} · points ${pointsSummary} · attempts ${structureData.attempts || 0} · recovery calls used ${structureData.recoveryCalls || 0}${guidanceNote}.`;
   const isIncomplete = !coverage.complete || finalQuestions.length === 0;
   const structureStatus = structureData.isCachedHit && !isIncomplete
     ? 'cached'
@@ -761,5 +785,54 @@ export async function runFullPipeline(
   examDoc = validateAndFixDuplicateImageIds(examDoc).doc;
 
   await saveExamDoc(examDoc);
+
+  // D3 — pipeline finish (including partial) is a job completion point: journal the run,
+  // credit/blame matched lessons from the OUTCOME, and maybe reflect. Fire-and-forget.
+  if (job) {
+    try {
+      const finalHealth = getExamHealth(examDoc);
+      const liveCalls = usageRecords.filter(record => !record.isCachedHit);
+      const isCacheHit = usageRecords.length > 0 && liveCalls.length === 0;
+      job.ladderPath = [
+        'extract',
+        ...(ocrUsed ? ['ocr'] : []),
+        'structure',
+        ...(structureData.callUsage?.length ? structureData.callUsage.map((call: any) => String(call.label || 'structure')) : []),
+        ...(updatedImages.length ? ['vision'] : []),
+        'assemble',
+        ...(assembled.failingQuestions?.length ? ['repair'] : []),
+        ...(options?.answerKeyFile ? ['keyfile'] : []),
+      ];
+      job.flagsRaised = allFlags.map(flag => String(flag?.code || '')).filter(Boolean);
+      await endJob(job, {
+        health: {
+          expected: finalHealth.expectedCount, parsed: finalHealth.parsedCount, missing: finalHealth.missing,
+          duplicates: finalHealth.duplicates, coveragePercent: finalHealth.coveragePercent, state: finalHealth.state,
+          complete: finalHealth.complete, pointsParsed: finalHealth.pointsParsed, pointsExpected: finalHealth.pointsExpected,
+        },
+        calls: liveCalls.length,
+        tokens: {
+          input: usageRecords.reduce((sum, record) => sum + (record.inputTokens || 0), 0),
+          output: usageRecords.reduce((sum, record) => sum + (record.outputTokens || 0), 0),
+          cached: usageRecords.reduce((sum, record) => sum + (record.cachedTokens || 0), 0),
+        },
+        costUsd: usageRecords.reduce((sum, record) => sum + (record.costUsd || 0), 0),
+        isCacheHit,
+        settings,
+        baselineRevision: examContentRevisionLocal(examDoc),
+        sourceLines: workingLines.slice(0, 500).map((line: any) => String(line?.text || '')),
+      });
+      onStageUpdate({
+        id: 'structure', name: 'Structure Pass', status: structureStatus as any,
+        message: `${structureSummary} ${guidanceSummary(job)}`,
+      });
+    } catch { /* memory is advisory (E1) — never fail a parse over it */ }
+  }
+  void jobStartedAt;
   return examDoc;
+}
+
+/** Local revision helper so the memory harness never imports the quality module twice. */
+function examContentRevisionLocal(doc: ExamDoc): string {
+  try { return JSON.stringify([doc.questions?.length, doc.sections?.length, doc.images?.length, doc.flags?.length, doc.meta]).slice(0, 400); } catch { return ''; }
 }

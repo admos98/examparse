@@ -23,6 +23,8 @@ import { retryMissingCoverage } from "../pipeline/retryCoverage";
 import { calculateActualCost } from "../utils/budget";
 import { prepareSectionReparse } from "../pipeline/reparseSection";
 import { assistantError, AgentOperationError } from "../pipeline/agentI18n";
+import { beginJob, endJob, guidanceSummary, type JobHandle } from "../pipeline/memory/harness";
+import { MemoryPanel } from "../components/MemoryPanel";
 
 type UndoState = Pick<
   ExamDoc,
@@ -313,6 +315,43 @@ export function AssistantView({
       if (!monthly.ok) throw new AgentOperationError("folderUsage");
       monthlySpend =
         (await monthly.json())[new Date().toISOString().slice(0, 7)] || 0;
+      /** B1 — one soft-cap computation, shared by readOnly() and the reflection gate. */
+      const softCapExhausted = (): boolean => {
+        const cap = settingsRef.current.assistantMonthlySoftCapUsd;
+        if (cap === undefined) return false;
+        return (
+          monthlySpend +
+            loadUsageLog()
+              .filter(
+                (u) =>
+                  u.role === "agent" &&
+                  !baselineUsage.has(JSON.stringify(u)) &&
+                  u.ts.slice(0, 7) === new Date().toISOString().slice(0, 7),
+              )
+              .reduce((n, u) => n + (u.costUsd || 0), 0) >=
+            cap
+        );
+      };
+      // D2/D3 — assistant turn = one memory job. Guidance is assembled locally and
+      // bounded (state ≤1,200 B + playbook ≤1,500 tok + skills ≤3,000 tok / ≤3 skills).
+      const turnDoc = docRef.current;
+      const turnHealth = healthSummary(turnDoc);
+      let job: JobHandle | undefined;
+      try {
+        job = await beginJob({
+          kind: "assistant",
+          examId: turnDoc.id,
+          sourceLines: turnDoc.source?.lines,
+          images: turnDoc.images,
+          sections: turnDoc.sections,
+          modelId: role.model,
+          models: { agent: role.model },
+          role: "agent",
+          userMessage: user ?? working.user,
+          health: turnHealth,
+          openIssueCodes: (turnDoc.flags || []).map(flag => String(flag?.code || "")).filter(Boolean),
+        });
+      } catch { job = undefined; }
       const result = await runAgentTurn(
         {
           isActive: () => active.current,
@@ -336,6 +375,58 @@ export function AssistantView({
           persist,
           emit: publish,
           snapshot,
+          guidance: job
+            ? {
+                text: `${job.playbook.block}${job.skillsBlock}`,
+                skills: job.skills.map(skill => skill.slug),
+                playbookEntries: job.playbook.included.length,
+                playbookTokens: job.playbook.tokens,
+                skillsTokens: job.skills.reduce((sum, skill) => sum + skill.tokens, 0),
+                digest: guidanceSummary(job),
+              }
+            : undefined,
+          onJobEnd: async info => {
+            if (!job) return;
+            const turnUsage = loadUsageLog().filter(
+              record => record.role === "agent" && !baselineUsage.has(JSON.stringify(record)),
+            );
+            job.ladderPath = info.ladderPath;
+            job.flagsRaised = info.flagsRaised;
+            try {
+              await endJob(job, {
+                health: info.health,
+                calls: info.calls,
+                tokens: {
+                  input: turnUsage.reduce((sum, record) => sum + (record.inputTokens || 0), 0),
+                  output: turnUsage.reduce((sum, record) => sum + (record.outputTokens || 0), 0),
+                },
+                costUsd: info.costUsd,
+                ladderPath: info.ladderPath,
+                flagsRaised: info.flagsRaised,
+                toolRefused: info.toolRefused,
+                transcriptSummary: info.transcriptSummary,
+                baselineRevision: info.baselineRevision,
+                settings: settingsRef.current,
+                monthlyCapExhausted: softCapExhausted(),
+                reflection: {
+                  settings: settingsRef.current,
+                  sourceLines: (docRef.current.source?.lines || []).slice(0, 500).map(line => line.text),
+                  logUsage: record => {
+                    appendUsageRecord({
+                      ts: new Date().toISOString(),
+                      role: "agent",
+                      provider: provider?.name || "unknown",
+                      model: role.model,
+                      inputTokens: record.inputTokens,
+                      outputTokens: record.outputTokens,
+                      costUsd: calculateActualCost(record.inputTokens, record.outputTokens, role.model, settingsRef.current.costTable),
+                      label: record.label,
+                    });
+                  },
+                },
+              });
+            } catch { /* memory is advisory (E1) */ }
+          },
           totalModelCalls: () => modelCalls,
           totalCostUsd: () =>
             priorTurnCost +
@@ -345,23 +436,7 @@ export function AssistantView({
                   u.role === "agent" && !baselineUsage.has(JSON.stringify(u)),
               )
               .reduce((n, u) => n + (u.costUsd || 0), 0),
-          readOnly: () => {
-            const s = settingsRef.current;
-            const cap = s.assistantMonthlySoftCapUsd;
-            return (
-              cap !== undefined &&
-              monthlySpend +
-                loadUsageLog()
-                  .filter(
-                    (u) =>
-                      u.role === "agent" &&
-                      !baselineUsage.has(JSON.stringify(u)) &&
-                      u.ts.slice(0, 7) === new Date().toISOString().slice(0, 7),
-                  )
-                  .reduce((n, u) => n + (u.costUsd || 0), 0) >=
-                cap
-            );
-          },
+          readOnly: () => softCapExhausted(),
           model:
             configured && provider
               ? async (system, text) => {
@@ -472,7 +547,12 @@ export function AssistantView({
       !sessionRef.current.pending
     ) {
       autoVerified.current = true;
-      void run(t("Check this exam end-to-end", "این آزمون را کامل بررسی کن"));
+      void run(
+        t(
+          "Check this exam end-to-end: run run_remediation_pipeline first, then handle any exceptions it reports.",
+          "این آزمون را کامل بررسی کن: نخست run_remediation_pipeline را اجرا کن، سپس استثناهای گزارش‌شده را بررسی کن.",
+        ),
+      );
     }
   }, [ready, verifyOnOpen]);
   return (
@@ -511,6 +591,15 @@ export function AssistantView({
             "گفت‌وگو فقط خلاصه‌ها و بخش‌هایی را که می‌خواهید به مدل تنظیم‌شده می‌فرستد — فایل‌ها در پوشه محلی می‌مانند.",
           )}
         </p>
+        <details className="text-xs border rounded-xl p-2">
+          <summary className="cursor-pointer font-medium">
+            {t("Memory (read-only)", "حافظه (فقط خواندنی)")}
+            {session.guidanceDigest ? ` — ${session.guidanceDigest}` : ""}
+          </summary>
+          <div className="mt-2">
+            <MemoryPanel readOnly fa={fa} />
+          </div>
+        </details>
         {session.events.map((event) => (
           <div
             key={event.id}
@@ -664,7 +753,10 @@ export function AssistantView({
             className="border rounded p-2"
             onClick={() =>
               void run(
-                t("Check this exam end-to-end", "این آزمون را کامل بررسی کن"),
+                t(
+                  "Check this exam end-to-end: run run_remediation_pipeline first, then handle any exceptions it reports.",
+                  "این آزمون را کامل بررسی کن: نخست run_remediation_pipeline را اجرا کن، سپس استثناهای گزارش‌شده را بررسی کن.",
+                ),
               )
             }
           >

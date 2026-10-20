@@ -1,0 +1,190 @@
+{
+  "docTraitRerun": {
+    "iranian-rtl": {
+      "pages": 5,
+      "lines": 76,
+      "expectedQs": 67,
+      "languagesDetected": [
+        "fa",
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 3,
+      "rtl": true,
+      "isLong": true
+    },
+    "english-mcq": {
+      "pages": 5,
+      "lines": 26,
+      "expectedQs": 20,
+      "languagesDetected": [
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 2,
+      "rtl": false,
+      "isLong": false
+    },
+    "scanned-noisy": {
+      "pages": 5,
+      "lines": 13,
+      "expectedQs": 10,
+      "languagesDetected": [
+        "fa",
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 1,
+      "rtl": true,
+      "isLong": false
+    },
+    "two-column": {
+      "pages": 5,
+      "lines": 17,
+      "expectedQs": 12,
+      "languagesDetected": [
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 2,
+      "rtl": false,
+      "isLong": false
+    },
+    "image-heavy": {
+      "pages": 5,
+      "lines": 12,
+      "expectedQs": 8,
+      "languagesDetected": [
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 5,
+      "sectionCount": 1,
+      "rtl": false,
+      "isLong": false
+    },
+    "giant-120": {
+      "pages": 5,
+      "lines": 134,
+      "expectedQs": 119,
+      "languagesDetected": [
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 3,
+      "rtl": false,
+      "isLong": true
+    },
+    "separate-keyfile": {
+      "pages": 5,
+      "lines": 21,
+      "expectedQs": 20,
+      "languagesDetected": [
+        "en"
+      ],
+      "hasKeyPages": false,
+      "hasImages": 0,
+      "sectionCount": 1,
+      "rtl": false,
+      "isLong": false
+    },
+    "pathological-model": {
+      "pages": 5,
+      "lines": 18,
+      "expectedQs": 15,
+      "languagesDetected": [
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 4,
+      "rtl": false,
+      "isLong": false
+    }
+  },
+  "skillSelection": {
+    "iranian-rtl": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "english-mcq": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "scanned-noisy": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "two-column": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "image-heavy": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "giant-120": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "separate-keyfile": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "pathological-model": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    }
+  },
+  "capFixture": {
+    "included": 50,
+    "omitted": 0,
+    "tokens": 3574,
+    "cap": 5000
+  }
+}

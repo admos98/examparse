@@ -112,6 +112,8 @@ export function applySectionCandidate(doc: ExamDoc, input: unknown): ExamDoc {
         doc.source.keyTerritoryLineNos ||
         enumerateExpectedQuestionNos(doc.source.lines).keyTerritory.lineNos,
       imageIds: doc.images.map((i) => i.id),
+      // Hollow/option findings stay as question flags; they do not invalidate a user-consented candidate.
+      semanticErrorsToRepair: false,
     },
   );
   if (

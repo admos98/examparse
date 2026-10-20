@@ -2,7 +2,9 @@
 import fs from 'fs';
 import path from 'path';
 import { performance } from 'perf_hooks';
-import { assembleAndValidateQuestions, assembleAndValidateSections } from '../src/pipeline/assemble';
+import { assembleAndValidateQuestions } from '../src/pipeline/assemble';
+import { applyLocalGates } from '../src/pipeline/gates';
+import { runCleanupStage } from '../src/pipeline/cleanup';
 import { enumerateExpectedQuestionNos, evaluateCoverage, getExamHealth, parsePrintedNumberFromStem } from '../src/pipeline/quality';
 import { computeQualityScore } from '../src/utils/qualityScore';
 import { expandWireV2 } from '../src/pipeline/structure';
@@ -127,17 +129,18 @@ async function runFixture(id:string){
   const images = fixture.mockImages || [];
 
   const totalPoints = meta.totalPoints || fixture.expected.pointsTotal;
-  const assembled = assembleAndValidateQuestions(rawQuestions, sourceLines, totalPoints, {
+  // A4 — local cleanup pre-pass only (0 calls): tags never move text; bench reports prompt lines before/after.
+  const cleanup = await runCleanupStage({ lines: sourceLines, keyLines: enumerated.keyTerritory.lineNos, pages: 5, expectedNumbers: expectedNumbers });
+  const taggedLines = cleanup.lines;
+  const assembled = assembleAndValidateQuestions(rawQuestions, taggedLines, totalPoints, {
     keyTerritoryLineNos: [...enumerated.keyTerritory.lineNos],
     imageIds: images.map((i:any)=>i.id),
     unresolvedImageIds: [],
   });
-  // Sections
-  let finalSections = sections.length ? sections : [{ id:'sec_1', index:1, title:'Default', spans:[[1, sourceLines.length]] }];
-  try {
-    const secAssembled = assembleAndValidateSections(sections, sourceLines, assembled.questions, [...enumerated.keyTerritory.lineNos]);
-    if (secAssembled.sections.length) finalSections = secAssembled.sections;
-  } catch {}
+  // B/C — the same local gates the pipeline runs: section split, containment, META_TOTAL, ownership.
+  const gates = applyLocalGates({ questions: assembled.questions, rawSections: sections, lines: taggedLines, keyLines: enumerated.keyTerritory.lineNos, metaTotalPoints: totalPoints });
+  let finalSections: any[] = gates.sections.length ? gates.sections : [{ id:'sec_1', index:1, title:'Default', spans:[[1, sourceLines.length]] }];
+  const finalTotalPoints = gates.totalPoints ?? totalPoints;
 
   // Merge fragmented strips simulation for image-heavy: if duplicate dHash, merge
   let finalImages = images;
@@ -158,14 +161,19 @@ async function runFixture(id:string){
     fileHash: `hash-${id}`,
     createdAt: new Date().toISOString(),
     displayName: fixture.id,
-    meta: { title: fixture.id, subject: meta.subject, grade: meta.grade, totalPoints, language: meta.language || 'en', direction: 'ltr' },
+    meta: { title: fixture.id, subject: meta.subject, grade: meta.grade, totalPoints: finalTotalPoints, language: meta.language || 'en', direction: 'ltr' },
     sections: finalSections.map((s:any, i:number)=>({ id: s.id || `sec_${i+1}`, index: s.index || i+1, title: s.title || s.kind || `Section ${i+1}`, spans: s.spans || s.p || [[1, sourceLines.length]] })),
-    questions: assembled.questions,
+    questions: gates.questions,
     images: finalImages,
-    source: { lines: sourceLines, pages: 5, fileName: `${id}.pdf`, ocrUsed:false, expectedQuestionNos: expectedNumbers, keyTerritoryLineNos: [...enumerated.keyTerritory.lineNos] },
-    flags: assembled.flags,
+    source: { lines: taggedLines, pages: 5, fileName: `${id}.pdf`, ocrUsed:false, expectedQuestionNos: expectedNumbers, keyTerritoryLineNos: [...enumerated.keyTerritory.lineNos], orphanLineNos: gates.ownership.orphanLineNos, cleanupStats: cleanup.stats },
+    flags: [...assembled.flags, ...gates.flags],
     usage: [],
   };
+  // F1 gauntlet gates (reported for every fixture; asserted via thresholds / fixture.headerTitles).
+  const hollow = doc.flags.filter((f:any) => f.code === 'STEM_HOLLOW').length;
+  const mcqUnder2 = doc.questions.filter((q:any) => q.type === 'mcq' && (q.options || []).filter((o:any) => (o.text || '').trim().length >= 2).length < 2).length;
+  const orphanRate = gates.ownership.orphanRate;
+  const sectionTitles = doc.sections.map((s:any) => s.title);
 
   const health = getExamHealth(doc);
   const coverage = health.coveragePercent;
@@ -197,6 +205,9 @@ async function runFixture(id:string){
     health,
     doc,
     expected: fixture.expected,
+    hollow, mcqUnder2, orphanRate, sectionTitles,
+    cleanupLines: { before: cleanup.stats.linesBefore, after: cleanup.stats.linesAfter, tokensBefore: cleanup.stats.tokensBefore, tokensAfter: cleanup.stats.tokensAfter, fenceSaved: cleanup.stats.fenceSaved },
+    gates: { splits: gates.splits, reassigned: gates.reassigned, ambiguous: gates.ambiguous, totalPoints: finalTotalPoints, documentTotal: fixture.documentTotal, headerTitles: fixture.headerTitles },
   };
 }
 
@@ -207,8 +218,8 @@ async function main(){
     process.exit(1);
   }
   console.log(`\nGolden Benchmark — ${ids.length} fixtures (mock transport, offline)\n`);
-  console.log(`| Fixture            | Coverage | Points | OptBlob | Phantom | Calls | Tokens | Guidance | Wall ms | Quality | Status |`);
-  console.log(`|--------------------|----------|--------|---------|---------|-------|--------|----------|---------|---------|--------|`);
+  console.log(`| Fixture            | Coverage | Points | OptBlob | Phantom | Calls | Tokens | Guidance | Hollow | Orphan% | Clean L | Wall ms | Quality | Status |`);
+  console.log(`|--------------------|----------|--------|---------|---------|-------|--------|----------|--------|---------|---------|---------|---------|--------|`);
 
   let failed = false;
   const results:any[] = [];
@@ -229,11 +240,28 @@ async function main(){
     if (thr.maxUnplacedImages !== undefined) {
       imageOk = r.health.unplacedImages.length <= thr.maxUnplacedImages;
     }
-    const ok = covOk && ptsOk && blobOk && phantomOk && callsOk && tokensOk && wallOk && imageOk;
+    const orphanOk = thr.maxOrphanRate === undefined || r.orphanRate <= thr.maxOrphanRate;
+    const hollowOk = thr.maxHollow === undefined || r.hollow <= thr.maxHollow;
+    // F1 — the gauntlet gates (only fixtures that declare printed headers / a document total).
+    const gauntletReasons: string[] = [];
+    if (r.gates.headerTitles) {
+      if (r.hollow !== 0) gauntletReasons.push(`STEM_HOLLOW ${r.hollow} ≠ 0`);
+      if (r.mcqUnder2 !== 0) gauntletReasons.push(`${r.mcqUnder2} MCQ(s) with <2 options`);
+      if (r.orphanRate !== 0) gauntletReasons.push(`orphan rate ${(r.orphanRate * 100).toFixed(1)}% ≠ 0`);
+      if (r.gates.documentTotal !== undefined && r.gates.totalPoints !== r.gates.documentTotal) gauntletReasons.push(`totalPoints ${r.gates.totalPoints} ≠ document ${r.gates.documentTotal}`);
+      const want = [...r.gates.headerTitles].sort().join('|'); const got = [...r.sectionTitles].sort().join('|');
+      if (want !== got) gauntletReasons.push(`sections [${r.sectionTitles.join(', ')}] ≠ headers [${r.gates.headerTitles.join(', ')}]`);
+      const honestPartial = r.health.state !== 'green' && r.doc.flags.some((f: any) => f.code === 'PARTIAL_COVERAGE' || f.code === 'REPAIR_SURVIVORS' || f.code === 'COVERAGE_MISSING');
+      if (r.health.state !== 'green' && !honestPartial) gauntletReasons.push(`coverage ${r.health.state} without an honest PARTIAL flag`);
+    }
+    const ok = covOk && ptsOk && blobOk && phantomOk && callsOk && tokensOk && wallOk && imageOk && orphanOk && hollowOk && gauntletReasons.length === 0;
     if (!ok) failed = true;
     const status = ok ? 'PASS' : 'FAIL';
-    const line = `| ${id.padEnd(18)} | ${String(r.coverage.toFixed(1)+'%').padStart(8)} | ${String(r.pointsPercent+'%').padStart(6)} | ${String(r.optionBlobs).padStart(7)} | ${String(r.phantomMissing).padStart(7)} | ${String(r.structureCalls).padStart(5)} | ${String(r.outputTokens).padStart(6)} | ${String(r.guidanceTokens+' tok').padStart(8)} | ${String(r.wallMs).padStart(7)} | ${String(r.quality).padStart(7)} | ${status.padEnd(6)} |`;
+    const line = `| ${id.padEnd(18)} | ${String(r.coverage.toFixed(1)+'%').padStart(8)} | ${String(r.pointsPercent+'%').padStart(6)} | ${String(r.optionBlobs).padStart(7)} | ${String(r.phantomMissing).padStart(7)} | ${String(r.structureCalls).padStart(5)} | ${String(r.outputTokens).padStart(6)} | ${String(r.guidanceTokens+' tok').padStart(8)} | ${String(r.hollow).padStart(6)} | ${String((r.orphanRate*100).toFixed(1)+'%').padStart(7)} | ${String(`${r.cleanupLines.before}→${r.cleanupLines.after}`).padStart(7)} | ${String(r.wallMs).padStart(7)} | ${String(r.quality).padStart(7)} | ${status.padEnd(6)} |`;
     console.log(line);
+    for (const reason of gauntletReasons) console.log(`  ↳ ${id} GAUNTLET: ${reason}`);
+    if (!orphanOk) console.log(`  ↳ ${id} regression: orphan rate ${(r.orphanRate*100).toFixed(1)}% > ${thr.maxOrphanRate*100}%`);
+    if (!hollowOk) console.log(`  ↳ ${id} regression: hollow ${r.hollow} > ${thr.maxHollow}`);
     if (!ok) {
       const reasons:string[] = [];
       if (!covOk) reasons.push(`coverage ${r.coverage.toFixed(1)} < ${thr.coveragePercent}`);
@@ -253,10 +281,17 @@ async function main(){
   console.log(`Total: ${results.length} fixtures — ${failed ? 'FAIL' : 'PASS'}\n`);
 
   // Also print quality breakdown per fixture
-  console.log('Quality breakdown (coverage30 points15 options15 images15 numbering10 confidence10 passage5):');
+  console.log('Quality breakdown (coverage30 points15 options15 images15 numbering10 confidence6 orphan4 passage5):');
   for (const r of results) {
     const q = computeQualityScore(r.doc);
-    console.log(` ${r.id}: total ${q.total} [cov ${q.coverage} pts ${q.points} opt ${q.optionsCleanliness} img ${q.imagePlacement} num ${q.numbering} conf ${q.confidence} pass ${q.passage}]`);
+    console.log(` ${r.id}: total ${q.total} [cov ${q.coverage} pts ${q.points} opt ${q.optionsCleanliness} img ${q.imagePlacement} num ${q.numbering} conf ${q.confidence} orphan ${q.orphan} pass ${q.passage}]`);
+  }
+  console.log('');
+  // F1 scorecard for gauntlet fixtures.
+  for (const r of results.filter(x => x.gates.headerTitles)) {
+    const cs = r.doc.source.cleanupStats;
+    console.log(`Gauntlet scorecard — ${r.id}:`);
+    console.log(`  STEM_HOLLOW ${r.hollow} · MCQ<2opts ${r.mcqUnder2} · orphan rate ${(r.orphanRate*100).toFixed(1)}% · totalPoints ${r.gates.totalPoints} (document ${r.gates.documentTotal}) · sections [${r.sectionTitles.join(', ')}] vs headers [${r.gates.headerTitles.join(', ')}] · section splits ${r.gates.splits} · reassigned ${r.gates.reassigned} · ambiguous ${r.gates.ambiguous} · health ${r.health.state} (${r.health.coveragePercent}%) · cleanup local prompt lines ${cs.linesBefore}→${cs.linesAfter} (≈${cs.tokensBefore}→${cs.tokensAfter} tok, fence-saved ${cs.fenceSaved}) · flags ${Object.entries(r.doc.flags.reduce((acc: any, f: any) => { acc[f.code] = (acc[f.code]||0)+1; return acc; }, {})).map(([k,v]) => `${k}×${v}`).join(' ')}`);
   }
   console.log('');
 

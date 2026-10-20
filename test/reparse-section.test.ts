@@ -27,7 +27,7 @@ function fixture(): ExamDoc {
   const lines = [
     { id: "L0001", page: 1, text: "Writing" },
     { id: "L0002", page: 1, text: "۱. مي‌شود؟ Original exact stem" },
-    { id: "L0003", page: 1, text: "۲. يكي ديگر؟" },
+    { id: "L0003", page: 1, text: "۲. يكي ديگر از پرسش‌های اين بخش؟" },
     { id: "L0004", page: 1, text: "Reading" },
     { id: "L0005", page: 1, text: "۳. Outside section — untouched" },
     { id: "L0006", page: 2, text: "راهنمای تصحیح" },
@@ -469,6 +469,8 @@ test("a human edit during preparation rejects the candidate before it becomes pe
 
 test("confirmed local candidate can commit at the six-call bound without another provider call, and a capped confirmation still cannot mutate", async () => {
   const h = setup();
+  // This test pins the historical 6/12 bound explicitly (E3 raised the defaults to 30/200).
+  h.runtime.getSettings().agentLimits = { maxModelCalls: 6, maxToolExecutions: 12 };
   const s = await runAgentTurn(
     h.runtime,
     newAgentSession(h.doc.id),

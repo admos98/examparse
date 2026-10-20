@@ -616,7 +616,7 @@ function listExamFiles(): string[] {
 function summarizeStoredExam(doc: any): any {
   const usage = Array.isArray(doc?.usage) ? doc.usage : [];
   let health: ReturnType<typeof getExamHealth>;
-  try { health = getExamHealth(doc); } catch { health = { expectedCount: doc?.questions?.length || 0, parsedCount: doc?.questions?.length || 0, missing: [], duplicates: [], pointsParsed: 0, pointDeficit: 0, unplacedImages: [], unresolvedImageRefs: [], lowConfidenceCount: 0, coveragePercent: 0, state: 'amber', complete: false }; }
+  try { health = getExamHealth(doc); } catch { health = { expectedCount: doc?.questions?.length || 0, parsedCount: doc?.questions?.length || 0, missing: [], duplicates: [], pointsParsed: 0, pointDeficit: 0, unplacedImages: [], unresolvedImageRefs: [], lowConfidenceCount: 0, coveragePercent: 0, state: 'amber', complete: false, hollowQuestions: [], orphanLines: 0 }; }
   // Compute qualityScore inline (same weights as src/utils/qualityScore.ts to avoid circular import)
   let qualityScore = 0;
   try {

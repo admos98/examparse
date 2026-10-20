@@ -105,6 +105,20 @@
       "sectionCount": 4,
       "rtl": false,
       "isLong": false
+    },
+    "gauntlet-lazy": {
+      "pages": 5,
+      "lines": 73,
+      "expectedQs": 20,
+      "languagesDetected": [
+        "fa",
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 4,
+      "rtl": true,
+      "isLong": false
     }
   },
   "skillSelection": {
@@ -172,6 +186,15 @@
       "omitted": 3
     },
     "pathological-model": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 591,
+      "omitted": 3
+    },
+    "gauntlet-lazy": {
       "selected": [
         "image-placement",
         "verify-and-repair-exam",

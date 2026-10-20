@@ -8,6 +8,8 @@ import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine 
 import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
 import { validateSemantic, semanticConfidenceDeduction, semanticIssuesFor } from './semanticValidators';
+import { completeGapsRaw } from './ownership';
+import { isContentJunk, isFenceProtected } from './cleanup';
 
 export const SpanReferenceSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]);
 export const RawQuestionSchema = z.object({
@@ -71,7 +73,7 @@ export function sliceSourceSpans(
   for (const lineNo of spanLineNumbers(spans)) {
     const line = lineMap.get(lineNo);
     if (rewriteMap.has(lineNo)) output.push(rewriteMap.get(lineNo)!);
-    else if (line && !line.furniture) output.push(line.text);
+    else if (line && !line.furniture && !isContentJunk(line)) output.push(line.text);
   }
   return output.join('\n');
 }
@@ -109,7 +111,8 @@ function findOptionMarkers(text: string): Marker[] {
 /** Remove only text following explicit option markers; never delete ordinary stem words that match an option. */
 export function decontaminateOptionMarkup(text: string): string {
   return text.split(/\r?\n/).flatMap(line => {
-    const first = findOptionMarkers(line)[0];
+    // Explicit letter markers only: a stem such as "True or false: …" must not be cut at the word "True".
+    const first = findOptionMarkers(line).filter(marker => !marker.display)[0];
     if (!first) return [line];
     const stemPrefix = line.slice(0, first.start).trimEnd();
     return stemPrefix ? [stemPrefix] : [];
@@ -135,17 +138,19 @@ function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[
 }
 
 function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
-  return new Map(sourceLines.map(line => [lineNoFromId(line.id), line.furniture ? '' : line.text]));
+  return new Map(sourceLines.map(line => [lineNoFromId(line.id), line.furniture || isContentJunk(line) ? '' : line.text]));
 }
 
 function decontaminateStem(
   stemSpans: LineSpan[],
   optionSpans: LineSpan[],
   sourceLines: SourceLine[],
-  printedNo: number
+  printedNo: number,
+  rewrites?: { line: number; text: string }[]
 ): string {
   const consumed = new Set(spanLineNumbers(optionSpans));
   const textMap = lineTextMap(sourceLines);
+  for (const rewrite of rewrites || []) if (textMap.has(rewrite.line)) textMap.set(rewrite.line, rewrite.text);
   const output: string[] = [];
   for (const n of spanLineNumbers(stemSpans)) {
     const line = textMap.get(n);
@@ -156,7 +161,9 @@ function decontaminateStem(
     }
     const markers = findOptionMarkers(line);
     const number = parsePrintedNumberFromStem(line);
-    if (number === printedNo && markers.length > 0 && line.slice(0, markers[0].start).trim()) {
+    // Keep the stem prefix of an option line when it is this question's printed line or an
+    // un-numbered continuation (gap-completed "He ___ to school. a) go b) went" lines).
+    if ((number === printedNo || number === undefined) && markers.length > 0 && line.slice(0, markers[0].start).trim()) {
       output.push(line.slice(0, markers[0].start).trimEnd());
     }
   }
@@ -215,6 +222,26 @@ export interface AssembleOptions {
   unresolvedImageIds?: string[];
   /** 2A: assembled sections enable PASSAGE-ATTACHMENT / SECTION-CONTAINMENT validators. */
   sections?: ExamSection[];
+  /** B2: deterministic gap completion before assembly (default on; patches opt out). */
+  gapCompletion?: boolean;
+  /** C2: STEM_HOLLOW / OPTIONS_MISSING errors join failingQuestions (default on; patches opt out). */
+  semanticErrorsToRepair?: boolean;
+  /** D: 'fenced' (default) only accepts rewrites on locally garbled, number-free lines; 'open' for user patches. */
+  rewritePolicy?: 'fenced' | 'open';
+}
+
+export const REWRITE_MAX_CHARS = 140;
+/** D — fence a single rewrite request against the source line. Returns a rejection reason or undefined. */
+export function rewriteRejection(rewrite: { line: number; text: string }, line: SourceLine | undefined, keyLines: Set<number>, allowedLines: Set<number>): string | undefined {
+  if (!line) return 'line not in source';
+  if (keyLines.has(rewrite.line) || line.tag === 'key') return 'key territory';
+  if (!allowedLines.has(rewrite.line)) return 'outside question spans';
+  if (!line.garbled) return 'line is not locally garbled';
+  if (isFenceProtected(line.text) || /\d/.test(normalizeForMatching(line.text))) return 'line carries a printed number, option marker, digits or blank';
+  if (typeof rewrite.text !== 'string' || !rewrite.text.trim()) return 'empty rewrite';
+  if (rewrite.text.length > REWRITE_MAX_CHARS) return `rewrite longer than ${REWRITE_MAX_CHARS} chars`;
+  if (/\d/.test(normalizeForMatching(rewrite.text)) && !/\d/.test(normalizeForMatching(line.text))) return 'rewrite introduces digits';
+  return undefined;
 }
 
 function flag(code: string, message: string, severity: Flag['severity'], questionId?: string, id = `flag_${code}_${questionId || 'doc'}`): Flag {
@@ -279,8 +306,20 @@ export function assembleAndValidateQuestions(
   sourceLines.filter(l => l.furniture).forEach(l => keyLines.add(lineNoFromId(l.id)));
   const allImageIds = options.imageIds ? new Set(options.imageIds) : null;
   const questionOverlap = new Set<string>();
+  const rewritePolicy = options.rewritePolicy || 'fenced';
 
-  (Array.isArray(rawQuestions) ? rawQuestions : []).forEach((rawInput, idx) => {
+  // B2 — gap completion + option synthesis (pure, 0 calls) before any slicing.
+  let rawList: any[] = Array.isArray(rawQuestions) ? rawQuestions : [];
+  const absorbedByKey = new Map<string, number[]>();
+  const synthesizedByKey = new Map<string, number>();
+  if (options.gapCompletion !== false && rawList.length) {
+    const completed = completeGapsRaw(rawList, sourceLines, { keyLines: new Set(options.keyTerritoryLineNos || []), sections: options.sections });
+    rawList = completed.raw;
+    for (const [k, v] of completed.absorbed) absorbedByKey.set(k, v);
+    for (const [k, v] of completed.synthesized) synthesizedByKey.set(k, v);
+  }
+
+  rawList.forEach((rawInput, idx) => {
     const raw = rawInput && typeof rawInput === 'object' ? { ...rawInput } : {};
     const errors: string[] = [];
     const parsed = RawQuestionSchema.safeParse(raw);
@@ -326,10 +365,26 @@ export function assembleAndValidateQuestions(
     if (optionSplitFailed) {
       flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(sliceOptionUnion(rawOptions, sourceLines)).length}) did not match ${rawOptions.length} option spans; original option text retained.`, 'warn', qId));
     }
-    const originalStem = sliceSourceSpans(spans, sourceLines, raw.rewrites);
+    // D — rewrite rights: fenced by default (garbled, number-free, non-key lines inside the question only).
+    const lineById = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
+    const requestedRewrites: Array<{ line: number; text: string }> = Array.isArray(raw.rewrites) ? raw.rewrites.filter((r: any) => r && Number.isInteger(r.line) && typeof r.text === 'string') : [];
+    const acceptedRewrites: Array<{ line: number; text: string }> = [];
+    if (rewritePolicy === 'open') acceptedRewrites.push(...requestedRewrites);
+    else {
+      const allowed = new Set(spanLineNumbers(spans));
+      for (const rewrite of requestedRewrites) {
+        const reason = rewriteRejection(rewrite, lineById.get(rewrite.line), keyLines, allowed);
+        if (reason) flags.push(flag('REWRITE_REJECTED', `Question ${raw.label || qId}: rewrite for L${String(rewrite.line).padStart(4, '0')} rejected (${reason}); original text kept.`, 'info', qId, `flag_REWRITE_REJECTED_${qId}_${rewrite.line}`));
+        else { acceptedRewrites.push(rewrite); flags.push(flag('REWRITE_APPLIED', `Question ${raw.label || qId}: garbled L${String(rewrite.line).padStart(4, '0')} rendered from the model's rewrite; original retained for one-click revert.`, 'info', qId, `flag_REWRITE_APPLIED_${qId}_${rewrite.line}`)); }
+      }
+    }
+    const originalStem = sliceSourceSpans(spans, sourceLines, acceptedRewrites);
     const printedBeforeCleanup = parsePrintedNumberFromStem(originalStem) ?? originalNo;
-    const stem = decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup);
+    const stem = decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
     if (!stem.trim()) errors.push('Assembled stem is empty');
+    const gapKey = String(raw.id || `#${idx}`);
+    if (absorbedByKey.has(gapKey)) flags.push(flag('GAP_ABSORBED', `Question ${raw.label || qId}: ${absorbedByKey.get(gapKey)!.length} unclaimed line(s) after the model's anchor were absorbed locally (${absorbedByKey.get(gapKey)!.slice(0, 6).map(n => `L${String(n).padStart(4, '0')}`).join(', ')}${absorbedByKey.get(gapKey)!.length > 6 ? ', …' : ''}).`, 'info', qId));
+    if (synthesizedByKey.has(gapKey)) flags.push(flag('OPTIONS_SYNTHESIZED', `Question ${raw.label || qId}: ${synthesizedByKey.get(gapKey)} option(s) split locally from printed markers the model did not return.`, 'info', qId));
 
     // D3: printed source numbering is authoritative over a model's shifted label/no.
     const printedNo = parsePrintedNumberFromStem(stem) ?? parsePrintedNumberFromStem(originalStem);
@@ -408,7 +463,7 @@ export function assembleAndValidateQuestions(
       type: raw.type || 'unknown',
       options: assembledOptions.length ? assembledOptions : undefined,
       answer,
-      rewrites: Array.isArray(raw.rewrites) ? raw.rewrites : [],
+      rewrites: acceptedRewrites,
       images: questionImages,
       tables: assembledTables.length ? assembledTables : undefined,
       confidence,
@@ -469,12 +524,20 @@ export function assembleAndValidateQuestions(
 
   // 2A semantic validators (pure, 0 calls) — inside the single assembly funnel so
   // fresh/resumed/chunked/imported documents are all checked identically.
-  for (const issue of validateSemantic(questions, options.sections || [])) {
+  for (const issue of validateSemantic(questions, options.sections || [], q => sliceSourceSpans(q.spans, sourceLines))) {
     flags.push(flag(issue.code, issue.message, issue.severity, issue.questionId));
     const q = questions.find(item => item.id === issue.questionId);
     if (q) {
       if (!q.flags?.includes(issue.code)) q.flags = [...(q.flags || []), issue.code];
       if (issue.severity === 'warn') q.confidence = Math.max(0.05, q.confidence - semanticConfidenceDeduction([issue]));
+      if (issue.severity === 'error') {
+        // C2 — error validators are wired into the escalation-repair queue, never left as decoration.
+        q.confidence = Math.max(0.05, q.confidence - 0.15);
+        if (options.semanticErrorsToRepair !== false) {
+          const existing = failingQuestions.find(f => f.question.id === q.id);
+          if (existing) existing.errors.push(issue.message); else failingQuestions.push({ question: q, errors: [issue.message] });
+        }
+      }
     }
   }
 

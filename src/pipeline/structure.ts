@@ -9,6 +9,7 @@ import { T1_GEMINI_SCHEMA, T1_STRUCTURE_SYSTEM } from './prompts';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { appendJournalCall, loadJournal, markJournalComplete } from './journal';
 import { evaluateCoverage, enumerateExpectedQuestionNos, normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
+import { renderCleanView } from './cleanup';
 
 
 export interface StructurePassResult {
@@ -83,6 +84,13 @@ export function expandWireV2(raw: any): any {
     const answerSpanValue = q.a ?? q.answer?.spans;
     const imageValues = q.i ?? q.images;
     const tablesValue = q.x ?? q.tables;
+    // D: wire `r` = [[line, text], ...] rewrite requests; fenced later by the assembly funnel.
+    const rewriteRaw = q.r ?? q.rewrites;
+    const rewrites = Array.isArray(rewriteRaw) ? rewriteRaw.flatMap((item: any) => {
+      if (Array.isArray(item) && Number.isInteger(Number(item[0])) && typeof item[1] === 'string') return [{ line: Number(item[0]), text: item[1] }];
+      if (item && typeof item === 'object' && Number.isInteger(Number(item.line)) && typeof item.text === 'string') return [{ line: Number(item.line), text: item.text }];
+      return [];
+    }) : [];
     return {
       id: q.id || `q${no}${q.g !== undefined ? `_child_${index + 1}` : ''}`,
       label: String(q.label ?? no),
@@ -96,6 +104,7 @@ export function expandWireV2(raw: any): any {
       ...(answerSpanValue !== undefined ? { answer: { spans: spansFromWire(answerSpanValue) } } : {}),
       ...(Array.isArray(tablesValue) && tablesValue.length ? { tables: tablesValue.map((t: any) => ({ spans: spansFromWire(t?.spans ?? t?.p ?? t) })) } : {}),
       ...(Array.isArray(imageValues) && imageValues.length ? { images: imageValues.map((image: any) => typeof image === 'string' ? { imageId: image, role: 'stem' } : image) } : {}),
+      ...(rewrites.length ? { rewrites } : {}),
       confidence: typeof q.c === 'number' ? Math.max(0, Math.min(9, q.c)) / 10 : (typeof q.confidence === 'number' ? q.confidence : 0.9),
       ...(Array.isArray(q.flags) ? { flags: q.flags } : {}),
     };
@@ -278,9 +287,13 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
     const title = line.furniture ? undefined : isSectionHeading(line.text);
     return title ? [{ index, title, line: Number(line.id.replace(/\D/g, '')) }] : [];
   });
-  const headerCandidates = detectSectionHeaders(sourceLines);
+  // C3: anchor on header TAGS first (cleanup/AI/user), then the keyword detector, then printed-number contiguity.
+  const detected = detectSectionHeaders(sourceLines);
+  const taggedHeaders = sorted.filter(line => line.tag === 'header' && !detected.some(h => h.headerLine === Number(line.id.replace(/\D/g, ''))))
+    .map(line => ({ title: isSectionHeading(line.text) || line.text.trim().slice(0, 60), headerLine: Number(line.id.replace(/\D/g, '')), kind: 'Other', start: Number(line.id.replace(/\D/g, '')), rawTitle: line.text.trim() }));
+  const headerCandidates = [...detected, ...taggedHeaders].sort((a, b) => a.headerLine - b.headerLine);
   let boundaries: Array<{ start: number; end: number; title: string; kind?: string }> = [];
-  if (headerCandidates.length >= 3) {
+  if (headerCandidates.length >= 3 || (headerCandidates.length >= 2 && taggedHeaders.length > 0)) {
     const maxLine = Number(sorted[sorted.length - 1].id.replace(/\D/g, '')) || 1;
     const minLine = Number(sorted[0].id.replace(/\D/g, '')) || 1;
     for (let i=0;i<headerCandidates.length;i++) {
@@ -314,7 +327,7 @@ function makeSectionPlans(sourceLines: SourceLine[], expectedNumbers: number[], 
       }
     }
   }
-  if (boundaries.length > 1 && headerCandidates.length < 3) {
+  if (boundaries.length > 1 && !(headerCandidates.length >= 3 || (headerCandidates.length >= 2 && taggedHeaders.length > 0))) {
     const firstQuestionLine = Math.min(...expectedNumbers.map(n => expectedLineByNo.get(n) || Infinity));
     if (Number.isFinite(firstQuestionLine) && firstQuestionLine < boundaries[0].start) boundaries[0].start = Number(sorted[0].id.replace(/\D/g, '')) || 1;
   }
@@ -429,15 +442,14 @@ function attachWireTokenAccounting(result: StructurePassResult): StructurePassRe
   return accounted;
 }
 
+/**
+ * A4 — the structure prompt sees the CLEAN VIEW: cleanup tags rendered as prefixes
+ * ([FURNITURE]/[KEY]/[HDR]/[INSTR]/[GARBLED?]), confirmed junk omitted. Line ids are the
+ * original ids, so every span the model returns still references original line numbers.
+ * Untagged lines render exactly as before cleanup existed.
+ */
 function formatLas(sourceLines: SourceLine[], keyLines: Set<number>): string {
-  let text = '';
-  let currentPage = 0;
-  for (const line of sourceLines) {
-    if (line.page !== currentPage) { currentPage = line.page; text += `=== PAGE ${currentPage} ===\n`; }
-    const n = Number(line.id.replace(/\D/g, ''));
-    text += `[${line.id}] ${keyLines.has(n) ? '[KEY] ' : ''}${line.furniture ? '[FURNITURE] ' : ''}${line.text}\n`;
-  }
-  return text;
+  return renderCleanView(sourceLines, keyLines).text;
 }
 
 async function parseStructureResponse(response: any): Promise<any> {

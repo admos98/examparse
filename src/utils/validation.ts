@@ -86,11 +86,12 @@ const providerSchema = z.object({
 });
 export const AppSettingsSchema = z.object({
   providers: z.array(providerSchema).min(1).max(50),
-  roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional(), critic: selection.optional(), consensus: selection.optional() }),
+  roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional(), critic: selection.optional(), consensus: selection.optional(), cleanup: selection.optional() }),
   costTable: z.record(z.string(), z.object({ inputCostPerMillion: z.number().finite().nonnegative(), outputCostPerMillion: z.number().finite().nonnegative() })),
   thrift: z.object({ latexNormalization: z.boolean(), maxImagesPerVisionCall: z.number().int().min(1).max(64), imageMaxLongEdge: z.number().int().min(64).max(8192), jpegQuality: z.number().int().min(1).max(100), cacheEnabled: z.boolean() }),
   budget: z.object({ maxUsdPerRun: z.number().finite().nonnegative(), maxOutputTokens: z.number().int().min(256).max(65_536) }),
-  agentLimits: z.object({ maxModelCalls: z.number().int().min(1).max(100).optional(), maxToolExecutions: z.number().int().min(1).max(200).optional() }).optional(),
+  agentLimits: z.object({ maxModelCalls: z.number().int().min(1).max(100).optional(), maxToolExecutions: z.number().int().min(1).max(400).optional() }).optional(),
+  cleanupEnabled: z.boolean().optional(),
   assistantMonthlySoftCapUsd: z.number().finite().nonnegative().optional(),
   uiLanguage: z.enum(['fa', 'en']).optional(),
   themeMode: z.enum(['system', 'light', 'dark']).optional(),

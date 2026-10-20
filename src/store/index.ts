@@ -103,10 +103,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxUsdPerRun: 0.25, // default hard cap
     maxOutputTokens: 16384,
   },
+  // E3: executor budgets — model calls 30 (5–60 configurable), tool executions 200 (reads weigh 0.25).
   agentLimits: {
-    maxModelCalls: 6,
-    maxToolExecutions: 12,
+    maxModelCalls: 30,
+    maxToolExecutions: 200,
   },
+  // A5: Stage 2.5 cleanup on by default; off ⇒ byte-identical pre-cleanup behaviour (tags aside).
+  cleanupEnabled: true,
   document: {
     defaultLanguage: 'auto',
     paperSize: 'A4',
@@ -262,7 +265,8 @@ export function loadSettings(): AppSettings {
       thrift: { ...DEFAULT_SETTINGS.thrift, ...(parsed.thrift || {}) },
       budget: { ...DEFAULT_SETTINGS.budget, ...(parsed.budget || {}) },
       document: { ...DEFAULT_SETTINGS.document, ...(parsed.document || {}) },
-      agentLimits: { maxModelCalls: 25, maxToolExecutions: 60, ...DEFAULT_SETTINGS.agentLimits, ...(parsed.agentLimits || {}) },
+      agentLimits: { ...DEFAULT_SETTINGS.agentLimits, ...(parsed.agentLimits || {}) },
+      cleanupEnabled: typeof parsed.cleanupEnabled === 'boolean' ? parsed.cleanupEnabled : true,
     };
     return validateAppSettings(merged);
   } catch {

@@ -1,11 +1,115 @@
 {
-  "_comment": "Loosening a threshold requires editing it visibly in the diff. coveragePercent is a minimum; pointsPercent is an inclusive [min, max] range so duplicate/replayed questions cannot inflate points unnoticed. A [0, 115] points range is allowed only for a fixture that genuinely declares no total points.",
-  "iranian-rtl": { "coveragePercent": 95, "pointsPercent": [85, 115], "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 4000, "maxWallMs": 2000 },
-  "english-mcq": { "coveragePercent": 90, "pointsPercent": [95, 115], "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 2, "maxOutputTokens": 3000, "maxWallMs": 1500 },
-  "scanned-noisy": { "coveragePercent": 90, "pointsPercent": [80, 115], "maxOptionBlob": 1, "maxPhantomMissing": 1, "maxStructureCalls": 3, "maxOutputTokens": 5000, "maxWallMs": 2500 },
-  "two-column": { "coveragePercent": 90, "pointsPercent": [95, 115], "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 3500, "maxWallMs": 2000 },
-  "image-heavy": { "coveragePercent": 90, "pointsPercent": [80, 115], "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 4500, "maxWallMs": 2500, "maxUnplacedImages": 5 },
-  "giant-120": { "coveragePercent": 90, "pointsPercent": [90, 115], "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 5, "maxOutputTokens": 15000, "maxWallMs": 5000 },
-  "separate-keyfile": { "coveragePercent": 95, "pointsPercent": [100, 115], "maxOptionBlob": 0, "maxPhantomMissing": 0, "maxStructureCalls": 3, "maxOutputTokens": 4000, "maxWallMs": 2000 },
-  "pathological-model": { "coveragePercent": 85, "pointsPercent": [85, 115], "maxOptionBlob": 1, "maxPhantomMissing": 0, "maxStructureCalls": 4, "maxOutputTokens": 6000, "maxWallMs": 3000 }
+  "_comment": "Loosening a threshold requires editing it visibly in the diff. coveragePercent is a minimum; pointsPercent is an inclusive [min, max] range so duplicate/replayed questions cannot inflate points unnoticed. A [0, 115] points range is allowed only for a fixture that genuinely declares no total points. maxOrphanRate (B3) is the maximum share of exam-territory lines owned by nothing; maxHollow caps STEM_HOLLOW errors. gauntlet-lazy is the F1 golden gauntlet: a lazy one-line-span scripted model that must still produce 0 hollow stems, every MCQ with ≥2 options, orphan rate 0, the printed total and the printed header set.",
+  "iranian-rtl": {
+    "coveragePercent": 95,
+    "pointsPercent": [
+      85,
+      115
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 3,
+    "maxOutputTokens": 4000,
+    "maxWallMs": 2000,
+    "maxOrphanRate": 0
+  },
+  "english-mcq": {
+    "coveragePercent": 90,
+    "pointsPercent": [
+      95,
+      115
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 2,
+    "maxOutputTokens": 3000,
+    "maxWallMs": 1500
+  },
+  "scanned-noisy": {
+    "coveragePercent": 90,
+    "pointsPercent": [
+      80,
+      115
+    ],
+    "maxOptionBlob": 1,
+    "maxPhantomMissing": 1,
+    "maxStructureCalls": 3,
+    "maxOutputTokens": 5000,
+    "maxWallMs": 2500
+  },
+  "two-column": {
+    "coveragePercent": 90,
+    "pointsPercent": [
+      95,
+      115
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 3,
+    "maxOutputTokens": 3500,
+    "maxWallMs": 2000
+  },
+  "image-heavy": {
+    "coveragePercent": 90,
+    "pointsPercent": [
+      80,
+      115
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 3,
+    "maxOutputTokens": 4500,
+    "maxWallMs": 2500,
+    "maxUnplacedImages": 5
+  },
+  "giant-120": {
+    "coveragePercent": 90,
+    "pointsPercent": [
+      90,
+      115
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 5,
+    "maxOutputTokens": 15000,
+    "maxWallMs": 5000
+  },
+  "separate-keyfile": {
+    "coveragePercent": 95,
+    "pointsPercent": [
+      100,
+      115
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 3,
+    "maxOutputTokens": 4000,
+    "maxWallMs": 2000
+  },
+  "pathological-model": {
+    "coveragePercent": 85,
+    "pointsPercent": [
+      85,
+      115
+    ],
+    "maxOptionBlob": 1,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 4,
+    "maxOutputTokens": 6000,
+    "maxWallMs": 3000
+  },
+  "gauntlet-lazy": {
+    "coveragePercent": 100,
+    "pointsPercent": [
+      100,
+      100
+    ],
+    "maxOptionBlob": 0,
+    "maxPhantomMissing": 0,
+    "maxStructureCalls": 1,
+    "maxOutputTokens": 2500,
+    "maxWallMs": 2000,
+    "maxOrphanRate": 0,
+    "maxHollow": 0
+  }
 }

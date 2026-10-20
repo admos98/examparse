@@ -3,10 +3,12 @@
  * Heuristic humility: shape suspicions are info, only structural contradictions warn. */
 import type { ExamSection, Question } from '../types';
 import { normalizeForMatching } from './quality';
+import { isOptionMarkerLine } from './cleanup';
 
 export interface SemanticIssue {
-  code: 'ANSWER_ANCHOR_SUSPECT' | 'STEM_SHAPE_SUSPECT' | 'OPTION_DUPLICATE' | 'PASSAGE_DETACHED' | 'PASSAGE_CONTAINS_STEM' | 'SECTION_SPAN_OUTSIDE';
-  severity: 'info' | 'warn';
+  code: 'ANSWER_ANCHOR_SUSPECT' | 'STEM_SHAPE_SUSPECT' | 'OPTION_DUPLICATE' | 'PASSAGE_DETACHED' | 'PASSAGE_CONTAINS_STEM' | 'SECTION_SPAN_OUTSIDE' | 'STEM_HOLLOW' | 'OPTIONS_MISSING' | 'OPTIONS_UNVERIFIED';
+  /** 'error' issues are wired into the escalation-repair queue by the assembly funnel (C2). */
+  severity: 'info' | 'warn' | 'error';
   questionId?: string;
   message: string;
   keys?: string[]; // offending option keys for OPTION_DUPLICATE
@@ -28,11 +30,54 @@ function spanLineNumbers(spans: Array<[number, number]>): number[] {
   return out;
 }
 
-export function validateSemantic(questions: Question[], sections: ExamSection[] = []): SemanticIssue[] {
+/** C1 — non-number characters left in a stem once its printed number / parent reference and digits are removed. */
+export function stemLetterCount(stem?: string): number {
+  return norm(stem)
+    .replace(/^\s*(?:\(\d{1,3}\)|\d{1,3}\s*[.)\-:]|\d{1,3}\s*-\s*\d{1,3}\s*[.):]?)\s*/, '')
+    .replace(/\d+/g, '').replace(/\s+/g, ' ').trim().length;
+}
+export function hollowThreshold(type?: string): number {
+  return type === 'truefalse' || type === 'fillblank' || type === 'matching' ? 6 : 12;
+}
+const MATH_RE = /\d\s*[-+×÷*/^=<>]\s*\d|[=]\s*\?|\?\s*=|\d\s*%/;
+export function isStemHollow(q: Question, parent?: Question): boolean {
+  if (q.parentId && parent && !isStemHollow(parent)) return false; // children inherit a group stem
+  if ((q.images || []).length && (q.type === 'diagram' || q.type === 'matching')) return false;
+  if (q.type === 'numeric' || MATH_RE.test(norm(q.stem))) return false; // arithmetic stems are mostly digits by nature
+  return stemLetterCount(q.stem) < hollowThreshold(q.type);
+}
+const TF_RE = /^(?:true|false|t|f|درست|نادرست|صحیح|غلط|ص|غ)$/;
+/** C1 — MCQ_OPTIONS: mcq needs ≥2 distinct options of ≥2 chars; truefalse needs the exact pair when printed. */
+export function optionsProblem(q: Question, sourceText?: string): { code: 'OPTIONS_MISSING' | 'OPTIONS_UNVERIFIED'; severity: 'error' | 'warn'; message: string } | undefined {
+  const options = (q.options || []).filter(o => norm(o.text).length >= 2);
+  const distinct = new Set(options.map(o => norm(o.text))).size;
+  if (q.type === 'mcq') {
+    if (options.length >= 2 && distinct === options.length) return undefined;
+    const evidence = (q.options || []).length > 0 || (sourceText || '').split(/\r?\n/).some(line => isOptionMarkerLine(line));
+    if (evidence) return { code: 'OPTIONS_MISSING', severity: 'error', message: `Q${q.no}: MCQ has ${distinct} usable distinct option(s) (need ≥2) although the source prints option markers.` };
+    return { code: 'OPTIONS_UNVERIFIED', severity: 'warn', message: `Q${q.no}: typed MCQ but no option markers are printed in its source lines; type unverified.` };
+  }
+  if (q.type === 'truefalse' && q.options && q.options.length) {
+    const texts = q.options.map(o => norm(o.text));
+    const ok = texts.length === 2 && texts.every(t => TF_RE.test(t)) && texts[0] !== texts[1];
+    if (!ok) return { code: 'OPTIONS_MISSING', severity: 'error', message: `Q${q.no}: true/false question must carry exactly the True/False pair (got ${texts.join(' | ') || 'nothing'}).` };
+  }
+  return undefined;
+}
+
+export function validateSemantic(questions: Question[], sections: ExamSection[] = [], sourceTextFor?: (q: Question) => string): SemanticIssue[] {
   const issues: SemanticIssue[] = [];
   const sectionById = new Map((sections || []).map(s => [s.id, s]));
+  const questionById = new Map((questions || []).map(q => [q.id, q]));
   const answerTexts = (questions || []).map(q => norm(q.answer?.text));
   for (const q of questions || []) {
+    // C1 STEM_HOLLOW — a number with no question behind it (lazy one-line span, wrong anchor).
+    if (isStemHollow(q, q.parentId ? questionById.get(q.parentId) : undefined)) {
+      issues.push({ code: 'STEM_HOLLOW', severity: 'error', questionId: q.id, message: `Q${q.no}: stem has only ${stemLetterCount(q.stem)} non-number character(s) beyond its number (need ≥${hollowThreshold(q.type)}); the span likely stops at the number line.` });
+    }
+    // C1 MCQ_OPTIONS
+    const op = optionsProblem(q, sourceTextFor?.(q));
+    if (op) issues.push({ code: op.code, severity: op.severity, questionId: q.id, message: op.message });
     // (a) ANSWER-ANCHOR
     if (q.answer?.source === 'paper' && q.answer.text && norm(q.answer.text)) {
       const seg = norm(q.answer.text);

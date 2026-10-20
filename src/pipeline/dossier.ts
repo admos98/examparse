@@ -1,6 +1,7 @@
 import { ExamDoc } from '../types';
 import { getExamHealth, lineNumber, detectSectionHeaders } from './quality';
 import { PARSER_VERSION } from './prompts';
+import { computeQualityScore } from '../utils/qualityScore';
 
 export interface DossierQuestionIndex { no: number; label: string; sectionId?: string; type: string; points?: number; spanRange: [number, number] | null; hasImages: boolean; answerPresent: boolean; confidence: number; }
 export interface DossierImageIndex { id: string; page: number; anchorLine?: number; assignedTo?: string; role?: string; suspectStrip: boolean; }
@@ -58,18 +59,9 @@ export function buildDossier(doc: ExamDoc, existing?: Dossier): Dossier {
   // Quality score stored in dossier for Library sort/filter (local only, not gate)
   let qualityScore: any = undefined;
   try{
-    const coverageScore = Math.round((health.coveragePercent/100)*30);
-    const pointsScore = health.pointsExpected!==undefined ? (health.pointDeficit===0?15:Math.max(0,15-Math.abs(health.pointDeficit)*3)) : (health.pointsParsed>0?10:0);
-    let optionBlobCount=0;
-    for(const q of doc.questions||[]){ if(q.options&&q.stem) for(const opt of q.options) if(opt.text&&q.stem.includes(opt.text)&&opt.text.length>4) optionBlobCount++; }
-    const optionsCleanliness = Math.max(0,15-optionBlobCount*3);
-    const imagePlacement = Math.max(0,15 - health.unplacedImages.length*3 - health.unresolvedImageRefs.length*3);
-    const numbering = Math.max(0,10 - health.duplicates.length*3 - health.missing.length*2);
-    const confidence = Math.round((1 - health.lowConfidenceCount/(doc.questions?.length||1))*10);
-    const hasReadingListening = (doc.sections||[]).some(s=>/reading|listening|درک|شنیداری/i.test(s.title||''));
-    const passage = hasReadingListening ? ((doc.sections||[]).some(s=>s.passage && s.passage.trim().length>20) ?5:0) :5;
-    const total = Math.max(0,Math.min(100, coverageScore+Math.round(pointsScore)+optionsCleanliness+imagePlacement+numbering+confidence+passage));
-    qualityScore = { total, coverage:coverageScore, points:Math.round(pointsScore), optionsCleanliness, imagePlacement, numbering, confidence, passage };
+    // Single source of truth (B3 reweighting lives in utils/qualityScore).
+    const q = computeQualityScore(doc);
+    qualityScore = { total: q.total, coverage: q.coverage, points: q.points, optionsCleanliness: q.optionsCleanliness, imagePlacement: q.imagePlacement, numbering: q.numbering, confidence: q.confidence, orphan: q.orphan, passage: q.passage };
   }catch{}
   const dossier: Dossier = {
     identity: { id: doc.id, fileHash: doc.fileHash, title: doc.displayName, subject: doc.meta.subject, grade: doc.meta.grade, createdAt: doc.createdAt, parserVersion: PARSER_VERSION },

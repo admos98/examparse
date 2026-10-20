@@ -392,6 +392,79 @@ export function evaluateCoverage(
   };
 }
 
+/** C1 — META_TOTAL cross-check sources, in priority order. */
+export interface DocumentTotals {
+  totalLine?: { value: number; line: number };
+  keyPage?: { value: number; line: number };
+  sectionSum?: { value: number; headers: number };
+  /** Winner: total-points line (last occurrence in exam territory) > key page > section header sum. */
+  documentTotal?: number;
+  source?: 'total-line' | 'key-page' | 'section-sum';
+}
+
+const TOTAL_LINE_RE = /(?:جمع\s*(?:کل\s*)?نمر(?:ه|ات)|نمره\s*کل|بارم\s*کل|total\s*(?:points|marks|score)?|out\s*of)\s*[:：=]?\s*(\d{1,3}(?:[.,]\d{1,2})?)/i;
+const TOTAL_LINE_TRAILING_RE = /(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:نمره|points?|marks?)\s*(?:کل|total)?\s*$/i;
+function parseTotalValue(text: string): number | undefined {
+  const v = normalizeForMatching(text);
+  if (!/(?:جمع|نمره\s*کل|بارم\s*کل|total|out of)/i.test(v)) return undefined;
+  const m = v.match(TOTAL_LINE_RE) || v.match(TOTAL_LINE_TRAILING_RE);
+  const n = m ? Number(m[1].replace(',', '.')) : NaN;
+  return Number.isFinite(n) && n > 0 && n <= 300 ? n : undefined;
+}
+function parseHeaderPoints(text: string): number | undefined {
+  const v = normalizeForMatching(text);
+  const m = v.match(/\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:نمره|points?|marks?)\s*[:：]?\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)/i);
+  const n = Number(m?.[1] || m?.[2] || m?.[3]);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+export function extractDocumentTotals(lines: SourceLine[], keyLines: Set<number> | number[] = []): DocumentTotals {
+  const keys = keyLines instanceof Set ? keyLines : new Set(keyLines);
+  const sorted = [...lines].sort((a, b) => lineNumber(a) - lineNumber(b));
+  const out: DocumentTotals = {};
+  for (const line of sorted) {
+    if (line.furniture) continue;
+    const n = lineNumber(line);
+    if (parsePrintedNumberFromStem(line.text) !== undefined) continue; // "12. Total the following..." is a question
+    const value = parseTotalValue(line.text);
+    if (value === undefined) continue;
+    if (keys.has(n)) { if (!out.keyPage) out.keyPage = { value, line: n }; }
+    else out.totalLine = { value, line: n }; // last occurrence wins
+  }
+  const headers = detectSectionHeaders(sorted).filter(h => !keys.has(h.headerLine));
+  const pts = headers.map(h => parseHeaderPoints(h.rawTitle)).filter((v): v is number => v !== undefined);
+  if (headers.length >= 2 && pts.length === headers.length) out.sectionSum = { value: Number(pts.reduce((a, b) => a + b, 0).toFixed(2)), headers: headers.length };
+  const winner = out.totalLine ? ['total-line', out.totalLine.value] as const : out.keyPage ? ['key-page', out.keyPage.value] as const : out.sectionSum ? ['section-sum', out.sectionSum.value] as const : undefined;
+  if (winner) { out.source = winner[0]; out.documentTotal = winner[1]; }
+  return out;
+}
+
+export interface MetaTotalReconciliation {
+  totalPoints?: number;
+  flag?: { code: 'META_TOTAL_CORRECTED' | 'META_TOTAL_UNCHECKED'; severity: 'info' | 'warn'; message: string };
+  totals: DocumentTotals;
+}
+/** C1 — the document wins over the model's meta.totalPoints; a total below the question sum is always raised. */
+export function reconcileMetaTotal(metaTotal: number | undefined, lines: SourceLine[], keyLines: Set<number> | number[], questions: Array<{ points?: number; parentId?: string }>): MetaTotalReconciliation {
+  const totals = extractDocumentTotals(lines, keyLines);
+  const questionSum = Number(questions.filter(q => !q.parentId).reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2));
+  let total = metaTotal;
+  let flag: MetaTotalReconciliation['flag'];
+  if (totals.documentTotal !== undefined) {
+    if (metaTotal === undefined || Math.abs(metaTotal - totals.documentTotal) > 0.01) {
+      total = totals.documentTotal;
+      flag = { code: 'META_TOTAL_CORRECTED', severity: 'info', message: `Total points ${metaTotal === undefined ? 'were missing' : `${metaTotal} (model)`} → ${totals.documentTotal} from the document's ${totals.source === 'total-line' ? 'total-points line' : totals.source === 'key-page' ? 'answer-key total' : 'section header sum'}.` };
+    }
+  } else {
+    flag = { code: 'META_TOTAL_UNCHECKED', severity: 'info', message: `No total-points line, key total or complete section header points found; meta total ${metaTotal ?? '—'} is unchecked.` };
+  }
+  if (questionSum > 0 && total !== undefined && total + 0.01 < questionSum) {
+    flag = { code: 'META_TOTAL_CORRECTED', severity: 'warn', message: `Total points ${total} were below the parsed question sum ${questionSum}; raised to the question sum.` };
+    total = questionSum;
+  }
+  return { totalPoints: total, flag, totals };
+}
+
 export interface ExamHealth {
   expectedCount: number;
   parsedCount: number;
@@ -407,6 +480,10 @@ export interface ExamHealth {
   coveragePercent: number;
   state: 'green' | 'amber' | 'red';
   complete: boolean;
+  /** C2 survivors: questions still carrying error-severity validator flags after repair. */
+  hollowQuestions: Array<{ id: string; label: string; code: string }>;
+  /** B3 orphan lines (persisted by the pipeline; recomputed lazily by callers that need exactness). */
+  orphanLines: number;
 }
 
 export function getExamHealth(doc: ExamDoc): ExamHealth {
@@ -467,7 +544,9 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
   const hasQuestions = (doc.questions || []).length > 0;
   const hierarchy = buildQuestionTree(doc.questions || []);
   const parentLinkIssueCount = hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size;
-  const complete = hasQuestions && coverage.complete && unplacedImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0;
+  const hollowQuestions = (doc.questions || []).flatMap(q => (q.flags || []).filter(code => code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS').map(code => ({ id: q.id, label: q.label, code })));
+  const orphanLines = (doc.source?.orphanLineNos || []).length;
+  const complete = hasQuestions && coverage.complete && unplacedImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0 && hollowQuestions.length === 0;
   const state = coverage.expected.length > 0 && coverage.coveragePercent < 80
     ? 'red'
     : complete ? 'green' : 'amber';
@@ -486,6 +565,8 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     coveragePercent: coverage.coveragePercent,
     state: hasCoverageProblem && coverage.expected.length > 0 && coverage.coveragePercent < 80 ? 'red' : state,
     complete,
+    hollowQuestions,
+    orphanLines,
   };
 }
 

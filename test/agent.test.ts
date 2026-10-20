@@ -311,6 +311,8 @@ test('soft cap is read-only and hard bounds stop at ≤6 model and ≤12 tool ex
   const h = harness(
     Array(6).fill(tool('rename_exam', { name: 'forbidden by cap' })),
   );
+  // Pin the historical 6/12 bound explicitly (E3 raised the defaults to 30/200).
+  h.runtime.getSettings().agentLimits = { maxModelCalls: 6, maxToolExecutions: 12 };
   h.runtime.readOnly = () => true;
   const s = newAgentSession(h.doc.id);
   await runAgentTurn(h.runtime, s, 'rename');
@@ -330,6 +332,7 @@ test('soft cap is read-only and hard bounds stop at ≤6 model and ≤12 tool ex
       ].join('\n'),
     ),
   );
+  reads.runtime.getSettings().agentLimits = { maxModelCalls: 6, maxToolExecutions: 12 };
   const rs = newAgentSession(reads.doc.id);
   await runAgentTurn(reads.runtime, rs, 'check');
   assert.ok(rs.executions <= 12);

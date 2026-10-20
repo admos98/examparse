@@ -140,7 +140,7 @@ export function applyValidatedQuestionPatch(question: Question, patch: unknown, 
     rewrites: merged.rewrites, images: merged.images, confidence: merged.confidence,
     answer: merged.answer?.spans ? { spans: merged.answer.spans } : undefined,
     tables: merged.tables?.map((t: any) => ({ spans: t.spans })),
-  }], sourceLines, undefined, { keyTerritoryLineNos: keyLines });
+  }], sourceLines, undefined, { keyTerritoryLineNos: keyLines, gapCompletion: false, semanticErrorsToRepair: false, rewritePolicy: 'open' });
   if (!result.questions[0] || result.failingQuestions.length) throw new Error(`Question patch refused: ${result.failingQuestions.flatMap(f => f.errors).join('; ') || 'invalid question'}`);
   return { ...result.questions[0], answer: result.questions[0].answer || question.answer };
 }

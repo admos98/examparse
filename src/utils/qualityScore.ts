@@ -1,5 +1,6 @@
 import { ExamDoc } from '../types';
-import { getExamHealth, enumerateExpectedQuestionNos } from '../pipeline/quality';
+import { getExamHealth } from '../pipeline/quality';
+import { computeDocOwnership } from '../pipeline/ownership';
 
 export interface QualityBreakdown {
   coverage: number; // 0-30
@@ -7,7 +8,8 @@ export interface QualityBreakdown {
   optionsCleanliness: number; // 0-15
   imagePlacement: number; // 0-15
   numbering: number; // 0-10
-  confidence: number; // 0-10
+  confidence: number; // 0-6 (B3 reweighting: confidence 6 + orphan 4 = the former confidence 10)
+  orphan: number; // 0-4 — share of exam-territory lines owned by nothing
   passage: number; // 0-5
   total: number; // 0-100
   details: {
@@ -19,6 +21,8 @@ export interface QualityBreakdown {
     missingNumbers: number;
     lowConfidenceCount: number;
     passageMissing: boolean;
+    orphanLines: number;
+    orphanRate: number;
   };
 }
 
@@ -55,11 +59,15 @@ export function computeQualityScore(doc: ExamDoc): QualityBreakdown {
   const numberingPenalty = health.duplicates.length * 3 + health.missing.length * 2;
   const numbering = clamp(10 - numberingPenalty, 0, 10);
 
-  // confidence 10 pts
+  // confidence 6 pts
   const low = health.lowConfidenceCount;
   const totalQ = doc.questions?.length || 1;
   const confidenceRatio = 1 - low / totalQ;
-  const confidence = Math.round(confidenceRatio * 10);
+  const confidence = Math.round(confidenceRatio * 6);
+
+  // orphan lines 4 pts (B3): 0% → 4, each 1% of exam territory costs a point
+  const ownership = computeDocOwnership(doc);
+  const orphan = clamp(4 - Math.ceil(ownership.orphanRate * 100), 0, 4);
 
   // passage presence 5 pts: if any reading/listening section exists, check passage
   const hasReadingListening = (doc.sections || []).some(s => /reading|listening|درک|شنیداری/i.test(s.title || '') || (s as any).kind?.match(/Reading|Listening/));
@@ -69,7 +77,7 @@ export function computeQualityScore(doc: ExamDoc): QualityBreakdown {
     passage = anyPassage ? 5 : 0;
   }
 
-  const total = clamp(coverageScore + pointsScore + optionsCleanliness + imagePlacement + numbering + confidence + passage, 0, 100);
+  const total = clamp(coverageScore + pointsScore + optionsCleanliness + imagePlacement + numbering + confidence + orphan + passage, 0, 100);
 
   return {
     coverage: coverageScore,
@@ -78,6 +86,7 @@ export function computeQualityScore(doc: ExamDoc): QualityBreakdown {
     imagePlacement,
     numbering,
     confidence,
+    orphan,
     passage,
     total,
     details: {
@@ -89,6 +98,8 @@ export function computeQualityScore(doc: ExamDoc): QualityBreakdown {
       missingNumbers: health.missing.length,
       lowConfidenceCount: low,
       passageMissing: hasReadingListening && passage === 0,
+      orphanLines: ownership.orphanLineNos.length,
+      orphanRate: ownership.orphanRate,
     },
   };
 }

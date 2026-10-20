@@ -3,6 +3,15 @@
  * Strictly implements §4 and §7 of specifications
  */
 
+/**
+ * Stage 2.5 cleanup tags. Tags are JUDGMENTS applied to line objects by deterministic
+ * code: the line's id, text and position are never changed, so tagging is reversible.
+ */
+export type LineTag =
+  | 'keep' | 'junk' | 'suspect-junk' | 'furniture' | 'pagenum' | 'key'
+  | 'header' | 'instruction' | 'question' | 'option' | 'passage' | 'dialogue' | 'table-row';
+export type LineTagSource = 'local' | 'ai' | 'user';
+
 export type SourceLine = {
   id: string; // e.g. "L0001"
   page: number;
@@ -11,6 +20,13 @@ export type SourceLine = {
   pageHeight?: number; // PDF coordinate height, for conservative header/footer-only furniture
   furniture?: boolean;
   layoutWarning?: string;
+  /** Cleanup verdict (A2/A3). Absent ⇒ untagged ⇒ behaves exactly like the pre-cleanup pipeline. */
+  tag?: LineTag;
+  tagSource?: LineTagSource;
+  /** AI confidence digit 0–9 for the verdict (local tags omit it). */
+  tagConf?: number;
+  /** Local readability signal (D1): ≥30% tokens with mixed-script glue / U+FFFD / watermark residue. */
+  garbled?: boolean;
 };
 
 export type LineSpan = [number, number]; // inclusive start/end, 1-based (e.g. [41, 45])
@@ -111,7 +127,7 @@ export interface Flag {
 
 export interface UsageRecord {
   ts: string;
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup';
   provider: string;
   model: string;
   inputTokens: number;
@@ -161,6 +177,12 @@ export interface ExamDoc {
     expectedQuestionNos?: number[];
     /** 1-based LAS line numbers belonging to official key territory. */
     keyTerritoryLineNos?: number[];
+    /** B3: lines that belong to nothing after gap completion (excluding furniture/pagenum/key/junk). */
+    orphanLineNos?: number[];
+    /** A4: user-flipped cleanup verdicts (line → tag); respected by re-runs via the pipeline cache. */
+    cleanupOverrides?: Record<string, LineTag>;
+    /** Stage 2.5 summary for the stage card / bench (lines judged, junk, tokens saved). */
+    cleanupStats?: { judged: number; junk: number; suspect: number; fenceSaved: number; aiSkipped: boolean; linesBefore: number; linesAfter: number; tokensBefore: number; tokensAfter: number; source: 'off' | 'local' | 'ai' | 'cached' };
   };
   flags: Flag[];
   usage: UsageRecord[];
@@ -251,6 +273,8 @@ export interface RoleMapping {
   /** 2B/2C: optional roles; defaults — critic→escalation, consensus→distinct model else escalation. */
   critic?: RoleModelSelection;
   consensus?: RoleModelSelection;
+  /** A2: cleanup role (defaults to the fast/structure model). */
+  cleanup?: RoleModelSelection;
 }
 
 export interface CostRate {
@@ -298,13 +322,15 @@ export interface AppSettings {
   defaultExamMode?: 'exam' | 'review';
   livePanel?: boolean;
   agentLimits?: { maxModelCalls?: number; maxToolExecutions?: number };
+  /** A4/F3: Stage 2.5 cleanup on/off (default on). Off ⇒ no tags, byte-identical pre-cleanup behaviour. */
+  cleanupEnabled?: boolean;
 }
 
 /**
  * LLM Request & Response Abstraction (§7)
  */
 export interface LLMRequest {
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup';
   system: string;
   text: string;
   images?: {
@@ -349,7 +375,7 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'ocr' | 'structure' | 'vision' | 'assemble' | 'repair';
+export type PipelineStageId = 'extract' | 'ocr' | 'cleanup' | 'structure' | 'vision' | 'assemble' | 'repair';
 
 export interface StageStatus {
   id: PipelineStageId;

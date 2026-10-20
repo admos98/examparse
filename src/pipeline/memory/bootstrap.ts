@@ -35,7 +35,7 @@ export const BOOTSTRAP_PLAYBOOK: PlaybookFile = {
       id: 'bootstrap_004_option_shared',
       kind: 'doc-trait',
       scope: { docTrait: 'image-heavy' },
-      lesson: 'Option lines shared across adjacent questions are stems, not gaps — keep option spans local to each question; do not drop shared lines.',
+      lesson: 'When two options share one printed line, split at the second option marker and assign each fragment to its own option key; never give both options the whole line.',
       evidence: { runIds: ['bootstrap'], successes: 2, failures: 0, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString(), lastVerified: new Date().toISOString() },
       status: 'active',
       confidence: 0.7,

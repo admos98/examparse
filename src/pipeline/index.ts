@@ -10,6 +10,11 @@ import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
 import { labelImagesBatched } from './vision';
 import { assembleAndValidateQuestions, assembleAndValidateSections, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
+import { validateSemantic } from './semanticValidators';
+import { buildCriticQueue, runCritic, recordVerdicts } from './critic';
+import { consensusTriggerForSection, diffConsensus, resolveConsensusModel, CONSENSUS_CAPS } from './consensus';
+import { tracesForDoc } from './provenance';
+import { LLMAdapter } from '../providers/adapter';
 import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, parsePrintedNumberFromStem } from './quality';
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
@@ -23,6 +28,8 @@ import { beginJob, endJob, guidanceSummary, type JobHandle } from './memory/harn
 
 export interface PipelineCallbacks {
   onStageUpdate: (stage: StageStatus) => void;
+  /** 2E: task-graph node events (section · status · tokens) for the Step 3 node list. */
+  onNodeUpdate?: (node: { id: string; label?: string; status: string; tokens?: number; error?: string }) => void;
   onUsageUpdate?: (record: UsageRecord) => void;
   onLiveText?: (stageId: string, label: string, channel: 'output' | 'reasoning' | 'info', fullText: string) => void;
 }
@@ -349,6 +356,8 @@ export async function runFullPipeline(
           onProgress: message => onStageUpdate({ id: 'structure', name: 'Structure Pass', status: 'running', message }),
           onLiveText: (label, channel, fullText) => onLiveText?.('structure', label, channel, fullText),
           guidance: structureGuidance,
+          parallelSections: settings.parallelSections ?? 3,
+          onNode: node => { onLiveText?.('structure', `node ${node.id}`, 'info', `${node.label || node.id}: ${node.status}${node.error ? ` — ${node.error}` : ''}`); callbacks.onNodeUpdate?.(node); },
         });
       } catch (err: any) {
         onStageUpdate({
@@ -706,6 +715,14 @@ export async function runFullPipeline(
   const sectionAssembly = assembleAndValidateSections(structureData.sections, workingLines, finalQuestions, keyTerritoryLineNos);
   allFlags.push(...sectionAssembly.flags.map((f, i) => ({ ...f, id: f.id || `flag_section_${i + 1}` })));
 
+  // 2A (d)/(e): section-aware semantic validators, now that sections exist.
+  for (const issue of validateSemantic(finalQuestions, sectionAssembly.sections)) {
+    if (issue.code !== 'PASSAGE_DETACHED' && issue.code !== 'PASSAGE_CONTAINS_STEM' && issue.code !== 'SECTION_SPAN_OUTSIDE') continue;
+    allFlags.push({ id: `flag_${issue.code}_${issue.questionId || 'doc'}`, severity: issue.severity, code: issue.code, message: issue.message, questionId: issue.questionId });
+    const q = finalQuestions.find(item => item.id === issue.questionId);
+    if (q && !q.flags?.includes(issue.code)) q.flags = [...(q.flags || []), issue.code];
+  }
+
   const pointsSummary = `${coverage.pointsParsed}${totalDeclaredPoints !== undefined ? ` of ${totalDeclaredPoints}` : ''}`;
   const missingSummary = coverage.missing.length ? `missing ${coverage.missing.join(', ')}` : 'missing none';
   const guidanceNote = structureData.guidanceTokens ? ` · guidance tokens ${structureData.guidanceTokens}` : ' · guidance tokens 0';
@@ -726,6 +743,139 @@ export async function runFullPipeline(
     status: isIncomplete ? (coverage.coveragePercent < 80 ? 'partial' : 'completed-with-problems') : 'completed',
     message: `Assembled ${finalQuestions.length} questions across ${sectionAssembly.sections.length} sections. ${structureSummary}`,
   });
+
+  // 2C CONSENSUS + 2B CRITIC (evidence-only, caps enforced, never blocks on failure)
+  let verdictStore: Record<string, any[]> = {};
+  let consensusSectionsRun: string[] = [];
+  let criticSummary = { calls: 0, defects: 0, ok: 0 };
+  try {
+    const semanticAll = validateSemantic(finalQuestions, sectionAssembly.sections);
+    const disagreementIds: string[] = [];
+    // 2C — hard sections only; clean sections never pay.
+    if (settings.consensusEnabled !== false && settings.providers.length) {
+      const consSel = settings.roleMapping.consensus || settings.roleMapping.escalation;
+      const consProvider = settings.providers.find(p => p.id === consSel?.providerId) || settings.providers[0];
+      const resolved = resolveConsensusModel(structProviderConfig.model, consSel?.model, settings.roleMapping.escalation?.model);
+      const parsedNosGlobal = new Set(finalQuestions.map(q => q.no));
+      const triggered = sectionAssembly.sections.filter(sec => {
+        const qs = finalQuestions.filter(q => q.sectionId === sec.id);
+        // Missing in-section: expected printed number whose source line lies inside this section's spans and was not parsed.
+        const missingInSection = expectedQuestionNos.filter(n => {
+          if (parsedNosGlobal.has(n)) return false;
+          const line = expectedEnumeration.lineByNumber.get(n);
+          return line !== undefined && (sec.spans || []).some(([a, b]) => line >= a && line <= b);
+        });
+        // In-section points mismatch: parsed points vs the section header total, when declared.
+        const parsedPoints = qs.reduce((sum, q) => sum + (q.points || 0), 0);
+        const pointsMismatch = typeof sec.points === 'number' && sec.points > 0 && parsedPoints > 0 && Math.abs(parsedPoints - sec.points) > 0.51;
+        // Tripwires fired by this section's structure call (flag messages name the section).
+        const tripwiresFired = (structureData.flags || []).some((f: any) => /TRIPWIRE/i.test(String(f?.code)) && (!sec.title || String(f?.message || '').includes(sec.title)));
+        return consensusTriggerForSection({ questions: qs, issues: semanticAll, missingInSection, pointsMismatch, tripwiresFired }).triggered;
+      }).slice(0, CONSENSUS_CAPS.maxSections);
+      if ('skip' in resolved) {
+        if (triggered.length) allFlags.push({ id: 'flag_CONSENSUS_SAME_MODEL', severity: 'info', code: 'CONSENSUS_SAME_MODEL', message: `Consensus skipped: consensus model is the structure model (${resolved.model}); ${triggered.length} hard section(s) not re-parsed (0 calls).` });
+      } else if (triggered.length) {
+        const consProviderConfig = { ...consProvider, model: resolved.model };
+        let consCalls = 0;
+        for (const sec of triggered) {
+          if (consCalls >= CONSENSUS_CAPS.maxCalls) break;
+          const aQs = finalQuestions.filter(q => q.sectionId === sec.id);
+          if (!aQs.length) continue;
+          const second = await runStructurePass({
+            sourceLines: workingLines, images: extracted.images, languageHint: language,
+            latexEnabled: settings.thrift.latexNormalization, providerConfig: consProviderConfig,
+            maxBudgetTokens: settings.budget.maxOutputTokens, journalEnabled: false,
+            recoveryOnlyNumbers: aQs.map(q => q.no), guidance: structureGuidance,
+            parallelSections: settings.parallelSections ?? 3,
+          });
+          consCalls += second.callUsage?.length || second.attempts || 1;
+          consensusSectionsRun.push(sec.id);
+          const usageRec: UsageRecord = { ts: new Date().toISOString(), role: 'consensus', provider: consProviderConfig.name, model: resolved.model, inputTokens: second.usage.inputTokens || 0, outputTokens: second.usage.outputTokens || 0, costUsd: calculateActualCost(second.usage.inputTokens || 0, second.usage.outputTokens || 0, resolved.model, settings.costTable), label: `Consensus: ${sec.title || sec.id}` };
+          usageRecords.push(usageRec); appendUsageRecord(usageRec); onUsageUpdate?.(usageRec);
+          const bAssembled = assembleAndValidateQuestions(second.rawQuestions || [], workingLines, totalDeclaredPoints, { keyTerritoryLineNos, imageIds: updatedImages.map(i => i.id), unresolvedImageIds, sections: sectionAssembly.sections });
+          const dec = diffConsensus(aQs, bAssembled.questions.filter(q => aQs.some(a => a.no === q.no) || q.sectionId === sec.id), semanticAll);
+          for (const accepted of dec.accepted) {
+            const idx = finalQuestions.findIndex(q => q.no === accepted.no && q.sectionId === sec.id);
+            if (idx >= 0) finalQuestions[idx] = { ...accepted, sectionId: sec.id };
+            else finalQuestions.push({ ...accepted, sectionId: sec.id });
+          }
+          for (const rev of dec.review) {
+            disagreementIds.push(finalQuestions.find(q => q.no === rev.no && q.sectionId === sec.id)?.id || '');
+            allFlags.push({ id: `flag_CONSENSUS_REVIEW_${sec.id}_${rev.no}`, severity: 'warn', code: 'CONSENSUS_REVIEW', message: `Q${rev.no} (${sec.title || sec.id}): ${rev.reason}; both parses kept for Step 4 review.`, questionId: finalQuestions.find(q => q.no === rev.no && q.sectionId === sec.id)?.id });
+          }
+          if (dec.needsCritic.length) allFlags.push({ id: `flag_CONSENSUS_CRITIC_${sec.id}`, severity: 'info', code: 'CONSENSUS_CRITIC_TIEBREAK', message: `${sec.title || sec.id}: span conflict with both sides clean on Q${dec.needsCritic.join(', Q')} — queued for the critic.` });
+        }
+        onStageUpdate({ id: 'assemble', name: 'Assemble & Validate', status: 'completed', message: `Consensus ran on ${consensusSectionsRun.length} hard section(s) (${consCalls} call(s), model ${resolved.model}); clean sections were not re-parsed.` });
+      }
+    }
+    // 2B — critic on evidence only. Defaults to the escalation model; never edits.
+    const queue = buildCriticQueue(finalQuestions, validateSemantic(finalQuestions, sectionAssembly.sections), disagreementIds.filter(Boolean));
+    if (queue.length) {
+      const criticSel = settings.roleMapping.critic || settings.roleMapping.escalation;
+      const criticProvider = settings.providers.find(p => p.id === criticSel?.providerId) || settings.providers[0];
+      const caller = criticProvider ? async (batch: any[]) => {
+        const cfg = { ...criticProvider, model: criticSel?.model || settings.roleMapping.escalation.model };
+        const payload = batch.map(item => ({ questionId: item.question.id, no: item.question.no, type: item.question.type, stem: (item.question.stem || '').slice(0, 400), options: (item.question.options || []).map((o: any) => o.text), sourceSlice: sliceSourceSpans(item.question.spans || [], workingLines).slice(0, 600), suspicions: item.suspicions.map((x: any) => x.code), reason: item.reason }));
+        const resp = await LLMAdapter.execute({ role: 'critic', system: 'You are an adversarial verifier. You NEVER edit. For each item return a verdict only. Output strict JSON: {"verdicts":[{"questionId":"...","verdict":"ok|defect","defectKind":"...","suggestedAction":"accept|reparse|review","note":"≤140 chars"}]}', text: JSON.stringify(payload), maxOutputTokens: 1200, label: 'Critic (evidence queue)', providerConfig: cfg } as any);
+        const usageRec: UsageRecord = { ts: new Date().toISOString(), role: 'critic', provider: criticProvider.name, model: cfg.model, inputTokens: resp.usage.inputTokens || 0, outputTokens: resp.usage.outputTokens || 0, costUsd: calculateActualCost(resp.usage.inputTokens || 0, resp.usage.outputTokens || 0, cfg.model, settings.costTable), label: 'Critic (evidence queue)' };
+        usageRecords.push(usageRec); appendUsageRecord(usageRec); onUsageUpdate?.(usageRec);
+        try { const parsed = JSON.parse(resp.rawText.match(/\{[\s\S]*\}/)?.[0] || '{}'); return Array.isArray(parsed.verdicts) ? parsed.verdicts : []; } catch { return []; }
+      } : null;
+      const criticRun = await runCritic(queue, caller);
+      criticSummary = { calls: criticRun.calls, defects: criticRun.verdicts.filter(v => v.verdict === 'defect').length, ok: criticRun.verdicts.filter(v => v.verdict === 'ok').length };
+      verdictStore = recordVerdicts(verdictStore, criticRun.verdicts);
+      for (const v of criticRun.verdicts) {
+        const q = finalQuestions.find(item => item.id === v.questionId);
+        if (q && !q.flags?.includes('CRITIC_' + v.verdict.toUpperCase())) q.flags = [...(q.flags || []), 'CRITIC_' + v.verdict.toUpperCase()];
+        allFlags.push({ id: `flag_CRITIC_${v.questionId}`, severity: v.verdict === 'defect' ? 'warn' : 'info', code: v.verdict === 'defect' ? 'CRITIC_DEFECT' : 'CRITIC_OK', message: `Critic Q${q?.no ?? v.questionId}: ${v.verdict}${v.defectKind ? ` (${v.defectKind})` : ''} → ${v.suggestedAction}. ${v.note}`, questionId: v.questionId });
+      }
+      if (criticRun.degraded) allFlags.push({ id: 'flag_CRITIC_UNCONFIGURED', severity: 'info', code: 'CRITIC_UNCONFIGURED', message: `No critic model configured: ${queue.length} flagged question(s) queued for Step 4 review (0 critic calls).` });
+      else if (criticRun.reparseQueue.length) {
+        // 2B: reparse → existing recovery machinery/budget. The critic never edits;
+        // the structure role re-parses only the condemned printed numbers and the
+        // replacement must assemble cleanly (or at least differently) to be adopted.
+        const reparseNos = [...new Set(criticRun.reparseQueue.map(id => finalQuestions.find(q => q.id === id)?.no).filter((n): n is number => typeof n === 'number'))];
+        let adopted = 0;
+        if (reparseNos.length) {
+          try {
+            const existingRawQuestions = finalQuestions.map(question => ({
+              id: question.id, label: question.label, no: question.no, parentId: question.parentId, sectionId: question.sectionId,
+              spans: question.spans, points: question.points, type: question.type,
+              options: question.options?.map(option => ({ key: option.key, spans: option.spans })),
+              answer: question.answer?.spans ? { spans: question.answer.spans } : undefined,
+              tables: question.tables?.map(table => ({ spans: table.spans })),
+              rewrites: question.rewrites, images: question.images, confidence: question.confidence, flags: question.flags,
+            }));
+            const reparsed = await runStructurePass({
+              sourceLines: workingLines, images: extracted.images, languageHint: language,
+              latexEnabled: settings.thrift.latexNormalization, providerConfig: structProviderConfig,
+              maxBudgetTokens: settings.budget.maxOutputTokens, journalEnabled: false,
+              forceSectionMode: true, recoveryOnlyNumbers: reparseNos, existingRawQuestions,
+              existingSections: sectionAssembly.sections, guidance: structureGuidance,
+              parallelSections: settings.parallelSections ?? 3,
+            });
+            const usageRec: UsageRecord = { ts: new Date().toISOString(), role: 'fast', provider: structProviderConfig.name, model: structProviderConfig.model, inputTokens: reparsed.usage.inputTokens || 0, outputTokens: reparsed.usage.outputTokens || 0, costUsd: calculateActualCost(reparsed.usage.inputTokens || 0, reparsed.usage.outputTokens || 0, structProviderConfig.model, settings.costTable), label: 'Critic Reparse (recovery machinery)' };
+            usageRecords.push(usageRec); appendUsageRecord(usageRec); onUsageUpdate?.(usageRec);
+            const fresh = assembleAndValidateQuestions((reparsed.rawQuestions || []).filter((raw: any) => reparseNos.includes(Number(raw.no))), workingLines, totalDeclaredPoints, { keyTerritoryLineNos, imageIds: updatedImages.map(i => i.id), unresolvedImageIds, sections: sectionAssembly.sections });
+            for (const candidate of fresh.questions) {
+              const idx = finalQuestions.findIndex(q => q.no === candidate.no);
+              if (idx < 0) continue;
+              const before = finalQuestions[idx];
+              const candidateWarns = validateSemantic([candidate], sectionAssembly.sections).filter(i => i.severity === 'warn').length;
+              const beforeWarns = validateSemantic([before], sectionAssembly.sections).filter(i => i.severity === 'warn').length;
+              if (candidateWarns < beforeWarns || JSON.stringify(candidate.spans) !== JSON.stringify(before.spans)) {
+                finalQuestions[idx] = { ...candidate, id: before.id, sectionId: before.sectionId, flags: [...(candidate.flags || []), 'CRITIC_REPARSED'] };
+                adopted++;
+              }
+            }
+          } catch { /* recovery failure leaves the original questions + review flags intact */ }
+        }
+        allFlags.push({ id: 'flag_CRITIC_REPARSE', severity: 'warn', code: 'CRITIC_REPARSE_DONE', message: `Critic requested reparse for ${reparseNos.length} question(s); existing recovery machinery re-parsed them and ${adopted} replacement(s) were adopted (critic itself never edits). Remainder stay at the top of the Step 4 queue.` });
+      }
+    }
+  } catch (err: any) {
+    allFlags.push({ id: 'flag_PROVING_GROUND_SKIPPED', severity: 'info', code: 'PROVING_GROUND_SKIPPED', message: `Consensus/critic stage skipped after a local error (pipeline result unaffected): ${String(err?.message || err).slice(0, 160)}` });
+  }
 
   // 7. BUILD FINAL EXAM DOC & PERSIST
   const examId = `exam_${fileHash.slice(0, 12)}`;
@@ -778,6 +928,8 @@ export async function runFullPipeline(
     },
     flags: allFlags,
     usage: usageRecords,
+    verdicts: verdictStore,
+    traces: tracesForDoc({ id: examId, questions: finalQuestions } as any, { callLabel: 'Structure Pass', model: structProviderConfig.model, journalResumed: Boolean(structureData.isCachedHit) }),
   };
 
   // C5: resolve extraction collisions only after assembly, when source-page context
@@ -810,6 +962,7 @@ export async function runFullPipeline(
           duplicates: finalHealth.duplicates, coveragePercent: finalHealth.coveragePercent, state: finalHealth.state,
           complete: finalHealth.complete, pointsParsed: finalHealth.pointsParsed, pointsExpected: finalHealth.pointsExpected,
         },
+        verifierDefects: allFlags.filter(f => ['ANSWER_ANCHOR_SUSPECT','OPTION_DUPLICATE','PASSAGE_DETACHED','SECTION_SPAN_OUTSIDE','CRITIC_DEFECT'].includes(String(f?.code))).length,
         calls: liveCalls.length,
         tokens: {
           input: usageRecords.reduce((sum, record) => sum + (record.inputTokens || 0), 0),

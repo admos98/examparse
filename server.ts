@@ -332,6 +332,25 @@ app.post('/api/memory/runs', (req, res) => {
   return res.json({ ok: true, lines: fs.existsSync(RUNS_FILE()) ? fs.readFileSync(RUNS_FILE(), 'utf8').split('\n').filter(Boolean).length : 0 });
 });
 
+// --- Live bench scorecards (2G) — stored, never auto-run ---
+const LIVEBENCH_FILE = () => path.join(MEMORY_DIR, 'livebench.json');
+app.get('/api/memory/livebench', (_req, res) => {
+  if (!DATA_DIR || !fs.existsSync(LIVEBENCH_FILE())) return res.json([]);
+  try { const data = JSON.parse(fs.readFileSync(LIVEBENCH_FILE(), 'utf8')); return res.json(Array.isArray(data) ? data : []); } catch { return res.json([]); }
+});
+app.post('/api/memory/livebench', (req, res) => {
+  if (!DATA_DIR) return res.status(503).json({ error: 'Choose a local data folder first.' });
+  const card = req.body;
+  if (!card || typeof card !== 'object' || typeof card.modelId !== 'string') return res.status(400).json({ error: 'Scorecard requires a modelId.' });
+  ensureMemoryDirs();
+  let all: any[] = [];
+  try { all = JSON.parse(fs.readFileSync(LIVEBENCH_FILE(), 'utf8')); if (!Array.isArray(all)) all = []; } catch { all = []; }
+  all.push(card);
+  atomicWriteJson(LIVEBENCH_FILE(), all.slice(-20));
+  appendActivity({ type: 'livebench', message: `Live bench stored for ${card.modelId}: mean coverage ${card.meanCoverage}%` });
+  return res.json({ ok: true, stored: all.length });
+});
+
 // --- Playbook (A2/B2/B4) ---
 app.get('/api/memory/playbook', (_req, res) => {
   if (!DATA_DIR) return res.json({ version: 1, entries: [] });

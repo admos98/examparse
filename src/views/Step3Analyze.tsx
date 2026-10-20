@@ -50,6 +50,7 @@ export const Step3Analyze: React.FC<Props> = ({
 }) => {
   const [forceRerun, setForceRerun] = useState(false);
   const [live, setLive] = useState({ stage: '', label: '', output: '', reasoning: '', info: '', attempts: [] as Array<{ stage: string; label: string; output: string; reasoning: string; ts?: string; finishReason?: string }> });
+  const [graphNodes, setGraphNodes] = useState<Array<{ id: string; label?: string; status: string; tokens?: number; error?: string }>>([]);
   const liveRef = useRef(live);
   const [liveOpen, setLiveOpen] = useState(settings.livePanel ?? true);
   useEffect(() => { setLiveOpen(settings.livePanel ?? true); }, [settings.livePanel]);
@@ -291,6 +292,7 @@ export const Step3Analyze: React.FC<Props> = ({
     }
 
     setErrorMsg(null);
+    setGraphNodes([]);
     liveUserScrolledUp.current = false;
     liveRef.current = { ...liveRef.current, stage: '', label: '', output: '', reasoning: '', info: '' };
     setLive(liveRef.current);
@@ -314,6 +316,13 @@ export const Step3Analyze: React.FC<Props> = ({
         {
           onStageUpdate: updated => {
             onStagesUpdate(prev => prev.map(s => (s.id === updated.id ? { ...s, ...updated } : s)));
+          },
+          onNodeUpdate: node => {
+            setGraphNodes(prev => {
+              const idx = prev.findIndex(n => n.id === node.id);
+              if (idx >= 0) { const next = [...prev]; next[idx] = node; return next; }
+              return [...prev, node];
+            });
           },
           onLiveText: (stage, label, channel, fullText) => {
             const prev = liveRef.current;
@@ -634,6 +643,22 @@ export const Step3Analyze: React.FC<Props> = ({
             );
           })}
         </div>
+        {/* 2E task-graph nodes: section · status · tokens (live text streams into the Live panel below) */}
+        {graphNodes.length > 0 && (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-1.5 text-xs">
+            <div className="font-semibold text-slate-700 dark:text-slate-200">Section nodes ({graphNodes.filter(n => n.status === 'done' || n.status === 'resumed').length}/{graphNodes.length} complete · parallel sections {settings.parallelSections ?? 3})</div>
+            {graphNodes.map(node => (
+              <div key={node.id} className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${node.status === 'done' || node.status === 'resumed' ? 'bg-emerald-500' : node.status === 'running' ? 'bg-blue-500 animate-pulse' : node.status === 'failed' ? 'bg-red-500' : node.status === 'skipped' ? 'bg-amber-500' : 'bg-slate-300'}`} />
+                <span className="font-medium text-slate-800 dark:text-slate-100">{node.label || node.id}</span>
+                <span className="text-slate-500">{node.status}</span>
+                {node.tokens !== undefined && node.status === 'done' && <span className="font-mono text-slate-400">{node.tokens} tok</span>}
+                {node.error && <span className="text-red-500 truncate">{node.error}</span>}
+              </div>
+            ))}
+            {graphNodes.some(n => n.status === 'failed' || n.status === 'skipped') && <div className="text-amber-600 dark:text-amber-400">PARTIAL: failed/skipped section nodes are named above; the rest of the exam completed.</div>}
+          </div>
+        )}
         <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
           <button className="w-full px-3 py-2 text-left text-xs font-semibold bg-slate-50 dark:bg-slate-800" onClick={() => setLiveOpen(v => !v)}>Live AI {live.stage ? `— ${live.stage} / ${live.label}` : ''} {liveOpen ? '▾' : '▸'}</button>
           {liveOpen && <div ref={liveScroll} onScroll={e => { const el = e.currentTarget; liveUserScrolledUp.current = el.scrollHeight - el.scrollTop - el.clientHeight > 24; }} className="max-h-72 overflow-auto p-3 space-y-2 text-xs">

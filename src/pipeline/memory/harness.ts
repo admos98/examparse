@@ -127,6 +127,7 @@ async function defaultReflectionUsageLogger(record: { label: string; inputTokens
 
 export interface EndJobParams {
   health: any;
+  verifierDefects?: number;
   calls: number;
   tokens: { input: number; output: number; cached?: number };
   costUsd: number;
@@ -178,6 +179,7 @@ export async function endJob(handle: JobHandle, params: EndJobParams): Promise<E
     models: handle.models, health: params.health, calls: params.calls, tokens: params.tokens,
     costUsd: params.costUsd, wallMs, ladderPath, flagsRaised, userCorrections: params.userCorrections || 0,
   });
+  if (typeof params.verifierDefects === 'number') entry.verifierDefects = params.verifierDefects;
   if (params.baselineRevision) { entry.baselineRevision = params.baselineRevision; entry.baselineTs = new Date().toISOString(); }
   // B2/D3 — the ids credited/blamed for this job ride in the journal line itself so the
   // server's delayed correction sweep can blame them after the 10-minute window closes.

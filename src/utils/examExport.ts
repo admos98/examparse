@@ -5,6 +5,26 @@
 import { ExamDoc, getDisplayName, sanitizeFileName } from '../types';
 import { getExamHealth } from '../pipeline/quality';
 import { stripCredentialFields } from './validation';
+import { buildParseReport, type ParseReport } from '../pipeline/provenance';
+
+/** 2F exam-level Parse report — shared by Step 5 and the JSON export receipt (no secrets). */
+export function parseReportForDoc(doc: ExamDoc): ParseReport {
+  const health = getExamHealth(doc);
+  const models: Record<string, string> = {};
+  for (const u of doc.usage || []) if (u.role && u.model) models[u.role] = u.model;
+  const verdicts = Object.values((doc as any).verdicts || {}).flat() as any[];
+  return buildParseReport(doc as any, {
+    models,
+    calls: (doc.usage || []).filter(u => !(u as any).isCachedHit).length,
+    tokens: { input: (doc.usage || []).reduce((a, u) => a + (u.inputTokens || 0), 0), output: (doc.usage || []).reduce((a, u) => a + (u.outputTokens || 0), 0) },
+    cost: Number((doc.usage || []).reduce((a, u) => a + ((u as any).costUsd || 0), 0).toFixed(4)),
+    coverageAfter: health.coveragePercent,
+    consensusSections: [...new Set((doc.flags || []).filter(f => f.code.startsWith('CONSENSUS')).map(f => f.questionId || 'section'))],
+    critic: { calls: (doc.usage || []).filter(u => (u as any).role === 'critic').length, defects: verdicts.filter(v => v.verdict === 'defect').length, ok: verdicts.filter(v => v.verdict === 'ok').length },
+    memory: { playbookIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.playbookIds || []))], skillIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.skillIds || []))], guidanceTokens: 0 },
+    config: { models },
+  });
+}
 
 /** Build the clean export payload: no image dataUrls, no heavy page-image data URLs. */
 export function buildExportDoc(doc: ExamDoc): any {
@@ -19,6 +39,7 @@ export function buildExportDoc(doc: ExamDoc): any {
   const { pageImages, ...sourceWithoutPageImages } = (doc.source || {}) as any;
   return stripCredentialFields({
     ...doc,
+    parseReport: parseReportForDoc(doc),
     displayName: getDisplayName(doc),
     images: cleanImages,
     source: sourceWithoutPageImages,

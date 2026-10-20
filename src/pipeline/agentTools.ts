@@ -15,6 +15,7 @@ import {
   sectionDiffView,
 } from "./reparseSection";
 import { buildDossier } from "./dossier";
+import { traceForAgent } from "./provenance";
 const empty = z.object({}).strict();
 const id = z.string().min(1).max(128);
 const questionId = z.object({ questionId: id }).strict();
@@ -146,6 +147,33 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       schema: questionId,
       access: "read",
       execute: ({ questionId }) => question(questionId),
+    },
+    get_verdicts: {
+      description: "{questionId?} → 2B critic verdicts (last 3 per question) from the dossier",
+      schema: z.object({ questionId: id.optional() }).strict(),
+      access: "read",
+      execute: ({ questionId }) => {
+        const verdicts = ctx.getDossier?.()?.verdicts || {};
+        return questionId ? { questionId, verdicts: verdicts[questionId] || [] } : { verdicts };
+      },
+    },
+    get_trace: {
+      description: "{questionId} → 2F provenance trace JSON (≤600 tok): origin, transforms, guidance, confidence math, verdicts",
+      schema: questionId,
+      access: "read",
+      execute: ({ questionId }) => {
+        const q = question(questionId);
+        const dossier = ctx.getDossier?.();
+        const stored = (dossier?.traces || []).find((t: any) => t.questionId === questionId);
+        const trace = stored || {
+          questionId: q.id, no: q.no,
+          origin: { callLabel: "structure", model: "unknown", journalResumed: false },
+          transforms: [], guidance: { playbookIds: [], skillIds: [] },
+          confidenceMath: { base: q.confidence, deductions: [], final: q.confidence },
+          verdicts: (dossier?.verdicts || {})[questionId] || [],
+        };
+        return traceForAgent(trace);
+      },
     },
     list_images: {
       description: "{placed?:boolean,offset?,limit?} labels, no image bytes",

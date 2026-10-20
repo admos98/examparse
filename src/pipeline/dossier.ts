@@ -15,6 +15,9 @@ export interface Dossier {
   knownIssues: Record<string, { count: number; questionRefs: string[] }>;
   ledger: DossierLedgerEntry[];
   userNotes: string[];
+  /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */
+  verdicts?: Record<string, any[]>;
+  traces?: any[];
   task?: any;
   updatedAt: string;
   fileHash: string;
@@ -78,6 +81,8 @@ export function buildDossier(doc: ExamDoc, existing?: Dossier): Dossier {
     ledger,
     userNotes,
     task: existing?.task,
+    verdicts: (doc as any).verdicts || existing?.verdicts || {},
+    traces: (doc as any).traces || existing?.traces || [],
     updatedAt: new Date().toISOString(),
     fileHash: doc.fileHash,
     qualityScore,

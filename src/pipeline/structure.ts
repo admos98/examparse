@@ -4,6 +4,7 @@
  */
 import { ImageAsset, LLMRequest, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
+import { runTaskGraph } from './taskGraph';
 import { T1_GEMINI_SCHEMA, T1_STRUCTURE_SYSTEM } from './prompts';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { appendJournalCall, loadJournal, markJournalComplete } from './journal';
@@ -170,6 +171,9 @@ export interface StructurePassParams {
   /** Recovery may target only these printed numbers. */
   recoveryOnlyNumbers?: number[];
   onProgress?: (message: string) => void;
+  /** 2E: bounded section parallelism (1–6, default 3) + node observer for the Step 3 node list. */
+  parallelSections?: number;
+  onNode?: (node: { id: string; label?: string; status: string; tokens?: number; error?: string }) => void;
   /** Audit completed section calls immediately, including candidates later rejected or interrupted. */
   onCallUsage?: (call: { label: string; inputTokens: number; outputTokens: number; cachedTokens?: number }) => Promise<void>;
   existingRawQuestions?: any[];
@@ -654,15 +658,29 @@ async function runSectionedStructurePass(params: StructurePassParams, options: {
     return chosen.tripwires;
   };
 
-  // Initial G1 per-section calls. Resume skips complete, valid section entries.
-  for (const plan of plans) {
-    if (resumed.has(plan.id)) continue;
-    if (options.recoveryOnly && !plan.expected.some(n => targetSet.has(n))) continue;
-    const targets = options.recoveryOnly ? plan.expected.filter(n => targetSet.has(n)) : plan.expected;
-    await runPlan(plan, targets, options.recoveryOnly ? 'recovery-ui' : 'initial', Boolean(options.recoveryOnly));
-    const found = new Set(mergedQuestions.map(q => rawQuestionNumber(q, params.sourceLines)).filter((n): n is number => n !== undefined));
-    const missingInSection = targets.filter(n => !found.has(n));
-    params.onProgress?.(`Section ${plan.index}/${plans.length} · ${plan.title} · ${targets.length} questions ${missingInSection.length ? `— missing ${missingInSection.join(', ')}` : '✓'}`);
+  // Initial G1 per-section calls — 2E task graph: bounded concurrency, per-node
+  // timeout, branch-local failure. Journal-resumed sections never re-execute.
+  const initialPlans = plans.filter(plan => !resumed.has(plan.id) && (!options.recoveryOnly || plan.expected.some(n => targetSet.has(n))));
+  const graph = await runTaskGraph(
+    initialPlans.map(plan => ({
+      id: plan.id,
+      label: plan.title,
+      run: async () => {
+        const targets = options.recoveryOnly ? plan.expected.filter(n => targetSet.has(n)) : plan.expected;
+        const usageBefore = callUsage.length;
+        await runPlan(plan, targets, options.recoveryOnly ? 'recovery-ui' : 'initial', Boolean(options.recoveryOnly));
+        const tokens = callUsage.slice(usageBefore).reduce((sum, c) => sum + (c.inputTokens || 0) + (c.outputTokens || 0), 0);
+        const found = new Set(mergedQuestions.map(q => rawQuestionNumber(q, params.sourceLines)).filter((n): n is number => n !== undefined));
+        const missingInSection = targets.filter(n => !found.has(n));
+        params.onProgress?.(`Section ${plan.index}/${plans.length} · ${plan.title} · ${targets.length} questions ${missingInSection.length ? `— missing ${missingInSection.join(', ')}` : '✓'}`);
+        return { planId: plan.id, tokens };
+      },
+    })),
+    { concurrency: params.parallelSections ?? 3, onNode: node => params.onNode?.(node) },
+  );
+  for (const failedId of graph.failedNodes) {
+    const plan = plans.find(p => p.id === failedId);
+    flags.push({ code: 'SECTION_NODE_FAILED', severity: 'error', message: `${plan?.title || failedId}: section node failed; other sections continued. ${graph.partialMessage || ''}` });
   }
 
   // A3: at most 2 rounds, max 3 affected sections in each round, ≤8 recovery calls total.

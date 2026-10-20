@@ -325,8 +325,8 @@ export const LibraryView: React.FC<Props> = ({
               type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search name, subject, grade, or file name…"
-              className="w-full bg-transparent outline-hidden text-xs text-[var(--ink)] "
+              placeholder={fa ? 'جستجوی نام، درس، پایه یا نام فایل…' : 'Search name, subject, grade, or file name…'}
+              className="w-full bg-[var(--surface-transparent)] outline-hidden text-xs text-[var(--ink)] "
             />
           </div>
           <select

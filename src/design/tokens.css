@@ -60,6 +60,7 @@
   color-scheme: light;
   --paper: var(--legacy-paper, #FAF7F2);
   --paper-raised: #FFFFFF;
+  --surface-transparent: transparent;
   --ink: var(--legacy-ink, #1A1815);
   --ink-2: #55504A;
   --ink-3: #8A8378;

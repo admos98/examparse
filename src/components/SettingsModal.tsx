@@ -498,7 +498,7 @@ export const SettingsModal: React.FC<Props> = ({
                             type="text"
                             value={p.name}
                             onChange={e => handleUpdateProvider(p.id, { name: e.target.value })}
-                            className="font-medium text-xs text-[var(--ink)]  bg-transparent border-b border-transparent hover:border-[var(--rule-strong)] focus:border-[var(--accent)] outline-hidden"
+                            className="font-medium text-xs text-[var(--ink)]  bg-[var(--surface-transparent)] border-b border-[var(--surface-transparent)] hover:border-[var(--rule-strong)] focus:border-[var(--accent)] outline-hidden"
                           />
                           <div className="flex items-center gap-2">
                             <span className="text-[length:var(--type-12)] px-2 py-0.5 rounded-[6px] bg-[var(--paper)]  text-[var(--ink-2)]  font-mono">

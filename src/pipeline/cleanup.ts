@@ -418,17 +418,17 @@ export async function runCleanupStage(params: RunCleanupParams): Promise<RunClea
   const usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   const flags: CleanupFlag[] = [];
   const baseStats = (): CleanupStats => ({ judged: 0, junk: 0, suspect: 0, fenceSaved: 0, aiSkipped: false, linesBefore: lines.length, linesAfter: lines.length, tokensBefore: 0, tokensAfter: 0, source: 'off' });
-  if (params.enabled === false) {
-    const view = renderCleanView(lines, keyLines, { cleanup: false });
-    return { lines, verdicts: [], aiVerdicts: [], stats: { ...baseStats(), tokensBefore: view.tokensBefore, tokensAfter: view.tokensBefore }, flags, usage, calls: 0, cached: false };
-  }
+  // The deterministic local pre-pass (A1) always runs — it is free, regex-only, and feeds
+  // ownership/gap completion. `enabled:false` switches off the AI judgment only (0 calls).
+  const aiEnabled = params.enabled !== false;
   const local = localCleanupPrepass(lines, keyLines, { pages: params.pages, expectedNumbers: params.expectedNumbers, overrides: params.overrides });
-  let aiVerdicts: Array<{ line: number; tag: LineTag; conf: number }> = params.cachedVerdicts || [];
+  let aiVerdicts: Array<{ line: number; tag: LineTag; conf: number }> = aiEnabled ? (params.cachedVerdicts || []) : [];
   let calls = 0;
   let aiSkipped = false;
-  let source: CleanupStats['source'] = params.cachedVerdicts ? 'cached' : 'local';
+  let source: CleanupStats['source'] = !aiEnabled ? 'off' : params.cachedVerdicts ? 'cached' : 'local';
   const chunks = buildCleanupChunks(lines, local.verdicts);
-  if (!params.cachedVerdicts && params.caller && chunks.length) {
+  void baseStats;
+  if (aiEnabled && !params.cachedVerdicts && params.caller && chunks.length) {
     source = 'ai';
     for (const chunk of chunks) {
       const text = renderCleanupChunk(chunk);
@@ -464,7 +464,7 @@ export async function runCleanupStage(params: RunCleanupParams): Promise<RunClea
     linesBefore: view.linesBefore, linesAfter: view.linesAfter, tokensBefore: view.tokensBefore, tokensAfter: view.tokensAfter,
     source: aiSkipped ? 'local' : source,
   };
-  return { lines: tagged, verdicts: [...fenced.verdicts.values()].sort((a, b) => a.line - b.line), aiVerdicts, stats, flags, usage, calls, cached: Boolean(params.cachedVerdicts) };
+  return { lines: tagged, verdicts: [...fenced.verdicts.values()].sort((a, b) => a.line - b.line), aiVerdicts, stats, flags, usage, calls, cached: aiEnabled && Boolean(params.cachedVerdicts) };
 }
 
 /** Stable content hash input for the cleanup cache (ids + text + version + model). */

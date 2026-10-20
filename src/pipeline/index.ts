@@ -269,19 +269,21 @@ export async function runFullPipeline(
   let cleanupOverrides: Record<string, LineTag> = {};
   const cleanupFlags: any[] = [];
   let cleanupSignature = 'off';
-  if (cleanupEnabled) {
+  {
+    // The local pre-pass always runs (deterministic, 0 calls); the Settings toggle governs the AI judgment only.
     const cleanupStageName = 'Cleanup (Stage 2.5)';
-    onStageUpdate({ id: 'cleanup', name: cleanupStageName, status: 'running', message: 'Local pre-pass: furniture, page numbers, key territory, headers…' });
+    onStageUpdate({ id: 'cleanup', name: cleanupStageName, status: 'running', message: cleanupEnabled ? 'Local pre-pass: furniture, page numbers, key territory, headers…' : 'AI cleanup disabled in Settings — local pre-pass only (0 calls)…' });
     const cleanupSel = settings.roleMapping.cleanup || settings.roleMapping.fast;
     const cleanupProvider = settings.providers.find(p => p.id === cleanupSel.providerId) || settings.providers[0];
-    const cleanupProviderConfig = cleanupProvider ? { ...cleanupProvider, model: cleanupSel.model } : undefined;
+    const cleanupProviderConfig = cleanupEnabled && cleanupProvider ? { ...cleanupProvider, model: cleanupSel.model } : undefined;
     try { cleanupOverrides = (await getPipelineCache<Record<string, LineTag>>(`cleanupOverrides:${fileHash}`)) || {}; } catch { cleanupOverrides = {}; }
     const cleanupCacheParams = { fileHash, stage: 'cleanup' as const, provider: cleanupProviderConfig?.id || 'none', model: cleanupProviderConfig?.model || 'none', options: { linesHash, version: CLEANUP_VERSION } };
     const cachedCleanup = !stageForced('cleanup') ? await getCachedStageResult<{ aiVerdicts: any[]; usage: any }>(cleanupCacheParams) : null;
     const t0 = Date.now();
     const cleanupResult = await runCleanupStage({
       lines: workingLines, keyLines: new Set(keyTerritoryLineNos), pages: extracted.pages, expectedNumbers: expectedQuestionNos, overrides: cleanupOverrides,
-      cachedVerdicts: cachedCleanup?.aiVerdicts,
+      enabled: cleanupEnabled,
+      cachedVerdicts: cleanupEnabled ? cachedCleanup?.aiVerdicts : undefined,
       caller: cleanupProviderConfig ? async req => {
         const response = await LLMAdapter.execute(
           { role: 'cleanup', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: cleanupProviderConfig },
@@ -307,10 +309,8 @@ export async function runFullPipeline(
       id: 'cleanup', name: cleanupStageName,
       status: cleanupResult.cached ? 'cached' : st.aiSkipped ? 'completed-with-problems' : 'completed',
       durationMs: Date.now() - t0, inputTokens: cleanupResult.usage.inputTokens, outputTokens: cleanupResult.usage.outputTokens, costUsd: cleanupCost,
-      message: `${st.source === 'cached' ? 'Verdicts from cache (0 calls) · ' : st.aiSkipped ? 'AI cleanup skipped after retry — local tags only · ' : cleanupResult.calls ? `${cleanupResult.calls} call(s) · ` : 'local tags only (no provider) · '}judged ${st.judged} · junk ${st.junk} · suspect ${st.suspect} · fence-saved ${st.fenceSaved} · prompt lines ${st.linesBefore}→${st.linesAfter} (≈${st.tokensBefore}→${st.tokensAfter} tok).`,
+      message: `${st.source === 'off' ? 'AI cleanup disabled — local tags only (0 calls) · ' : st.source === 'cached' ? 'Verdicts from cache (0 calls) · ' : st.aiSkipped ? 'AI cleanup skipped after retry — local tags only · ' : cleanupResult.calls ? `${cleanupResult.calls} call(s) · ` : 'local tags only (no provider) · '}judged ${st.judged} · junk ${st.junk} · suspect ${st.suspect} · fence-saved ${st.fenceSaved} · prompt lines ${st.linesBefore}→${st.linesAfter} (≈${st.tokensBefore}→${st.tokensAfter} tok).`,
     });
-  } else {
-    onStageUpdate({ id: 'cleanup', name: 'Cleanup (Stage 2.5)', status: 'skipped', message: 'Cleanup disabled in Settings (0 calls); structure prompts use the raw LAS.' });
   }
 
   // 3. STAGE: STRUCTURE PASS (single call for short docs; bounded sections for long/weak-model docs)
@@ -1031,7 +1031,7 @@ export async function runFullPipeline(
       job.ladderPath = [
         'extract',
         ...(ocrUsed ? ['ocr'] : []),
-        ...(cleanupEnabled ? ['cleanup'] : []),
+        'cleanup',
         'structure',
         ...(structureData.callUsage?.length ? structureData.callUsage.map((call: any) => String(call.label || 'structure')) : []),
         ...(updatedImages.length ? ['vision'] : []),

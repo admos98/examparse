@@ -368,18 +368,18 @@ export const Step3Analyze: React.FC<Props> = ({
     <div className="max-w-4xl mx-auto py-8 px-4 space-y-6">
       {/* Step Header */}
       <div className="text-center space-y-1">
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+        <h1 className="text-2xl font-bold tracking-tight text-[var(--ink)] ">
           Analyze Exam Structure
         </h1>
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-[var(--ink-2)]">
           Deterministic 1-call structure pass, batched vision, and span-referenced assembly
         </p>
       </div>
 
       {/* Error / Budget Stop Banner */}
       {errorMsg && (
-        <div className="p-4 rounded-2xl border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300 flex items-start gap-3 text-xs animate-in fade-in">
-          <ShieldAlert className="w-5 h-5 shrink-0 text-red-500 mt-0.5" />
+        <div className="p-4 rounded-[10px] border border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]  flex items-start gap-3 text-xs  ">
+          <ShieldAlert className="w-5 h-5 shrink-0 text-[var(--danger)] mt-0.5" />
           <div className="flex-1 space-y-1">
             <span className="font-bold">Budget / Execution Stop:</span>
             <p>{errorMsg}</p>
@@ -389,13 +389,13 @@ export const Step3Analyze: React.FC<Props> = ({
 
       {/* Saved-result fast-path */}
       {savedExam && onOpenSavedExam && (
-        <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs flex items-center justify-between gap-3">
+        <div className="p-3 rounded-[10px] bg-[var(--ok-soft)] border border-[var(--ok)] text-[var(--ok)]  text-xs flex items-center justify-between gap-3">
           <span>
             <span className="font-semibold">Already parsed — Open saved result</span> — “{savedExam.displayName}” ({savedExam.questions.length} questions). Re-analyze remains available below.
           </span>
           <button
             onClick={() => onOpenSavedExam(savedExam)}
-            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-medium shrink-0"
+            className="px-3 py-1.5 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent)] text-[var(--on-accent)] font-medium shrink-0"
           >
             Open saved result
           </button>
@@ -403,24 +403,24 @@ export const Step3Analyze: React.FC<Props> = ({
       )}
 
       {/* Pre-Flight Estimator Panel (§5.7) */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-xs space-y-5">
-        <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800">
+      <div className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-6  space-y-5">
+        <div className="flex items-center justify-between pb-4 border-b border-[var(--rule)] ">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-amber-500/10 text-amber-600 dark:text-amber-400">
+            <div className="p-2.5 rounded-[10px] bg-[var(--warn-soft)] text-[var(--warn-ink)] ">
               <Coins className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+              <h2 className="text-sm font-bold text-[var(--ink)] ">
                 Pre-Flight Usage & Cost Estimate
               </h2>
-              <p className="text-[11px] text-slate-500">
+              <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">
                 Calculated before any network call using self-calibrating token metrics
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="text-[10px] text-slate-400 font-mono">
+            <span className="text-[length:var(--type-12)] text-[var(--ink-2)] font-mono">
               Provider: {activeProvider.name} ({activeRole.model})
             </span>
           </div>
@@ -428,42 +428,42 @@ export const Step3Analyze: React.FC<Props> = ({
 
         {/* Metric Cards Grid */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
-          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 space-y-1">
-            <div className="text-[10px] uppercase font-semibold text-slate-400">Est. Input</div>
-            <div className="text-lg font-bold font-mono text-slate-900 dark:text-white">
+          <div className="p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  space-y-1">
+            <div className="text-[length:var(--type-12)] uppercase font-semibold text-[var(--ink-2)]">Est. Input</div>
+            <div className="text-lg font-bold font-mono text-[var(--ink)] ">
               {isPreflightCached && !forceRerun ? '0 toks' : `~${(estimate.estimatedInputTokens / 1000).toFixed(1)}k`}
             </div>
-            <div className="text-[10px] text-slate-400">
+            <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">
               {isPreflightCached && !forceRerun ? 'Cache hit' : `${estimate.breakdown.textTokens} text + ${estimate.breakdown.imageTokens} img`}
             </div>
           </div>
 
-          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 space-y-1">
-            <div className="text-[10px] uppercase font-semibold text-slate-400">Est. Output</div>
-            <div className="text-lg font-bold font-mono text-slate-900 dark:text-white">
+          <div className="p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  space-y-1">
+            <div className="text-[length:var(--type-12)] uppercase font-semibold text-[var(--ink-2)]">Est. Output</div>
+            <div className="text-lg font-bold font-mono text-[var(--ink)] ">
               {isPreflightCached && !forceRerun ? '0 toks' : `~${estimate.estimatedOutputTokens}`}
             </div>
-            <div className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">
+            <div className="text-[length:var(--type-12)] text-[var(--ok)]  font-medium">
               {isPreflightCached && !forceRerun ? 'From local store' : '~85% saved by spans'}
             </div>
           </div>
 
-          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 space-y-1">
-            <div className="text-[10px] uppercase font-semibold text-slate-400">Est. Cost</div>
-            <div className="text-lg font-bold font-mono text-emerald-600 dark:text-emerald-400">
+          <div className="p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  space-y-1">
+            <div className="text-[length:var(--type-12)] uppercase font-semibold text-[var(--ink-2)]">Est. Cost</div>
+            <div className="text-lg font-bold font-mono text-[var(--ok)] ">
               {isPreflightCached && !forceRerun ? '$0.00' : `$${estimate.estimatedCostUsd.toFixed(4)}`}
             </div>
-            <div className="text-[10px] text-slate-400">
+            <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">
               {isPreflightCached && !forceRerun ? '0 calls · $0.00' : `Cap: $${settings.budget.maxUsdPerRun}`}
             </div>
           </div>
 
-          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 space-y-1">
-            <div className="text-[10px] uppercase font-semibold text-slate-400">API Calls</div>
-            <div className="text-lg font-bold font-mono text-slate-900 dark:text-white">
+          <div className="p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  space-y-1">
+            <div className="text-[length:var(--type-12)] uppercase font-semibold text-[var(--ink-2)]">API Calls</div>
+            <div className="text-lg font-bold font-mono text-[var(--ink)] ">
               {isPreflightCached && !forceRerun ? '0 calls' : `1 text + ${estimate.breakdown.visionCalls} vision`}
             </div>
-            <div className="text-[10px] text-purple-600 dark:text-purple-400 font-medium">
+            <div className="text-[length:var(--type-12)] text-[var(--accent-ink)]  font-medium">
               {isPreflightCached && !forceRerun ? 'Cached result' : 'Target: ≤ 3 calls total'}
             </div>
           </div>
@@ -471,13 +471,13 @@ export const Step3Analyze: React.FC<Props> = ({
 
         {/* Cache status banner if hit */}
         {isPreflightCached && !forceRerun && (
-          <div className="p-3 rounded-xl bg-purple-500/10 border border-purple-500/30 text-purple-700 dark:text-purple-300 text-xs flex items-center justify-between">
+          <div className="p-3 rounded-[10px] bg-[var(--paper)] border border-[var(--accent)] text-[var(--accent-ink)]  text-xs flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <Database className="w-4 h-4 shrink-0 text-purple-500" />
+              <Database className="w-4 h-4 shrink-0 text-[var(--accent-ink)]" />
               <span className="font-semibold">0 calls · $0.00 · cached</span>
               <span>— Document already analyzed with identical settings.</span>
             </div>
-            <span className="text-[10px] font-mono bg-purple-500/20 px-2 py-0.5 rounded text-purple-800 dark:text-purple-200">
+            <span className="text-[length:var(--type-12)] font-mono bg-[var(--paper)] px-2 py-0.5 rounded-[6px] text-[var(--accent-ink)] ">
               Instant Load
             </span>
           </div>
@@ -485,20 +485,20 @@ export const Step3Analyze: React.FC<Props> = ({
 
         {/* Warning if 50% budget */}
         {estimate.warning50Percent && !estimate.exceedsBudget && (
-          <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-700 dark:text-amber-300 text-xs flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 shrink-0 text-amber-500" />
+          <div className="p-3 rounded-[10px] bg-[var(--warn-soft)] border border-[var(--warn)] text-[var(--warn-ink)]  text-xs flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-[var(--warn-ink)]" />
             <span>Pre-flight estimate exceeds 50% of your configured budget. Proceed with caution.</span>
           </div>
         )}
 
         {/* Controls Bar: Force Re-run toggle & Run Button */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
-          <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 cursor-pointer">
+          <label className="flex items-center gap-2 text-xs text-[var(--ink-2)]  cursor-pointer">
             <input
               type="checkbox"
               checked={forceRerun}
               onChange={e => setForceRerun(e.target.checked)}
-              className="w-4 h-4 rounded text-blue-600"
+              className="w-4 h-4 rounded-[6px] text-[var(--accent-ink)]"
             />
             <span>Force re-run (bypass content-hash cache)</span>
           </label>
@@ -506,10 +506,10 @@ export const Step3Analyze: React.FC<Props> = ({
           <button
             disabled={isAnalyzing || (estimate.exceedsBudget && estimate.estimatedCostUsd > 0)}
             onClick={handleStartAnalysis}
-            className={`flex items-center gap-2 px-6 py-2.5 rounded-2xl font-semibold text-xs text-white transition cursor-pointer shadow-md ${
+            className={`flex items-center gap-2 px-6 py-2.5 rounded-[6px] font-semibold text-xs text-[var(--on-accent)] transition cursor-pointer  ${
               isAnalyzing || (estimate.exceedsBudget && estimate.estimatedCostUsd > 0)
-                ? 'bg-slate-400 cursor-not-allowed'
-                : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-blue-500/20'
+                ? 'bg-[var(--paper)] cursor-not-allowed'
+                : '     /20'
             }`}
           >
             {isAnalyzing ? (
@@ -519,9 +519,9 @@ export const Step3Analyze: React.FC<Props> = ({
               </>
             ) : (
               <>
-                <Play className="w-4 h-4 fill-white" />
+                <Play className="w-4 h-4 fill-[var(--on-accent)]" />
                 <span>Run Analysis</span>
-                <span className="text-[10px] opacity-75 font-mono ml-1">⌘↵</span>
+                <span className="text-[length:var(--type-12)] opacity-75 font-mono ms-1">⌘↵</span>
               </>
             )}
           </button>
@@ -529,13 +529,13 @@ export const Step3Analyze: React.FC<Props> = ({
       </div>
 
       {/* Pipeline Stage Execution Card (§6) */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-xs space-y-4">
-        <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
-          <div className="flex items-center gap-2 font-bold text-xs text-slate-900 dark:text-white">
-            <Layers className="w-4 h-4 text-blue-500" />
+      <div className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-6  space-y-4">
+        <div className="flex items-center justify-between pb-2 border-b border-[var(--rule)] ">
+          <div className="flex items-center gap-2 font-bold text-xs text-[var(--ink)] ">
+            <Layers className="w-4 h-4 text-[var(--accent-ink)]" />
             <span>Pipeline Execution Stages</span>
           </div>
-          <span className="text-[10px] text-slate-400">Order: Extract → OCR → Structure → Vision → Assemble → Repair</span>
+          <span className="text-[length:var(--type-12)] text-[var(--ink-2)]">Order: Extract → OCR → Structure → Vision → Assemble → Repair</span>
         </div>
 
         <div className="space-y-2">
@@ -549,28 +549,28 @@ export const Step3Analyze: React.FC<Props> = ({
             return (
               <div
                 key={stage.id}
-                className={`flex items-center justify-between p-3 rounded-2xl border transition text-xs ${
+                className={`flex items-center justify-between p-3 rounded-[10px] border transition text-xs ${
                   isRunning
-                    ? 'border-blue-500 bg-blue-50/40 dark:bg-blue-950/20 shadow-xs'
+                    ? 'border-[var(--accent)] bg-[var(--paper)]  '
                     : isCompleted
-                    ? 'border-emerald-500/30 bg-emerald-50/20 dark:bg-emerald-950/10'
+                    ? 'border-[var(--ok)] bg-[var(--ok-soft)] '
                     : isCached
-                    ? 'border-purple-500/30 bg-purple-50/20 dark:bg-purple-950/10'
+                    ? 'border-[var(--accent)] bg-[var(--paper)] '
                     : isSkipped
-                    ? 'border-slate-200 dark:border-slate-800/60 opacity-60'
-                    : 'border-slate-200 dark:border-slate-800'
+                    ? 'border-[var(--rule)]  opacity-60'
+                    : 'border-[var(--rule)] '
                 }`}
               >
                 <div className="flex items-center gap-3">
                   <div
-                    className={`w-6 h-6 rounded-full flex items-center justify-center font-bold text-[10px] ${
+                    className={`w-6 h-6 rounded-[10px] flex items-center justify-center font-bold text-[length:var(--type-12)] ${
                       isCompleted
-                        ? 'bg-emerald-500 text-white'
+                        ? 'bg-[var(--ok)] text-[var(--on-accent)]'
                         : isCached
-                        ? 'bg-purple-600 text-white'
+                        ? 'bg-[var(--accent)] text-[var(--on-accent)]'
                         : isRunning
-                        ? 'bg-blue-600 text-white animate-pulse'
-                        : 'bg-slate-200 dark:bg-slate-800 text-slate-500'
+                        ? 'bg-[var(--accent)] text-[var(--on-accent)] animate-pulse'
+                        : 'bg-[var(--paper)]  text-[var(--ink-2)]'
                     }`}
                   >
                     {isCompleted ? (
@@ -585,16 +585,16 @@ export const Step3Analyze: React.FC<Props> = ({
                   </div>
 
                   <div>
-                    <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                      <button type="button" onClick={() => setAttemptStage(current => current === stage.id ? null : stage.id)} className="text-left hover:underline" title="Show this stage's model calls">{stage.name}</button>
+                    <div className="font-semibold text-[var(--ink)]  flex items-center gap-2">
+                      <button type="button" onClick={() => setAttemptStage(current => current === stage.id ? null : stage.id)} className="text-start hover:underline" title="Show this stage's model calls">{stage.name}</button>
                       {isCached && (
-                        <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20">
+                        <span className="px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)]">
                           0 calls · cached
                         </span>
                       )}
                     </div>
                     {stage.message && (
-                      <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      <p className="text-[length:var(--type-12)] text-[var(--ink-2)] ">
                         {stage.message}
                         {stage.attempts !== undefined && stage.attempts > 1 ? ` (${stage.attempts} attempts)` : ''}
                       </p>
@@ -603,7 +603,7 @@ export const Step3Analyze: React.FC<Props> = ({
                 </div>
 
                 {/* Stage Metrics */}
-                <div className="flex items-center gap-3 text-right font-mono text-[11px]">
+                <div className="flex items-center gap-3 text-end font-mono text-[length:var(--type-12)]">
                   <button
                     onClick={() =>
                       setForcedStages(prev => {
@@ -614,26 +614,26 @@ export const Step3Analyze: React.FC<Props> = ({
                       })
                     }
                     title={forcedStages.has(stage.id) ? `Cache bypass armed for ${stage.id} — click to disarm` : `Force re-run of ${stage.id} only`}
-                    className={`px-1.5 py-0.5 rounded border text-[11px] cursor-pointer ${
+                    className={`px-1.5 py-0.5 rounded-[6px] border text-[length:var(--type-12)] cursor-pointer ${
                       forcedStages.has(stage.id)
-                        ? 'bg-amber-500/20 border-amber-500/50 text-amber-600 dark:text-amber-400 font-bold'
-                        : 'border-slate-200 dark:border-slate-700 text-slate-400 hover:text-slate-600'
+                        ? 'bg-[var(--warn-soft)] border-[var(--warn)] text-[var(--warn-ink)]  font-bold'
+                        : 'border-[var(--rule)]  text-[var(--ink-2)] hover:text-[var(--ink-2)]'
                     }`}
                   >
                     ↻
                   </button>
                   {stage.inputTokens !== undefined && (
-                    <span className="text-slate-600 dark:text-slate-400">
+                    <span className="text-[var(--ink-2)] ">
                       {stage.inputTokens} in · {stage.outputTokens || 0} out
                     </span>
                   )}
                   {stage.costUsd !== undefined && (
-                    <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                    <span className="text-[var(--ok)]  font-bold">
                       ${stage.costUsd.toFixed(5)}
                     </span>
                   )}
                   {stage.durationMs !== undefined && (
-                    <span className="text-slate-400 flex items-center gap-1">
+                    <span className="text-[var(--ink-2)] flex items-center gap-1">
                       <Clock className="w-2.5 h-2.5" />
                       {(stage.durationMs / 1000).toFixed(1)}s
                     </span>
@@ -645,28 +645,28 @@ export const Step3Analyze: React.FC<Props> = ({
         </div>
         {/* 2E task-graph nodes: section · status · tokens (live text streams into the Live panel below) */}
         {graphNodes.length > 0 && (
-          <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-1.5 text-xs">
-            <div className="font-semibold text-slate-700 dark:text-slate-200">Section nodes ({graphNodes.filter(n => n.status === 'done' || n.status === 'resumed').length}/{graphNodes.length} complete · parallel sections {settings.parallelSections ?? 3})</div>
+          <div className="rounded-[10px] border border-[var(--rule)]  p-3 space-y-1.5 text-xs">
+            <div className="font-semibold text-[var(--ink)] ">Section nodes ({graphNodes.filter(n => n.status === 'done' || n.status === 'resumed').length}/{graphNodes.length} complete · parallel sections {settings.parallelSections ?? 3})</div>
             {graphNodes.map(node => (
               <div key={node.id} className="flex items-center gap-2">
-                <span className={`w-2 h-2 rounded-full shrink-0 ${node.status === 'done' || node.status === 'resumed' ? 'bg-emerald-500' : node.status === 'running' ? 'bg-blue-500 animate-pulse' : node.status === 'failed' ? 'bg-red-500' : node.status === 'skipped' ? 'bg-amber-500' : 'bg-slate-300'}`} />
-                <span className="font-medium text-slate-800 dark:text-slate-100">{node.label || node.id}</span>
-                <span className="text-slate-500">{node.status}</span>
-                {node.tokens !== undefined && node.status === 'done' && <span className="font-mono text-slate-400">{node.tokens} tok</span>}
-                {node.error && <span className="text-red-500 truncate">{node.error}</span>}
+                <span className={`w-2 h-2 rounded-[10px] shrink-0 ${node.status === 'done' || node.status === 'resumed' ? 'bg-[var(--ok)]' : node.status === 'running' ? 'bg-[var(--accent)] animate-pulse' : node.status === 'failed' ? 'bg-[var(--danger)]' : node.status === 'skipped' ? 'bg-[var(--warn)]' : 'bg-[var(--paper)]'}`} />
+                <span className="font-medium text-[var(--ink)] ">{node.label || node.id}</span>
+                <span className="text-[var(--ink-2)]">{node.status}</span>
+                {node.tokens !== undefined && node.status === 'done' && <span className="font-mono text-[var(--ink-2)]">{node.tokens} tok</span>}
+                {node.error && <span className="text-[var(--danger)] truncate">{node.error}</span>}
               </div>
             ))}
-            {graphNodes.some(n => n.status === 'failed' || n.status === 'skipped') && <div className="text-amber-600 dark:text-amber-400">PARTIAL: failed/skipped section nodes are named above; the rest of the exam completed.</div>}
+            {graphNodes.some(n => n.status === 'failed' || n.status === 'skipped') && <div className="text-[var(--warn-ink)] ">PARTIAL: failed/skipped section nodes are named above; the rest of the exam completed.</div>}
           </div>
         )}
-        <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
-          <button className="w-full px-3 py-2 text-left text-xs font-semibold bg-slate-50 dark:bg-slate-800" onClick={() => setLiveOpen(v => !v)}>Live AI {live.stage ? `— ${live.stage} / ${live.label}` : ''} {liveOpen ? '▾' : '▸'}</button>
+        <div className="rounded-[10px] border border-[var(--rule)]  overflow-hidden">
+          <button className="w-full px-3 py-2 text-start text-xs font-semibold bg-[var(--paper)] " onClick={() => setLiveOpen(v => !v)}>Live AI {live.stage ? `— ${live.stage} / ${live.label}` : ''} {liveOpen ? '▾' : '▸'}</button>
           {liveOpen && <div ref={liveScroll} onScroll={e => { const el = e.currentTarget; liveUserScrolledUp.current = el.scrollHeight - el.scrollTop - el.clientHeight > 24; }} className="max-h-72 overflow-auto p-3 space-y-2 text-xs">
-            {live.reasoning && <div className="text-slate-500"><div className="font-semibold">Model reasoning — live (not part of the answer)</div><pre className="whitespace-pre-wrap font-mono">{live.reasoning.slice(-6000)}</pre></div>}
-            {live.output && <pre className="whitespace-pre-wrap font-mono text-slate-800 dark:text-slate-200">{live.output.length > 6000 ? '…earlier output elided in this view only\n' : ''}{live.output.slice(-6000)}</pre>}
-            {live.info && <div className="whitespace-pre-wrap text-amber-600 dark:text-amber-400">{live.info}</div>}
-            {!live.output && !live.reasoning && !live.info && <div className="text-slate-400">Waiting for model output…</div>}
-            {live.attempts.length > 0 && <div className="border-t border-slate-200 dark:border-slate-700 pt-2 space-y-1"><div className="font-semibold text-slate-500">Call attempts {attemptStage ? `— ${attemptStage}` : ''} <button onClick={() => setAttemptStage(null)} className="ml-2 text-blue-500">All</button></div>{live.attempts.filter(attempt => !attemptStage || attempt.stage === attemptStage).map((attempt, i) => <details key={`${attempt.stage}-${attempt.label}-${i}`} className="rounded border border-slate-200 dark:border-slate-700 p-2"><summary className="cursor-pointer">{attempt.stage} · {attempt.label}{attempt.finishReason ? ` · ${attempt.finishReason}` : ''}{attempt.ts ? ` · ${new Date(attempt.ts).toLocaleString()}` : ''}</summary>{attempt.reasoning && <pre className="mt-2 whitespace-pre-wrap text-slate-500">{attempt.reasoning.slice(-6000)}</pre>}<pre className="mt-2 whitespace-pre-wrap font-mono">{attempt.output.slice(-6000)}</pre></details>)}</div>}
+            {live.reasoning && <div className="text-[var(--ink-2)]"><div className="font-semibold">Model reasoning — live (not part of the answer)</div><pre className="whitespace-pre-wrap font-mono">{live.reasoning.slice(-6000)}</pre></div>}
+            {live.output && <pre className="whitespace-pre-wrap font-mono text-[var(--ink)] ">{live.output.length > 6000 ? '…earlier output elided in this view only\n' : ''}{live.output.slice(-6000)}</pre>}
+            {live.info && <div className="whitespace-pre-wrap text-[var(--warn-ink)] ">{live.info}</div>}
+            {!live.output && !live.reasoning && !live.info && <div className="text-[var(--ink-2)]">Waiting for model output…</div>}
+            {live.attempts.length > 0 && <div className="border-t border-[var(--rule)]  pt-2 space-y-1"><div className="font-semibold text-[var(--ink-2)]">Call attempts {attemptStage ? `— ${attemptStage}` : ''} <button onClick={() => setAttemptStage(null)} className="ms-2 text-[var(--accent-ink)]">All</button></div>{live.attempts.filter(attempt => !attemptStage || attempt.stage === attemptStage).map((attempt, i) => <details key={`${attempt.stage}-${attempt.label}-${i}`} className="rounded-[6px] border border-[var(--rule)]  p-2"><summary className="cursor-pointer">{attempt.stage} · {attempt.label}{attempt.finishReason ? ` · ${attempt.finishReason}` : ''}{attempt.ts ? ` · ${new Date(attempt.ts).toLocaleString()}` : ''}</summary>{attempt.reasoning && <pre className="mt-2 whitespace-pre-wrap text-[var(--ink-2)]">{attempt.reasoning.slice(-6000)}</pre>}<pre className="mt-2 whitespace-pre-wrap font-mono">{attempt.output.slice(-6000)}</pre></details>)}</div>}
           </div>}
         </div>
       </div>

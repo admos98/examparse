@@ -1,74 +1,121 @@
-import React, { useState, useRef, useEffect } from 'react';
-import {
-  Printer,
-  Download,
-  Upload,
-  FileText,
-  Copy,
-  Check,
-  Eye,
-  FileSpreadsheet,
-} from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Printer, Download, Upload, Copy, FileSpreadsheet } from 'lucide-react';
 import { ExamDoc, ImageAsset, getDisplayName, sanitizeFileName } from '../types';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
 import { saveExamDoc, getImageBlob } from '../store';
-import { duplicateExamDoc, exportExamJson, confirmPartialExport, parseReportForDoc } from '../utils/examExport';
+import { duplicateExamDoc, exportExamJson, partialExportIssues, parseReportForDoc } from '../utils/examExport';
 import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { MAX_EXAM_JSON_BYTES, parseExamDocImport } from '../utils/validation';
 import { printStyles, checkPrintLayout } from '../utils/printCheck';
+import { Button, ConfirmCard, Tabs } from '../design/primitives';
 
 interface Props {
   defaultExamMode?: 'exam' | 'review';
   doc: ExamDoc;
   onUpdateDoc: (updated: ExamDoc) => void;
+  exportRequest?: number;
 }
 
-export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }) => {
+type PendingAction = 'print' | 'docx' | 'json';
+
+export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, exportRequest = 0 }) => {
   const [renderMode, setRenderMode] = useState<ExamRenderMode>(defaultExamMode === 'review' ? 'review' : 'paper');
   useEffect(() => { setRenderMode(defaultExamMode === 'review' ? 'review' : 'paper'); }, [defaultExamMode]);
-  const [copiedJson, setCopiedJson] = useState(false);
   const jsonInputRef = useRef<HTMLInputElement>(null);
-
   const [printRisks, setPrintRisks] = useState<ReturnType<typeof checkPrintLayout>>([]);
   const [showReport, setShowReport] = useState(false);
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
+  const [importNotice, setImportNotice] = useState('');
   const printAreaRef = useRef<HTMLDivElement>(null);
-  // Inject print stylesheet once
+  const lastExportRequest = useRef(exportRequest);
+  const isPersian = /^fa|^ar/i.test(doc.meta.language || '');
+  const t = (en: string, fa: string) => isPersian ? fa : en;
+  const partialIssues = partialExportIssues(doc);
+  const localizedPartialIssues = isPersian ? partialIssues.map(issue => {
+    if (issue.startsWith('missing questions:')) return issue.replace('missing questions:', 'سؤال‌های جاافتاده:');
+    if (issue.startsWith('duplicate question numbers:')) return issue.replace('duplicate question numbers:', 'شمارهٔ سؤال‌های تکراری:');
+    if (issue.startsWith('points deficit:')) return issue.replace('points deficit:', 'کسری نمره:');
+    const unplaced = issue.match(/^(\d+) unplaced image\(s\)$/);
+    if (unplaced) return `${unplaced[1]} تصویرِ بدون جایگاه`;
+    const unresolved = issue.match(/^(\d+) unresolved image reference\(s\)$/);
+    if (unresolved) return `${unresolved[1]} ارجاع تصویریِ حل‌نشده`;
+    const nested = issue.match(/^(\d+) invalid nested-question link\(s\)$/);
+    if (nested) return `${nested[1]} پیوندِ پرسشِ تو‌در‌توی نامعتبر`;
+    return t('Integrity checks need review.', 'بررسی یکپارچگی نیاز است.');
+  }) : partialIssues;
+
   useEffect(() => {
     const id = 'examparse-print-styles';
     if (!document.getElementById(id)) {
       const el = document.createElement('style');
-      el.id = id; el.textContent = printStyles;
+      el.id = id;
+      el.textContent = printStyles;
       document.head.appendChild(el);
     }
   }, []);
-  // Check layout on mount + mode change
+
   useEffect(() => {
-    const t = setTimeout(()=> setPrintRisks(checkPrintLayout(printAreaRef.current || undefined)), 300);
-    return ()=> clearTimeout(t);
+    const timeout = window.setTimeout(() => setPrintRisks(checkPrintLayout(printAreaRef.current || undefined)), 300);
+    return () => window.clearTimeout(timeout);
   }, [doc, renderMode]);
 
-  // Trigger browser print dialog for A4 output
-  const handlePrint = () => {
-    if (!confirmPartialExport(doc, 'Print / Save PDF')) return;
-    // iframe split check: warn if questions would be cut
-    const risks = checkPrintLayout(printAreaRef.current || undefined);
-    if (risks.length > 0) {
-      const ok = confirm(`${risks.length} question(s) may be split across pages. Continue to Print anyway?`);
-      if (!ok) return;
-    }
+  const executePrint = useCallback(() => {
+    setPendingAction(null);
     window.print();
-  };
-
-  // Export JSON via the shared helper (also used by the Exam Library)
-  const handleExportJson = () => {
+  }, []);
+  const executeDocx = useCallback(() => {
+    setPendingAction(null);
+    const printArea = document.getElementById('printable-exam-area');
+    if (!printArea) return;
+    const safeTitle = getDisplayName(doc).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const ruleColor = getComputedStyle(document.documentElement).getPropertyValue('--rule-strong').trim() || 'currentColor';
+    const htmlContent = `
+      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+      <head><meta charset='utf-8'><title>${safeTitle}</title><style>
+      body { font-family: Georgia, Tahoma, serif; font-size: 11pt; direction: ${doc.meta.direction}; }
+      table { border-collapse: collapse; width: 100%; } td, th { border: 1px solid ${ruleColor}; padding: 6px; }
+      </style></head><body>${printArea.innerHTML}</body></html>`;
+    const blob = new Blob(['\ufeff', htmlContent], { type: 'application/msword' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${sanitizeFileName(getDisplayName(doc))}.doc`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [doc]);
+  const executeJson = useCallback(() => {
+    setPendingAction(null);
     exportExamJson(doc);
+  }, [doc]);
+
+  const requestAction = useCallback((action: PendingAction) => {
+    const hasPrintRisk = action === 'print' && checkPrintLayout(printAreaRef.current || undefined).length > 0;
+    if (partialIssues.length || hasPrintRisk) setPendingAction(action);
+    else if (action === 'print') executePrint();
+    else if (action === 'docx') executeDocx();
+    else executeJson();
+  }, [executeDocx, executeJson, executePrint, partialIssues.length]);
+
+  useEffect(() => {
+    if (exportRequest === lastExportRequest.current) return;
+    lastExportRequest.current = exportRequest;
+    requestAction('json');
+  }, [exportRequest, requestAction]);
+
+  const confirmPendingAction = () => {
+    if (pendingAction === 'print') executePrint();
+    else if (pendingAction === 'docx') executeDocx();
+    else if (pendingAction === 'json') executeJson();
   };
 
-  // Import JSON to reconstruct exam view — re-links image dataUrls from the local folder by blobKey
-  const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleImportJson = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
     if (!file) return;
-    if (file.size > MAX_EXAM_JSON_BYTES) { alert(`Exam JSON exceeds the ${Math.round(MAX_EXAM_JSON_BYTES / 1024 / 1024)} MiB import limit.`); e.target.value = ''; return; }
+    if (file.size > MAX_EXAM_JSON_BYTES) {
+      setImportNotice(t(`Exam JSON exceeds the ${Math.round(MAX_EXAM_JSON_BYTES / 1024 / 1024)} MiB import limit.`, `حجم فایل JSON آزمون از سقف ${Math.round(MAX_EXAM_JSON_BYTES / 1024 / 1024)} مگابایت بیشتر است.`));
+      event.target.value = '';
+      return;
+    }
     const reader = new FileReader();
     reader.onload = async () => {
       try {
@@ -82,169 +129,87 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc }
         const importedDoc: ExamDoc = { ...imported, images: restoredImages };
         onUpdateDoc(importedDoc);
         await saveExamDoc(importedDoc);
+        setImportNotice(t('Exam JSON imported.', 'فایل JSON آزمون وارد شد.'));
       } catch (error: any) {
-        alert(`Invalid Exam JSON: ${error?.message || 'validation failed'}`);
-      } finally { e.target.value = ''; }
+        setImportNotice(t(`Invalid Exam JSON: ${error?.message || 'validation failed'}`, `فایل JSON آزمون معتبر نیست: ${error?.message || 'اعتبارسنجی ناموفق بود'}`));
+      } finally { event.target.value = ''; }
     };
-    reader.onerror = () => { alert('Could not read Exam JSON file.'); e.target.value = ''; };
+    reader.onerror = () => {
+      setImportNotice(t('Could not read the Exam JSON file.', 'خواندن فایل JSON آزمون ممکن نشد.'));
+      event.target.value = '';
+    };
     reader.readAsText(file);
   };
 
-  // Duplicate exam -> new version (shared helper, same semantics as the Library)
   const handleDuplicate = () => {
     const newDoc = duplicateExamDoc(doc);
     onUpdateDoc(newDoc);
-    saveExamDoc(newDoc);
+    void saveExamDoc(newDoc);
   };
 
-  // Export as DOCX format using HTML document MIME
-  const handleExportDocx = () => {
-    if (!confirmPartialExport(doc, 'Export DOCX')) return;
-    const printArea = document.getElementById('printable-exam-area');
-    if (!printArea) return;
+  const report = showReport ? parseReportForDoc(doc) : null;
+  const pendingDescription = pendingAction
+    ? [
+      partialIssues.length ? t(`This exam is partial: ${partialIssues.join('; ')}.`, `این آزمون ناقص است: ${localizedPartialIssues.join('؛ ')}.`) : '',
+      pendingAction === 'print' && printRisks.length ? t(`${printRisks.length} question(s) may split across printed pages.`, `${printRisks.length} سؤال ممکن است بین صفحات چاپ شکسته شود.`) : '',
+      t('Continue only if you intend to export this state.', 'فقط در صورت تأیید این وضعیت ادامه دهید.'),
+    ].filter(Boolean).join(' ')
+    : '';
 
-    const safeTitle = getDisplayName(doc).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-    const htmlContent = `
-      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-      <head>
-        <meta charset='utf-8'>
-        <title>${safeTitle}</title>
-        <style>
-          body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 11pt; direction: ${doc.meta.direction}; }
-          table { border-collapse: collapse; width: 100%; }
-          td, th { border: 1px solid #999; padding: 6px; }
-        </style>
-      </head>
-      <body>
-        ${printArea.innerHTML}
-      </body>
-      </html>
-    `;
-
-    const blob = new Blob(['\ufeff', htmlContent], {
-      type: 'application/msword',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${sanitizeFileName(getDisplayName(doc))}.doc`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <div className="py-6 px-4 space-y-6">
-      <div className="max-w-5xl mx-auto print:hidden"><ExamHealthBanner doc={doc} /></div>
-      {/* Top Action Bar (Hidden on print) */}
-      <div className="max-w-5xl mx-auto flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs print:hidden">
-        {/* Render Modes Selector */}
-        <div className="inline-flex rounded-xl p-1 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700/60 text-xs font-medium">
-          <button
-            onClick={() => setRenderMode('paper')}
-            className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-              renderMode === 'paper'
-                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs font-semibold'
-                : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-            }`}
-          >
-            Exam Paper (Blank)
-          </button>
-          <button
-            onClick={() => setRenderMode('answer-key')}
-            className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-              renderMode === 'answer-key'
-                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs font-semibold'
-                : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-            }`}
-          >
-            Answer Key Mode
-          </button>
-          <button
-            onClick={() => setRenderMode('review')}
-            className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-              renderMode === 'review'
-                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs font-semibold'
-                : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-            }`}
-          >
-            Review (Anchors & Flags)
-          </button>
-        </div>
-
-        {/* 2F Parse report (optional, print-friendly) */}
-        <div className="mb-3 print:block">
-          <button onClick={() => setShowReport(v => !v)} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 print:hidden">{showReport ? 'Hide' : 'Show'} Parse report</button>
-          {showReport && (() => { const r = parseReportForDoc(doc); return (
-            <div className="mt-2 p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs space-y-1 print:border-none">
-              <div className="font-bold">Parse report — {doc.id}</div>
-              <div>Models: {Object.entries(r.models).map(([k, v]) => `${k}: ${v}`).join(' · ') || '—'}</div>
-              <div>Calls: {r.calls} · Tokens: {r.tokens.input} in / {r.tokens.output} out · Cost: ${r.cost.toFixed(4)}</div>
-              <div>Coverage after: {r.coverageAfter ?? '—'}% · Consensus sections: {r.consensusSections.length} · Critic: {r.critic.calls} call(s), {r.critic.defects} defect(s), {r.critic.ok} ok</div>
-              <div>Memory injected — playbook: [{r.memory.playbookIds.join(', ') || 'none'}] · skills: [{r.memory.skillIds.join(', ') || 'none'}] · guidance {r.memory.guidanceTokens} tok</div>
-              <div>Config hash: {r.configHash} · Generated: {r.generatedAt} · The JSON export embeds this report as a receipt (no keys).</div>
-            </div> ); })()}
-        </div>
-
-        {/* Export & Print Action Buttons */}
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <button
-            onClick={handleDuplicate}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-            title="Duplicate exam to create Version B"
-          >
-            <Copy className="w-3.5 h-3.5 text-slate-500" />
-            <span>Duplicate</span>
-          </button>
-
-          <button
-            onClick={handleExportDocx}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-            title="Export DOCX document"
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5 text-blue-500" />
-            <span>DOCX</span>
-          </button>
-
-          <button
-            onClick={handleExportJson}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-            title="Export clean ExamDoc JSON"
-          >
-            <Download className="w-3.5 h-3.5 text-emerald-500" />
-            <span>Export JSON</span>
-          </button>
-
-          <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer">
-            <Upload className="w-3.5 h-3.5 text-purple-500" />
-            <span>Import JSON</span>
-            <input
-              ref={jsonInputRef}
-              type="file"
-              accept=".json"
-              onChange={handleImportJson}
-              className="hidden"
-            />
-          </label>
-
-          <button
-            onClick={handlePrint}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold transition cursor-pointer shadow-xs ml-1"
-          >
-            <Printer className="w-4 h-4" />
-            <span>Print / Save PDF</span>
-          </button>
-        </div>
+  return <div className="ep-exam-view py-6 px-4">
+    <div className="max-w-5xl mx-auto print:hidden"><ExamHealthBanner doc={doc} /></div>
+    {pendingAction && <div className="max-w-5xl mx-auto my-4 print:hidden">
+      <ConfirmCard
+        title={t('Confirm export', 'تأیید خروجی')}
+        description={pendingDescription}
+        confirmLabel={t('Continue', 'ادامه')}
+        cancelLabel={t('Cancel', 'لغو')}
+        onConfirm={confirmPendingAction}
+        onCancel={() => setPendingAction(null)}
+      />
+    </div>}
+    <div className="ep-exam-toolbar max-w-5xl mx-auto my-6 flex flex-wrap items-center justify-between gap-3 border border-[var(--rule)] rounded-[var(--radius-card)] bg-[var(--paper-raised)] p-4 print:hidden">
+      <Tabs
+        label={t('Exam view mode', 'حالت نمایش آزمون')}
+        value={renderMode}
+        onChange={value => setRenderMode(value as ExamRenderMode)}
+        items={[
+          { id: 'paper', label: t('Exam', 'آزمون') },
+          { id: 'answer-key', label: t('Answer key', 'پاسخ‌نامه') },
+          { id: 'review', label: t('Review', 'بازبینی') },
+        ]}
+      />
+      <div className="flex flex-wrap items-center gap-2 text-[length:var(--type-12)]">
+        <Button size="sm" variant="ghost" onClick={handleDuplicate} title={t('Duplicate exam to create Version B', 'برای ساخت نسخه ب از آزمون یک کپی بسازید')}><Copy aria-hidden="true" size={16} /><span>{t('Duplicate', 'کپی')}</span></Button>
+        <Button size="sm" variant="ghost" onClick={() => requestAction('docx')} title={t('Export DOCX document', 'خروجی فایل DOCX')}><FileSpreadsheet aria-hidden="true" size={16} /><span>DOCX</span></Button>
+        <Button size="sm" variant="ghost" onClick={() => requestAction('json')} title={t('Export clean ExamDoc JSON', 'خروجی JSON پاک آزمون')}><Download aria-hidden="true" size={16} /><span>{t('Export JSON', 'خروجی JSON')}</span></Button>
+        <label className="ep-button ep-button-ghost ep-button-sm cursor-pointer">
+          <Upload aria-hidden="true" size={16} /><span>{t('Import JSON', 'ورود JSON')}</span>
+          <input ref={jsonInputRef} type="file" accept=".json" onChange={handleImportJson} className="sr-only" />
+        </label>
+        <Button size="sm" variant="primary" onClick={() => requestAction('print')}><Printer aria-hidden="true" size={16} /><span>{t('Print / Save PDF', 'چاپ / ذخیره PDF')}</span></Button>
+        <Button size="sm" variant="ghost" aria-expanded={showReport} onClick={() => setShowReport(value => !value)}>{showReport ? t('Hide report', 'پنهان کردن گزارش') : t('Parse report', 'گزارش استخراج')}</Button>
       </div>
+    </div>
 
-      {printRisks.length>0 && (
-        <div className="max-w-5xl mx-auto p-2 rounded bg-amber-50 border border-amber-300 text-xs text-amber-800 print:hidden">
-          Print check: {printRisks.length} question(s) may split across pages — <button onClick={handlePrint} className="underline font-semibold">Print anyway</button>
-        </div>
-      )}
-      {/* Rendered Printable Exam Container */}
+    {importNotice && <p className="max-w-5xl mx-auto text-[length:var(--type-12)]" role="status" aria-live="polite">{importNotice}</p>}
+    {report && <section className="ep-card ep-parse-report max-w-5xl mx-auto my-3 p-3 text-[length:var(--type-12)]" aria-label={t('Parse report', 'گزارش استخراج')}>
+      <div className="font-semibold">{t('Parse report', 'گزارش استخراج')} — <span className="ep-mono">{doc.id}</span></div>
+      <div>{t('Models', 'مدل‌ها')}: {Object.entries(report.models).map(([key, value]) => `${key}: ${value}`).join(' · ') || '—'}</div>
+      <div>{t('Calls', 'فراخوانی')}: {report.calls} · {t('Input tokens', 'توکن ورودی')}: {report.tokens.input} · {t('Output tokens', 'توکن خروجی')}: {report.tokens.output} · ${report.cost.toFixed(4)}</div>
+      <div>{t('Coverage after', 'پوشش پس از اجرا')}: {report.coverageAfter ?? '—'}% · {t('Consensus sections', 'بخش‌های اجماع')}: {report.consensusSections.length} · {t('Critic', 'ممیز')}: {report.critic.calls} {t('calls', 'فراخوانی')}, {report.critic.defects} {t('defects', 'ایراد')}, {report.critic.ok} {t('ok', 'مورد تأیید')}</div>
+      <div>{t('Memory injected', 'حافظه تزریق‌شده')}: {t('playbook', 'راهنمای پایه')} [{report.memory.playbookIds.join(', ') || t('none', 'هیچ')}] · {t('skills', 'مهارت‌ها')} [{report.memory.skillIds.join(', ') || t('none', 'هیچ')}] · {report.memory.guidanceTokens} {t('tokens', 'توکن')}</div>
+      <div>{t('Config hash', 'هش پیکربندی')}: <span className="ep-mono">{report.configHash}</span> · {t('Generated', 'ساخته‌شده')}: {report.generatedAt}</div>
+      <p className="ep-caption m-0">{t('The JSON export embeds this report as a receipt; no keys are included.', 'فایل JSON خروجی این گزارش را به‌عنوان رسید دارد و هیچ کلیدی در آن نیست.')}</p>
+    </section>}
+    {printRisks.length > 0 && <div className="max-w-5xl mx-auto my-3 border border-[var(--warn)] p-3 text-[length:var(--type-12)] print:hidden" role="status">
+      {t(`Print check: ${printRisks.length} question(s) may split across pages.`, `بررسی چاپ: ${printRisks.length} سؤال ممکن است بین صفحات شکسته شود.`)}{' '}
+      <Button size="sm" variant="ghost" onClick={() => requestAction('print')}>{t('Review and print', 'بازبینی و چاپ')}</Button>
+    </div>}
+    <div id={`panel-${renderMode}`} role="tabpanel" aria-labelledby={`tab-${renderMode}`} tabIndex={0}>
       <div id="printable-exam-area" ref={printAreaRef} className="w-full overflow-x-auto pb-10">
         <DeterministicRenderer doc={doc} mode={renderMode} />
       </div>
     </div>
-  );
+  </div>;
 };

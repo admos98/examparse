@@ -1,5 +1,5 @@
 import { applyExamMutation } from '../pipeline/patch';
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Edit3,
   RotateCcw,
@@ -30,12 +30,15 @@ import { buildQuestionTree } from '../utils/questionTree';
 import { computeSuggestions } from '../pipeline/suggestions';
 import { computeQualityScore } from '../utils/qualityScore';
 import { traceTimeline } from '../pipeline/provenance';
+import { ConfirmCard, Modal } from '../design/primitives';
 
 interface Props {
   examDoc: ExamDoc;
   settings: AppSettings;
   onUpdateDoc: (updated: ExamDoc) => void;
   onProceedToExamView: () => void;
+  retryRequest?: number;
+  onRetryRequestHandled?: () => void;
 }
 
 export const Step4Review: React.FC<Props> = ({
@@ -43,6 +46,8 @@ export const Step4Review: React.FC<Props> = ({
   settings,
   onUpdateDoc,
   onProceedToExamView,
+  retryRequest = 0,
+  onRetryRequestHandled,
 }) => {
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
   const [patchModalQuestion, setPatchModalQuestion] = useState<Question | null>(null);
@@ -68,6 +73,7 @@ export const Step4Review: React.FC<Props> = ({
   const [dismissedChips, setDismissedChips] = useState<Set<string>>(new Set());
   const [scoreExplain, setScoreExplain] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [pendingBulkDelete, setPendingBulkDelete] = useState(false);
   const [bulkPts, setBulkPts] = useState(2);
   const [undoSnapshot, setUndoSnapshot] = useState<string | null>(null);
 
@@ -101,6 +107,13 @@ export const Step4Review: React.FC<Props> = ({
       setRetryingCoverage(false);
     }
   };
+  const lastRetryRequest = useRef(0);
+  useEffect(() => {
+    if (retryRequest <= lastRetryRequest.current) return;
+    lastRetryRequest.current = retryRequest;
+    onRetryRequestHandled?.();
+    void handleRetryMissingCoverage();
+  }, [retryRequest, onRetryRequestHandled]);
 
   const handleAssignImage = (imageId: string, questionId: string) => {
     const question = examDoc.questions.find(item => item.id === questionId);
@@ -192,7 +205,7 @@ export const Step4Review: React.FC<Props> = ({
 
       setPatchDiffResult(result);
     } catch (err: any) {
-      alert(`Patch failed: ${err.message}`);
+      setSolverError(`Patch failed: ${err?.message || 'The provider request could not be completed.'}`);
     } finally {
       setIsPatching(false);
     }
@@ -258,7 +271,7 @@ export const Step4Review: React.FC<Props> = ({
         saveExamDoc(newDoc);
       }
     } catch (err: any) {
-      alert(`AI Solve failed: ${err.message}`);
+      setSolverError(`AI Solve failed: ${err?.message || 'The provider request could not be completed.'}`);
     } finally {
       setIsSolvingBatch(false);
     }
@@ -302,7 +315,7 @@ export const Step4Review: React.FC<Props> = ({
 
       handleUpdateQuestion(q.id, updatedQ);
     } catch (err: any) {
-      alert(`Failed to solve question: ${err.message}`);
+      setSolverError(`Failed to solve question: ${err?.message || 'The provider request could not be completed.'}`);
     } finally {
       setSolvingQuestionId(null);
     }
@@ -343,12 +356,12 @@ export const Step4Review: React.FC<Props> = ({
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-6">
       {/* Control Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs">
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 ">
         <div>
-          <h1 className="text-sm font-bold text-slate-900 dark:text-white">
+          <h1 className="text-sm font-bold text-[var(--ink)] ">
             Question Bank Review & Editor
           </h1>
-          <p className="text-xs text-slate-500">
+          <p className="text-xs text-[var(--ink-2)]">
             {examDoc.questions.length} questions • {examDoc.sections.length} sections • {examDoc.flags.length} flags
           </p>
         </div>
@@ -361,14 +374,14 @@ export const Step4Review: React.FC<Props> = ({
               <button
                 disabled={isSolvingBatch || missingCount === 0}
                 onClick={handleSolveAllMissing}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border font-medium transition cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border font-medium transition cursor-pointer ${
                   missingCount > 0
-                    ? 'bg-purple-50 dark:bg-purple-950/40 border-purple-300 dark:border-purple-800 text-purple-700 dark:text-purple-300 hover:bg-purple-100'
-                    : 'border-slate-200 dark:border-slate-800 text-slate-400 opacity-60'
+                    ? 'bg-[var(--paper)]  border-[var(--accent)]  text-[var(--accent-ink)]  hover:bg-[var(--paper)]'
+                    : 'border-[var(--rule)]  text-[var(--ink-2)] opacity-60'
                 }`}
                 title="Solve all questions lacking an answer with AI in 1 batched call"
               >
-                <Sparkles className="w-3.5 h-3.5 text-purple-500" />
+                <Sparkles className="w-3.5 h-3.5 text-[var(--accent-ink)]" />
                 <span>
                   {isSolvingBatch
                     ? 'Solving Batch...'
@@ -382,40 +395,40 @@ export const Step4Review: React.FC<Props> = ({
 
           <button
             onClick={handleRenumberQuestions}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 font-medium transition cursor-pointer"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  font-medium transition cursor-pointer"
             title="Renumber all questions sequentially 1..N"
           >
-            <ListOrdered className="w-3.5 h-3.5 text-blue-500" />
+            <ListOrdered className="w-3.5 h-3.5 text-[var(--accent-ink)]" />
             <span>Renumber</span>
           </button>
 
           <button
             onClick={() => setShowImageManager(!showImageManager)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border transition cursor-pointer ${
               showImageManager
-                ? 'bg-purple-50 dark:bg-purple-950/40 border-purple-300 dark:border-purple-800 text-purple-700 dark:text-purple-300'
-                : 'border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800'
+                ? 'bg-[var(--paper)]  border-[var(--accent)]  text-[var(--accent-ink)] '
+                : 'border-[var(--rule)]  hover:bg-[var(--paper)] '
             }`}
           >
-            <ImageIcon className="w-3.5 h-3.5 text-purple-500" />
+            <ImageIcon className="w-3.5 h-3.5 text-[var(--accent-ink)]" />
             <span>Images ({examDoc.images.length})</span>
           </button>
 
           <button
             onClick={() => setShowFlagsPanel(!showFlagsPanel)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border transition cursor-pointer ${
               showFlagsPanel && examDoc.flags.length > 0
-                ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-300'
-                : 'border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800'
+                ? 'bg-[var(--warn-soft)]  border-[var(--warn)]  text-[var(--warn-ink)] '
+                : 'border-[var(--rule)]  hover:bg-[var(--paper)] '
             }`}
           >
-            <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+            <AlertTriangle className="w-3.5 h-3.5 text-[var(--warn-ink)]" />
             <span>Flags ({examDoc.flags.length})</span>
           </button>
 
           <button
             onClick={onProceedToExamView}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs transition cursor-pointer shadow-xs ml-2"
+            className="ep-directional-forward flex items-center gap-1.5 px-4 py-2 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent)] text-[var(--on-accent)] font-medium text-xs transition cursor-pointer  ms-2"
           >
             <span>Preview & Print Exam</span>
             <ArrowRight className="w-3.5 h-3.5" />
@@ -429,7 +442,7 @@ export const Step4Review: React.FC<Props> = ({
         const chips = computeSuggestions(examDoc).filter(c=> !dismissedChips.has(c.id));
         if (chips.length===0) return null;
         return <div className="flex flex-wrap gap-2">{chips.map(c=> (
-          <span key={c.id} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs">
+          <span key={c.id} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-[10px] bg-[var(--accent)] text-[var(--on-accent)] text-xs">
             <button onClick={()=> {
               if (c.id==='missing') handleRetryMissingCoverage();
               else if (c.id==='unplaced') setShowImageManager(true);
@@ -439,25 +452,26 @@ export const Step4Review: React.FC<Props> = ({
           </span>
         ))}</div>;
       })()}
-      {scoreExplain && <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-3 text-xs flex items-center justify-between"><span>{scoreExplain}</span><button onClick={()=> setScoreExplain(null)} className="text-slate-400 hover:text-slate-600"><X className="w-4 h-4" /></button></div>}
+      {scoreExplain && <div className="rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)]  p-3 text-xs flex items-center justify-between"><span>{scoreExplain}</span><button onClick={()=> setScoreExplain(null)} className="text-[var(--ink-2)] hover:text-[var(--ink-2)]"><X className="w-4 h-4" /></button></div>}
       {/* Bulk ops bar (D2) — confirm destructive */}
       {selectedIds.size>0 && (
-        <div role="toolbar" aria-label="Bulk actions" className="flex flex-wrap items-center gap-2 p-2 rounded-xl border bg-blue-50 dark:bg-blue-950/30 text-xs">
+        <div role="toolbar" aria-label="Bulk actions" className="flex flex-wrap items-center gap-2 p-2 rounded-[10px] border bg-[var(--paper)]  text-xs">
           <span className="font-semibold">{selectedIds.size} selected</span>
-          <label className="flex items-center gap-1">Points <input type="number" min={0} max={50} step={1} value={bulkPts} onChange={e=> setBulkPts(Number(e.target.value))} className="w-16 px-1 py-0.5 rounded border text-xs" /></label>
-          <button onClick={()=> { const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'setPoints', points:bulkPts}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); }} className="px-2 py-1 rounded bg-blue-600 text-white text-xs">Set points</button>
-          <button onClick={()=> { if(!confirm(`Delete ${selectedIds.size} question(s)?`)) return; const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'delete'}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); setSelectedIds(new Set()); }} className="px-2 py-1 rounded bg-red-600 text-white text-xs">Delete</button>
-          <button onClick={()=> { const exp=exportSelected(examDoc, [...selectedIds]); const blob=new Blob([JSON.stringify(exp.json,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='selected.json'; a.click(); URL.revokeObjectURL(url); }} className="px-2 py-1 rounded border text-xs">Export selected</button>
-          {undoSnapshot && <button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs font-semibold">Undo</button>}
-          <button onClick={()=> setSelectedIds(new Set())} className="px-2 py-1 rounded border text-xs">Clear</button>
+          <label className="flex items-center gap-1">Points <input type="number" min={0} max={50} step={1} value={bulkPts} onChange={e=> setBulkPts(Number(e.target.value))} className="w-16 px-1 py-0.5 rounded-[6px] border text-xs" /></label>
+          <button onClick={()=> { const {doc:next, undo}=applyBulk(examDoc, [...selectedIds], {type:'setPoints', points:bulkPts}); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); }} className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] text-xs">Set points</button>
+          <button onClick={()=> setPendingBulkDelete(true)} className="px-2 py-1 rounded-[6px] border border-[var(--danger)] text-[var(--danger)] text-xs">Delete</button>
+          <button onClick={()=> { const exp=exportSelected(examDoc, [...selectedIds]); const blob=new Blob([JSON.stringify(exp.json,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='selected.json'; a.click(); URL.revokeObjectURL(url); }} className="px-2 py-1 rounded-[6px] border text-xs">Export selected</button>
+          {undoSnapshot && <button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded-[6px] border text-xs font-semibold">Undo</button>}
+          <button onClick={()=> setSelectedIds(new Set())} className="px-2 py-1 rounded-[6px] border text-xs">Clear</button>
         </div>
       )}
-      {undoSnapshot && selectedIds.size===0 && <div className="text-xs flex items-center gap-2"><span>Bulk change applied.</span><button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded border text-xs font-semibold">Undo</button></div>}
+      {pendingBulkDelete && <ConfirmCard title={settings.uiLanguage === 'fa' ? 'حذف پرسش‌های انتخاب‌شده؟' : 'Delete selected questions?'} description={settings.uiLanguage === 'fa' ? `تعداد ${selectedIds.size} پرسش حذف می‌شود. این تغییر قابل بازگردانی است.` : `${selectedIds.size} selected question(s) will be removed. This change can be undone.`} confirmLabel={settings.uiLanguage === 'fa' ? 'حذف پرسش‌ها' : 'Delete questions'} cancelLabel={settings.uiLanguage === 'fa' ? 'لغو' : 'Cancel'} danger onConfirm={() => { const { doc: next, undo } = applyBulk(examDoc, [...selectedIds], { type: 'delete' }); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); setSelectedIds(new Set()); setPendingBulkDelete(false); }} onCancel={() => setPendingBulkDelete(false)} />}
+      {undoSnapshot && selectedIds.size===0 && <div className="text-xs flex items-center gap-2"><span>Bulk change applied.</span><button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded-[6px] border text-xs font-semibold">Undo</button></div>}
       {health.missing.length > 0 && (
-        <div className="rounded-2xl border border-red-300 bg-red-50 p-4 text-xs text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+        <div className="rounded-[10px] border border-[var(--danger)] bg-[var(--danger-soft)] p-4 text-xs text-[var(--danger)]   ">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div><strong>PARTIAL COVERAGE — {health.missing.length} expected question(s) are missing.</strong><div className="mt-1">Missing printed numbers: {health.missing.join(', ')}. This document remains incomplete and exports require confirmation.</div></div>
-            <button disabled={retryingCoverage} onClick={handleRetryMissingCoverage} className="rounded-lg bg-red-700 px-3 py-2 font-semibold text-white disabled:opacity-50">
+            <button disabled={retryingCoverage} onClick={handleRetryMissingCoverage} className="rounded-[6px] bg-[var(--danger)] px-3 py-2 font-semibold text-[var(--on-accent)] disabled:opacity-50">
               {retryingCoverage ? 'Recovering…' : 'Retry missing questions'}
             </button>
           </div>
@@ -466,12 +480,12 @@ export const Step4Review: React.FC<Props> = ({
         </div>
       )}
       {health.unplacedImages.length > 0 && (
-        <section className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-xs dark:border-amber-900 dark:bg-amber-950/30">
-          <h2 className="font-bold text-amber-900 dark:text-amber-200">Unplaced image assets ({health.unplacedImages.length}) — none are hidden</h2>
+        <section className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-4 text-xs  ">
+          <h2 className="font-bold text-[var(--warn-ink)] ">Unplaced image assets ({health.unplacedImages.length}) — none are hidden</h2>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{health.unplacedImages.map(image => (
-            <div key={image.id} className="flex gap-3 rounded-xl border border-amber-300 bg-white p-2 dark:border-amber-800 dark:bg-slate-900">
-              {image.dataUrl ? <img src={image.dataUrl} alt={image.id} className="h-16 w-20 object-contain rounded bg-slate-100" /> : <div className="flex h-16 w-20 items-center justify-center rounded border border-dashed border-amber-500 text-[10px]">Missing asset</div>}
-              <div className="min-w-0 flex-1"><div className="font-mono font-bold">{image.id} · page {image.page}</div><div className="truncate text-slate-600">{image.label?.caption || 'Unassigned extracted image'}</div><label className="mt-1 block text-[10px]">Assign to question<select value="" onChange={event => event.target.value && handleAssignImage(image.id, event.target.value)} className="mt-1 w-full rounded border border-amber-300 bg-white p-1 dark:bg-slate-900"><option value="">Choose question…</option>{examDoc.questions.filter(question => !question.parentId).map(question => <option key={question.id} value={question.id}>Q{question.label} — {(question.stem || '').slice(0, 60)}</option>)}</select></label></div>
+            <div key={image.id} className="flex gap-3 rounded-[10px] border border-[var(--warn)] bg-[var(--paper-raised)] p-2  ">
+              {image.dataUrl ? <img src={image.dataUrl} alt={image.id} className="h-16 w-20 object-contain rounded-[6px] bg-[var(--paper)]" /> : <div className="flex h-16 w-20 items-center justify-center rounded-[6px] border border-dashed border-[var(--warn)] text-[length:var(--type-12)]">Missing asset</div>}
+              <div className="min-w-0 flex-1"><div className="font-mono font-bold">{image.id} · page {image.page}</div><div className="truncate text-[var(--ink-2)]">{image.label?.caption || 'Unassigned extracted image'}</div><label className="mt-1 block text-[length:var(--type-12)]">Assign to question<select value="" onChange={event => event.target.value && handleAssignImage(image.id, event.target.value)} className="mt-1 w-full rounded-[6px] border border-[var(--warn)] bg-[var(--paper-raised)] p-1 "><option value="">Choose question…</option>{examDoc.questions.filter(question => !question.parentId).map(question => <option key={question.id} value={question.id}>Q{question.label} — {(question.stem || '').slice(0, 60)}</option>)}</select></label></div>
             </div>
           ))}</div>
         </section>
@@ -479,13 +493,13 @@ export const Step4Review: React.FC<Props> = ({
 
       {/* Solver Budget Stop Banner */}
       {solverError && (
-        <div className="p-4 rounded-2xl border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300 flex items-start gap-3 text-xs">
-          <ShieldAlert className="w-5 h-5 shrink-0 text-red-500 mt-0.5" />
+        <div className="p-4 rounded-[10px] border border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]  flex items-start gap-3 text-xs">
+          <ShieldAlert className="w-5 h-5 shrink-0 text-[var(--danger)] mt-0.5" />
           <div className="flex-1 space-y-1">
             <span className="font-bold">Budget / Execution Stop:</span>
             <p>{solverError}</p>
           </div>
-          <button onClick={() => setSolverError(null)} className="text-red-400 hover:text-red-600">
+          <button onClick={() => setSolverError(null)} className="text-[var(--danger)] hover:text-[var(--danger)]">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -493,13 +507,13 @@ export const Step4Review: React.FC<Props> = ({
 
       {/* Flags Panel (§4 & §6.3) */}
       {showFlagsPanel && examDoc.flags.length > 0 && (
-        <div className="bg-amber-50/60 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/60 rounded-2xl p-4 space-y-2 text-xs">
-          <div className="font-bold text-amber-800 dark:text-amber-300 flex items-center justify-between">
+        <div className="bg-[var(--warn-soft)]  border border-[var(--warn)]  rounded-[10px] p-4 space-y-2 text-xs">
+          <div className="font-bold text-[var(--warn-ink)]  flex items-center justify-between">
             <span className="flex items-center gap-1.5">
-              <ShieldAlert className="w-4 h-4 text-amber-500" />
+              <ShieldAlert className="w-4 h-4 text-[var(--warn-ink)]" />
               <span>Integrity Flags ({examDoc.flags.length})</span>
             </span>
-            <button onClick={() => setShowFlagsPanel(false)} className="text-amber-600 hover:text-amber-800">
+            <button onClick={() => setShowFlagsPanel(false)} className="text-[var(--warn-ink)] hover:text-[var(--warn-ink)]">
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -507,20 +521,20 @@ export const Step4Review: React.FC<Props> = ({
             {examDoc.flags.map(f => (
               <div
                 key={f.id}
-                className="p-2.5 rounded-xl bg-white/80 dark:bg-slate-900/80 border border-amber-200 dark:border-amber-800/40 flex items-start gap-2"
+                className="p-2.5 rounded-[10px] bg-[var(--paper-raised)]  border border-[var(--warn)]  flex items-start gap-2"
               >
                 <span
-                  className={`text-[9px] font-mono px-1.5 py-0.5 rounded uppercase font-semibold shrink-0 ${
+                  className={`text-[length:var(--type-12)] font-mono px-1.5 py-0.5 rounded-[6px] uppercase font-semibold shrink-0 ${
                     f.severity === 'error'
-                      ? 'bg-red-500/10 text-red-600'
+                      ? 'bg-[var(--danger-soft)] text-[var(--danger)]'
                       : f.severity === 'warn'
-                      ? 'bg-amber-500/10 text-amber-600'
-                      : 'bg-blue-500/10 text-blue-600'
+                      ? 'bg-[var(--warn-soft)] text-[var(--warn-ink)]'
+                      : 'bg-[var(--paper)] text-[var(--accent-ink)]'
                   }`}
                 >
                   {f.code}
                 </span>
-                <span className="text-slate-700 dark:text-slate-300 leading-snug">{f.message}</span>
+                <span className="text-[var(--ink)]  leading-snug">{f.message}</span>
               </div>
             ))}
           </div>
@@ -529,29 +543,29 @@ export const Step4Review: React.FC<Props> = ({
 
       {/* 2F Provenance — per-question Trace disclosure + 2B critic verdict badges */}
       {(((examDoc as any).traces?.length || Object.keys((examDoc as any).verdicts || {}).length) ? (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-2 text-xs">
-          <div className="font-bold text-slate-900 dark:text-white">Provenance — Trace & Critic verdicts</div>
+        <div className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 space-y-2 text-xs">
+          <div className="font-bold text-[var(--ink)] ">Provenance — Trace & Critic verdicts</div>
           <div className="space-y-1.5">
             {examDoc.questions.map(q => {
               const trace = ((examDoc as any).traces || []).find((t: any) => t.questionId === q.id);
               const verdicts = ((examDoc as any).verdicts || {})[q.id] || [];
               if (!trace && !verdicts.length) return null;
               return (
-                <details key={q.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
-                  <summary className="cursor-pointer font-medium text-slate-800 dark:text-slate-100">
+                <details key={q.id} className="rounded-[10px] border border-[var(--rule)]  p-2.5">
+                  <summary className="cursor-pointer font-medium text-[var(--ink)] ">
                     Trace — Q{q.no}
                     {verdicts.map((v: any, i: number) => (
-                      <span key={i} className={`ml-2 text-[9px] font-mono px-1.5 py-0.5 rounded uppercase ${v.verdict === 'defect' ? 'bg-red-500/10 text-red-600' : 'bg-emerald-500/10 text-emerald-600'}`}>critic: {v.verdict}{v.defectKind ? ` · ${v.defectKind}` : ''} → {v.suggestedAction}</span>
+                      <span key={i} className={`ms-2 text-[length:var(--type-12)] font-mono px-1.5 py-0.5 rounded-[6px] uppercase ${v.verdict === 'defect' ? 'bg-[var(--danger-soft)] text-[var(--danger)]' : 'bg-[var(--ok-soft)] text-[var(--ok)]'}`}>critic: {v.verdict}{v.defectKind ? ` · ${v.defectKind}` : ''} → {v.suggestedAction}</span>
                     ))}
                   </summary>
                   {trace ? traceTimeline(trace).map((line: any, i: number) => (
-                    <div key={i} className="mt-1.5 text-slate-600 dark:text-slate-300">
+                    <div key={i} className="mt-1.5 text-[var(--ink-2)] ">
                       <div>{line.en}</div>
-                      <div dir="rtl" className="text-slate-500">{line.fa}</div>
+                      <div dir="rtl" className="text-[var(--ink-2)]">{line.fa}</div>
                     </div>
-                  )) : <div className="mt-1.5 text-slate-500">No trace recorded for this question.</div>}
-                  {verdicts.map((v: any, i: number) => <div key={`v${i}`} className="mt-1 text-slate-500">Critic note: {v.note}</div>)}
-                  {q.spans?.length ? <div className="mt-1 text-slate-400">Source: lines {q.spans.map((sp: any) => `${sp[0]}–${sp[1]}`).join(', ')} (Step 2)</div> : null}
+                  )) : <div className="mt-1.5 text-[var(--ink-2)]">No trace recorded for this question.</div>}
+                  {verdicts.map((v: any, i: number) => <div key={`v${i}`} className="mt-1 text-[var(--ink-2)]">Critic note: {v.note}</div>)}
+                  {q.spans?.length ? <div className="mt-1 text-[var(--ink-2)]">Source: lines {q.spans.map((sp: any) => `${sp[0]}–${sp[1]}`).join(', ')} (Step 2)</div> : null}
                 </details>
               );
             })}
@@ -561,17 +575,17 @@ export const Step4Review: React.FC<Props> = ({
 
       {/* Local Image Manager Modal / Panel */}
       {showImageManager && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-4 shadow-sm text-xs">
-          <div className="flex justify-between items-center pb-2 border-b border-slate-100 dark:border-slate-800">
+        <div className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 space-y-4  text-xs">
+          <div className="flex justify-between items-center pb-2 border-b border-[var(--rule)] ">
             <div>
-              <h3 className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-                <ImageIcon className="w-4 h-4 text-purple-500" /> Local Image Manager
+              <h3 className="font-bold text-[var(--ink)]  flex items-center gap-1.5">
+                <ImageIcon className="w-4 h-4 text-[var(--accent-ink)]" /> Local Image Manager
               </h3>
-              <p className="text-[11px] text-slate-500">
+              <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">
                 Reassign images to questions or mark as decoration locally (0 API calls)
               </p>
             </div>
-            <button onClick={() => setShowImageManager(false)} className="text-slate-400 hover:text-slate-600">
+            <button onClick={() => setShowImageManager(false)} className="text-[var(--ink-2)] hover:text-[var(--ink-2)]">
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -580,22 +594,22 @@ export const Step4Review: React.FC<Props> = ({
             {examDoc.images.map(img => (
               <div
                 key={img.id}
-                className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 space-y-2"
+                className="p-3 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)]  space-y-2"
               >
                 {img.dataUrl ? (
                   <img
                     src={img.dataUrl}
                     alt={img.id}
-                    className="w-full h-28 object-contain rounded-lg bg-white border border-slate-200 dark:border-slate-800"
+                    className="w-full h-28 object-contain rounded-[10px] bg-[var(--paper-raised)] border border-[var(--rule)] "
                   />
                 ) : (
-                  <div className="w-full h-28 rounded-lg bg-slate-200 dark:bg-slate-800 flex items-center justify-center text-slate-400">
+                  <div className="w-full h-28 rounded-[10px] bg-[var(--paper)]  flex items-center justify-center text-[var(--ink-2)]">
                     Image {img.id}
                   </div>
                 )}
 
                 <div className="space-y-1">
-                  <div className="flex justify-between items-center font-mono text-[10px] text-slate-500">
+                  <div className="flex justify-between items-center font-mono text-[length:var(--type-12)] text-[var(--ink-2)]">
                     <span>{img.id} (P{img.page})</span>
                     <span>{img.width}×{img.height}</span>
                   </div>
@@ -604,7 +618,7 @@ export const Step4Review: React.FC<Props> = ({
                     <select
                       value={img.label?.role || 'stem'}
                       onChange={e => handleReassignImage(img.id, { role: e.target.value })}
-                      className="px-2 py-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-[11px] flex-1"
+                      className="px-2 py-1 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper-raised)]  text-[length:var(--type-12)] flex-1"
                     >
                       <option value="stem">Stem</option>
                       <option value="option">Option</option>
@@ -617,7 +631,7 @@ export const Step4Review: React.FC<Props> = ({
                       placeholder="Q# Ref"
                       value={img.label?.questionRef || ''}
                       onChange={e => handleReassignImage(img.id, { questionRef: e.target.value })}
-                      className="w-16 px-2 py-1 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-[11px] font-mono"
+                      className="w-16 px-2 py-1 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper-raised)]  text-[length:var(--type-12)] font-mono"
                     />
                   </div>
                 </div>
@@ -636,12 +650,12 @@ export const Step4Review: React.FC<Props> = ({
           const renderNestedChildren = (parentId: string, depth = 1): React.ReactNode => {
             const children = hierarchy.children.get(parentId) || [];
             if (!children.length) return null;
-            return <div className={`${depth === 1 ? 'ml-4 border-l-2 border-indigo-300 pl-3 dark:border-indigo-700' : 'ml-4 border-l border-indigo-200 pl-3 dark:border-indigo-800'} space-y-2`}>
-              {children.map((child, childIndex) => <div key={child.id} className="rounded-xl border border-indigo-200 bg-indigo-50/60 p-3 text-xs dark:border-indigo-900 dark:bg-indigo-950/20">
-                <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded bg-indigo-200 px-1.5 py-0.5 font-mono font-bold text-indigo-900 dark:bg-indigo-900 dark:text-indigo-100">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span><span className="text-[10px] text-slate-500">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {child.spans.map(([start, end]) => `L${start}..L${end}`).join(', ')}</span></div><button onClick={() => setActiveQuestionId(activeQuestionId === child.id ? null : child.id)} className="text-[10px] font-semibold text-indigo-700 underline dark:text-indigo-300">{activeQuestionId === child.id ? 'Close edit' : 'Edit child'}</button></div>
-                {activeQuestionId === child.id ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded border border-indigo-300 bg-white p-2 dark:bg-slate-900" /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
+            return <div className={`${depth === 1 ? 'ms-4 border-s-2 border-[var(--accent)] ps-3 ' : 'ms-4 border-s border-[var(--accent)] ps-3 '} space-y-2`}>
+              {children.map((child, childIndex) => <div key={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
+                <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span><span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {child.spans.map(([start, end]) => `L${start}..L${end}`).join(', ')}</span></div><button onClick={() => setActiveQuestionId(activeQuestionId === child.id ? null : child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{activeQuestionId === child.id ? 'Close edit' : 'Edit child'}</button></div>
+                {activeQuestionId === child.id ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
                 {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
-                {child.answer?.text && <div className="mt-2 border-t border-indigo-200 pt-2"><b>Answer:</b> {child.answer.text}</div>}
+                {child.answer?.text && <div className="mt-2 border-t border-[var(--accent)] pt-2"><b>Answer:</b> {child.answer.text}</div>}
                 {renderNestedChildren(child.id, depth + 1)}
               </div>)}
             </div>;
@@ -650,17 +664,17 @@ export const Step4Review: React.FC<Props> = ({
 
           return (
             <div key={sec.id} className="space-y-3">
-              {(hierarchy.cycleBreaks.size > 0 || hierarchy.orphanedParents.size > 0) && <div role="status" className="rounded-lg border border-amber-300 bg-amber-50 p-2 text-[11px] text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">Invalid nested-question links were flattened so all {hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size} affected question(s) remain visible.</div>}
+              {(hierarchy.cycleBreaks.size > 0 || hierarchy.orphanedParents.size > 0) && <div role="status" className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]   ">Invalid nested-question links were flattened so all {hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size} affected question(s) remain visible.</div>}
               {/* Section Header */}
-              <div className="flex items-center justify-between pb-1 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center justify-between pb-1 border-b border-[var(--rule)] ">
                 <div className="space-y-0.5">
-                  <h2 className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
+                  <h2 className="text-xs font-bold text-[var(--ink)]  uppercase tracking-wider">
                     {sec.title || `Section ${sec.index}`}
                   </h2>
-                  {sec.instructions && <p dir="auto" className="text-[11px] text-slate-500 italic">{sec.instructions}</p>}
-                  {sec.passage && <div dir="auto" className="mt-2 max-w-4xl whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-relaxed text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">{sec.passage}</div>}
+                  {sec.instructions && <p dir="auto" className="text-[length:var(--type-12)] text-[var(--ink-2)] italic">{sec.instructions}</p>}
+                  {sec.passage && <div dir="auto" className="mt-2 max-w-4xl whitespace-pre-wrap rounded-[10px] border border-[var(--rule)] bg-[var(--paper)] p-3 text-xs leading-relaxed text-[var(--ink)]   ">{sec.passage}</div>}
                 </div>
-                <span className="text-[11px] font-mono text-slate-400">
+                <span className="text-[length:var(--type-12)] font-mono text-[var(--ink-2)]">
                   {sec.points !== undefined ? `${sec.points} pts · ` : ''}{secQuestions.length} question(s)
                 </span>
               </div>
@@ -675,40 +689,42 @@ export const Step4Review: React.FC<Props> = ({
                   return (
                     <div
                       key={q.id}
-                      className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs space-y-3 transition hover:border-slate-300 dark:hover:border-slate-700"
+                      data-review-question={q.id}
+                      tabIndex={-1}
+                      className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4  space-y-3 transition hover:border-[var(--rule-strong)] "
                     >
                       {/* Question Header Row */}
                       <div className="flex items-center justify-between gap-3 text-xs">
                         <div className="flex items-center gap-2">
                           <input type="checkbox" checked={selectedIds.has(q.id)} onChange={e=> setSelectedIds(s=> { const n=new Set(s); if(e.target.checked) n.add(q.id); else n.delete(q.id); return n; })} className="w-3.5 h-3.5" />
-                          <span className="w-7 h-7 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 font-bold flex items-center justify-center font-mono">
+                          <span className="w-7 h-7 rounded-[10px] bg-[var(--paper)] text-[var(--accent-ink)]  font-bold flex items-center justify-center font-mono">
                             {q.label}
                           </span>
 
-                          <span className="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                          <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono uppercase bg-[var(--paper)]  text-[var(--ink-2)] ">
                             {q.type}
                           </span>
 
                           {q.points !== undefined && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-semibold">
+                            <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono bg-[var(--ok-soft)] text-[var(--ok)]  font-semibold">
                               {q.points} pts
                             </span>
                           )}
 
-                          <span className="text-[10px] text-slate-400 font-mono">
+                          <span className="text-[length:var(--type-12)] text-[var(--ink-2)] font-mono">
                             spans: {q.spans.map(([s, e]) => `L${s}..L${e}`).join(', ')}
                           </span>
 
                           <span
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                            className={`px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono ${
                               q.confidence >= 0.8
-                                ? 'bg-emerald-500/10 text-emerald-600'
-                                : 'bg-amber-500/10 text-amber-600'
+                                ? 'bg-[var(--ok-soft)] text-[var(--ok)]'
+                                : 'bg-[var(--warn-soft)] text-[var(--warn-ink)]'
                             }`}
                           >
                             {((q.confidence ?? 1) * 100).toFixed(0)}% conf
                           </span>
-                          {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded bg-indigo-50 px-2 py-1 text-[10px] font-semibold text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
+                          {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded-[6px] bg-[var(--paper)] px-2 py-1 text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)]  ">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
                         </div>
 
                         {/* Question Action Buttons */}
@@ -717,10 +733,10 @@ export const Step4Review: React.FC<Props> = ({
                           <button
                             disabled={solvingQuestionId === q.id}
                             onClick={() => handleSolveSingle(q)}
-                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-purple-50 dark:bg-purple-950/40 border border-purple-300 dark:border-purple-800 text-purple-700 dark:text-purple-300 text-[11px] font-medium hover:bg-purple-100 dark:hover:bg-purple-900/40 transition cursor-pointer"
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-[6px] bg-[var(--paper)]  border border-[var(--accent)]  text-[var(--accent-ink)]  text-[length:var(--type-12)] font-medium hover:bg-[var(--paper)]  transition cursor-pointer"
                             title="Solve or regenerate answer for this question with AI"
                           >
-                            <Sparkles className="w-3 h-3 text-purple-500" />
+                            <Sparkles className="w-3 h-3 text-[var(--accent-ink)]" />
                             <span>{solvingQuestionId === q.id ? 'Solving...' : q.answer?.text ? 'Re-solve' : 'AI Solve'}</span>
                           </button>
 
@@ -731,23 +747,23 @@ export const Step4Review: React.FC<Props> = ({
                               setPatchDiffResult(null);
                               setPatchInstruction('');
                             }}
-                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-300 text-[11px] font-medium hover:bg-amber-100 dark:hover:bg-amber-900/40 transition cursor-pointer"
-                            title="Regenerate this single question using minimal RFC 7386 JSON Merge Patch"
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-[6px] bg-[var(--warn-soft)]  border border-[var(--warn)]  text-[var(--warn-ink)]  text-[length:var(--type-12)] font-medium hover:bg-[var(--warn-soft)]  transition cursor-pointer"
+                            title={settings.uiLanguage === 'fa' ? 'بازسازی همین پرسش با وصلهٔ کمینهٔ RFC 7386' : 'Regenerate this single question using minimal RFC 7386 JSON Merge Patch'}
                           >
-                            <Sparkles className="w-3 h-3 text-amber-500" />
-                            <span>Patch</span>
+                            <Sparkles className="w-3 h-3 text-[var(--warn-ink)]" />
+                            <span>{settings.uiLanguage === 'fa' ? 'وصله' : 'Patch'}</span>
                           </button>
 
                           <button
                             onClick={() => setActiveQuestionId(isExpanded ? null : q.id)}
-                            className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+                            className="p-1.5 text-[var(--ink-2)] hover:text-[var(--ink-2)]  rounded-[6px] hover:bg-[var(--paper)]  transition cursor-pointer"
                           >
                             {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                           </button>
 
                           <button
                             onClick={() => handleDeleteQuestion(q.id)}
-                            className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/30 transition cursor-pointer"
+                            className="p-1.5 text-[var(--ink-2)] hover:text-[var(--danger)] rounded-[6px] hover:bg-[var(--danger-soft)]  transition cursor-pointer"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -761,10 +777,10 @@ export const Step4Review: React.FC<Props> = ({
                             rows={3}
                             value={q.stem || ''}
                             onChange={e => handleUpdateQuestion(q.id, { stem: e.target.value })}
-                            className="w-full p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs font-sans text-slate-900 dark:text-slate-100"
+                            className="w-full p-2.5 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper)]  text-xs font-sans text-[var(--ink)] "
                           />
                         ) : (
-                          <div className="text-xs text-slate-800 dark:text-slate-200 whitespace-pre-wrap leading-relaxed">
+                          <div className="text-xs text-[var(--ink)]  whitespace-pre-wrap leading-relaxed">
                             {q.stem}
                           </div>
                         )}
@@ -776,23 +792,23 @@ export const Step4Review: React.FC<Props> = ({
                           {q.images.map(imgRef => {
                             const asset = examDoc.images.find(i => i.id === imgRef.imageId);
                             if (!asset || !asset.dataUrl) return (
-                              <div key={imgRef.imageId} className="rounded-xl border-2 border-dashed border-amber-500 bg-amber-50 p-3 text-[10px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                              <div key={imgRef.imageId} className="rounded-[10px] border-2 border-dashed border-[var(--warn)] bg-[var(--warn-soft)] p-3 text-[length:var(--type-12)] text-[var(--warn-ink)]  ">
                                 Missing image {imgRef.imageId} — open original page {asset?.page ?? 'unknown'}
                               </div>
                             );
                             return (
                               <div
                                 key={imgRef.imageId}
-                                className="relative rounded-xl border border-slate-200 dark:border-slate-800 p-1 bg-slate-50 dark:bg-slate-950 inline-block"
+                                className="relative rounded-[10px] border border-[var(--rule)]  p-1 bg-[var(--paper)]  inline-block"
                               >
                                 <img
                                   src={asset.dataUrl}
                                   alt={asset.id}
                                   onError={event => { event.currentTarget.style.display = 'none'; const fallback = event.currentTarget.parentElement?.querySelector('[data-image-error]') as HTMLElement | null; if (fallback) fallback.hidden = false; }}
-                                  className="max-h-24 rounded-lg object-contain bg-white"
+                                  className="max-h-24 rounded-[10px] object-contain bg-[var(--paper-raised)]"
                                 />
-                                <div hidden data-image-error className="p-2 text-[10px] text-amber-900">Image unavailable — open original page {asset.page}.</div>
-                                <span className="absolute bottom-1 right-1 text-[9px] font-mono px-1 rounded bg-black/70 text-white">
+                                <div hidden data-image-error className="p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">Image unavailable — open original page {asset.page}.</div>
+                                <span className="absolute bottom-1 end-1 text-[length:var(--type-12)] font-mono px-1 rounded-[6px] ep-scrim text-[var(--scrim-fg)]">
                                   {imgRef.role}
                                 </span>
                               </div>
@@ -807,12 +823,12 @@ export const Step4Review: React.FC<Props> = ({
                           {q.options.map(opt => (
                             <div
                               key={opt.key}
-                              className="flex items-center gap-2 p-2 rounded-xl border border-slate-100 dark:border-slate-800/80 bg-slate-50/50 dark:bg-slate-950/40"
+                              className="flex items-center gap-2 p-2 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] "
                             >
-                              <span className="w-5 h-5 rounded-md bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-bold flex items-center justify-center text-[11px] shrink-0 font-mono">
+                              <span className="w-5 h-5 rounded-[10px] bg-[var(--paper)]  text-[var(--ink)]  font-bold flex items-center justify-center text-[length:var(--type-12)] shrink-0 font-mono">
                                 {opt.key}
                               </span>
-                              <span className="text-slate-800 dark:text-slate-200 truncate">
+                              <span className="text-[var(--ink)]  truncate">
                                 {opt.text}
                               </span>
                             </div>
@@ -823,19 +839,19 @@ export const Step4Review: React.FC<Props> = ({
                       {/* Answer Key preview with Origin Badge & Inline Edit */}
                       <div className="pt-1">
                         {q.answer && q.answer.text ? (
-                          <div className="text-[11px] bg-slate-50 dark:bg-slate-950/60 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 space-y-1.5">
+                          <div className="text-[length:var(--type-12)] bg-[var(--paper)]  p-2.5 rounded-[10px] border border-[var(--rule)]  space-y-1.5">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
-                                <span className="font-bold text-slate-800 dark:text-slate-200">Answer:</span>
+                                <span className="font-bold text-[var(--ink)] ">Answer:</span>
                                 <span
-                                  className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-semibold uppercase ${
+                                  className={`text-[length:var(--type-12)] font-mono px-1.5 py-0.5 rounded-[6px] font-semibold uppercase ${
                                     q.answer.source === 'paper'
-                                      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
+                                      ? 'bg-[var(--ok-soft)] text-[var(--ok)]  border border-[var(--ok)]'
                                       : q.answer.source === 'keyfile'
-                                      ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20'
+                                      ? 'bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)]'
                                       : q.answer.source === 'ai'
-                                      ? 'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20'
-                                      : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20'
+                                      ? 'bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)]'
+                                      : 'bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)]'
                                   }`}
                                 >
                                   {q.answer.source === 'paper'
@@ -857,21 +873,21 @@ export const Step4Review: React.FC<Props> = ({
                                     answer: { ...q.answer, text: e.target.value, source: 'manual' },
                                   })
                                 }
-                                className="w-full p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs font-mono"
+                                className="w-full p-2 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper-raised)]  text-xs font-mono"
                               />
                             ) : (
-                              <div className="text-slate-700 dark:text-slate-300 font-medium whitespace-pre-wrap">
+                              <div className="text-[var(--ink)]  font-medium whitespace-pre-wrap">
                                 {q.answer.text}
                               </div>
                             )}
                           </div>
                         ) : (
-                          <div className="flex items-center justify-between p-2 rounded-xl border border-dashed border-slate-300 dark:border-slate-800 text-[11px] text-slate-400">
+                          <div className="flex items-center justify-between p-2 rounded-[10px] border border-dashed border-[var(--rule-strong)]  text-[length:var(--type-12)] text-[var(--ink-2)]">
                             <span>No answer linked yet</span>
                             <div className="flex items-center gap-2">
                               <button
                                 onClick={() => handleSolveSingle(q)}
-                                className="text-purple-600 dark:text-purple-400 hover:underline cursor-pointer flex items-center gap-1 font-medium"
+                                className="text-[var(--accent-ink)]  hover:underline cursor-pointer flex items-center gap-1 font-medium"
                               >
                                 <Sparkles className="w-3 h-3" />
                                 <span>Solve with AI</span>
@@ -883,7 +899,7 @@ export const Step4Review: React.FC<Props> = ({
                                     answer: { text: '', source: 'manual' },
                                   })
                                 }
-                                className="text-blue-500 hover:underline cursor-pointer"
+                                className="text-[var(--accent-ink)] hover:underline cursor-pointer"
                               >
                                 + Add manual
                               </button>
@@ -903,60 +919,63 @@ export const Step4Review: React.FC<Props> = ({
 
       {/* Minimal-Patch Regeneration Modal (§5.4) */}
       {patchModalQuestion && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
+        <Modal open onClose={() => { setPatchModalQuestion(null); setPatchDiffResult(null); }} title={settings.uiLanguage === 'fa' ? 'بازسازی پرسش' : 'Regenerate question'} labelledBy="patch-question-title" className="ep-patch-window">
+          <div className="p-6 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-[var(--rule)] ">
               <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-amber-500" />
-                <h3 className="font-bold text-sm text-slate-900 dark:text-white">
-                  Regenerate Question #{patchModalQuestion.label} (RFC 7386 Patch)
+                <Sparkles className="w-4 h-4 text-[var(--warn-ink)]" />
+                <h3 id="patch-question-title" className="font-bold text-sm text-[var(--ink)] ">
+                  {settings.uiLanguage === 'fa' ? `بازسازی پرسش ${patchModalQuestion.label}` : `Regenerate Question #${patchModalQuestion.label} (RFC 7386 Patch)`}
                 </h3>
               </div>
               <button
+                type="button"
+                aria-label={settings.uiLanguage === 'fa' ? 'بستن پنجره بازسازی' : 'Close regeneration dialog'}
                 onClick={() => {
                   setPatchModalQuestion(null);
                   setPatchDiffResult(null);
                 }}
-                className="text-slate-400 hover:text-slate-600"
+                className="text-[var(--ink-2)] hover:text-[var(--ink-2)]"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <p className="text-xs text-slate-500 leading-relaxed">
-              Sends only this question&apos;s source slice &plusmn;5 context lines (~1k tokens).
-              The model returns a JSON merge patch instead of re-running the document.
+            <p className="text-xs text-[var(--ink-2)] leading-relaxed">
+              {settings.uiLanguage === 'fa'
+                ? 'فقط برش منبع همین پرسش و پنج خط پیرامون آن (حدود ۱۰۰۰ توکن) ارسال می‌شود؛ مدل یک وصله JSON برمی‌گرداند، نه بازتحلیل کل سند.'
+                : 'Sends only this question’s source slice and five context lines (~1k tokens). The model returns a JSON merge patch instead of re-running the document.'}
             </p>
 
             <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Instruction for AI (Optional)
+              <label className="block text-xs font-semibold text-[var(--ink)] ">
+                {settings.uiLanguage === 'fa' ? 'دستور برای هوش مصنوعی (اختیاری)' : 'Instruction for AI (optional)'}
               </label>
               <input
                 type="text"
-                placeholder="E.g., Normalize math with LaTeX, or re-detect MCQ options"
+                placeholder={settings.uiLanguage === 'fa' ? 'مثلاً: ریاضی را با LaTeX یکدست کن یا گزینه‌ها را دوباره تشخیص بده' : 'E.g., normalize math with LaTeX or re-detect MCQ options'}
                 value={patchInstruction}
                 onChange={e => setPatchInstruction(e.target.value)}
-                className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs font-sans"
+                className="w-full px-3 py-2 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper)]  text-xs font-sans"
               />
             </div>
 
             {/* Diff Preview */}
             {patchDiffResult && (
-              <div className="space-y-2 p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 text-xs font-mono">
-                <div className="font-bold text-emerald-600 flex items-center justify-between">
-                  <span>Patch Received ({patchDiffResult.usage?.inputTokens || 0} toks):</span>
-                  <span>Tokens saved: ~92%</span>
+              <div className="space-y-2 p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  text-xs font-mono">
+                <div className="font-bold text-[var(--ok)] flex items-center justify-between">
+                  <span>{settings.uiLanguage === 'fa' ? `وصله دریافت شد (${patchDiffResult.usage?.inputTokens || 0} توکن):` : `Patch received (${patchDiffResult.usage?.inputTokens || 0} tokens):`}</span>
+                  <span>{settings.uiLanguage === 'fa' ? 'صرفه‌جویی توکن: حدود ۹۲٪' : 'Tokens saved: ~92%'}</span>
                 </div>
-                <div className="space-y-1 text-[11px] text-slate-700 dark:text-slate-300 max-h-36 overflow-y-auto">
+                <div className="space-y-1 text-[length:var(--type-12)] text-[var(--ink)]  max-h-36 overflow-y-auto">
                   {patchDiffResult.diffSummary.length > 0 ? (
                     patchDiffResult.diffSummary.map((d, i) => (
-                      <div key={i} className="text-blue-600 dark:text-blue-400">
+                      <div key={i} className="text-[var(--accent-ink)] ">
                         {d}
                       </div>
                     ))
                   ) : (
-                    <div>No fields changed.</div>
+                    <div>{settings.uiLanguage === 'fa' ? 'هیچ فیلدی تغییر نکرد.' : 'No fields changed.'}</div>
                   )}
                 </div>
               </div>
@@ -965,45 +984,48 @@ export const Step4Review: React.FC<Props> = ({
             {/* Modal Actions */}
             <div className="flex justify-end gap-2 pt-2">
               <button
+                type="button"
                 onClick={() => {
                   setPatchModalQuestion(null);
                   setPatchDiffResult(null);
                 }}
-                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800"
+                className="px-4 py-2 rounded-[6px] border border-[var(--rule)]  text-xs font-medium text-[var(--ink-2)] hover:bg-[var(--paper)] "
               >
-                Cancel
+                {settings.uiLanguage === 'fa' ? 'لغو' : 'Cancel'}
               </button>
 
               {patchDiffResult ? (
                 <button
+                  type="button"
                   onClick={handleAcceptPatch}
-                  className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-medium shadow-xs"
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent)] text-[var(--on-accent)] text-xs font-medium "
                 >
                   <Check className="w-3.5 h-3.5" />
-                  <span>Accept Patch</span>
+                  <span>{settings.uiLanguage === 'fa' ? 'پذیرفتن وصله' : 'Accept patch'}</span>
                 </button>
               ) : (
                 <button
+                  type="button"
                   disabled={isPatching}
                   onClick={handleRunPatch}
-                  className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium shadow-xs disabled:opacity-50"
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent)] text-[var(--on-accent)] text-xs font-medium  disabled:opacity-50"
                 >
                   {isPatching ? (
                     <>
                       <RotateCcw className="w-3.5 h-3.5 animate-spin" />
-                      <span>Dispatching Patch...</span>
+                      <span>{settings.uiLanguage === 'fa' ? 'در حال ارسال وصله…' : 'Sending patch…'}</span>
                     </>
                   ) : (
                     <>
                       <Sparkles className="w-3.5 h-3.5" />
-                      <span>Generate Patch</span>
+                      <span>{settings.uiLanguage === 'fa' ? 'ساخت وصله' : 'Generate patch'}</span>
                     </>
                   )}
                 </button>
               )}
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

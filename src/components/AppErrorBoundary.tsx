@@ -41,11 +41,11 @@ export class AppErrorBoundary extends React.Component<React.PropsWithChildren, S
 
   render() {
     if (!this.state.hasError) return this.props.children;
-    return <main role="alert" className="mx-auto my-12 max-w-2xl rounded-2xl border border-red-300 bg-red-50 p-6 text-red-950 dark:border-red-900 dark:bg-red-950/30 dark:text-red-100">
+    return <main role="alert" className="mx-auto my-12 max-w-2xl rounded-[10px] border border-[var(--danger)] bg-[var(--danger-soft)] p-6 text-[var(--danger)]   ">
       <h1 className="text-lg font-bold">ExamParse stopped safely</h1>
       <p className="mt-2 text-sm">The current screen failed to render. Saved exams remain in local storage; reload the app to continue.</p>
-      <pre className="mt-3 whitespace-pre-wrap rounded bg-white/70 p-3 font-mono text-xs dark:bg-black/20">{this.state.errorName}: {this.state.message}</pre>
-      <div className="mt-4 flex gap-2"><button onClick={this.copyDiagnostics} className="rounded-lg bg-red-800 px-3 py-2 text-xs font-semibold text-white">{this.state.copied ? 'Diagnostics copied' : 'Copy safe diagnostics'}</button><button onClick={() => window.location.reload()} className="rounded-lg border border-red-500 px-3 py-2 text-xs font-semibold">Reload</button></div>
+      <pre className="mt-3 whitespace-pre-wrap rounded-[6px] bg-[var(--paper-raised)] p-3 font-mono text-xs">{this.state.errorName}: {this.state.message}</pre>
+      <div className="mt-4 flex gap-2"><button onClick={this.copyDiagnostics} className="rounded-[6px] bg-[var(--danger)] px-3 py-2 text-xs font-semibold text-[var(--on-accent)]">{this.state.copied ? 'Diagnostics copied' : 'Copy safe diagnostics'}</button><button onClick={() => window.location.reload()} className="rounded-[6px] border border-[var(--danger)] px-3 py-2 text-xs font-semibold">Reload</button></div>
     </main>;
   }
 }

@@ -41,7 +41,11 @@ export interface GapCompletionResult {
 
 function spanLines(spans: LineSpan[] | undefined): number[] {
   const out = new Set<number>();
-  for (const [a, b] of spans || []) if (Number.isInteger(a) && Number.isInteger(b) && b >= a && b - a < 5000) for (let n = a; n <= b; n++) out.add(n);
+  for (const s of Array.isArray(spans) ? spans : []) {
+    if (!Array.isArray(s)) continue; // tolerate malformed spans from older/foreign docs
+    const [a, b] = s;
+    if (Number.isInteger(a) && Number.isInteger(b) && b >= a && b - a < 5000) for (let n = a; n <= b; n++) out.add(n);
+  }
   return [...out].sort((x, y) => x - y);
 }
 function compress(lines: number[]): LineSpan[] {
@@ -329,13 +333,24 @@ export function reassignSectionsByContainment(questions: Question[], sections: E
   const ambiguous: Array<{ questionId: string; candidates: string[] }> = [];
   const sectionLines = sections.map(s => ({ id: s.id, set: new Set(spanLines(s.spans || [])) })).filter(s => s.set.size);
   if (!sectionLines.length) return { questions, reassigned, ambiguous };
+  // Order-based territory: from a section's first line up to the next section's first line. Lazy
+  // section spans (a header-only span) must not turn every question into an "ambiguous" error.
+  const ordered = sectionLines.map(s => ({ id: s.id, start: Math.min(...s.set) })).sort((a, b) => a.start - b.start);
+  const territoryOf = (id: string): [number, number] | undefined => {
+    const i = ordered.findIndex(s => s.id === id);
+    if (i < 0) return undefined;
+    return [ordered[i].start, i + 1 < ordered.length ? ordered[i + 1].start - 1 : Number.MAX_SAFE_INTEGER];
+  };
   const next = questions.map(q => {
     const qLines = spanLines(q.spans || []);
     if (!qLines.length) return q;
     const current = sectionLines.find(s => s.id === q.sectionId);
     const inside = (s: { set: Set<number> }) => qLines.filter(n => s.set.has(n)).length / qLines.length;
     if (current && inside(current) >= 0.8) return q;
-    const containing = sectionLines.filter(s => inside(s) >= 0.8).map(s => s.id);
+    const inTerritory = (id: string) => { const t = territoryOf(id); return !!t && qLines.filter(n => n >= t[0] && n <= t[1]).length / qLines.length >= 0.8; };
+    if (current && inTerritory(current.id)) return q;
+    let containing = sectionLines.filter(s => inside(s) >= 0.8).map(s => s.id);
+    if (containing.length !== 1) { const byTerritory = ordered.filter(s => inTerritory(s.id)).map(s => s.id); if (byTerritory.length === 1) containing = byTerritory; }
     if (containing.length === 1) {
       reassigned.push({ questionId: q.id, from: q.sectionId, to: containing[0] });
       return { ...q, sectionId: containing[0] };

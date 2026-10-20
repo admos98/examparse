@@ -460,7 +460,7 @@ export const Step4Review: React.FC<Props> = ({
             <button onClick={()=> {
               if (c.id==='missing') handleRetryMissingCoverage();
               else if (c.id==='unplaced') setShowImageManager(true);
-              else if (c.id==='quality') setScoreExplain((()=>{ const q=computeQualityScore(examDoc); return `Coverage ${q.coverage}/30, Points ${q.points}/15, Options ${q.optionsCleanliness}/15, Images ${q.imagePlacement}/15, Numbering ${q.numbering}/10, Confidence ${q.confidence}/10, Passage ${q.passage}/5 = Total ${q.total}/100`; })());
+              else if (c.id==='quality') setScoreExplain((()=>{ const q=computeQualityScore(examDoc); return `Coverage ${q.coverage}/30, Points ${q.points}/15, Options ${q.optionsCleanliness}/15, Images ${q.imagePlacement}/15, Numbering ${q.numbering}/10, Confidence ${q.confidence}/6, Orphan lines ${q.orphan}/4, Passage ${q.passage}/5 = Total ${q.total}/100`; })());
             }} className="font-medium hover:underline cursor-pointer">{c.label}</button>
             <button onClick={()=> setDismissedChips(s=> new Set([...s, c.id]))} className="opacity-80 hover:opacity-100 cursor-pointer"><X className="w-3 h-3" /></button>
           </span>
@@ -738,6 +738,13 @@ export const Step4Review: React.FC<Props> = ({
                           >
                             {((q.confidence ?? 1) * 100).toFixed(0)}% conf
                           </span>
+                          {/* Per-question validator/funnel flags (C1/B2/D): error codes red, the rest muted. */}
+                          {(q.flags || []).length > 0 && (q.flags || []).slice(0, 4).map(code => {
+                            const isError = code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS';
+                            const label = code === 'GAP_ABSORBED' ? 'gap absorbed' : code === 'REWRITE_APPLIED' ? 'rewrite' : code === 'OPTIONS_SYNTHESIZED' ? 'options synthesized' : code === 'SECTION_REASSIGNED' ? 'section reassigned' : code.toLowerCase().replace(/_/g, ' ');
+                            return <span key={code} title={code} className={`px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] border ${isError ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger-soft)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{label}</span>;
+                          })}
+                          {(q.flags || []).length > 4 && <span className="text-[length:var(--type-12)] text-[var(--ink-2)]" title={(q.flags || []).slice(4).join(', ')}>+{(q.flags || []).length - 4}</span>}
                           {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded-[6px] bg-[var(--paper)] px-2 py-1 text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)]  ">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
                         </div>
 

@@ -257,9 +257,20 @@ Branch `arena/c68468f1-examparse`, 5 commits on top of `b13e776`. Suites: `npx t
 
 New: `src/pipeline/cleanup.ts` (473), `src/pipeline/ownership.ts` (347), `src/pipeline/gates.ts` (62), `test/gauntlet.test.ts` (217), `test/executor.test.ts` (245), `test/fixtures/golden/gauntlet-lazy.ts` (157). Modified (34): `agent.ts` (+804), `assemble.ts`, `index.ts`, `structure.ts`, `semanticValidators.ts`, `quality.ts`, `qualityScore.ts`, `repair.ts`, `provenance.ts`, `prompts.ts`, `agentTools.ts`, `dossier.ts`, `cache.ts`, `patch.ts`, `reparseSection.ts`, `shippedSkills.ts`, `types.ts`, `store/index.ts`, `utils/validation.ts`, `utils/budget.ts`, `server.ts`, `App.tsx`, `Step2Source.tsx`, `Step3Analyze.tsx`, `Step4Review.tsx`, `AssistantView.tsx`, `ExamHealthBanner.tsx`, `SettingsModal.tsx`, `scripts/bench.ts`, `thresholds.json`, `memory-goldens.json`, 3 existing tests.
 
+## Bug sweep (after the parts landed)
+
+- **ExamDoc schema rejected new usage roles** — `usage[].role` enum lacked `cleanup`/`critic`/`consensus`, so any parsed doc with a cleanup call failed export → import (`parseExamDocImport`) and `reparseSection`'s post-validation. Fixed + regression test (`test/gauntlet.test.ts` "schema — …").
+- **Step 3 cache-hit check never matched** the pipeline's structure key (which now carries the cleanup signature). The signature is now deterministic and computable pre-flight (`cleanupKeySignature`: version | model-or-off | overrides) and shared by both sides.
+- **False `SECTION_AMBIGUOUS` on lazy section spans** — containment now falls back to order-based territory (section first line → next section's first line) before declaring an error.
+- **"Choose one out of four …" parsed as a total-points line** — bare `out of` now needs a score word or a very short line.
+- Chunked fallback sent raw `L####` lines — now renders the same clean view as every other structure path.
+- Malformed spans from foreign docs crashed `spanLines`; banner orphan rate used a different denominator than the score; orphan count went stale after Step 4 edits (now recomputed live); PARTIAL headline now names validator survivors; Step 2 jump switches page/lens; Step 2 gains an **Orphan** lens + per-line ORPHAN badge; per-question flag chips in Step 4; cleanup role row in Settings.
+
+Suites after the sweep: tsc clean · **163 tests pass** · bench PASS · `vite build` OK.
+
 ## Deliberately not implemented
 
-- Garbled-section escalation on the consensus second pass and the chunked fallback — the consensus pass intentionally uses a different model and is recovery-only (where the spec excludes routing); the chunked fallback is the last-resort path and still sends raw `L####` lines.
+- Garbled-section escalation on the consensus second pass — the consensus pass intentionally uses a different model and is recovery-only (where the spec excludes routing).
 - Local-only token savings — a regex-only pass cannot omit lines safely (only AI-confirmed junk conf ≥ 8 is omitted), so the F2 token column is honest about −0.6 %.
 - Rewrites that translate or invent, rewrites on numbered/option/digit lines, or any rewrite outside the `rewrites` channel.
 - Any model call in gap completion, ownership, gates, META_TOTAL or the "Fix it" path — all deterministic by design.

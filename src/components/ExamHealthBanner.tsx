@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ExamDoc } from '../types';
 import { getExamHealth } from '../pipeline/quality';
+import { computeDocOwnership } from '../pipeline/ownership';
 import { computeQualityScore, qualityColor } from '../utils/qualityScore';
 
 export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onExplainScore?: (filter?: string)=>void; /** B3 — jump to the first orphan line in Step 2. */ onJumpToSource?: (lineNo: number) => void }> = ({ doc, className = '', onExplainScore, onJumpToSource }) => {
@@ -19,6 +20,8 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
     : health.state === 'red'
       ? 'border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]   '
       : 'border-[var(--warn)] bg-[var(--warn-soft)] text-[var(--warn-ink)]   ';
+  // B3 — orphan lines are recomputed from the current doc so edits in Step 4 move the number (the stored list is the parse-time snapshot).
+  const liveOrphans = React.useMemo(() => { try { return computeDocOwnership(doc).orphanLineNos; } catch { return doc.source?.orphanLineNos || []; } }, [doc]);
   const points = health.pointsExpected === undefined ? `${health.pointsParsed}` : `${health.pointsParsed} / ${health.pointsExpected}`;
   const partialCoverage = health.missing.length > 0 || health.duplicates.length > 0 || (health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51);
   const noQuestionsParsed = (doc.questions || []).length === 0;
@@ -31,7 +34,7 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
 
   return <div role="status" aria-live="polite" className={`rounded-[10px] border px-4 py-3 text-xs ${colors} ${className}`}>
     <div className="flex items-center justify-between gap-3">
-      <div className="font-bold">{health.state === 'green' ? 'Exam health: complete' : noQuestionsParsed ? 'PARTIAL EXAM — no questions parsed' : partialCoverage ? `PARTIAL EXAM — ${health.coveragePercent.toFixed(0)}% printed-number coverage` : health.state === 'red' ? 'PARTIAL EXAM — completeness is below 80%' : 'Exam health: review required'}</div>
+      <div className="font-bold">{health.state === 'green' ? 'Exam health: complete' : noQuestionsParsed ? 'PARTIAL EXAM — no questions parsed' : partialCoverage ? `PARTIAL EXAM — ${health.coveragePercent.toFixed(0)}% printed-number coverage` : health.state === 'red' ? 'PARTIAL EXAM — completeness is below 80%' : (health.hollowQuestions?.length || 0) > 0 ? `PARTIAL EXAM — ${health.hollowQuestions.length} question(s) failed local validators after repair` : 'Exam health: review required'}</div>
       <button
         onClick={()=> setShowBreakdown(!showBreakdown)}
         className={`shrink-0 px-2.5 py-1 rounded-[6px] border text-xs font-bold ${qTone} hover:opacity-90 transition`}
@@ -51,12 +54,11 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
       {health.lowConfidenceCount > 0 && <span>{health.lowConfidenceCount} low-confidence question(s)</span>}
       {(health.parentLinkIssueCount || 0) > 0 && <span className="font-semibold">{health.parentLinkIssueCount} invalid nested-question link(s)</span>}
       {(health.hollowQuestions?.length || 0) > 0 && <span className="font-semibold" title={health.hollowQuestions.map(h => `${h.label}: ${h.code}`).join(', ')}>{health.hollowQuestions.length} hollow/unverified question(s)</span>}
-      {(health.orphanLines || 0) > 0 && (() => {
-        const first = (doc.source?.orphanLineNos || [])[0];
-        const territory = Math.max(1, (doc.source?.lines || []).length - (doc.source?.keyTerritoryLineNos || []).length);
-        const rate = (health.orphanLines / territory) * 100;
-        return <span className={rate > 2 ? 'font-semibold' : ''} title="Exam-territory lines owned by no question or section (ORPHAN_LINES)">
-          {health.orphanLines} orphan line(s) ({rate.toFixed(1)}%)
+      {liveOrphans.length > 0 && (() => {
+        const first = liveOrphans[0];
+        const rate = (quality?.details?.orphanRate ?? 0) * 100; // same denominator as the quality score (exam territory, non-skip lines)
+        return <span className={rate > 2 ? 'font-semibold' : ''} title="Exam-territory lines owned by no question or section (ORPHAN_LINES) — recomputed live after edits">
+          {liveOrphans.length} orphan line(s) ({rate.toFixed(1)}%)
           {onJumpToSource && first !== undefined && <button onClick={() => onJumpToSource(first)} className="ms-1 underline hover:opacity-80">jump to L{String(first).padStart(4, '0')}</button>}
         </span>;
       })()}

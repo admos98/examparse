@@ -468,6 +468,15 @@ export async function runCleanupStage(params: RunCleanupParams): Promise<RunClea
 }
 
 /** Stable content hash input for the cleanup cache (ids + text + version + model). */
+/**
+ * Deterministic part of the structure cache key that the cleanup stage contributes. It is computable
+ * BEFORE any call (Step 3 pre-flight uses the same function), so cache-hit reporting matches the run.
+ */
+export function cleanupKeySignature(params: { enabled: boolean; model?: string; overrides?: Record<string, LineTag> }): string {
+  const overrides = Object.entries(params.overrides || {}).sort(([a], [b]) => Number(a) - Number(b)).map(([k, v]) => `${k}=${v}`).join(',');
+  return `${CLEANUP_VERSION}|${params.enabled ? params.model || 'fast' : 'off'}|${overrides || '-'}`;
+}
+
 export function cleanupCacheOptions(lines: SourceLine[], model: string, overrides?: Record<string, LineTag>): { version: string; model: string; lineCount: number; overrides: string } {
   return { version: CLEANUP_VERSION, model, lineCount: lines.length, overrides: JSON.stringify(overrides || {}) };
 }

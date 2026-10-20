@@ -20,7 +20,7 @@ import { runFullPipeline } from '../pipeline';
 import { loadJournal } from '../pipeline/journal';
 import { getPipelineCache } from '../store';
 import { PARSER_VERSION } from '../pipeline/prompts';
-import { estimateCleanupCall } from '../pipeline/cleanup';
+import { estimateCleanupCall, cleanupKeySignature } from '../pipeline/cleanup';
 import { enumerateExpectedQuestionNos } from '../pipeline/quality';
 
 interface Props {
@@ -146,13 +146,17 @@ export const Step3Analyze: React.FC<Props> = ({
         const linesHash = (await sha256(effectiveLines.map((l: any) => l.id + ' ' + l.text).join('\n'))).slice(0, 16);
         const imgShas = [...new Set(extractedDoc.images.map((i: any) => i.sha).filter(Boolean))].sort();
 
-        // 1. Structure stage (dependency-correct key)
+        // 1. Structure stage (dependency-correct key — includes the cleanup signature the pipeline uses)
+        const cleanupOn = settings.cleanupEnabled !== false;
+        const cleanupModel = (settings.roleMapping.cleanup || settings.roleMapping.fast).model;
+        let cleanupOverrides: Record<string, string> | null = null;
+        try { cleanupOverrides = (await getPipelineCache<Record<string, string>>(`cleanupOverrides:${hash}`)) || null; } catch { cleanupOverrides = null; }
         const cachedStruct = await getCachedStageResult<any>({
           fileHash: hash,
           stage: 'structure',
           provider: activeProvider.id,
           model: activeRole.model,
-          options: { latex: settings.thrift.latexNormalization, linesHash },
+          options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupKeySignature({ enabled: cleanupOn, model: cleanupModel, overrides: (cleanupOverrides || {}) as any }) },
         });
 
         // 2. Vision stage (dependency-correct key)
@@ -226,6 +230,8 @@ export const Step3Analyze: React.FC<Props> = ({
     settings.roleMapping.vision.model,
     settings.roleMapping.escalation.providerId,
     settings.roleMapping.escalation.model,
+    settings.cleanupEnabled,
+    settings.roleMapping.cleanup?.model,
   ]);
 
   const isFullyCached =

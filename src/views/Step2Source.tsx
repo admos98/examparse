@@ -28,12 +28,15 @@ interface Props {
   taggedLines?: SourceLine[];
   /** Line number to scroll to (Step 4 → Step 2 orphan jump). */
   focusLine?: number;
+  /** B3 — lines the last parse left unowned (ORPHAN_LINES); enables the Orphan lens. */
+  orphanLineNos?: number[];
 }
 
-type CleanupLens = 'all' | 'kept' | 'junk' | 'suspect';
+type CleanupLens = 'all' | 'kept' | 'junk' | 'suspect' | 'orphan';
 const JUNK_TAGS = new Set<LineTag>(['junk', 'pagenum', 'furniture']);
-export function lensMatches(line: SourceLine, lens: CleanupLens): boolean {
+export function lensMatches(line: SourceLine, lens: CleanupLens, orphanLineNos?: Set<number>): boolean {
   if (lens === 'all') return true;
+  if (lens === 'orphan') return Boolean(orphanLineNos?.has(Number(line.id.replace(/\D/g, ''))));
   if (lens === 'junk') return Boolean(line.tag && JUNK_TAGS.has(line.tag));
   if (lens === 'suspect') return line.tag === 'suspect-junk' || Boolean(line.garbled);
   return !(line.tag && JUNK_TAGS.has(line.tag)) && line.tag !== 'suspect-junk';
@@ -52,6 +55,7 @@ export const Step2Source: React.FC<Props> = ({
   fileHash,
   taggedLines,
   focusLine,
+  orphanLineNos,
 }) => {
   const [showLineIds, setShowLineIds] = useState(true);
   const [activePage, setActivePage] = useState<number>(() => (focusLine ? (lines.find(l => Number(l.id.replace(/\D/g, '')) === focusLine)?.page || 1) : 1));
@@ -92,11 +96,20 @@ export const Step2Source: React.FC<Props> = ({
     return () => { mounted = false; };
   }, [lines, taggedLines, overrides, pages]);
 
+  // Jumping to a line (Step 4 → Step 2) switches to its page, clears a narrowing lens/search, then scrolls.
+  useEffect(() => {
+    if (!focusLine) return;
+    const page = lines.find(l => Number(l.id.replace(/\D/g, '')) === focusLine)?.page;
+    if (page && page !== activePage) setActivePage(page);
+    setLens('all');
+    setSearchQuery('');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusLine, lines]);
   useEffect(() => {
     if (!focusLine) return;
     const el = document.getElementById(`las-line-${focusLine}`);
     el?.scrollIntoView({ block: 'center' });
-  }, [focusLine, tagged, activePage]);
+  }, [focusLine, tagged, activePage, lens, searchQuery]);
 
   const setOverride = async (lineNo: number, tag: LineTag | '') => {
     const next = { ...overrides };
@@ -104,11 +117,13 @@ export const Step2Source: React.FC<Props> = ({
     setOverrides(next);
     if (fileHash) { try { await setPipelineCache(`cleanupOverrides:${fileHash}`, next); } catch { /* local-only until storage is back */ } }
   };
+  const orphanSet = React.useMemo(() => new Set(orphanLineNos || []), [orphanLineNos]);
   const lensCounts = {
     all: tagged.length,
     kept: tagged.filter(l => lensMatches(l, 'kept')).length,
     junk: tagged.filter(l => lensMatches(l, 'junk')).length,
     suspect: tagged.filter(l => lensMatches(l, 'suspect')).length,
+    orphan: orphanSet.size,
   };
 
   // Resolve page thumbnails through thumb blobs like regular images (A3).
@@ -139,7 +154,7 @@ export const Step2Source: React.FC<Props> = ({
   // Filter lines if search query is active, then by the Cleanup lens
   const filteredLines = (searchQuery.trim()
     ? tagged.filter(l => l.text.toLowerCase().includes(searchQuery.toLowerCase()))
-    : (linesByPage[activePage] || tagged)).filter(l => lensMatches(l, lens));
+    : (linesByPage[activePage] || tagged)).filter(l => lensMatches(l, lens, orphanSet));
 
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-4">
@@ -175,7 +190,7 @@ export const Step2Source: React.FC<Props> = ({
         <div className="flex items-center gap-2 text-xs flex-wrap">
           {/* A4 — Cleanup lens */}
           <div role="group" aria-label="Cleanup lens" title={cleanupNote} className="flex items-center rounded-[6px] border border-[var(--rule)] overflow-hidden">
-            {(['all', 'kept', 'junk', 'suspect'] as CleanupLens[]).map(value => (
+            {(['all', 'kept', 'junk', 'suspect', ...(orphanSet.size ? ['orphan'] : [])] as CleanupLens[]).map(value => (
               <button
                 key={value}
                 onClick={() => setLens(value)}
@@ -307,6 +322,7 @@ export const Step2Source: React.FC<Props> = ({
                       [{line.id}]
                     </span>
                   )}
+                  {orphanSet.has(lineNo) && <span title="Owned by no question or section in the last parse (ORPHAN_LINES)" className="select-none shrink-0 text-[length:var(--type-12)] px-1 rounded-[4px] border border-[var(--warn)] text-[var(--warn-ink)]">ORPHAN</span>}
                   {(line.tag || line.garbled) && (
                     <span
                       title={`${line.tag ? `${line.tag} (${line.tagSource || 'local'}${line.tagConf !== undefined ? ` · conf ${line.tagConf}` : ''})` : ''}${line.garbled ? ' · low readability [GARBLED?]' : ''}${omitted ? ' · omitted from structure prompts' : ''}`}

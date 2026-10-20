@@ -407,6 +407,8 @@ const TOTAL_LINE_TRAILING_RE = /(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:نمره|points?|
 function parseTotalValue(text: string): number | undefined {
   const v = normalizeForMatching(text);
   if (!/(?:جمع|نمره\s*کل|بارم\s*کل|total|out of)/i.test(v)) return undefined;
+  // "Choose one out of four options" is an instruction, not a total: a bare "out of" needs a score word or a very short line.
+  if (!/(?:جمع|نمره\s*کل|بارم\s*کل|total)/i.test(v) && v.length > 30 && !/\b(?:score|marks?|points?|grade)\b/i.test(v)) return undefined;
   const m = v.match(TOTAL_LINE_RE) || v.match(TOTAL_LINE_TRAILING_RE);
   const n = m ? Number(m[1].replace(',', '.')) : NaN;
   return Number.isFinite(n) && n > 0 && n <= 300 ? n : undefined;

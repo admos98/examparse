@@ -638,10 +638,11 @@ export const SettingsModal: React.FC<Props> = ({
                 </div>
 
                 <div className="space-y-4">
-                  {(['fast', 'standard', 'escalation', 'vision', 'agent', 'critic', 'consensus'] as const).map(role => {
+                  {(['fast', 'cleanup', 'standard', 'escalation', 'vision', 'agent', 'critic', 'consensus'] as const).map(role => {
                     const sel = current.roleMapping[role] || current.roleMapping.fast;
                     const labelMap: Record<string, string> = {
                       agent: 'Assistant (defaults to Fast until configured)',
+                      cleanup: 'Cleanup (Stage 2.5 line judgment — defaults to Fast; cheapest model is fine)',
                       fast: 'Fast (Structure Pass — Span references)',
                       standard: 'Standard (General questions)',
                       escalation: 'Escalation (Repair failing items & ambiguity)',

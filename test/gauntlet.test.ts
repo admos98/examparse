@@ -215,3 +215,25 @@ test('D — rewrite fence: only locally garbled, digit-free, in-span, non-key li
   assert.ok(sectionGarbledRatio(lines) > GARBLED_ESCALATION_RATIO);
   assert.equal(sectionGarbledRatio([clean]), 0);
 });
+
+test('schema — docs carrying cleanup/critic/consensus usage records and tagged lines survive export → import', async () => {
+  const { parseExamDocImport } = await import('../src/utils/validation');
+  const doc: any = {
+    id: 'doc_schema_1', fileHash: 'a'.repeat(64), createdAt: new Date().toISOString(),
+    meta: { language: 'en', direction: 'ltr', totalPoints: 2 },
+    sections: [{ id: 'sec_1', index: 1, title: 'A', spans: [[1, 3]] }],
+    questions: [{ id: 'q1', no: 1, label: '1', type: 'mcq', spans: [[2, 2]], stem: '1. Choose the right verb form.', options: [{ key: 'a', spans: [[3, 3]], text: 'go' }, { key: 'b', spans: [[3, 3]], text: 'goes' }], rewrites: [{ line: 2, text: 'x' }], flags: ['GAP_ABSORBED', 'REWRITE_APPLIED'], points: 2, confidence: 0.9, images: [], sectionId: 'sec_1' }],
+    images: [],
+    source: { lines: [{ id: 'L0001', page: 1, text: 'Section A', tag: 'header', tagSource: 'local' }, { id: 'L0002', page: 1, text: '1. Choose the right verb form.', tag: 'question', tagSource: 'ai', tagConf: 8, garbled: false }, { id: 'L0003', page: 1, text: 'a) go b) goes' }], pages: 1, ocrUsed: false, fileName: 'x.pdf', orphanLineNos: [], cleanupStats: { judged: 1, junk: 0, suspect: 0, fenceSaved: 0, aiSkipped: false, linesBefore: 3, linesAfter: 3, tokensBefore: 10, tokensAfter: 10, source: 'ai' } },
+    flags: [{ id: 'f1', severity: 'info', code: 'ORPHAN_LINES', message: 'none' }],
+    usage: [
+      { ts: 't', role: 'cleanup', provider: 'p', model: 'm', inputTokens: 1, outputTokens: 1, label: 'Cleanup (1 call)' },
+      { ts: 't', role: 'critic', provider: 'p', model: 'm', inputTokens: 1, outputTokens: 1, label: 'Critic' },
+      { ts: 't', role: 'consensus', provider: 'p', model: 'm', inputTokens: 1, outputTokens: 1, label: 'Consensus' },
+    ],
+  };
+  const parsed = parseExamDocImport(JSON.stringify(doc));
+  assert.equal(parsed.error, undefined, parsed.error);
+  assert.equal(parsed.doc?.usage?.length, 3);
+  assert.equal((parsed.doc?.source.lines[1] as any).tag, 'question');
+});

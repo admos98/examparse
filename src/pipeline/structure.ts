@@ -1086,10 +1086,8 @@ async function runChunkedStructurePass(params: any, _fullLas: string, manifest: 
       if (!params.recoveryBudget || params.recoveryBudget.count >= 8) { capped = true; return; }
       params.recoveryBudget.count++;
     }
-    const las = lines.map(line => {
-      const n = Number(line.id.replace(/\D/g, ''));
-      return `[${line.id}] ${keyLines.has(n) ? '[KEY] ' : ''}${line.furniture ? '[FURNITURE] ' : ''}${line.text}`;
-    }).join('\n');
+    // A4 — chunks see the same clean view as every other structure path (tags as prefixes, confirmed junk omitted, original ids).
+    const las = renderCleanView(lines, keyLines).text;
     const start = Number(lines[0]?.id.replace(/\D/g,'')), end = Number(lines[lines.length-1]?.id.replace(/\D/g,''));
     const chunkManifest = manifest.filter((m:any) => { const n = Number(m.nearLine); return n >= start && n <= end; });
     const keyPreamble = keyLines.size ? 'Lines tagged [KEY] are official answer-key territory: use them ONLY for answer spans; never parse questions from them.\n' : '';

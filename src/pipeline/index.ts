@@ -4,7 +4,7 @@
  * with content-hash caching, token thrift enforcement, and live stage status.
  */
 import { AppSettings, ExamDoc, LineTag, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
-import { CLEANUP_VERSION, runCleanupStage } from './cleanup';
+import { CLEANUP_VERSION, runCleanupStage, cleanupKeySignature } from './cleanup';
 import { computeOwnership, orphanFlag } from './ownership';
 import { applyLocalGates } from './gates';
 import { extractDocument, ExtractedDocument } from './extract';
@@ -296,7 +296,7 @@ export async function runFullPipeline(
     workingLines = cleanupResult.lines;
     cleanupStats = cleanupResult.stats;
     cleanupFlags.push(...cleanupResult.flags.map((f, i) => ({ id: `flag_${f.code}_${i + 1}`, code: f.code, severity: f.severity, message: f.message })));
-    cleanupSignature = (await sha256(workingLines.map(l => `${l.id}:${l.tag || ''}:${l.garbled ? 'g' : ''}`).join('|'))).slice(0, 12);
+    cleanupSignature = cleanupKeySignature({ enabled: cleanupEnabled, model: cleanupProviderConfig?.model, overrides: cleanupOverrides });
     let cleanupCost = 0;
     if (cleanupResult.calls && cleanupProviderConfig) {
       cleanupCost = calculateActualCost(cleanupResult.usage.inputTokens, cleanupResult.usage.outputTokens, cleanupProviderConfig.model, settings.costTable);

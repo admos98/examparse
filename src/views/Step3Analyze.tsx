@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Play,
   RotateCcw,
@@ -20,6 +20,8 @@ import { runFullPipeline } from '../pipeline';
 import { loadJournal } from '../pipeline/journal';
 import { getPipelineCache } from '../store';
 import { PARSER_VERSION } from '../pipeline/prompts';
+import { estimateCleanupCall } from '../pipeline/cleanup';
+import { enumerateExpectedQuestionNos } from '../pipeline/quality';
 
 interface Props {
   extractedDoc: ExtractedDocument;
@@ -240,8 +242,8 @@ export const Step3Analyze: React.FC<Props> = ({
   const isRtl = settings.document.defaultLanguage === 'rtl' || (settings.document.defaultLanguage === 'auto' && detectedDir.direction === 'rtl');
 
   // Resolve per-stage models for pricing each stage at its own role model
-  const resolveModel = (role: 'fast' | 'vision' | 'escalation') => {
-    const sel = settings.roleMapping[role];
+  const resolveModel = (role: 'fast' | 'vision' | 'escalation' | 'cleanup') => {
+    const sel = settings.roleMapping[role] || settings.roleMapping.fast;
     const prov = settings.providers.find(p => p.id === sel.providerId) || settings.providers[0];
     return sel.model;
   };
@@ -251,7 +253,18 @@ export const Step3Analyze: React.FC<Props> = ({
     ocrModel: resolveModel('vision'),
     visionModel: resolveModel('vision'),
     repairModel: resolveModel('escalation'),
+    cleanupModel: resolveModel('cleanup'),
   };
+
+  // A5 — Stage 2.5 cleanup judgment estimate (0 calls when the toggle is off; the local pre-pass is always free).
+  const cleanupEnabled = settings.cleanupEnabled !== false;
+  const cleanupEstimate = useMemo(() => {
+    if (!cleanupEnabled) return { chunks: 0, inputTokens: 0, outputTokens: 0, judged: 0 };
+    try {
+      const keyLines = new Set(enumerateExpectedQuestionNos(extractedDoc.lines).keyTerritory.lineNos);
+      return estimateCleanupCall(extractedDoc.lines, keyLines, extractedDoc.pages);
+    } catch { return { chunks: 0, inputTokens: 0, outputTokens: 0, judged: 0 }; }
+  }, [extractedDoc.lines, extractedDoc.pages, cleanupEnabled]);
 
   // Applicable estimate: full estimate when forceRerun, else uncached-stages estimate
   const estimate = isFullyCached && !forceRerun
@@ -259,7 +272,7 @@ export const Step3Analyze: React.FC<Props> = ({
         estimatedInputTokens: 0,
         estimatedOutputTokens: 0,
         estimatedCostUsd: 0,
-        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, ocrCalls: 0 },
+        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, ocrCalls: 0, cleanupCalls: 0, cleanupTokens: 0, cleanupCostUsd: 0 },
         exceedsBudget: false,
         warning50Percent: false,
       }
@@ -275,6 +288,7 @@ export const Step3Analyze: React.FC<Props> = ({
         stageModels,
         maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
         providerKey: `${activeProvider.kind}:${activeProvider.id}`,
+        cleanup: cachedStages.structure && !forceRerun ? undefined : cleanupEstimate,
       });
 
   const handleStartAnalysis = async () => {
@@ -302,6 +316,7 @@ export const Step3Analyze: React.FC<Props> = ({
     const initialStages: StageStatus[] = [
       { id: 'extract', name: 'Local Text & Image Extraction', status: 'completed', message: '0 API calls (done)' },
       { id: 'ocr', name: 'Scanned Pages OCR', status: extractedDoc.scannedPageIndices.length > 0 ? 'idle' : 'skipped', message: 'Batched <= 3 pages' },
+      { id: 'cleanup', name: 'Cleanup Tags (Stage 2.5)', status: cleanupEnabled ? 'idle' : 'skipped', message: cleanupEnabled ? `${cleanupEstimate.chunks} judgment call(s) · ${cleanupEstimate.judged} line(s) · local tags first` : 'AI off — local tags only' },
       { id: 'structure', name: 'Structure Pass (Span References)', status: 'idle', message: '1 text call' },
       { id: 'vision', name: 'Batched Vision Labeling', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
       { id: 'assemble', name: 'Assemble & Validate', status: 'idle', message: 'Local assembly' },
@@ -434,7 +449,7 @@ export const Step3Analyze: React.FC<Props> = ({
               {isPreflightCached && !forceRerun ? '0 toks' : `~${(estimate.estimatedInputTokens / 1000).toFixed(1)}k`}
             </div>
             <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">
-              {isPreflightCached && !forceRerun ? 'Cache hit' : `${estimate.breakdown.textTokens} text + ${estimate.breakdown.imageTokens} img`}
+              {isPreflightCached && !forceRerun ? 'Cache hit' : `${estimate.breakdown.textTokens} text + ${estimate.breakdown.imageTokens} img${estimate.breakdown.cleanupCalls ? ` + ${estimate.breakdown.cleanupTokens} cleanup` : ''}`}
             </div>
           </div>
 
@@ -461,7 +476,7 @@ export const Step3Analyze: React.FC<Props> = ({
           <div className="p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  space-y-1">
             <div className="text-[length:var(--type-12)] uppercase font-semibold text-[var(--ink-2)]">API Calls</div>
             <div className="text-lg font-bold font-mono text-[var(--ink)] ">
-              {isPreflightCached && !forceRerun ? '0 calls' : `1 text + ${estimate.breakdown.visionCalls} vision`}
+              {isPreflightCached && !forceRerun ? '0 calls' : `${estimate.breakdown.cleanupCalls ? `${estimate.breakdown.cleanupCalls} cleanup + ` : ''}1 text + ${estimate.breakdown.visionCalls} vision`}
             </div>
             <div className="text-[length:var(--type-12)] text-[var(--accent-ink)]  font-medium">
               {isPreflightCached && !forceRerun ? 'Cached result' : 'Target: ≤ 3 calls total'}

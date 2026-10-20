@@ -635,9 +635,13 @@ function summarizeStoredExam(doc: any): any {
     const dupCount = health.duplicates?.length || 0;
     const numScore = Math.max(0, 10 - dupCount * 5);
     const low = health.lowConfidenceCount || 0;
-    const confScore = Math.max(0, 10 - low * 2);
+    // B3 reweighting: confidence 6 + orphan lines 4 (mirrors src/utils/qualityScore.ts)
+    const confScore = Math.max(0, 6 - low * 2);
+    const orphanCount = (health as any).orphanLines || (doc?.source?.orphanLineNos?.length ?? 0);
+    const territory = Math.max(1, (doc?.source?.lines?.length || 0) - (doc?.source?.keyTerritoryLineNos?.length || 0));
+    const orphanScore = Math.max(0, Math.min(4, 4 - Math.ceil((orphanCount / territory) * 100)));
     let passScore = 5; for (const q of qs) { if (q.text && /passage|reading.*text|listen/i.test(q.text) && (!q.sourceLineIds || q.sourceLineIds.length === 0)) { passScore = 0; break; } }
-    qualityScore = Math.max(0, Math.min(100, covScore + ptsScore + optScore + imgScore + numScore + confScore + passScore));
+    qualityScore = Math.max(0, Math.min(100, covScore + ptsScore + optScore + imgScore + numScore + confScore + orphanScore + passScore));
   } catch { qualityScore = 0; }
   return {
     id: doc.id,

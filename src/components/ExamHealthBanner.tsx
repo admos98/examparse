@@ -3,7 +3,7 @@ import { ExamDoc } from '../types';
 import { getExamHealth } from '../pipeline/quality';
 import { computeQualityScore, qualityColor } from '../utils/qualityScore';
 
-export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onExplainScore?: (filter?: string)=>void }> = ({ doc, className = '', onExplainScore }) => {
+export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onExplainScore?: (filter?: string)=>void; /** B3 — jump to the first orphan line in Step 2. */ onJumpToSource?: (lineNo: number) => void }> = ({ doc, className = '', onExplainScore, onJumpToSource }) => {
   // getExamHealth throws if doc is incomplete (e.g. missing source.lines) — degrade to partial instead of white-screen
   let health: ReturnType<typeof getExamHealth>;
   try { health = getExamHealth(doc); } catch {
@@ -50,6 +50,16 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
       {health.unresolvedImageRefs.length > 0 && <span>{health.unresolvedImageRefs.length} unresolved image reference(s)</span>}
       {health.lowConfidenceCount > 0 && <span>{health.lowConfidenceCount} low-confidence question(s)</span>}
       {(health.parentLinkIssueCount || 0) > 0 && <span className="font-semibold">{health.parentLinkIssueCount} invalid nested-question link(s)</span>}
+      {(health.hollowQuestions?.length || 0) > 0 && <span className="font-semibold" title={health.hollowQuestions.map(h => `${h.label}: ${h.code}`).join(', ')}>{health.hollowQuestions.length} hollow/unverified question(s)</span>}
+      {(health.orphanLines || 0) > 0 && (() => {
+        const first = (doc.source?.orphanLineNos || [])[0];
+        const territory = Math.max(1, (doc.source?.lines || []).length - (doc.source?.keyTerritoryLineNos || []).length);
+        const rate = (health.orphanLines / territory) * 100;
+        return <span className={rate > 2 ? 'font-semibold' : ''} title="Exam-territory lines owned by no question or section (ORPHAN_LINES)">
+          {health.orphanLines} orphan line(s) ({rate.toFixed(1)}%)
+          {onJumpToSource && first !== undefined && <button onClick={() => onJumpToSource(first)} className="ms-1 underline hover:opacity-80">jump to L{String(first).padStart(4, '0')}</button>}
+        </span>;
+      })()}
     </div>
     {showBreakdown && (
       <div className="mt-3 p-3 rounded-[10px] bg-[var(--paper-raised)]  border border-[var(--rule)]  text-xs">
@@ -60,7 +70,8 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
           <button onClick={()=> onExplainScore?.('options')} className="text-start hover:underline">Options {quality.optionsCleanliness}/15 — blobs {quality.details.optionBlobCount}</button>
           <button onClick={()=> onExplainScore?.('images')} className="text-start hover:underline">Images {quality.imagePlacement}/15 — unplaced {quality.details.unplacedImages}</button>
           <button onClick={()=> onExplainScore?.('numbering')} className="text-start hover:underline">Numbering {quality.numbering}/10 — dup {quality.details.duplicateNumbers}</button>
-          <button onClick={()=> onExplainScore?.('confidence')} className="text-start hover:underline">Confidence {quality.confidence}/10 — low {quality.details.lowConfidenceCount}</button>
+          <button onClick={()=> onExplainScore?.('confidence')} className="text-start hover:underline">Confidence {quality.confidence}/6 — low {quality.details.lowConfidenceCount}</button>
+          <button onClick={()=> onExplainScore?.('orphan')} className="text-start hover:underline">Orphan lines {quality.orphan}/4 — {quality.details.orphanLines} line(s), {(quality.details.orphanRate * 100).toFixed(1)}%</button>
           <button onClick={()=> onExplainScore?.('passage')} className="text-start hover:underline col-span-2">Passage {quality.passage}/5 — {quality.details.passageMissing ? 'missing for reading/listening' : 'ok'}</button>
         </div>
         <div className="mt-2 text-[length:var(--type-12)] text-[var(--ink-2)]">Explain-my-score: clicking an item jumps to the exact questions/images causing it.</div>

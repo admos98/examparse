@@ -158,7 +158,7 @@ function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
   return new Map(lineIndexFor(sourceLines).text);
 }
 
-function decontaminateStem(
+export function decontaminateStem(
   stemSpans: LineSpan[],
   optionSpans: LineSpan[],
   sourceLines: SourceLine[],

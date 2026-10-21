@@ -281,6 +281,7 @@ export async function prepareSectionReparse(params: {
     ...provider,
     model: role.model,
     agentBudgetId: params.agentBudgetId,
+    agentMaxCalls: settings.agentLimits?.maxModelCalls ?? 30,
   };
   const journalKey = await sha256(
     JSON.stringify([

@@ -281,7 +281,62 @@ export interface WorkingBrief {
   triedActions: string[];
   openQuestions: string[];
   nextPlanned: string;
+  executedFingerprints?: string[];
+  refusedFingerprints?: Record<string, number>;
+  retriedMissingKeys?: string[];
+  preconditionsWaived?: string[];
 }
+export interface ActionLedger {
+  executedFingerprints: Set<string>;
+  refusedFingerprints: Map<string, number>;
+  retriedMissingKeys: Set<string>;
+  preconditionsWaived: string[];
+}
+export function createActionLedger(init?: Partial<WorkingBrief>): ActionLedger {
+  return {
+    executedFingerprints: new Set(init?.executedFingerprints || []),
+    refusedFingerprints: new Map(Object.entries(init?.refusedFingerprints || {})),
+    retriedMissingKeys: new Set(init?.retriedMissingKeys || []),
+    preconditionsWaived: [...(init?.preconditionsWaived || [])],
+  };
+}
+export function serializeActionLedger(ledger: ActionLedger): Pick<WorkingBrief, "executedFingerprints" | "refusedFingerprints" | "retriedMissingKeys" | "preconditionsWaived"> {
+  return {
+    executedFingerprints: [...ledger.executedFingerprints].slice(-60),
+    refusedFingerprints: Object.fromEntries([...ledger.refusedFingerprints.entries()].slice(-60)),
+    retriedMissingKeys: [...ledger.retriedMissingKeys].slice(-30),
+    preconditionsWaived: [...ledger.preconditionsWaived].slice(-30),
+  };
+}
+export function computeActionFingerprint(
+  tool: string,
+  args: Record<string, unknown>,
+  doc: ExamDoc,
+): string {
+  const target =
+    typeof args.sectionId === "string"
+      ? args.sectionId
+      : typeof args.parentQuestionId === "string"
+        ? args.parentQuestionId
+        : typeof args.questionId === "string"
+          ? args.questionId
+          : Array.isArray(args.childNumbers)
+            ? `children:${args.childNumbers.join(",")}`
+            : Array.isArray(args.numbers)
+              ? `numbers:${args.numbers.join(",")}`
+              : JSON.stringify(args);
+  return `${tool}:${target}:${examContentRevision(doc)}`;
+}
+export function missingSetFingerprint(missing: number[], doc: ExamDoc): string {
+  return `${[...missing].sort((a, b) => a - b).join(",")}@${examContentRevision(doc)}`;
+}
+let activeTurnLedger: ActionLedger | undefined;
+export function getActiveTurnLedger(): ActionLedger | undefined {
+  return activeTurnLedger;
+}
+/** Default executor bounds: 30 model calls / 200 weighted tool executions. */
+export const DEFAULT_MAX_MODEL_CALLS = 30;
+export const DEFAULT_MAX_TOOL_EXECUTIONS = 200;
 /** E3 — reads cost a quarter of a mutation against the tool-execution budget. */
 export const READ_WEIGHT = 0.25;
 /** E6 — the "Fix it" chip: deterministic pipeline, zero model calls. */
@@ -379,6 +434,8 @@ export interface AgentSession {
   ladderPath?: string[];
   /** True when any tool call was refused or no-opped this turn (B1 trigger). */
   toolRefused?: boolean;
+  /** Stateful waiver markers recorded when a repeated refusal proceeds. */
+  preconditionsWaived?: string[];
   /** B5 — exactly what memory was injected this turn, shown in the transcript/UI. */
   guidanceDigest?: string;
 }
@@ -574,8 +631,8 @@ export async function runAgentTurn(
     const s = runtime.getSettings();
     const limits = (s as any).agentLimits || {};
     return {
-      maxModelCalls: limits.maxModelCalls ?? 30,
-      maxToolExecutions: limits.maxToolExecutions ?? 200,
+      maxModelCalls: limits.maxModelCalls ?? DEFAULT_MAX_MODEL_CALLS,
+      maxToolExecutions: limits.maxToolExecutions ?? DEFAULT_MAX_TOOL_EXECUTIONS,
     };
   };
   const observe = () => {
@@ -602,6 +659,7 @@ export async function runAgentTurn(
     session.healthCache = { snapshot: snap, ts: now, revision: rev };
     return { ...snap, cached: false, ageMs: 0 };
   };
+  let prevActiveLedger = activeTurnLedger;
   try {
     // C4: Task memory across turns — resume existing task if same exam+goal
     if (!session.task && session.events.length===0 && user) {
@@ -614,6 +672,8 @@ export async function runAgentTurn(
       } catch {}
     }
     if (user !== undefined) {
+      // Preserve cross-turn/cross-window action & refusal fingerprints from prior task brief on this session
+      const priorBrief = session.task?.brief;
       // If continuing same task (user says "continue" or same goal), resume task instead of resetting
       const isContinue = user.toLowerCase().trim() === 'continue' || user.toLowerCase().includes('continue');
       if (isContinue && session.task) {
@@ -648,7 +708,17 @@ export async function runAgentTurn(
             triedActions: [],
             healthTrajectory: [],
             budgetLedger: { modelCalls: 0, toolExecs: 0 },
-            brief: { goal: user.slice(0, 200), establishedFacts: [], triedActions: [], openQuestions: [], nextPlanned: 'L1 retry_missing_questions' },
+            brief: {
+              goal: user.slice(0, 200),
+              establishedFacts: [],
+              triedActions: [],
+              openQuestions: [],
+              nextPlanned: 'L1 retry_missing_questions',
+              executedFingerprints: priorBrief?.executedFingerprints ? [...priorBrief.executedFingerprints] : [],
+              refusedFingerprints: priorBrief?.refusedFingerprints ? { ...priorBrief.refusedFingerprints } : {},
+              retriedMissingKeys: priorBrief?.retriedMissingKeys ? [...priorBrief.retriedMissingKeys] : [],
+              preconditionsWaived: priorBrief?.preconditionsWaived ? [...priorBrief.preconditionsWaived] : [],
+            },
             completedRungs: [],
             executorQueue: [],
           };
@@ -658,7 +728,9 @@ export async function runAgentTurn(
         session.pending = undefined;
         session.prepared = undefined;
         session.preparing = false;
-        session.retriedMissing = false;
+        // Keep retriedMissing true when prior turn already retried against the same missing set
+        const curMissingKey = missingSetFingerprint(healthSummary(runtime.getDoc()).missing, runtime.getDoc());
+        session.retriedMissing = Boolean(priorBrief?.retriedMissingKeys?.includes(curMissingKey));
         session.confirmed = false;
         session.turnCache = new Map();
         session.healthCache = undefined;
@@ -682,6 +754,15 @@ export async function runAgentTurn(
         }
       }
     }
+    const turnLedger = createActionLedger(session.task?.brief);
+    const syncLedgerToBrief = () => {
+      if (!session.task) return;
+      const b = brief();
+      Object.assign(b, serializeActionLedger(turnLedger));
+    };
+    const prevOuterLedger = prevActiveLedger;
+    prevActiveLedger = prevOuterLedger;
+    activeTurnLedger = turnLedger;
     session.running = true;
     await save();
     // E6 — "Fix it" needs no provider at all; everything else does.
@@ -744,28 +825,50 @@ export async function runAgentTurn(
         event(session, "tool", cachedResult, { tool: call, status: "complete" });
         return "next";
       }
-      // C3 no-loop: same tool with equivalent args and unchanged health snapshot may not run twice in one task
-      const healthSnap = JSON.stringify(healthSummary(runtime.getDoc()));
+      // C3 no-loop: same tool with equivalent args and unchanged health snapshot may not run twice in one task,
+      // UNLESS a prior soft refusal already happened for the same (tool + target + docFingerprint), in which case waive & proceed.
+      const currentDocForFp = runtime.getDoc();
+      const actionFp = computeActionFingerprint(call.name, call.args || {}, currentDocForFp);
+      const currentMissingSetFp = missingSetFingerprint(healthSummary(currentDocForFp).missing, currentDocForFp);
+      const recordOrWaiveSoftRefusal = (refusalMsg: string): { waived: boolean } => {
+        const prevCount = turnLedger.refusedFingerprints.get(actionFp) ?? 0;
+        turnLedger.refusedFingerprints.set(actionFp, prevCount + 1);
+        if (prevCount >= 1) {
+          turnLedger.preconditionsWaived.push(actionFp);
+          session.preconditionsWaived = [...(session.preconditionsWaived || []), actionFp];
+          brief().establishedFacts = dedupePush(brief().establishedFacts, `PRECONDITION_WAIVED: ${actionFp}`, 10);
+          event(session, "tool", JSON.stringify({ code: "PRECONDITION_WAIVED", action: actionFp }), {
+            tool: call,
+            status: "waived",
+          });
+          syncLedgerToBrief();
+          return { waived: true };
+        }
+        syncLedgerToBrief();
+        note(compactResult({ error: refusalMsg }, call.name));
+        event(session, "error", refusalMsg, { tool: call, status: "refused" });
+        session.toolRefused = true;
+        noteStep(`${call.name}:refused-noop`);
+        opts.collect?.push({ tool: call.name, summary: refusalMsg.slice(0, 120), ok: false });
+        return { waived: false };
+      };
+
+      const healthSnap = JSON.stringify(healthSummary(currentDocForFp));
       const triedKey = `${call.name}:${JSON.stringify(call.args)}:${healthSnap}`;
       const rung = rungOf(call.name);
-      // E4 — a finished rung (same mutating tool, or any L1 retry, with the health snapshot it left behind) is not re-planned.
-      // Exact repeats of any tool are caught by triedKey; the rung rule additionally covers the
-      // L1 retry family (retry_missing_questions ⇄ run_remediation_pipeline) whatever the wording.
       const completedRung = rung === 'L1'
         ? session.task?.completedRungs?.find((r) => r.rung === 'L1' && r.healthSnap === healthSnap)
         : undefined;
       if (session.task?.triedActions.includes(triedKey) || completedRung) {
         const nextRung = nextRungFor(call.name);
-        const refusal = completedRung
+        const refusalMsg = completedRung
           ? `Refused: rung ${rung} (${call.name}) is already completed in this task and health has not changed since — no re-planning of completed rungs. Brief says next: ${session.task?.brief?.nextPlanned || nextRung}.`
           : `Refused: same tool ${call.name} with equivalent args and unchanged health snapshot already tried in this task (health unchanged). What changed=NOTHING. Suggested next: ${nextRung}`;
-        note(compactResult({ error: refusal }, call.name));
-        event(session, "error", refusal, { tool: call, status: "refused" });
-        session.toolRefused = true;
-        noteStep(`${call.name}:refused-noop`);
-        opts.collect?.push({ tool: call.name, summary: refusal.slice(0, 120), ok: false });
-        await save();
-        return "next";
+        const decision = recordOrWaiveSoftRefusal(refusalMsg);
+        if (!decision.waived) {
+          await save();
+          return "next";
+        }
       }
       const tool = Object.hasOwn(runtime.registry, call.name)
         ? runtime.registry[call.name]
@@ -774,6 +877,26 @@ export async function runAgentTurn(
       const parsed = tool?.schema.safeParse(call.args);
       let result: unknown;
       let refusal: string | undefined;
+      const retrySatisfiedForMissing = Boolean(
+        session.retriedMissing || turnLedger.retriedMissingKeys.has(currentMissingSetFp),
+      );
+      const waiveOrCountRetryRefusal = (): boolean => {
+        const prevRefusals = turnLedger.refusedFingerprints.get(actionFp) ?? 0;
+        turnLedger.refusedFingerprints.set(actionFp, prevRefusals + 1);
+        if (prevRefusals >= 1) {
+          turnLedger.preconditionsWaived.push(actionFp);
+          session.preconditionsWaived = [...(session.preconditionsWaived || []), actionFp];
+          brief().establishedFacts = dedupePush(brief().establishedFacts, `PRECONDITION_WAIVED: ${actionFp}`, 10);
+          event(session, "tool", JSON.stringify({ code: "PRECONDITION_WAIVED", action: actionFp }), {
+            tool: call,
+            status: "waived",
+          });
+          syncLedgerToBrief();
+          return true;
+        }
+        syncLedgerToBrief();
+        return false;
+      };
       if (!tool)
         result = {
           error: (refusal = text("forbidden", { name: call.name })),
@@ -791,8 +914,9 @@ export async function runAgentTurn(
         };
       else if (
         call.name === "reparse_section" &&
-        !session.retriedMissing &&
-        healthSummary(runtime.getDoc()).missing.length
+        !retrySatisfiedForMissing &&
+        healthSummary(runtime.getDoc()).missing.length &&
+        !waiveOrCountRetryRefusal()
       )
         result = { error: (refusal = text("retryFirst")) };
       else if (tool.access === "destructive" && used() + 1 >= limits.maxToolExecutions)
@@ -884,10 +1008,16 @@ export async function runAgentTurn(
                   if (dossier.ledger.length > 20) dossier.ledger = dossier.ledger.slice(-20);
               }
           } catch {}
-          // Track triedActions for no-loop
+          // Track triedActions & stateful action fingerprints for no-loop / no-requeue
           if (session.task) session.task.triedActions.push(triedKey);
-          if (call.name === "retry_missing_questions")
+          turnLedger.executedFingerprints.add(actionFp);
+          if (call.name === "retry_missing_questions" || call.name === "run_remediation_pipeline") {
             session.retriedMissing = true;
+            turnLedger.retriedMissingKeys.add(currentMissingSetFp);
+            const postMissingFp = missingSetFingerprint(healthSummary(runtime.getDoc()).missing, runtime.getDoc());
+            turnLedger.retriedMissingKeys.add(postMissingFp);
+          }
+          syncLedgerToBrief();
           approvedPreparation = undefined;
           if (tool.access === "destructive") approved = "";
           // Wrap result with tool contract if not already
@@ -1231,6 +1361,7 @@ export async function runAgentTurn(
     await reportJobEnd(session, runtime, stoppedHealth);
     return session;
   } finally {
+    activeTurnLedger = prevActiveLedger;
     session.running = false;
     try {
       await save();

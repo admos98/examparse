@@ -158,7 +158,8 @@ export function applySemanticDeterministicFixes(questions: Question[]): { questi
     // option keeps the head fragment, the next duplicated option takes the tail.
     const fragments: string[] = [];
     for (const opt of options) {
-      const m = (opt.text || '').match(/^([\s\S]*?)\s+(?:[b-dB-D]|[۲-۴2-4])\s*[).．]\s+([\s\S]+)$/);
+      const cleaned = (opt.text || '').replace(/`/g, "'");
+      const m = cleaned.match(/^([\s\S]*?)\s+(?:[b-dB-D]|[۲-۴2-4])\s*[).．]\s+([\s\S]+)$/);
       if (m && norm(m[1]) && norm(m[2]) && norm(m[1]) !== norm(m[2])) fragments.push(m[1].trim(), m[2].trim());
     }
     if (fragments.length >= 2) {

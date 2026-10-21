@@ -113,12 +113,57 @@ export function classifyLines(lines: SourceLine[], keyLines: Set<number>): Map<n
   return out;
 }
 
-function optionMarkerKeys(text: string): string[] {
+const PERSIAN_OPTION_SERIES: readonly (readonly string[])[] = [
+  ['الف', 'ب', 'ج', 'د', 'ه', 'و'],
+  ['الف', 'ب', 'پ', 'ت', 'ث', 'ج', 'چ'],
+];
+
+function hasIntraLineMultiNumbers(text: string): boolean {
+  if (!/(?:^|\s)(?:\([0-9۰-۹٠-٩０-９]{1,3}\)|[0-9۰-۹٠-٩０-９]{1,3}\s*[.):-])\s*(?:\([a-jالفبپتثجچدهو]\)|[a-jالفبپتثجچدهو][).:])/i.test(text)) return false;
   const v = normalizeForMatching(text);
-  const re = /(?:^|\s)(?:\(([a-h])\)|([a-h])[).:]|\((الف|ب|پ|ت|ث|ج|چ|د)\)|(الف|ب|پ|ت|ث|ج|چ|د)[).:])(?=\s|$)/gi;
-  const keys: string[] = [];
-  for (const m of v.matchAll(re)) keys.push((m[1] || m[2] || m[3] || m[4] || '').toLowerCase());
-  return keys;
+  const re = /(?:^|\s)(?:\((\d{1,3})\)|(\d{1,3})\s*[.):-])\s*(?:\(([a-j])\)|([a-j])[).:]|\((الف|ب|پ|ت|ث|ج|چ|د|ه|و)\)|(الف|ب|پ|ت|ث|ج|چ|د|ه|و)[).:])(?=\s|$)/gi;
+  const nos: number[] = [];
+  for (const m of v.matchAll(re)) {
+    const n = Number(m[1] || m[2]);
+    if (Number.isInteger(n) && n >= 1 && n <= 300) nos.push(n);
+  }
+  return nos.length >= 2 && nos.every((n, i) => i === 0 || n > nos[i - 1]);
+}
+
+function optionMarkerKeys(text: string): string[] {
+  if (hasIntraLineMultiNumbers(text)) return [];
+  const v = normalizeForMatching(text);
+  const re = /(?:^|\s)(?:\(([a-j])\)|([a-j])[).:]|\((الف|ب|پ|ت|ث|ج|چ|د|ه|و)\)|(الف|ب|پ|ت|ث|ج|چ|د|ه|و)[).:])(?=\s|$)/gi;
+  const raw: string[] = [];
+  for (const m of v.matchAll(re)) raw.push((m[1] || m[2] || m[3] || m[4] || '').toLowerCase());
+  // Ordered Latin sequence starting at 'a'
+  let bestLatin: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] !== 'a') continue;
+    const seq: string[] = ['a'];
+    for (let j = i + 1; j < raw.length; j++) {
+      if (raw[j] === String.fromCharCode(97 + seq.length)) seq.push(raw[j]);
+    }
+    if (seq.length >= bestLatin.length) bestLatin = seq;
+  }
+  if (bestLatin.length >= 2) return bestLatin;
+  // Ordered Persian sequence starting strictly at 'الف'
+  for (const series of PERSIAN_OPTION_SERIES) {
+    let bestFa: string[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== series[0]) continue;
+      const seq: string[] = [series[0]];
+      for (let j = i + 1; j < raw.length && seq.length < series.length; j++) {
+        if (raw[j] === series[seq.length]) seq.push(raw[j]);
+      }
+      if (seq.length >= bestFa.length) bestFa = seq;
+    }
+    if (bestFa.length >= 2) return bestFa;
+  }
+  const tf = [...v.matchAll(/(?:^|[\s/])(true|false|درست|نادرست)(?=\s|$|[).:/])/g)].map(m => m[1]);
+  if (tf.includes('true') && tf.includes('false')) return ['true', 'false'];
+  if (tf.includes('درست') && tf.includes('نادرست')) return ['درست', 'نادرست'];
+  return [];
 }
 
 /**
@@ -202,7 +247,7 @@ export function completeGapsRaw(
     q.spans = compress([...stemLines, ...gained]);
     if (optionArea.length) {
       const pool = [...new Set([...existingOptionLines, ...optionArea])].sort((a, b) => a - b);
-      const keys = dedupeKeys(pool.flatMap(m => optionMarkerKeys(byNo.get(m)?.text || '')));
+      const keys = dedupeKeys(optionMarkerKeys(pool.map(m => byNo.get(m)?.text || '').join('\n')));
       if (keys.length >= 2) {
         // Rebuild options from the markers actually printed: each option references the pooled area;
         // the assembly option splitter assigns texts by marker order.
@@ -233,13 +278,16 @@ function isTrueFalsePair(keys: string[], pool: number[], byNo: Map<number, Sourc
 /** Option synthesis: a lazy span with no options but ≥2 printed markers → options from markers. */
 function maybeSynthesizeOptions(q: any, stemLines: number[], byNo: Map<number, SourceLine>, synthesized: Map<string, number>, k: string): void {
   if (Array.isArray(q.options) && q.options.length) return;
-  const markerLines = stemLines.filter(m => { const line = byNo.get(m); return line && !isSkippedLine(line) && optionMarkerKeys(line.text).length > 0; });
-  if (!markerLines.length) return;
-  // Option area = first marker line through the end of the stem lines (continuations included).
-  const first = markerLines[0];
-  const pool = stemLines.filter(m => m >= first && byNo.has(m) && !isSkippedLine(byNo.get(m)!));
-  const keys = dedupeKeys(pool.flatMap(m => optionMarkerKeys(byNo.get(m)?.text || '')));
+  const candidateLines = stemLines.filter(m => { const line = byNo.get(m); return Boolean(line && !isSkippedLine(line)); });
+  if (!candidateLines.length) return;
+  const keys = dedupeKeys(optionMarkerKeys(candidateLines.map(m => byNo.get(m)?.text || '').join('\n')));
   if (keys.length < 2) return;
+  const firstMarkerRe = /^\s*(?:\([a-j]\)|[a-j][).:]|\((?:الف|ب|پ|ت|ث|ج|چ|د|ه|و)\)|(?:الف|ب|پ|ت|ث|ج|چ|د|ه|و)[).:])(?=\s|$)/i;
+  const first = candidateLines.find(m => {
+    const t = byNo.get(m)?.text || '';
+    return optionMarkerKeys(t).length >= 2 || firstMarkerRe.test(normalizeForMatching(t));
+  }) ?? candidateLines[0];
+  const pool = candidateLines.filter(m => m >= first);
   q.options = keys.map(key => ({ key, spans: compress(pool) }));
   synthesized.set(k, keys.length);
   if (!q.type || q.type === 'unknown' || q.type === 'short') q.type = isTrueFalsePair(keys, pool, byNo) ? 'truefalse' : 'mcq';

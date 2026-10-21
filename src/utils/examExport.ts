@@ -77,16 +77,186 @@ export function confirmPartialExport(doc: ExamDoc, _action = 'export'): boolean 
   return partialExportIssues(doc).length === 0;
 }
 
-/** Download an ExamDoc as `<displayName>_structured.json` (filesystem-sanitized). */
-export function exportExamJson(doc: ExamDoc): void {
+/** Canonical source key grouping re-parses of the same exam file (by fileHash first, else stripped base fileName). */
+export function canonicalSourceKey(entry: { fileHash?: string; fileName?: string; displayName?: string; id?: string }): string {
+  if (entry.fileHash && entry.fileHash.trim()) return `hash:${entry.fileHash.trim()}`;
+  const rawName = (entry.fileName || entry.displayName || '').trim();
+  if (rawName) {
+    const normalized = rawName
+      .replace(/\.[^./\\]+$/, '')
+      .replace(/\s*\(\d+\)\s*$/, '')
+      .trim()
+      .toLowerCase();
+    if (normalized) return `name:${normalized}`;
+  }
+  return `id:${entry.id || ''}`;
+}
+
+export type LibrarySortMode = 'newest' | 'oldest' | 'name' | 'quality-desc' | 'quality-asc';
+
+export interface AnnotatedLibrarySummary<T> {
+  item: T;
+  isLatest: boolean;
+  reparseIndex: number;
+}
+
+/**
+ * Sort library entries (default: newest-first) and mark the newest parse of each source with `isLatest = true`
+ * while computing deterministic `reparseIndex` (`0` = initial parse, `1` = `(1)`, `2` = `(2)`, ...).
+ */
+export function annotateLibrarySummaries<
+  T extends {
+    id: string;
+    displayName: string;
+    createdAt: string;
+    fileHash?: string;
+    fileName?: string;
+    qualityScore?: number;
+  },
+>(summaries: T[], sort: LibrarySortMode = 'newest'): Array<T & { isLatest: boolean; reparseIndex: number }> {
+  const bySource = new Map<string, T[]>();
+  for (const s of summaries) {
+    const key = canonicalSourceKey(s);
+    const arr = bySource.get(key) || [];
+    arr.push(s);
+    bySource.set(key, arr);
+  }
+  const latestIds = new Set<string>();
+  const reparseById = new Map<string, number>();
+  for (const group of bySource.values()) {
+    const chronological = [...group].sort((a, b) => {
+      const ta = Date.parse(a.createdAt) || 0;
+      const tb = Date.parse(b.createdAt) || 0;
+      return ta !== tb ? ta - tb : a.id.localeCompare(b.id);
+    });
+    chronological.forEach((entry, idx) => reparseById.set(entry.id, idx));
+    if (chronological.length) latestIds.add(chronological[chronological.length - 1].id);
+  }
+
+  const out = summaries.map(s => ({
+    ...s,
+    isLatest: latestIds.has(s.id),
+    reparseIndex: reparseById.get(s.id) ?? 0,
+  }));
+
+  switch (sort) {
+    case 'oldest':
+      out.sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
+      break;
+    case 'name':
+      out.sort((a, b) => a.displayName.localeCompare(b.displayName));
+      break;
+    case 'quality-desc':
+      out.sort((a, b) => (b.qualityScore ?? 0) - (a.qualityScore ?? 0));
+      break;
+    case 'quality-asc':
+      out.sort((a, b) => (a.qualityScore ?? 0) - (b.qualityScore ?? 0));
+      break;
+    case 'newest':
+    default:
+      out.sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0));
+      break;
+  }
+  return out;
+}
+
+/** Build lightweight library summary directly from an ExamDoc (mirrors server summarizeStoredExam). */
+export function summarizeExamForLibrary(doc: ExamDoc) {
+  const health = getExamHealth(doc);
+  const usage = doc.usage || [];
+  const isPartialDoc = Boolean((doc as any).partial === true || (doc.flags || []).some(f => f.code === 'PARTIAL_EXAM'));
+  const healthState: 'green' | 'amber' | 'red' | 'PARTIAL' = isPartialDoc
+    ? 'PARTIAL'
+    : (health.state || (health.complete ? 'green' : 'amber'));
+  const modelUsed =
+    doc.modelInfo?.fast ||
+    usage.find(u => (u.role as string) === 'standard' || (u.role as string) === 'fast')?.model ||
+    usage.find(u => u.role === 'escalation')?.model ||
+    usage.find(u => Boolean(u.model))?.model ||
+    doc.modelInfo?.escalation ||
+    undefined;
+  return {
+    id: doc.id,
+    fileHash: doc.fileHash || undefined,
+    displayName: getDisplayName(doc),
+    subject: doc.meta?.subject,
+    grade: doc.meta?.grade,
+    term: doc.meta?.term,
+    year: doc.meta?.year,
+    createdAt: doc.createdAt,
+    fileName: doc.source?.fileName || '',
+    pages: doc.source?.pages || 0,
+    questionCount: (doc.questions || []).length,
+    expectedQuestionCount: health.expectedCount,
+    parsedQuestionCount: health.parsedCount,
+    pointsParsed: health.pointsParsed,
+    pointsExpected: health.pointsExpected ?? doc.meta?.totalPoints,
+    healthState,
+    modelUsed,
+    coveragePercent: health.coveragePercent,
+    missingQuestionNos: health.missing,
+    duplicateQuestionNos: health.duplicates,
+    complete: health.complete,
+    sectionCount: (doc.sections || []).length,
+    imageCount: (doc.images || []).length,
+    ocrUsed: Boolean(doc.source?.ocrUsed),
+    qualityScore: 0,
+    totalCostUsd: usage.reduce((a, u) => a + (u.costUsd || 0), 0),
+    totalTokens: usage.reduce((a, u) => a + (u.inputTokens || 0) + (u.outputTokens || 0), 0),
+  };
+}
+
+/** Compute filesystem-safe export JSON filename, preserving `(1), (2), ...` suffix on re-parses. */
+export function exportExamFileName(
+  doc: ExamDoc,
+  options?: {
+    reparseIndex?: number;
+    siblingSummaries?: Array<{ id: string; fileHash?: string; fileName?: string; displayName?: string; createdAt: string }>;
+  },
+): string {
+  const baseDisplay = sanitizeFileName(getDisplayName(doc));
+  const explicitMatch = (doc.source?.fileName || '').replace(/\.[^./\\]+$/, '').match(/\((\d+)\)\s*$/);
+  let idx = options?.reparseIndex;
+  if (idx === undefined && options?.siblingSummaries?.length) {
+    const annotated = annotateLibrarySummaries(
+      options.siblingSummaries.map(s => ({
+        id: s.id,
+        displayName: s.displayName || '',
+        createdAt: s.createdAt,
+        fileHash: s.fileHash,
+        fileName: s.fileName,
+      })),
+    );
+    idx = annotated.find(a => a.id === doc.id)?.reparseIndex;
+  }
+  if ((idx === undefined || idx === 0) && explicitMatch && !/\(\d+\)\s*$/.test(baseDisplay)) {
+    idx = Number(explicitMatch[1]);
+  }
+  const withReparseSuffix =
+    idx && idx >= 1 && !/\(\d+\)\s*$/.test(baseDisplay)
+      ? `${baseDisplay} (${idx})`
+      : baseDisplay;
+  return `${sanitizeFileName(withReparseSuffix)}_structured.json`;
+}
+
+/** Download an ExamDoc as `<displayName>_structured.json` (preserving `(1),(2)...` re-parse suffix). */
+export function exportExamJson(
+  doc: ExamDoc,
+  options?: {
+    reparseIndex?: number;
+    siblingSummaries?: Array<{ id: string; fileHash?: string; fileName?: string; displayName?: string; createdAt: string }>;
+  },
+): string {
+  const fileName = exportExamFileName(doc, options);
   const jsonStr = JSON.stringify(buildExportDoc(doc), null, 2);
   const blob = new Blob([jsonStr], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${sanitizeFileName(getDisplayName(doc))}_structured.json`;
+  a.download = fileName;
   a.click();
   URL.revokeObjectURL(url);
+  return fileName;
 }
 
 /**

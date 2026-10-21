@@ -13,6 +13,7 @@ export function normalizeStoredText(text: string): string {
   out = out.replace(/[\uFE80-\uFEFF]/g, c => c.normalize('NFKC'));
   out = out.replace(/[\uFB50-\uFDFF]/g, c => c.normalize('NFKC'));
   out = out.replace(/\u0640/g, ''); // tatweel
+  out = out.replace(/`/g, "'"); // backtick apostrophe normalization (e.g. won`t → won't)
   out = out.replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/ى/g, 'ی');
   // Do NOT lower-case or strip kanoon here; stored text keeps case but is normalized for Arabic/Persian variants.
   return out;
@@ -34,10 +35,12 @@ export function normalizeForMatching(text: string): string {
 /** @deprecated Use normalizeForMatching. */
 export const normalizeDigits = normalizeForMatching;
 
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
 /** Offsets into the ORIGINAL, including NFKC expansions, marks and joiners. */
 export function matchingView(text: string): { text: string; originalOffset: (offset: number) => number } {
   const starts: number[] = []; const ends: number[] = []; let copy = '';
-  const segments = new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text);
+  const segments = GRAPHEME_SEGMENTER.segment(text);
   for (const part of segments) {
     const normalized = normalizeForMatching(part.segment);
     for (const c of normalized) {
@@ -620,17 +623,29 @@ export function computeImageQuestionHints(
     }
     return maximum;
   };
+  const hasSpanOnPage = (q: typeof sortedQuestions[number], targetPage: number) => {
+    for (const [start, end] of spansFor(q)) {
+      for (let n = start; n <= end; n++) {
+        if (lineByNo.get(n)?.page === targetPage) return true;
+      }
+    }
+    return false;
+  };
   const hints: Record<string, { questionRef: string; group: string; page: number }> = {};
   for (const img of images) {
     if (!img.anchorLine) continue;
     const line = lineByNo.get(img.anchorLine);
-    const page = line?.page || img.page;
-    let candidates = sortedQuestions.filter(q => spansFor(q).some(([start, end]) => img.anchorLine! >= start && img.anchorLine! <= end));
+    // Geometry assignment is strict same-page (±0 pages) only; cross-page requires vision.
+    if (line && line.page !== img.page) continue;
+    const page = img.page;
+    const samePageQuestions = sortedQuestions.filter(q => hasSpanOnPage(q, page));
+    if (!samePageQuestions.length) continue;
+    let candidates = samePageQuestions.filter(q => spansFor(q).some(([start, end]) => img.anchorLine! >= start && img.anchorLine! <= end));
     // Prefer the parent group when it owns the containing range.
     const parentCandidate = candidates.find(q => !q.parentId);
     if (parentCandidate) candidates = [parentCandidate];
     if (!candidates.length) {
-      const preceding = sortedQuestions.filter(q => !q.parentId)
+      const preceding = samePageQuestions.filter(q => !q.parentId)
         .map(q => ({ q, line: pageEndFor(q, page, img.anchorLine!) }))
         .filter(item => Number.isFinite(item.line))
         .sort((a, b) => b.line - a.line)[0]?.q;
@@ -957,6 +972,31 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
       // So violation if not partial.
       violations.push({ code: 'I10', message: `missing expected numbers ${missing.join(',')} but not marked partial`, severity: 'warn' });
       flags.push({ id: 'flag_I10', code: 'INVARIANT_I10_COVERAGE', severity: 'warn', message: `Missing questions ${missing.join(',')} require partial marking` });
+    }
+  }
+  // I11 question number matches printed number in its first span line (unless legitimate group/intra-line child)
+  if ((doc.source?.lines || []).length > 0) {
+    const srcByNo = new Map((doc.source?.lines || []).map(l => [lineNumber(l), l]));
+    for (const q of doc.questions || []) {
+      const firstLineNo = q.spans?.[0]?.[0];
+      if (!firstLineNo) continue;
+      const firstLine = srcByNo.get(firstLineNo);
+      if (!firstLine || firstLine.furniture) continue;
+      const printedFirst = parseStartNumber(firstLine.text);
+      if (printedFirst === undefined || printedFirst === q.no) continue;
+      if (q.parentId) {
+        const spanLines: SourceLine[] = [];
+        for (const [s, e] of q.spans || []) {
+          for (let n = s; n <= e; n++) {
+            const ln = srcByNo.get(n);
+            if (ln) spanLines.push(ln);
+          }
+        }
+        const spanNos = enumerateExpectedQuestionNos(spanLines).numbers;
+        if (spanNos.includes(q.no)) continue;
+      }
+      violations.push({ code: 'I11', message: `Q${q.no} first span line L${firstLineNo} prints ${printedFirst} !== ${q.no}`, questionId: q.id, severity: 'error' });
+      flags.push({ id: `flag_I11_${q.id}`, code: 'INVARIANT_I11_NUMBER_SLIP', severity: 'error', message: `Q${q.no} first span line prints ${printedFirst}, not ${q.no}`, questionId: q.id });
     }
   }
   const ok = violations.filter(v => v.severity === 'error').length === 0;

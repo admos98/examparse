@@ -9,6 +9,14 @@ import { T2_IMAGE_LABELING_SYSTEM } from './prompts';
 import { getImageBlob } from '../store';
 import { Question } from '../types';
 
+/** Fallback kind: 'photo' for raster crops unless vector/diagram-detected; never blanket 'diagram'. */
+export function fallbackImageKind(img: Partial<ImageAsset> & { vectorDetected?: boolean; diagramDetected?: boolean }): 'photo' | 'diagram' {
+  if (img.vectorDetected === true || img.diagramDetected === true || /svg/i.test(img.mime || '')) {
+    return 'diagram';
+  }
+  return 'photo';
+}
+
 /**
  * Convert a Blob to base64 string without data prefix
  */
@@ -189,6 +197,7 @@ export async function labelImagesBatched(params: {
   maxImagesPerVisionCall?: number;
   maxOutputTokens?: number;
   questionHints?: Record<string, { questionRef: string; group: string; page: number }>;
+  questions?: Question[];
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<VisionLabelResult> {
   const {
@@ -225,8 +234,26 @@ export async function labelImagesBatched(params: {
   }
 
   if (prepared.length === 0) {
+    const fallbackImages = images.map(img => {
+      const rawHint = params.questionHints?.[img.id];
+      if (rawHint && rawHint.page === img.page) {
+        return {
+          ...img,
+          label: {
+            role: 'stem' as const,
+            questionRef: rawHint.questionRef,
+            kind: fallbackImageKind(img),
+            caption: undefined,
+            reason: 'Same-page geometry fallback',
+            source: 'geometry',
+          } as any,
+        };
+      }
+      const { label: _unplaced, ...cleanImg } = img as ImageAsset;
+      return cleanImg as ImageAsset;
+    });
     return {
-      updatedImages: images,
+      updatedImages: fallbackImages,
       usage: { inputTokens: 0, outputTokens: 0 },
     };
   }
@@ -295,13 +322,37 @@ export async function labelImagesBatched(params: {
     allFlags.push({ id: 'flag_vision_conservative', severity: 'info', code: 'VISION_CONSERVATIVE_GEOMETRY', message: 'Vision unparseable: refs from geometry only (captions discarded).' });
   }
 
-  // Apply labels to images & propagate to duplicates, with candidate validation
+  // Apply labels to images & propagate to duplicates, with candidate validation & strict ±0 same-page geometry sanity
+  const linePageByNo = new Map(sourceLines.map(l => [Number(String(l.id).replace(/\D/g, '')), l.page]));
+  const questionPagesByRef = new Map<string, Set<number>>();
+  for (const q of ((params as any).questions || []) as Question[]) {
+    const pages = new Set<number>();
+    for (const [s, e] of q.spans || []) {
+      for (let ln = s; ln <= e; ln++) {
+        const p = linePageByNo.get(ln);
+        if (p !== undefined) pages.add(p);
+      }
+    }
+    if (pages.size) {
+      questionPagesByRef.set(String(q.no), pages);
+      if (q.label) questionPagesByRef.set(String(q.label), pages);
+      if (q.id) questionPagesByRef.set(String(q.id), pages);
+    }
+  }
+  const samePageGeometryHint = (img: ImageAsset) => {
+    const rawHint = params.questionHints?.[img.id];
+    if (!rawHint || rawHint.page !== img.page) return undefined;
+    const knownPages = questionPagesByRef.get(String(rawHint.questionRef));
+    if (knownPages && !knownPages.has(img.page)) return undefined;
+    return rawHint;
+  };
+
   const updatedImages = images.map(img => {
     const targetId = img.duplicateOf || img.id;
     let label = mergedLabelMap.get(targetId);
     // D2: if shape mismatch, ignore model labels entirely (geometry only)
     if (hasShapeMismatch) label = undefined;
-    const hint = params.questionHints?.[targetId] || params.questionHints?.[img.id];
+    const hint = samePageGeometryHint(img);
     const candidates = candidatesByImage[targetId] || candidatesByImage[img.id];
     const candidateRefs = new Set((candidates||[]).map(c=>String(c.ref)));
     if (label && label.questionRef && candidateRefs.size > 0) {
@@ -309,15 +360,23 @@ export async function labelImagesBatched(params: {
       const isDecoration = label.role === 'decoration';
       if (!isDecoration && !candidateRefs.has(refStr)) {
         allFlags.push({ id: `flag_vision_ref_rejected_${img.id}`, severity: 'warn', code: 'VISION_REF_REJECTED', message: `${img.id} model ref ${refStr} outside candidates [${[...candidateRefs].join(',')}]; geometry applies.` });
-        // Reject: use geometry first candidate
-        label = { ...label, questionRef: candidates![0]?.ref || hint?.questionRef, reason: label.reason || 'Rejected out-of-candidate ref; geometry fallback.' };
+        const samePageFallbackRef = hint?.questionRef || (candidates || []).find(c => {
+          const pages = questionPagesByRef.get(String(c.ref));
+          return pages ? pages.has(img.page) : false;
+        })?.ref;
+        if (samePageFallbackRef) {
+          label = { ...label, questionRef: samePageFallbackRef, kind: label.kind || fallbackImageKind(img), reason: label.reason || 'Rejected out-of-candidate ref; same-page geometry fallback.' };
+        } else {
+          // Cross-page without valid vision ref → leave unplaced (no forced ref)
+          label = undefined;
+        }
       }
     }
     if (label) {
       const role = label.role || 'stem';
       const reassigned = Boolean(hint && label.questionRef && String(label.questionRef) !== hint.questionRef);
       if (reassigned && !String(label.reason || '').trim()) allFlags.push({ id: `flag_vision_reassign_${img.id}`, severity: 'warn', code: 'VISION_REASSIGNMENT_UNJUSTIFIED', message: `${img.id} was reassigned from geometric hint Q${hint!.questionRef} without a reason.` });
-      const kind = label.kind || 'diagram';
+      const kind = label.kind || fallbackImageKind(img);
       const caption = String(label.caption || '').trim().split(/\s+/).slice(0, 6).join(' ');
       const decorationCaption = role === 'decoration' || kind === 'decoration' ? (caption || 'Decoration; model supplied no caption') : caption;
       if ((role === 'decoration' || kind === 'decoration') && !caption && !hasShapeMismatch) allFlags.push({ id: `flag_vision_decoration_${img.id}`, severity: 'warn', code: 'DECORATION_UNJUSTIFIED', message: `${img.id} was marked decoration without a caption.` });
@@ -334,21 +393,23 @@ export async function labelImagesBatched(params: {
         } as any,
       };
     }
-    // No model label: geometry fallback (D2 conservative)
+    // No model label: conservative same-page (±0) geometry fallback only; unassignable → unplaced tray
     if (hint) {
       return {
         ...img,
         label: {
           role: 'stem',
           questionRef: hint.questionRef,
-          kind: 'diagram',
-          caption: hasShapeMismatch ? undefined : undefined,
-          reason: hasShapeMismatch ? 'Geometry fallback (unparsed vision)' : undefined,
-          source: hasShapeMismatch ? 'geometry' : undefined,
+          kind: fallbackImageKind(img),
+          caption: undefined,
+          reason: hasShapeMismatch ? 'Geometry fallback (unparsed vision)' : 'Same-page geometry fallback',
+          source: 'geometry',
         } as any,
       };
     }
-    return img;
+    // Unassignable by geometry and unconfirmed by vision → strip any pre-seeded ref so it lands in unplaced tray
+    const { label: _unplaced, ...cleanImg } = img as ImageAsset;
+    return cleanImg as ImageAsset;
   });
 
   return {

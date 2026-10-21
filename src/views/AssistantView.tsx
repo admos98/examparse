@@ -60,15 +60,16 @@ export function AssistantView({
   onUpdateDoc,
   onSettings,
   onClose,
-}: Props) {
+  initialSession,
+}: Props & { initialSession?: AgentSession }) {
   const [session, setSession] = useState<AgentSession>(() =>
-    newAgentSession(doc.id),
+    initialSession || newAgentSession(doc.id),
   );
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [stream, setStream] = useState("");
   const [error, setError] = useState("");
-  const [ready, setReady] = useState(false);
+  const [ready, setReady] = useState(() => Boolean(initialSession));
   const [envKey, setEnvKey] = useState(false);
   const docRef = useRef(doc);
   docRef.current = doc;
@@ -458,6 +459,7 @@ export function AssistantView({
                         structuredOutputs: false,
                         model: selection.model,
                         agentBudgetId: budgetId,
+                        agentMaxCalls: currentSettings.agentLimits?.maxModelCalls ?? 30,
                       },
                     },
                     {
@@ -573,9 +575,12 @@ export function AssistantView({
       <header className="p-4 border-b flex justify-between items-center">
         <div>
           <h2 id="assistant-panel-title" className="font-bold">{t("Assistant", "دستیار")}</h2>
-          <p className="text-xs">
+          <p className="text-xs" data-testid="assistant-budget-header">
             ${session.costUsd.toFixed(5)} {t("this turn", "این نوبت")} ·{" "}
-            {session.calls}/{(settings.agentLimits?.maxModelCalls ?? 25)} {t("model calls", "فراخوانی مدل")}
+            {session.calls}/{(settings.agentLimits?.maxModelCalls ?? 30)} {t("model calls", "فراخوانی مدل")} (
+            {Math.max(0, (settings.agentLimits?.maxModelCalls ?? 30) - session.calls)} {t("left", "باقی‌مانده")}) ·{" "}
+            {Math.max(0, Number(((settings.agentLimits?.maxToolExecutions ?? 200) - (session.weightedExecutions ?? 0)).toFixed(2)))}/
+            {(settings.agentLimits?.maxToolExecutions ?? 200)} {t("tools left", "ابزار باقی‌مانده")}
           </p>
         </div>
         <button

@@ -23,7 +23,7 @@ export async function retryMissingCoverage(
   if (before.missing.length === 0) return doc;
   const role = settings.roleMapping.fast;
   const provider = settings.providers.find(item => item.id === role.providerId) || settings.providers[0];
-  const providerConfig = { ...provider, model: role.model, agentBudgetId };
+  const providerConfig = { ...provider, model: role.model, agentBudgetId, agentMaxCalls: settings.agentLimits?.maxModelCalls ?? 30 };
   const lines = doc.source.lines;
   const linesHash = await sha256(JSON.stringify(lines));
   let journalKey = await getPipelineCache<string>(`journalkey:${doc.fileHash}`);

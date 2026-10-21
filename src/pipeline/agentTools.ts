@@ -1,13 +1,37 @@
 import { z } from "zod";
 import { AppSettings, ExamDoc } from "../types";
-import { ActionQueueItem, healthSummary, ToolRegistry } from "./agent";
+import {
+  ActionLedger,
+  ActionQueueItem,
+  computeActionFingerprint,
+  getActiveTurnLedger,
+  healthSummary,
+  missingSetFingerprint,
+  ToolRegistry,
+} from "./agent";
 import {
   applyValidatedQuestionPatch,
   QuestionMergePatchSchema,
   applyExamMutation,
 } from "./patch";
 import { ColorSchema, ThemeTokenSchema } from "./agentTheme";
-import { lineNumber, examContentRevision, enumerateExpectedQuestionNos, getExamHealth, parsePrintedNumberFromStem } from "./quality";
+import {
+  lineNumber,
+  examContentRevision,
+  enumerateExpectedQuestionNos,
+  getExamHealth,
+  parsePrintedNumberFromStem,
+  computeImageQuestionHints,
+  computeLearnedWatermarks,
+  exciseWatermarksWithLearned,
+} from "./quality";
+import {
+  canonicalizeSections,
+  normalizeOptionText,
+  splitInlineOptions,
+  stripLeadingOptionMarker,
+  trimOptionInstructionResidue,
+} from "./assemble";
 import { agentText, AgentOperationError } from "./agentI18n";
 import {
   applySectionCandidate,
@@ -36,6 +60,354 @@ export interface ToolContext {
     sectionId: string,
   ) => Promise<SectionCandidate>;
   remediationPipeline?: (doc: ExamDoc) => Promise<any>;
+  actionLedger?: ActionLedger;
+}
+
+export function resolveGroupRootParent(doc: ExamDoc, startIdOrQuestion: string | ExamDoc["questions"][number]) {
+  const byId = new Map(doc.questions.map((q) => [q.id, q]));
+  let cur = typeof startIdOrQuestion === "string" ? byId.get(startIdOrQuestion) : startIdOrQuestion;
+  const visited = new Set<string>();
+  while (cur?.parentId && byId.has(cur.parentId) && !visited.has(cur.id)) {
+    visited.add(cur.id);
+    cur = byId.get(cur.parentId)!;
+  }
+  return cur;
+}
+
+export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string): {
+  ok: boolean;
+  summary: string;
+  added: number[];
+  doc: ExamDoc;
+  residueTrimmed: boolean;
+} {
+  const start = doc.questions.find((q) => q.id === parentQuestionId);
+  if (!start) throw new AgentOperationError("questionMissing");
+  const root = resolveGroupRootParent(doc, start)!;
+
+  const lineByNo = new Map((doc.source?.lines || []).map((l) => [lineNumber(l), l]));
+  const pagesCount = new Set((doc.source?.lines || []).map((l) => l.page)).size;
+  const learnedWatermarks = computeLearnedWatermarks(doc.source?.lines || [], pagesCount);
+
+  const rootSpanLines = (root.spans || [])
+    .flatMap(([s, e]) => {
+      const acc: typeof doc.source.lines = [];
+      for (let ln = s; ln <= e; ln++) {
+        const line = lineByNo.get(ln);
+        if (line && !line.furniture) acc.push(line);
+      }
+      return acc;
+    });
+
+  // Collect all enumerated numbers on the group (from root.stem and source span lines)
+  const parenMatches = [
+    ...[...(root.stem || "").matchAll(/\((\d{1,3})\)/g)].map((m) => Number(m[1])),
+    ...rootSpanLines.flatMap((l) => [...l.text.matchAll(/\((\d{1,3})\)/g)].map((m) => Number(m[1]))),
+  ];
+  const spanEnumerated = enumerateExpectedQuestionNos(rootSpanLines).numbers;
+  const enumeratedAll: number[] = [];
+  for (const n of [...parenMatches, ...spanEnumerated]) {
+    if (Number.isInteger(n) && n > 0 && !enumeratedAll.includes(n)) enumeratedAll.push(n);
+  }
+  const existingNos = new Set(doc.questions.map((q) => q.no));
+  const toAdd = enumeratedAll.filter((n) => n !== root.no && !existingNos.has(n));
+  if (!enumeratedAll.filter((n) => n !== root.no).length) {
+    return { ok: false, summary: "No enumerated child numbers in parent stem", added: [], doc, residueTrimmed: false };
+  }
+  if (!toAdd.length) {
+    return { ok: true, summary: "Children already exist", added: [], doc, residueTrimmed: false };
+  }
+
+  // Raw parent instruction text from source spans (excised of watermarks)
+  const rawSourceSlice = rootSpanLines
+    .map((l) => exciseWatermarksWithLearned(l.text, learnedWatermarks).text.trim())
+    .filter(Boolean)
+    .join("\n");
+  const parentInstructionRef = [rawSourceSlice, root.stem || ""].filter(Boolean).join("\n");
+
+  // Clean shared instruction line from source (first instruction line without inline option list or raw `(15)(16)` run)
+  const rawFirstInstructionLine =
+    rootSpanLines
+      .map((l) => exciseWatermarksWithLearned(l.text, learnedWatermarks).text.trim())
+      .find((t) => t.length >= 6 && !/^\s*(?:\([a-j]\)|[a-j][).:])\s+/i.test(t)) ||
+    exciseWatermarksWithLearned(root.stem || "", learnedWatermarks).text.trim();
+  const cleanSharedInstruction = rawFirstInstructionLine
+    .replace(/(?:\(\d{1,3}\)\s*){2,}/g, " ")
+    .replace(/^\s*\d{1,3}\s*[.):-]\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Re-slice shared options through: watermark exciser -> inline option splitter -> parent instruction residue trimmer
+  const optionSpans = (root.options || []).flatMap((o) => o.spans || []);
+  const optionSourceText = optionSpans.length
+    ? optionSpans
+        .flatMap(([s, e]) => {
+          const lines: string[] = [];
+          for (let ln = s; ln <= e; ln++) {
+            const line = lineByNo.get(ln);
+            if (line && !line.furniture) lines.push(exciseWatermarksWithLearned(line.text, learnedWatermarks).text);
+          }
+          return lines;
+        })
+        .join("\n")
+    : (root.options || [])
+        .map((o, idx) => {
+          const exc = exciseWatermarksWithLearned(o.text || "", learnedWatermarks).text;
+          return `${o.key || String.fromCharCode(97 + idx)}) ${stripLeadingOptionMarker(exc)}`;
+        })
+        .join("\n");
+
+  let reSlicedOptions: NonNullable<ExamDoc["questions"][number]["options"]> = [];
+  if (optionSourceText.trim()) {
+    const inlineParts = splitInlineOptions(optionSourceText);
+    if (inlineParts && inlineParts.length >= 2) {
+      reSlicedOptions = inlineParts.map((p, idx) => ({
+        key: p.key || String.fromCharCode(97 + idx),
+        spans: optionSpans.length ? [[optionSpans[0][0], optionSpans[optionSpans.length - 1][1]]] : root.spans,
+        text: p.text,
+      }));
+    } else if ((root.options || []).length >= 2) {
+      reSlicedOptions = (root.options || [])
+        .map((o, idx) => ({
+          key: o.key || String.fromCharCode(97 + idx),
+          spans: o.spans?.length ? o.spans : root.spans,
+          text: stripLeadingOptionMarker(exciseWatermarksWithLearned(o.text || "", learnedWatermarks).text),
+        }))
+        .filter((o) => Boolean(o.text));
+    }
+  }
+
+  let residueTrimmed = false;
+  reSlicedOptions = reSlicedOptions.map((opt) => {
+    const tr = trimOptionInstructionResidue(opt.text || "", parentInstructionRef);
+    if (tr.trimmed) residueTrimmed = true;
+    return { ...opt, text: normalizeOptionText(tr.text) };
+  });
+  // Deduplicate any identical normalized options so I2 / I9 never trip
+  const seenOptText = new Set<string>();
+  reSlicedOptions = reSlicedOptions.filter((opt) => {
+    const keyNorm = (opt.text || "").trim().toLowerCase();
+    if (!keyNorm || seenOptText.has(keyNorm)) return false;
+    seenOptText.add(keyNorm);
+    return true;
+  });
+
+  // Resolve picture captions for group images (by child ref first, else by slot index in group images)
+  const imageById = new Map((doc.images || []).map((img) => [img.id, img]));
+  const rootAttachedImages = (root.images || [])
+    .map((ref) => imageById.get(ref.imageId))
+    .filter((img): img is NonNullable<typeof img> => Boolean(img && img.label?.role !== "decoration" && img.label?.kind !== "decoration"));
+  const rootPages = new Set(rootSpanLines.map((l) => l.page));
+  const candidateGroupImages = rootAttachedImages.length
+    ? rootAttachedImages
+    : (doc.images || []).filter(
+        (img) =>
+          rootPages.has(img.page) &&
+          img.label?.role !== "decoration" &&
+          img.label?.kind !== "decoration" &&
+          (img.label?.questionRef === root.id || img.label?.questionRef === String(root.no)),
+      );
+
+  const usedIds = new Set(doc.questions.map((q) => q.id));
+  const slotList = enumeratedAll.includes(root.no) ? enumeratedAll : toAdd;
+
+  const newQuestions = toAdd.map((n, addIdx) => {
+    let childId = `${root.id}_c${n}`;
+    let suffix = 2;
+    while (usedIds.has(childId)) {
+      childId = `${root.id}_c${n}_${suffix++}`;
+    }
+    usedIds.add(childId);
+
+    const directImg = (doc.images || []).find(
+      (img) => img.label?.questionRef === String(n) && img.label?.role !== "decoration",
+    );
+    const slotIdx = slotList.indexOf(n);
+    const candidateAtSlot =
+      slotIdx >= 0 && slotIdx < candidateGroupImages.length ? candidateGroupImages[slotIdx] : undefined;
+    // Never steal an image explicitly labeled for a different child question number
+    const belongsToOtherChild =
+      candidateAtSlot?.label?.questionRef &&
+      candidateAtSlot.label.questionRef !== String(n) &&
+      candidateAtSlot.label.questionRef !== root.id &&
+      candidateAtSlot.label.questionRef !== String(root.no);
+    const slotImg = directImg || (belongsToOtherChild ? undefined : candidateAtSlot);
+    const caption = String(slotImg?.label?.caption || "").trim();
+    const childStem = caption
+      ? `${n}. ${caption}`
+      : `${n}. ${cleanSharedInstruction || `Item ${n}`}`;
+
+    // I9: shared pool lives cleanly on root parent (`root.options`); children inherit pool via `parentId = root.id` with no duplicate per-child pool options
+    const childType = root.type === "mcq" ? "matching" : root.type;
+    const childFlags = ["GROUP_CHILD_CREATED", ...(residueTrimmed ? ["OPTION_RESIDUE_TRIMMED"] : [])];
+    const childImages = slotImg
+      ? [{ imageId: slotImg.id, role: slotImg.label?.role || "stem", anchorLine: slotImg.anchorLine }]
+      : (root.images || []);
+
+    return {
+      id: childId,
+      label: String(n),
+      no: n,
+      parentId: root.id,
+      sectionId: root.sectionId,
+      spans: root.spans,
+      stem: childStem,
+      points: 0,
+      type: childType,
+      options: undefined,
+      images: childImages,
+      confidence: 0.85,
+      flags: childFlags,
+    } as ExamDoc["questions"][number];
+  });
+
+  const updatedQuestions = doc.questions
+    .map((q) => {
+      if (q.id !== root.id) return q;
+      const rootFlags = [...(q.flags || [])];
+      if (residueTrimmed && !rootFlags.includes("OPTION_RESIDUE_TRIMMED")) {
+        rootFlags.push("OPTION_RESIDUE_TRIMMED");
+      }
+      const cleanedRootStem = exciseWatermarksWithLearned(q.stem || "", learnedWatermarks).text;
+      return {
+        ...q,
+        stem: cleanedRootStem,
+        options: reSlicedOptions.length >= 2 ? reSlicedOptions : q.options,
+        flags: rootFlags,
+      };
+    })
+    .concat(newQuestions)
+    .sort((a, b) => a.no - b.no);
+
+  const nextDocFlags = [...(doc.flags || [])];
+  if (residueTrimmed && !nextDocFlags.some((f) => f.code === "OPTION_RESIDUE_TRIMMED" && f.questionId === root.id)) {
+    nextDocFlags.push({
+      id: `flag_residue_${root.id}`,
+      code: "OPTION_RESIDUE_TRIMMED",
+      severity: "info",
+      questionId: root.id,
+      message: `Trimmed duplicated parent instruction fragment from shared options of group Q${root.no}.`,
+    });
+  }
+
+  return {
+    ok: true,
+    summary: `Split group: added ${toAdd.length} children (${toAdd.join(",")})`,
+    added: toAdd,
+    doc: { ...doc, questions: updatedQuestions, flags: nextDocFlags },
+    residueTrimmed,
+  };
+}
+
+function diagnoseMissingWithLedger(
+  doc: ExamDoc,
+  numbers: number[],
+  ledger?: ActionLedger,
+) {
+  const enumRes = enumerateExpectedQuestionNos(doc.source.lines);
+  const result = numbers.map((n: number) => {
+    const expectedLine = enumRes.lineByNumber.get(n);
+    const lineText = expectedLine ? doc.source.lines.find((l) => lineNumber(l) === expectedLine)?.text : undefined;
+    const sortedQs = [...doc.questions].sort((a, b) => a.no - b.no);
+    const idx = sortedQs.findIndex((q) => q.no >= n);
+    const neighbours = [];
+    if (idx > 0) neighbours.push(sortedQs[idx - 1]);
+    if (idx >= 0 && idx < sortedQs.length) neighbours.push(sortedQs[idx]);
+    if (idx >= 0 && idx + 1 < sortedQs.length) neighbours.push(sortedQs[idx + 1]);
+    const sec = doc.sections.find((s) => s.spans.some(([a, b]) => expectedLine && expectedLine >= a && expectedLine <= b));
+    let cause = "unknown";
+    if (!expectedLine) cause = "gap between sections or key-territory leak";
+    else {
+      const line = doc.source.lines.find((l) => lineNumber(l) === expectedLine);
+      if (line && /\(\d+\)/.test(line.text) && line.text.match(/\(\d+\)/g)!.length >= 2)
+        cause = "group-parent? (multiple (N) on one line) — parent may need children via split_group_children";
+      else if (
+        (line && /[a-h][).:]\s*$/.test(line.text.slice(0, 60))) ||
+        (line && /^[a-z]\).*64\./i.test(doc.source.lines.find((l) => lineNumber(l) === expectedLine + 1)?.text || ""))
+      )
+        cause = "sub-part line? (lettered a-d under previous number) — should be one question with sub-prompts";
+      else if (enumRes.keyTerritory.lineNos.has(expectedLine)) cause = "key-territory leak";
+      else cause = "section swallowed or not emitted";
+    }
+    return {
+      number: n,
+      expectedLine,
+      lineText: lineText?.slice(0, 120),
+      neighbours: neighbours.map((q) => ({ no: q.no, label: q.label, sectionId: q.sectionId })),
+      section: sec?.title,
+      sectionId: sec?.id,
+      cause,
+      sourceSlice: lineText,
+    };
+  });
+
+  const rawQueue: ActionQueueItem[] = [];
+  const splitParents = new Set<string>();
+  const acceptByParent = new Map<string, number[]>();
+  const reparseSections = new Set<string>();
+  for (const r of result) {
+    if (r.cause.startsWith("group-parent")) {
+      const matched =
+        doc.questions.find(
+          (q) =>
+            q.spans.some(([a, b]) => r.expectedLine !== undefined && r.expectedLine >= a && r.expectedLine <= b) &&
+            new RegExp(`\\(${r.number}\\)`).test(q.stem || ""),
+        ) || doc.questions.find((q) => new RegExp(`\\(${r.number}\\)`).test(q.stem || ""));
+      const rootParent = matched ? resolveGroupRootParent(doc, matched) : undefined;
+      if (rootParent && !splitParents.has(rootParent.id)) {
+        splitParents.add(rootParent.id);
+        rawQueue.push({
+          tool: "split_group_children",
+          args: { parentQuestionId: rootParent.id },
+          rationale: `Q${rootParent.no} enumerates (${r.number}) on its number line — children are deterministic shells`,
+          riskClass: "mutate",
+        });
+      }
+    } else if (r.cause.startsWith("sub-part")) {
+      const prev = r.neighbours.find((q: { no: number }) => q.no < r.number);
+      const prevQ = prev ? doc.questions.find((q) => q.no === prev.no) : undefined;
+      if (prevQ) acceptByParent.set(prevQ.id, [...(acceptByParent.get(prevQ.id) || []), r.number]);
+    } else if (r.cause.startsWith("section swallowed") && r.sectionId) {
+      reparseSections.add(r.sectionId);
+    }
+  }
+  for (const [parentQuestionId, childNumbers] of acceptByParent) {
+    const parent = doc.questions.find((q) => q.id === parentQuestionId)!;
+    rawQueue.push({
+      tool: "accept_group_representation",
+      args: { parentQuestionId, childNumbers },
+      rationale: `${childNumbers.join(",")} are lettered sub-parts of Q${parent.no}; represent them by the parent`,
+      riskClass: "mutate",
+    });
+  }
+  for (const sectionId of reparseSections) {
+    const sec = doc.sections.find((s) => s.id === sectionId);
+    rawQueue.push({
+      tool: "reparse_section",
+      args: { sectionId },
+      rationale: `Section ${sec?.title || sectionId} swallowed its numbers; a validated candidate needs confirmation`,
+      riskClass: "destructive",
+    });
+  }
+
+  // Filter actionQueue against executed/refused (action + target + docHash) fingerprints so already-tried items never re-queue
+  const filteredOut: string[] = [];
+  const queue = rawQueue.filter((item) => {
+    const fp = computeActionFingerprint(item.tool, item.args, doc);
+    if (ledger?.executedFingerprints.has(fp) || ledger?.refusedFingerprints.has(fp)) {
+      filteredOut.push(fp);
+      return false;
+    }
+    return true;
+  });
+
+  return {
+    ok: true,
+    summary: `Diagnosed ${numbers.length} missing numbers: ${result.map((r: { number: number; cause: string }) => `${r.number}=${r.cause.split("?")[0].split(" (")[0]}`).join("; ").slice(0, 200)}`,
+    data: result,
+    actionQueue: queue,
+    filteredFingerprints: filteredOut,
+  };
 }
 /** No filesystem, import, OCR, vision, provider, budget or arbitrary-code capability is registered. */
 export function createToolRegistry(ctx: ToolContext): ToolRegistry {
@@ -257,63 +629,8 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       access: "read",
       execute: ({ numbers }) => {
         const doc = ctx.getDoc();
-        const enumRes = enumerateExpectedQuestionNos(doc.source.lines);
-        const result = numbers.map((n: number)=>{
-          const expectedLine = enumRes.lineByNumber.get(n);
-          const lineText = expectedLine ? doc.source.lines.find(l=> lineNumber(l)===expectedLine)?.text : undefined;
-          // Neighbouring parsed
-          const sortedQs = [...doc.questions].sort((a,b)=>a.no-b.no);
-          const idx = sortedQs.findIndex(q=>q.no>=n);
-          const neighbours = [];
-          if (idx>0) neighbours.push(sortedQs[idx-1]);
-          if (idx>=0 && idx<sortedQs.length) neighbours.push(sortedQs[idx]);
-          if (idx>=0 && idx+1<sortedQs.length) neighbours.push(sortedQs[idx+1]);
-          // Section
-          const sec = doc.sections.find(s=> s.spans.some(([a,b])=> expectedLine && expectedLine>=a && expectedLine<=b));
-          // Likely cause heuristics
-          let cause = 'unknown';
-          if (!expectedLine) cause = 'gap between sections or key-territory leak';
-          else {
-            const line = doc.source.lines.find(l=> lineNumber(l)===expectedLine);
-            if (line && /\(\d+\)/.test(line.text) && line.text.match(/\(\d+\)/g)!.length >=2) cause = 'group-parent? (multiple (N) on one line) — parent may need children via split_group_children';
-            else if (line && /[a-h][).:]\s*$/.test(line.text.slice(0,60)) || (line && /^[a-z]\).*64\./i.test(doc.source.lines.find(l=> lineNumber(l)===expectedLine+1)?.text||''))) cause = 'sub-part line? (lettered a-d under previous number) — should be one question with sub-prompts';
-            else if (enumRes.keyTerritory.lineNos.has(expectedLine)) cause = 'key-territory leak';
-            else cause = 'section swallowed or not emitted';
-          }
-          return { number:n, expectedLine, lineText: lineText?.slice(0,120), neighbours: neighbours.map(q=>({no:q.no, label:q.label, sectionId:q.sectionId})), section: sec?.title, sectionId: sec?.id, cause, sourceSlice: lineText };
-        });
-        // E2 — canonical deterministic action queue. The harness executor validates each
-        // item against the registry + document state and runs read/mutate items between
-        // model turns; destructive items stop at the usual confirmation card.
-        const queue: ActionQueueItem[] = [];
-        const splitParents = new Set<string>();
-        const acceptByParent = new Map<string, number[]>();
-        const reparseSections = new Set<string>();
-        for (const r of result) {
-          if (r.cause.startsWith('group-parent')) {
-            const parent = doc.questions.find(q => q.spans.some(([a,b]) => r.expectedLine !== undefined && r.expectedLine >= a && r.expectedLine <= b) && new RegExp(`\\(${r.number}\\)`).test(q.stem || ''))
-              || doc.questions.find(q => new RegExp(`\\(${r.number}\\)`).test(q.stem || ''));
-            if (parent && !splitParents.has(parent.id)) {
-              splitParents.add(parent.id);
-              queue.push({ tool: 'split_group_children', args: { parentQuestionId: parent.id }, rationale: `Q${parent.no} enumerates (${r.number}) on its number line — children are deterministic shells`, riskClass: 'mutate' });
-            }
-          } else if (r.cause.startsWith('sub-part')) {
-            const prev = r.neighbours.find((q: { no: number }) => q.no < r.number);
-            const prevQ = prev ? doc.questions.find(q => q.no === prev.no) : undefined;
-            if (prevQ) acceptByParent.set(prevQ.id, [...(acceptByParent.get(prevQ.id) || []), r.number]);
-          } else if (r.cause.startsWith('section swallowed') && r.sectionId) {
-            reparseSections.add(r.sectionId);
-          }
-        }
-        for (const [parentQuestionId, childNumbers] of acceptByParent) {
-          const parent = doc.questions.find(q => q.id === parentQuestionId)!;
-          queue.push({ tool: 'accept_group_representation', args: { parentQuestionId, childNumbers }, rationale: `${childNumbers.join(',')} are lettered sub-parts of Q${parent.no}; represent them by the parent`, riskClass: 'mutate' });
-        }
-        for (const sectionId of reparseSections) {
-          const sec = doc.sections.find(s => s.id === sectionId);
-          queue.push({ tool: 'reparse_section', args: { sectionId }, rationale: `Section ${sec?.title || sectionId} swallowed its numbers; a validated candidate needs confirmation`, riskClass: 'destructive' });
-        }
-        return { ok:true, summary:`Diagnosed ${numbers.length} missing numbers: ${result.map((r: { number: number; cause: string }) => `${r.number}=${r.cause.split('?')[0].split(' (')[0]}`).join('; ').slice(0, 200)}`, data: result, actionQueue: queue };
+        const ledger = ctx.actionLedger ?? getActiveTurnLedger();
+        return diagnoseMissingWithLedger(doc, numbers, ledger);
       },
     },
     get_open_issues: {
@@ -442,6 +759,11 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           health: afterHealth,
           attempted, added, stillMissing, addedCount, sectionsTried, callsUsed:1, // for backward compat
         };
+        const ledger = ctx.actionLedger ?? getActiveTurnLedger();
+        if (ledger) {
+          ledger.retriedMissingKeys.add(missingSetFingerprint(beforeMissing, beforeDoc));
+          ledger.retriedMissingKeys.add(missingSetFingerprint(stillMissing, docAfter));
+        }
         await ctx.updateDoc(docAfter);
         return result;
       },
@@ -451,58 +773,151 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       schema: empty,
       access: "mutate",
       execute: async () => {
+        const ledger = ctx.actionLedger ?? getActiveTurnLedger();
         const startDoc = ctx.getDoc();
         const steps: any[] = [];
         let current = startDoc;
         const health0 = healthSummary(current);
-        steps.push({ step:'health', healthBefore: health0, delta:{addedCount:0} });
-        // L0 locals: deterministic image hints etc. For now, just note
-        steps.push({ step:'L0 locals', summary:'L0 checked deterministic splits/numbering/image assignment', delta:{addedCount:0} });
-        // L1 retry
+        steps.push({ step: "health", healthBefore: health0, delta: { addedCount: 0 } });
+
+        // L0 locals: deterministic section canonicalization + strict same-page geometry hints
+        const canon = canonicalizeSections(current.sections || [], current.questions || []);
+        const hints = computeImageQuestionHints(current.images || [], canon.questions, current.source?.lines || []);
+        let l0Mutated = canon.changed;
+        const nextImages = (current.images || []).map((img) => {
+          const h = hints[img.id];
+          if (!h || h.page !== img.page || img.label?.questionRef) return img;
+          l0Mutated = true;
+          return {
+            ...img,
+            label: { role: "stem" as const, questionRef: h.questionRef, kind: "photo" as const, source: "geometry" } as any,
+          };
+        });
+        if (l0Mutated) {
+          const nextFlags = canon.changed && !(current.flags || []).some((f) => f.code === "SECTION_ORDER_CANONICALIZED")
+            ? [
+                ...(current.flags || []),
+                {
+                  id: "flag_section_order_canonicalized",
+                  code: "SECTION_ORDER_CANONICALIZED",
+                  severity: "info" as const,
+                  message: "Section order and indices canonicalized by first span line.",
+                },
+              ]
+            : current.flags;
+          current = { ...current, sections: canon.sections, questions: canon.questions, images: nextImages, flags: nextFlags };
+          await ctx.updateDoc(current);
+        }
+        steps.push({
+          step: "L0 locals",
+          summary: "L0 checked deterministic splits/numbering/image assignment",
+          canonicalizedSections: canon.changed,
+          delta: { addedCount: 0 },
+        });
+
+        // L1 retry (satisfies reparse_section retry precondition even when addedCount === 0)
         const beforeMissing = healthSummary(current).missing;
         let retryResult: any = null;
         if (beforeMissing.length) {
           const before = healthSummary(current);
           const afterDoc = await ctx.retryMissing(current);
           const after = healthSummary(afterDoc);
-          const added = beforeMissing.filter(n=> !after.missing.includes(n));
+          const added = beforeMissing.filter((n) => !after.missing.includes(n));
           const addedCount = afterDoc.questions.length - current.questions.length;
-          retryResult = { attempted: beforeMissing, added, stillMissing: after.missing, addedCount, callsUsed:1 };
-          steps.push({ step:'retry_missing', ...retryResult, healthBefore: before, healthAfter: after });
-          if (addedCount>0) {
+          retryResult = { attempted: beforeMissing, added, stillMissing: after.missing, addedCount, callsUsed: 1 };
+          steps.push({ step: "retry_missing", ...retryResult, healthBefore: before, healthAfter: after });
+          if (ledger) {
+            ledger.retriedMissingKeys.add(missingSetFingerprint(beforeMissing, current));
+            ledger.retriedMissingKeys.add(missingSetFingerprint(after.missing, afterDoc));
+          }
+          if (addedCount > 0) {
             await ctx.updateDoc(afterDoc);
             current = afterDoc;
           } else {
-            steps.push({ step:'retry_missing zero-add', summary:'Zero added, suggesting L2', delta:{addedCount:0} });
+            steps.push({ step: "retry_missing zero-add", summary: "Zero added, advancing to L2 inspect", delta: { addedCount: 0 } });
           }
         }
-        // Per-section coverage recheck
+
+        // L2 inspect: diagnose remaining missing numbers + build filtered actionQueue
         const healthMid = healthSummary(current);
-        steps.push({ step:'per-section recheck', health: healthMid, missing: healthMid.missing });
-        // Prepare reparse candidates for still-broken sections (awaiting confirmation) — we just note they would be prepared
+        steps.push({ step: "per-section recheck", health: healthMid, missing: healthMid.missing });
+        let pipelineQueue: ActionQueueItem[] = [];
+        if (healthMid.missing.length) {
+          const diag = diagnoseMissingWithLedger(current, healthMid.missing.slice(0, 20), ledger);
+          pipelineQueue = diag.actionQueue;
+          steps.push({
+            step: "L2 inspect",
+            summary: diag.summary,
+            diagnosed: diag.data,
+            queued: pipelineQueue.map((q) => ({ tool: q.tool, args: q.args })),
+            filteredFingerprints: diag.filteredFingerprints,
+            delta: { addedCount: 0 },
+          });
+        }
+
+        // L3 reparse: surface candidate diff preview (autoConfirm strictly false — never auto-applied!)
+        const reparseCandidates: any[] = [];
         if (healthMid.missing.length && ctx.reparseSection) {
           const enumRes = enumerateExpectedQuestionNos(current.source.lines);
-          const sectionsForMissing = current.sections.filter(s=>{
-            return s.spans.some(([a,b])=>{
-              return healthMid.missing.some(m=>{
-                const ln = enumRes.lineByNumber.get(m);
-                return ln && ln>=a && ln<=b;
-              });
-            });
-          }).slice(0,2);
+          const sectionsForMissing = current.sections
+            .filter((s) =>
+              s.spans.some(([a, b]) =>
+                healthMid.missing.some((m) => {
+                  const ln = enumRes.lineByNumber.get(m);
+                  return ln && ln >= a && ln <= b;
+                }),
+              ),
+            )
+            .slice(0, 2);
           for (const sec of sectionsForMissing) {
-            steps.push({ step:'reparse_candidate', sectionId: sec.id, title: sec.title, summary:`Candidate prepared for ${sec.title} awaiting confirmation`, delta:{addedCount:0} });
+            let diffPreview: any = undefined;
+            if (!getActiveTurnLedger()) {
+              // Direct tool invocation: compute diff preview cleanly without auto-applying
+              try {
+                const candidate = await ctx.reparseSection(current, sec.id);
+                const previewDoc = applySectionCandidate(current, candidate);
+                diffPreview = {
+                  before: sectionDiffView(current, sec.id),
+                  after: sectionDiffView(previewDoc, sec.id),
+                };
+              } catch {}
+            }
+            const entry = {
+              step: "reparse_candidate",
+              sectionId: sec.id,
+              title: sec.title,
+              autoConfirm: false,
+              diff: diffPreview,
+              summary: `Candidate prepared for ${sec.title} awaiting confirmation`,
+              delta: { addedCount: 0 },
+            };
+            reparseCandidates.push(entry);
+            steps.push(entry);
+            // Ensure reparse_section is also queued when not filtered so agent executor advances to L3 confirm card in one call
+            const fp = computeActionFingerprint("reparse_section", { sectionId: sec.id }, current);
+            const alreadyQueued = pipelineQueue.some((i) => i.tool === "reparse_section" && i.args.sectionId === sec.id);
+            const alreadyTried = ledger?.executedFingerprints.has(fp) || ledger?.refusedFingerprints.has(fp);
+            if (!alreadyQueued && !alreadyTried) {
+              pipelineQueue.push({
+                tool: "reparse_section",
+                args: { sectionId: sec.id },
+                rationale: `L3 reparse candidate for ${sec.title} (auto-confirm off; requires UI confirmation)`,
+                riskClass: "destructive",
+              });
+            }
           }
         }
+
         const finalHealth = healthSummary(current);
-        steps.push({ step:'final health', health: finalHealth });
-        const totalAdded = steps.reduce((sum,s)=> sum + (s.addedCount|| s.delta?.addedCount ||0),0);
+        steps.push({ step: "final health", health: finalHealth });
+        const totalAdded = steps.reduce((sum, s) => sum + (s.addedCount || s.delta?.addedCount || 0), 0);
         return {
-          ok: finalHealth.state==='green' || finalHealth.missing.length===0,
+          ok: finalHealth.state === "green" || finalHealth.missing.length === 0,
           summary: `Pipeline: health ${health0.missing.length}→${finalHealth.missing.length} missing, added ${totalAdded}, state ${finalHealth.state}`,
-          data: { steps, healthBefore: health0, healthAfter: finalHealth, totalAdded },
+          data: { steps, reparseCandidates, autoConfirm: false, healthBefore: health0, healthAfter: finalHealth, totalAdded },
           delta: { addedCount: totalAdded, stillMissing: finalHealth.missing },
-          suggestedNext: finalHealth.missing.length ? 'Confirm reparse candidates or L4 escalate' : 'Complete',
+          actionQueue: pipelineQueue,
+          suggestedNext: finalHealth.missing.length ? "Confirm reparse candidates or L4 escalate" : "Complete",
         };
       },
     },
@@ -534,36 +949,23 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       },
     },
     split_group_children: {
-      description: "{parentQuestionId:string} deterministically create child question shells from group's enumerated numbers, spans = group's number line, options shared from parent",
+      description: "{parentQuestionId:string} deterministically create real child questions from group's enumerated numbers with own id, parentId = root parent id, points = 0, real stem, and clean shared options",
       schema: z.object({ parentQuestionId: id }).strict(),
       access: "mutate",
       execute: async ({ parentQuestionId }) => {
         const doc = ctx.getDoc();
-        const parent = doc.questions.find(q=>q.id===parentQuestionId);
-        if (!parent) throw new AgentOperationError("questionMissing");
-        const enumerated = [...(parent.stem||'').matchAll(/\((\d{1,3})\)/g)].map(m=>Number(m[1])).filter(n=>n!==parent.no);
-        if (!enumerated.length) return { ok:false, summary:'No enumerated child numbers in parent stem', delta:{addedCount:0} };
-        const existingNos = new Set(doc.questions.map(q=>q.no));
-        const toAdd = enumerated.filter(n=>!existingNos.has(n));
-        if (!toAdd.length) return { ok:true, summary:'Children already exist', delta:{addedCount:0} };
-        const newQuestions = toAdd.map(n=>({
-          id:`q_${parent.id}_child_${n}`,
-          label:String(n),
-          no:n,
-          parentId: parent.id,
-          sectionId: parent.sectionId,
-          spans: parent.spans,
-          stem: `Child ${n} of group ${parent.no}`,
-          type: parent.type,
-          options: parent.options,
-          images: parent.images,
-          confidence: 0.7,
-          flags:['GROUP_CHILD_CREATED'],
-        } as any));
-        const newDoc = { ...doc, questions: [...doc.questions, ...newQuestions].sort((a,b)=>a.no-b.no) };
-        await ctx.updateDoc(newDoc);
-        const health = healthSummary(newDoc);
-        return { ok:true, summary:`Split group: added ${toAdd.length} children (${toAdd.join(',')})`, delta:{addedCount: toAdd.length, added: toAdd}, data:{ added: toAdd, health } };
+        const res = splitGroupChildrenInDoc(doc, parentQuestionId);
+        if (!res.ok || !res.added.length) {
+          return { ok: res.ok, summary: res.summary, delta: { addedCount: 0 } };
+        }
+        await ctx.updateDoc(res.doc);
+        const health = healthSummary(res.doc);
+        return {
+          ok: true,
+          summary: res.summary,
+          delta: { addedCount: res.added.length, added: res.added },
+          data: { added: res.added, health, residueTrimmed: res.residueTrimmed },
+        };
       },
     },
     patch_question: {

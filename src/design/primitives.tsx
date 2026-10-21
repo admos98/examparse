@@ -291,13 +291,14 @@ export function Modal({
       previous?.focus();
     };
   }, [open]);
-  if (!open || typeof document === 'undefined') return null;
-  return createPortal(<div className={`ep-modal-backdrop ${backdropClassName}`} onMouseDown={event => { if (event.target === event.currentTarget) onCloseRef.current(); }}>
+  if (!open) return null;
+  const modalNode = <div className={`ep-modal-backdrop ${backdropClassName}`} onMouseDown={event => { if (event.target === event.currentTarget) onCloseRef.current(); }}>
     <div ref={dialogRef} className={`ep-modal-window ${className}`} role="dialog" aria-modal="true" aria-labelledby={labelledBy || titleId} tabIndex={-1}>
       {!labelledBy && <h2 id={titleId} className="sr-only">{title}</h2>}
       {children}
     </div>
-  </div>, document.body);
+  </div>;
+  return typeof document === 'undefined' ? modalNode : createPortal(modalNode, document.body);
 }
 
 export function ConfirmCard({

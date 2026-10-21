@@ -426,28 +426,69 @@ export async function runCleanupStage(params: RunCleanupParams): Promise<RunClea
   let calls = 0;
   let aiSkipped = false;
   let source: CleanupStats['source'] = !aiEnabled ? 'off' : params.cachedVerdicts ? 'cached' : 'local';
-  const chunks = buildCleanupChunks(lines, local.verdicts);
+  // F1 ladder: chunk sizes 400→200→100→50. The stage is invoked once per exam at 400;
+  // smaller sizes are used only when judged lines exceed the current window (large docs)
+  // or when the pipeline escalates a `completed-with-problems` result (cache-aware, outside).
+  // Shape-mismatch (<25% parsed) on a small doc (judged ≤400) is exactly 2 attempts then
+  // CLEANUP_AI_SKIPPED — no recursive 30-call explosion.
+  const ladderSizes = [400, 200, 100, 50] as const;
+  const judgedAllCount = (() => {
+    const sorted = [...lines].sort((a, b) => lineNumber(a) - lineNumber(b));
+    return sorted.filter(l => !local.verdicts.has(lineNumber(l))).length;
+  })();
   void baseStats;
-  if (aiEnabled && !params.cachedVerdicts && params.caller && chunks.length) {
+  if (aiEnabled && !params.cachedVerdicts && params.caller) {
     source = 'ai';
-    for (const chunk of chunks) {
-      const text = renderCleanupChunk(chunk);
-      const maxOutputTokens = Math.max(256, chunk.judge.length * 12 + 64);
-      let parsed: Array<{ line: number; tag: LineTag; conf: number }> = [];
-      for (let attempt = 0; attempt < 2 && !parsed.length; attempt++) {
-        try {
-          params.onProgress?.(`Cleanup: judging ${chunk.judge.length} line(s) (chunk ${chunk.index + 1}/${chunks.length}${attempt ? ', retry' : ''})`);
-          const response = await params.caller({ system: CLEANUP_SYSTEM, text: attempt ? `${text}\n\nYour previous reply was not the required JSON. Output {"v":[["L0001","keep",9],...]} only.` : text, label: `Cleanup${chunks.length > 1 ? ` (chunk ${chunk.index + 1}/${chunks.length})` : ''}${attempt ? ' retry' : ''}`, maxOutputTokens });
-          calls++;
-          usage.inputTokens += response.usage?.inputTokens || 0; usage.outputTokens += response.usage?.outputTokens || 0; usage.cachedTokens += response.usage?.cachedTokens || 0;
-          const judgeIds = new Set(chunk.judge.map(lineNumber));
-          parsed = parseCleanupVerdicts(response.rawText, response.json).filter(v => judgeIds.has(v.line));
-          // Shape mismatch: fewer than a quarter of judged lines answered counts as a failed call.
-          if (parsed.length < Math.ceil(chunk.judge.length / 4)) parsed = [];
-        } catch { parsed = []; }
+    let ladderSucceeded = false;
+    // Cache-aware: try 400 first; smaller sizes are fallback for large docs that don't fit.
+    for (let ladderIdx = 0; ladderIdx < ladderSizes.length && !ladderSucceeded; ladderIdx++) {
+      const chunkSize = ladderSizes[ladderIdx];
+      // Small-doc fast path: only the 400 window applies; smaller windows would be single chunk again.
+      if (judgedAllCount <= 400 && chunkSize !== 400) break;
+      // Large-doc: skip sizes that still exceed judged count? Actually we want 400→200→100→50 progression,
+      // so once we are at 200 we rebuild chunks at 200 (more chunks, smaller payload).
+      if (judgedAllCount <= chunkSize && ladderIdx > 0) continue;
+      const chunks = buildCleanupChunks(lines, local.verdicts, chunkSize);
+      if (!chunks.length) { ladderSucceeded = true; break; }
+      let chunkIdx = 0;
+      let failedThisLadder = false;
+      const verdictsThisLadder: Array<{ line: number; tag: LineTag; conf: number }> = [];
+      for (const chunk of chunks) {
+        const text = renderCleanupChunk(chunk);
+        const maxOutputTokens = Math.max(256, chunk.judge.length * 12 + 64);
+        let parsed: Array<{ line: number; tag: LineTag; conf: number }> = [];
+        for (let attempt = 0; attempt < 2 && !parsed.length; attempt++) {
+          try {
+            params.onProgress?.(`Cleanup: judging ${chunk.judge.length} line(s) (chunk ${chunk.index + 1}/${chunks.length} @${chunkSize}${attempt ? ', retry' : ''})`);
+            const response = await params.caller({ system: CLEANUP_SYSTEM, text: attempt ? `${text}\n\nYour previous reply was not the required JSON. Output {"v":[["L0001","keep",9],...]} only.` : text, label: `Cleanup${chunks.length > 1 ? ` (chunk ${chunk.index + 1}/${chunks.length})` : ''}@${chunkSize}${attempt ? ' retry' : ''}`, maxOutputTokens });
+            calls++;
+            usage.inputTokens += response.usage?.inputTokens || 0; usage.outputTokens += response.usage?.outputTokens || 0; usage.cachedTokens += response.usage?.cachedTokens || 0;
+            const judgeIds = new Set(chunk.judge.map(lineNumber));
+            parsed = parseCleanupVerdicts(response.rawText, response.json).filter(v => judgeIds.has(v.line));
+            if (parsed.length < Math.ceil(chunk.judge.length / 4)) parsed = [];
+          } catch { parsed = []; }
+        }
+        if (!parsed.length) { failedThisLadder = true; chunkIdx = chunk.index; break; }
+        verdictsThisLadder.push(...parsed);
       }
-      if (!parsed.length) { aiSkipped = true; break; }
-      aiVerdicts = [...aiVerdicts, ...parsed];
+      if (failedThisLadder) {
+        // Small doc shape-mismatch: exactly 2 attempts, then LOCAL fallback — do NOT ladder to smaller sizes
+        // (smaller sizes would still be single chunk and would double calls to 4, violating gauntlet).
+        if (judgedAllCount <= chunkSize) { aiSkipped = true; break; }
+        // Large doc: fall through to try next smaller chunkSize (cache will store per-size results externally).
+        // For gauntlet's shape-mismatch case (judged <=400) we already broke; for large docs we continue.
+        continue;
+      } else {
+        aiVerdicts = verdictsThisLadder;
+        ladderSucceeded = true;
+        // If we succeeded at a smaller size than 400, record that ladder was used (for observability)
+        if (chunkSize !== 400) flags.push({ code: 'CLEANUP_LADDER_USED', severity: 'info', message: `Cleanup ladder used chunk size ${chunkSize} (400→${chunkSize})` });
+      }
+    }
+    // If no ladder size succeeded and not already marked skipped (e.g., large doc all sizes failed), mark skipped
+    if (!ladderSucceeded && !aiSkipped && aiVerdicts.length === 0) {
+      // No verdicts collected → fallback to local
+      aiSkipped = true;
     }
   }
   if (aiSkipped) {

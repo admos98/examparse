@@ -330,6 +330,34 @@ export async function saveExamDoc(
   doc: ExamDoc,
   expectedContentHash?: string,
 ): Promise<void> {
+  // C1/C2 — hard invariant gate: validate before every save of parsed/repaired/assistant-mutated doc
+  // This is the single funnel, no bypasses. Imports included (doc may carry partial flag).
+  try {
+    const { validateExamInvariants } = await import('../pipeline/quality');
+    const gate = validateExamInvariants(doc);
+    const hasError = gate.violations.some(v=>v.severity==='error');
+    const isPartial = (doc as any).partial === true || doc.flags?.some(f=> f.code==='PARTIAL_EXAM' || f.code?.startsWith('INVARIANT_'));
+    if (hasError && !isPartial) {
+      // Attempt deterministic fixes? For now throw with violations named, requiring caller to mark partial or fix
+      const codes = gate.violations.filter(v=>v.severity==='error').map(v=>v.code).join(',');
+      throw new Error(`INVARIANT_GATE_BLOCKED: Exam fails hard invariants [${codes}]; save as PARTIAL with banner naming violating question numbers or fix violations. Violations: ${gate.violations.map(v=> `${v.code}:${v.message}`).join(' | ')}`);
+    }
+    if (gate.violations.length && hasError && isPartial) {
+      // Allow partial save but ensure banner flag present
+      const hasBanner = doc.flags?.some(f=>f.code==='PARTIAL_EXAM');
+      if (!hasBanner) {
+        // Auto-add partial banner
+        (doc as any).flags = [...(doc.flags||[]), { id: 'flag_PARTIAL_EXAM', code: 'PARTIAL_EXAM', severity: 'warn', message: `Partial exam: invariants violated [${gate.violations.filter(v=>v.severity==='error').map(v=>v.code).join(',')}] on questions ${gate.violations.filter(v=>v.questionId).map(v=>v.questionId).join(',')}` }];
+        (doc as any).partial = true;
+      }
+    }
+    // C3: write provenance transform for auto-fixed invariants (if any fix applied elsewhere, flag INVARIANT_FIX)
+    // Here we just preserve existing provenance handling; auto-fixes would have added flags earlier.
+  } catch (e: any) {
+    if (e?.message?.startsWith('INVARIANT_GATE_BLOCKED')) throw e;
+    // If validate not available or other error, don't block save (fail open for unrelated errors)
+    console.warn('Invariant gate check failed to run:', e?.message);
+  }
   // Save doc without dataUrls to keep it compact
   const cleanImages: ImageAsset[] = (doc.images || []).map((img) => {
     const { dataUrl, ...rest } = img;

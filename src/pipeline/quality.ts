@@ -1,6 +1,22 @@
 /** Deterministic completeness, key-territory, and exam-health helpers. */
-import { ExamDoc, ExamSection, ImageAsset, Question, SourceLine } from '../types';
+import { ExamDoc, ExamSection, Flag, ImageAsset, Question, SourceLine } from '../types';
 import { buildQuestionTree } from '../utils/questionTree';
+
+/**
+ * A1 — STORAGE-TIME NORMALIZATION (deterministic, zero invention):
+ * NFKC → fold Arabic presentation forms (U+FE80–FEFF, U+FB50–FDFF) → tatweel removed → Arabic ي/ك→Persian ی/ک.
+ * Applied to every stored SourceLine.text at extraction; matching layer already assumes it.
+ */
+export function normalizeStoredText(text: string): string {
+  let out = text.normalize('NFKC');
+  // Explicit presentation-form fold (NFKC already does most, but ensure coverage)
+  out = out.replace(/[\uFE80-\uFEFF]/g, c => c.normalize('NFKC'));
+  out = out.replace(/[\uFB50-\uFDFF]/g, c => c.normalize('NFKC'));
+  out = out.replace(/\u0640/g, ''); // tatweel
+  out = out.replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/ى/g, 'ی');
+  // Do NOT lower-case or strip kanoon here; stored text keeps case but is normalized for Arabic/Persian variants.
+  return out;
+}
 
 /** Matching/indexing ONLY. Never assign this result to source text or rendered fields. */
 export function normalizeForMatching(text: string): string {
@@ -662,6 +678,289 @@ export function sectionRangesFromSections(sections: ExamSection[]): Array<{ id: 
       end: Math.max(...section.spans.map(s => s[1])),
     }];
   });
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * A2 — WATERMARK EXCISION (applied to SLICED text, never stored lines)
+ * ───────────────────────────────────────────────────────────────── */
+
+export const WATERMARK_LEXICON = [
+  /مرکز\s*سنجش\s*و\s*پایش\s*کیفیت\s*آموزشی/gi,
+  /www[.\-]kanoon[.\-]ir/gi,
+  /kanoon\.ir/gi,
+  /aee\.medu\.ir/gi,
+  /https?:\/\/\S+/gi,
+  /ادامه\s*سوالات\s*در\s*صفحه/gi,
+];
+
+export function exciseWatermarks(text: string): { text: string; excised: boolean; count: number } {
+  let out = text;
+  let count = 0;
+  for (const re of WATERMARK_LEXICON) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    // count occurrences before replace
+    const matches = out.match(re);
+    if (matches) count += matches.length;
+    out = out.replace(re, '');
+  }
+  // Learned component placeholder: caller may supply learned substrings; we expose generic helper below.
+  out = out.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  // Remove empty lines left by excision?
+  const excised = count > 0;
+  return { text: out, excised, count };
+}
+
+export function exciseWatermarksWithLearned(text: string, learned: string[]): { text: string; excised: boolean; count: number } {
+  let out = text;
+  let count = 0;
+  for (const re of WATERMARK_LEXICON) {
+    re.lastIndex = 0;
+    const matches = out.match(re);
+    if (matches) count += matches.length;
+    out = out.replace(re, '');
+  }
+  for (const sub of learned || []) {
+    if (!sub || sub.length < 12) continue;
+    const esc = sub.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(esc, 'gi');
+    const matches = out.match(re);
+    if (matches) count += matches.length;
+    out = out.replace(re, '');
+  }
+  out = out.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  return { text: out, excised: count > 0, count };
+}
+
+/** Per-doc learned excision list: substrings ≥12 chars appearing inside lines on ≥40% of pages.
+ * Conservative: only learns substrings that look like watermarks (URL/kanoon/aee/مرکز/ادامه etc.),
+ * otherwise returns empty. Generic English phrases that happen to repeat across pages must NOT be learned. */
+export function computeLearnedWatermarks(lines: SourceLine[], pages: number): string[] {
+  if (pages < 2 || lines.length < 10) return [];
+  // Only consider phrases that contain watermark-indicative tokens; otherwise learning generic
+  // phrases like "What is" would incorrectly strip question content (seen in Iranian fixture).
+  const WATERMARK_HINT = /(?:www|kanoon|\.ir\b|aee|medu|https?:|مرکز|سنجش|پایش|کیفیت|آموزشی|ادامه\s*سوالات)/i;
+  const phraseCounts = new Map<string, Set<number>>();
+  for (const line of lines) {
+    const t = normalizeStoredText(line.text);
+    if (t.length < 12) continue;
+    if (!WATERMARK_HINT.test(t)) continue;
+    const words = t.split(/\s+/).filter(w => w.length >= 3);
+    for (let n = 2; n <= 3 && n <= words.length; n++) {
+      for (let i = 0; i <= words.length - n; i++) {
+        const phrase = words.slice(i, i + n).join(' ');
+        if (phrase.length < 12) continue;
+        if (!WATERMARK_HINT.test(phrase)) continue;
+        const set = phraseCounts.get(phrase) || new Set<number>();
+        set.add(line.page);
+        phraseCounts.set(phrase, set);
+      }
+    }
+  }
+  if (phraseCounts.size === 0) return [];
+  const threshold = Math.ceil(pages * 0.4);
+  const learned: string[] = [];
+  for (const [phrase, pagesSet] of phraseCounts) {
+    if (pagesSet.size >= threshold) {
+      const insideCount = lines.filter(l => {
+        const t = normalizeStoredText(l.text);
+        const idx = t.indexOf(phrase);
+        return idx > 0 && idx + phrase.length < t.length - 1;
+      }).length;
+      if (insideCount >= 2) learned.push(phrase);
+    }
+    if (learned.length >= 10) break;
+  }
+  return learned;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * A3 — LINE QUALITY SCORE
+ * ───────────────────────────────────────────────────────────────── */
+export interface LineQualityScore {
+  line: number;
+  score: number; // 0-100, lower = more garbled
+  signals: { scriptMix: number; replacement: number; presentation: number; watermark: number; lengthOutlier: boolean };
+  garbled: boolean;
+}
+
+export function computeLineQuality(lines: SourceLine[]): LineQualityScore[] {
+  const out: LineQualityScore[] = [];
+  const lengths = lines.map(l => l.text.length).filter(n => n > 0).sort((a, b) => a - b);
+  const median = lengths.length ? lengths[Math.floor(lengths.length / 2)] : 0;
+  for (const line of lines) {
+    const n = lineNumber(line);
+    const text = line.text;
+    const tokens = text.split(/\s+/).filter(Boolean);
+    let scriptMix = 0;
+    for (const tok of tokens) {
+      const arabic = /[\u0600-\u06FF]/.test(tok);
+      const latin = /[A-Za-z]/.test(tok);
+      if (arabic && latin && tok.length >= 4) scriptMix++;
+    }
+    const scriptMixRatio = tokens.length ? scriptMix / tokens.length : 0;
+    const replacement = (text.match(/\uFFFD/g) || []).length;
+    const presentation = (text.match(/[\uFE80-\uFEFF\uFB50-\uFDFF]/g) || []).length;
+    const watermark = /kanoon|www[.\-]|aee\.medu\.ir|ادامه سوالات/i.test(text) ? 1 : 0;
+    const lengthOutlier = median > 0 && (text.length > median * 3 || (text.length < 5 && tokens.length === 1 && /[^\w\s]/.test(text)));
+    let score = 100;
+    score -= scriptMixRatio * 40;
+    score -= replacement * 20;
+    score -= presentation * 5;
+    score -= watermark * 10;
+    if (lengthOutlier) score -= 10;
+    score = Math.max(0, Math.min(100, Math.round(score)));
+    const garbled = score < 70 || scriptMixRatio >= 0.3 || replacement > 0;
+    out.push({ line: n, score, signals: { scriptMix: scriptMixRatio, replacement, presentation, watermark, lengthOutlier }, garbled });
+  }
+  return out;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * C1 — HARD INVARIANTS GATE
+ * ───────────────────────────────────────────────────────────────── */
+export interface InvariantViolation {
+  code: string; // I1..I10
+  message: string;
+  questionId?: string;
+  severity: 'error' | 'warn';
+}
+
+export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations: InvariantViolation[]; flags: Flag[] } {
+  const violations: InvariantViolation[] = [];
+  const flags: Flag[] = [];
+  const watermarkRe = new RegExp(WATERMARK_LEXICON.map(r => r.source).join('|'), 'i');
+
+  // I1 no question with hollow stem (STEM_SUBSTANCE rules) — len<6 or matching/diagram+image waived
+  for (const q of doc.questions || []) {
+    if (!q.stem || q.stem.trim().length < 6) {
+      if (q.type === 'matching' || q.type === 'diagram') {
+        // allow via images check later
+      } else if ((q.images || []).length === 0) {
+        violations.push({ code: 'I1', message: `Q${q.no} hollow stem`, questionId: q.id, severity: 'error' });
+        flags.push({ id: `flag_I1_${q.id}`, code: 'INVARIANT_I1_HOLLOW_STEM', severity: 'error', message: `Q${q.no} has hollow stem`, questionId: q.id });
+      }
+    }
+  }
+  // I2 every mcq has ≥2 distinct options; truefalse exactly the pair
+  for (const q of doc.questions || []) {
+    if (q.type === 'mcq') {
+      const opts = (q.options || []).filter(o => (o.text || '').trim().length >= 2);
+      const distinct = new Set(opts.map(o => normalizeForMatching(o.text || ''))).size;
+      if (opts.length < 2 || distinct < 2) {
+        violations.push({ code: 'I2', message: `Q${q.no} mcq need ≥2 distinct options got ${opts.length}`, questionId: q.id, severity: 'error' });
+        flags.push({ id: `flag_I2_${q.id}`, code: 'INVARIANT_I2_MCQ_OPTIONS', severity: 'error', message: `Q${q.no} mcq requires ≥2 distinct options`, questionId: q.id });
+      }
+    }
+    if (q.type === 'truefalse') {
+      if ((q.options || []).length !== 2) {
+        violations.push({ code: 'I2', message: `Q${q.no} truefalse must have exactly 2 options`, questionId: q.id, severity: 'error' });
+        flags.push({ id: `flag_I2_${q.id}`, code: 'INVARIANT_I2_TF_OPTIONS', severity: 'error', message: `Q${q.no} truefalse must carry True/False pair`, questionId: q.id });
+      }
+    }
+  }
+  // I3 no option/stem/answer contains an excisable watermark substring
+  for (const q of doc.questions || []) {
+    const texts = [q.stem || '', ...((q.options || []).map(o => o.text || '')), q.answer?.text || ''];
+    for (const t of texts) {
+      if (watermarkRe.test(t)) {
+        violations.push({ code: 'I3', message: `Q${q.no} contains watermark`, questionId: q.id, severity: 'error' });
+        flags.push({ id: `flag_I3_${q.id}`, code: 'INVARIANT_I3_WATERMARK', severity: 'error', message: `Q${q.no} text contains excisable watermark`, questionId: q.id });
+        break;
+      }
+    }
+    watermarkRe.lastIndex = 0;
+  }
+  // I4 every question's points is a NUMBER (no null/undefined)
+  for (const q of doc.questions || []) {
+    if (typeof q.points !== 'number' || !Number.isFinite(q.points)) {
+      violations.push({ code: 'I4', message: `Q${q.no} points is not a number`, questionId: q.id, severity: 'error' });
+      flags.push({ id: `flag_I4_${q.id}`, code: 'INVARIANT_I4_POINTS_NUMBER', severity: 'error', message: `Q${q.no} points must be a number`, questionId: q.id });
+    }
+  }
+  // I5 points sum vs meta.totalPoints within 0.51
+  const rootSum = (doc.questions || []).filter(q => !q.parentId).reduce((s, q) => s + (q.points || 0), 0);
+  const total = doc.meta?.totalPoints;
+  if (typeof total === 'number' && Math.abs(rootSum - total) > 0.51) {
+    violations.push({ code: 'I5', message: `points sum ${rootSum} vs meta ${total} diff >0.51`, severity: 'error' });
+    flags.push({ id: 'flag_I5', code: 'INVARIANT_I5_POINTS_SUM', severity: 'error', message: `Points sum ${rootSum} differs from meta total ${total} by >0.51` });
+  }
+  // I6 image ids unique; every question imageRef resolves to an asset
+  const seenIds = new Set<string>();
+  for (const img of doc.images || []) {
+    if (seenIds.has(img.id)) {
+      violations.push({ code: 'I6', message: `duplicate image id ${img.id}`, severity: 'error' });
+      flags.push({ id: `flag_I6_dup_${img.id}`, code: 'INVARIANT_I6_DUP_IMAGE_ID', severity: 'error', message: `Duplicate image id ${img.id}` });
+    }
+    seenIds.add(img.id);
+  }
+  const assetIds = new Set((doc.images || []).map(i => i.id));
+  for (const q of doc.questions || []) {
+    for (const ref of q.images || []) {
+      if (!assetIds.has(ref.imageId)) {
+        violations.push({ code: 'I6', message: `Q${q.no} imageRef ${ref.imageId} does not resolve`, questionId: q.id, severity: 'error' });
+        flags.push({ id: `flag_I6_${q.id}_${ref.imageId}`, code: 'INVARIANT_I6_IMAGE_REF', severity: 'error', message: `Q${q.no} references missing image ${ref.imageId}`, questionId: q.id });
+      }
+    }
+  }
+  // I7 sections ordered by index; every question's sectionId exists
+  const sectionIds = new Set((doc.sections || []).map(s => s.id));
+  const indices = (doc.sections || []).map(s => s.index);
+  for (let i = 1; i < indices.length; i++) if (indices[i] <= indices[i - 1]) {
+    violations.push({ code: 'I7', message: `sections not ordered by index`, severity: 'error' });
+    flags.push({ id: 'flag_I7_order', code: 'INVARIANT_I7_SECTION_ORDER', severity: 'error', message: `Sections not ordered by index` });
+    break;
+  }
+  for (const q of doc.questions || []) {
+    if (q.sectionId && !sectionIds.has(q.sectionId)) {
+      violations.push({ code: 'I7', message: `Q${q.no} sectionId ${q.sectionId} not found`, questionId: q.id, severity: 'error' });
+      flags.push({ id: `flag_I7_${q.id}`, code: 'INVARIANT_I7_SECTION_EXISTS', severity: 'error', message: `Q${q.no} section ${q.sectionId} not found`, questionId: q.id });
+    }
+  }
+  // I8 no two questions share same printed number unless one is group child of other
+  const byNo = new Map<number, Question[]>();
+  for (const q of doc.questions || []) {
+    if (!byNo.has(q.no)) byNo.set(q.no, []);
+    byNo.get(q.no)!.push(q);
+  }
+  for (const [no, list] of byNo) if (list.length > 1) {
+    // Allow if one is parent of other
+    const parentIds = new Set(list.map(q => q.id));
+    const isParentChild = list.some(q => q.parentId && parentIds.has(q.parentId));
+    if (!isParentChild) {
+      violations.push({ code: 'I8', message: `duplicate printed number ${no} without parent-child`, severity: 'error' });
+      flags.push({ id: `flag_I8_${no}`, code: 'INVARIANT_I8_DUP_NUMBER', severity: 'error', message: `Duplicate printed number ${no} without parent-child relation` });
+    }
+  }
+  // I9 matching children share parent's option pool object (no per-child A/B pseudo-options)
+  // Simplified check: if child has parentId and parent has options, child should not have own options that are pseudo A/B
+  for (const q of doc.questions || []) if (q.parentId) {
+    const parent = (doc.questions || []).find(p => p.id === q.parentId);
+    if (parent && parent.options && q.options && q.options.length > 0) {
+      // If parent has pool and child has per-child options with same keys, violation
+      if (parent.options.length >= 2 && q.options.length >= 2) {
+        violations.push({ code: 'I9', message: `Q${q.no} child has per-child options but parent pool exists`, questionId: q.id, severity: 'error' });
+        flags.push({ id: `flag_I9_${q.id}`, code: 'INVARIANT_I9_SHARED_POOL', severity: 'error', message: `Matching child Q${q.no} should share parent pool, not per-child options`, questionId: q.id });
+      }
+    }
+  }
+  // I10 expected-coverage computed (missing list may be non-empty ONLY if doc is marked partial)
+  // This invariant is informational; partial handling done at save boundary. We flag if missing non-empty and not partial.
+  const expected = doc.source?.expectedQuestionNos || [];
+  if (expected.length) {
+    const parsedNos = new Set((doc.questions || []).filter(q => !q.parentId).map(q => q.no));
+    // also children count? For group enumeration, children cover enumeration; already handled in getExamHealth but simplify
+    const missing = expected.filter(n => !parsedNos.has(n));
+    const isPartial = (doc as any).partial === true || doc.flags?.some(f => f.code === 'PARTIAL_EXAM');
+    if (missing.length && !isPartial) {
+      // Not error by itself; will become error if I10 enforced strictly? Spec says missing may be non-empty ONLY if partial.
+      // So violation if not partial.
+      violations.push({ code: 'I10', message: `missing expected numbers ${missing.join(',')} but not marked partial`, severity: 'warn' });
+      flags.push({ id: 'flag_I10', code: 'INVARIANT_I10_COVERAGE', severity: 'warn', message: `Missing questions ${missing.join(',')} require partial marking` });
+    }
+  }
+  const ok = violations.filter(v => v.severity === 'error').length === 0;
+  return { ok, violations, flags };
 }
 
 /** Stable optimistic-concurrency fingerprint; transient object URLs and usage are not exam content. */

@@ -7,7 +7,7 @@ import JSZip from 'jszip';
 import { ImageAsset, SourceLine } from '../types';
 import { computeImageDHash, hammingDistance, isNearUniformColor, sha256 } from '../utils/hash';
 import { saveImageBlob } from '../store';
-import { normalizeForMatching, parsePrintedNumberFromStem } from './quality';
+import { normalizeForMatching, normalizeStoredText, parsePrintedNumberFromStem, computeLineQuality } from './quality';
 import { columnSegments, tagFurniture, extractionDiagnostics, ExtractionDiagnostics } from './extractionQuality';
 import { isSuspectStrip, mergeAdjacentImageGeometry, materializeMergedCrop } from './imageGeometry';
 
@@ -45,6 +45,14 @@ export async function extractDocument(file: File): Promise<ExtractedDocument> {
     : ['jpg', 'jpeg', 'png', 'webp'].includes(extension || '') ? await extractSingleImageScan(file)
     : await extractPlainText(file);
   result.lines = tagFurniture(result.lines, result.pages);
+  // A3: line quality scoring (unifies garbled detection)
+  const quality = computeLineQuality(result.lines);
+  const garbledSet = new Set(quality.filter(q => q.garbled).map(q => q.line));
+  result.lines = result.lines.map(l => {
+    const n = Number(l.id.replace(/\D/g, ''));
+    const q = quality.find(x => x.line === n);
+    return q?.garbled ? { ...l, garbled: true } : l;
+  });
   result.diagnostics = extractionDiagnostics(result.lines, result.pages, result.images, [], result.diagnostics);
   return result;
 }
@@ -175,11 +183,12 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         const trimmed = lineText.trim();
         if (!trimmed) continue;
 
+        const normalizedStored = normalizeStoredText(trimmed);
         const lineId = `L${String(globalLineNumber).padStart(4, '0')}`;
         lines.push({
           id: lineId,
           page: pageNum,
-          text: trimmed,
+          text: normalizedStored,
           layoutWarning: ambiguous ? 'COLUMN_AMBIGUOUS_LEGACY_ORDER' : undefined,
           y: segment[0].y,
           pageHeight: page.view[3] - page.view[1],
@@ -505,7 +514,7 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
       lines.push({
         id: `L${String(lineNum).padStart(4, '0')}`,
         page: 1,
-        text: sub,
+        text: normalizeStoredText(sub),
       });
       lineNum++;
     }
@@ -591,7 +600,7 @@ async function extractPlainText(file: File): Promise<ExtractedDocument> {
     lines.push({
       id: `L${String(lineNum).padStart(4, '0')}`,
       page,
-      text: raw,
+      text: normalizeStoredText(raw),
     });
     lineNum++;
   }

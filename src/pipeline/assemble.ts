@@ -5,7 +5,7 @@
  */
 import { z } from 'zod';
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine } from '../types';
-import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
+import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
 import { validateSemantic, semanticConfidenceDeduction, semanticIssuesFor } from './semanticValidators';
 import { completeGapsRaw } from './ownership';
@@ -351,6 +351,9 @@ function assembleAndValidateQuestionsInner(
     for (const [k, v] of completed.synthesized) synthesizedByKey.set(k, v);
   }
 
+  const pagesForWatermark = new Set(sourceLines.map(l=>l.page)).size;
+  const learnedWatermarks = computeLearnedWatermarks(sourceLines, pagesForWatermark);
+  let watermarkExcisionCount = 0;
   rawList.forEach((rawInput, idx) => {
     const raw = rawInput && typeof rawInput === 'object' ? { ...rawInput } : {};
     const errors: string[] = [];
@@ -391,8 +394,19 @@ function assembleAndValidateQuestionsInner(
         text: sliceSourceSpans(sanitized.spans, sourceLines),
       };
     });
+    let perQuestionWatermark = false;
+    // A2: watermark excision on option slices BEFORE splitting (excision then split)
+    // We apply excision to the union text handling inside splitOptionTexts by pre-cleaning lines? Simplest: excise each rawOption text before split via temporary lines?
+    // Here we excise the union after rawOptions creation but before split by cleaning sourceLines copy for option union?
+    // Instead we excise after split per-option (still counts as stripped) and also ensure split uses excised text
     const split = splitOptionTexts(rawOptions, sourceLines);
     let assembledOptions = split.options || [];
+    // Apply watermark excision to each option text (after split)
+    assembledOptions = assembledOptions.map(opt => {
+      const exc = exciseWatermarksWithLearned(opt.text || '', learnedWatermarks);
+      if (exc.excised) { watermarkExcisionCount += exc.count; perQuestionWatermark = true; }
+      return { ...opt, text: exc.text };
+    });
     const optionSplitFailed = split.failed;
     if (optionSplitFailed) {
       flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(sliceOptionUnion(rawOptions, sourceLines)).length}) did not match ${rawOptions.length} option spans; original option text retained.`, 'warn', qId));
@@ -410,9 +424,14 @@ function assembleAndValidateQuestionsInner(
         else { acceptedRewrites.push(rewrite); flags.push(flag('REWRITE_APPLIED', `Question ${raw.label || qId}: garbled L${String(rewrite.line).padStart(4, '0')} rendered from the model's rewrite; original retained for one-click revert.`, 'info', qId, `flag_REWRITE_APPLIED_${qId}_${rewrite.line}`)); }
       }
     }
-    const originalStem = sliceSourceSpans(spans, sourceLines, acceptedRewrites);
+    const originalStemRaw = sliceSourceSpans(spans, sourceLines, acceptedRewrites);
+    const originalExc = exciseWatermarksWithLearned(originalStemRaw, learnedWatermarks);
+    const originalStem = originalExc.text;
+    if (originalExc.excised) { watermarkExcisionCount += originalExc.count; perQuestionWatermark = true; }
     const printedBeforeCleanup = parsePrintedNumberFromStem(originalStem) ?? originalNo;
-    const stem = decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
+    let stem = decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
+    const stemExc = exciseWatermarksWithLearned(stem, learnedWatermarks);
+    if (stemExc.excised) { stem = stemExc.text; watermarkExcisionCount += stemExc.count; perQuestionWatermark = true; }
     if (!stem.trim()) errors.push('Assembled stem is empty');
     const gapKey = String(raw.id || `#${idx}`);
     if (absorbedByKey.has(gapKey)) flags.push(flag('GAP_ABSORBED', `Question ${raw.label || qId}: ${absorbedByKey.get(gapKey)!.length} unclaimed line(s) after the model's anchor were absorbed locally (${absorbedByKey.get(gapKey)!.slice(0, 6).map(n => `L${String(n).padStart(4, '0')}`).join(', ')}${absorbedByKey.get(gapKey)!.length > 6 ? ', …' : ''}).`, 'info', qId));
@@ -434,12 +453,18 @@ function assembleAndValidateQuestionsInner(
     let answer: Question['answer'];
     if (raw.answer?.spans) {
       const answerSpans = normalizedSpans(raw.answer.spans); // answer spans may point into key territory
-      const fullText = sliceSourceSpans(answerSpans, sourceLines);
+      let fullText = sliceSourceSpans(answerSpans, sourceLines);
+      const fullExc = exciseWatermarksWithLearned(fullText, learnedWatermarks);
+      if (fullExc.excised) { fullText = fullExc.text; watermarkExcisionCount += fullExc.count; perQuestionWatermark = true; }
       const segmented = splitGroupedAnswer(fullText, no);
-      answer = { spans: answerSpans, text: segmented.text, source: 'paper' };
+      let segText = segmented.text;
+      const segExc = exciseWatermarksWithLearned(segText, learnedWatermarks);
+      if (segExc.excised) { segText = segExc.text; watermarkExcisionCount += segExc.count; perQuestionWatermark = true; }
+      answer = { spans: answerSpans, text: segText, source: 'paper' };
       if (segmented.unmatched) flags.push(flag('ANSWER_SEGMENT_UNMATCHED', `Question ${label}: grouped answer line did not contain printed number ${no}; full line retained for review.`, 'info', qId));
     }
 
+    if (perQuestionWatermark) flags.push(flag('WATERMARK_STRIPPED', `Question ${label} had watermark substrings excised from sliced text.`, 'info', qId));
     const assembledTables = assembleTables(raw.tables, sourceLines, keyLines);
     const questionImages = (Array.isArray(raw.images) ? raw.images : []).map((image: any) => ({
       imageId: String(image?.imageId || ''), role: image?.role || 'stem', anchorLine: image?.anchorLine,
@@ -554,6 +579,58 @@ function assembleAndValidateQuestionsInner(
       'warn', question.id
     ));
   }
+  // E2/E3 — points derivation: ensure every question has a number, section sums reconcile
+  {
+    // Build section map for derivation
+    const sectionById = new Map<string, { points?: number; count: number }>();
+    for (const q of questions) {
+      const sid = q.sectionId || 'sec_1';
+      const cur = sectionById.get(sid) || { points: undefined, count: 0 };
+      cur.count++;
+      sectionById.set(sid, cur);
+    }
+    // Populate section points from options.sections if available (E1)
+    if (options.sections) {
+      for (const s of options.sections as any[]) {
+        const id = String(s.id || s.index || 'sec_1');
+        const pts = typeof s.points === 'number' ? s.points : undefined;
+        if (pts !== undefined) {
+          const cur = sectionById.get(id) || { count: 0 };
+          cur.points = pts;
+          sectionById.set(id, cur);
+        }
+      }
+    }
+    for (const q of questions) {
+      if (typeof q.points !== 'number') {
+        // Try section-derived
+        const sid = q.sectionId || 'sec_1';
+        const sec = sectionById.get(sid);
+        let derived: number | undefined;
+        if (sec?.points !== undefined && sec.count > 0) {
+          const per = Math.round((sec.points / sec.count) * 4) / 4;
+          // Remainder handling: last item gets remainder
+          const isLastInSection = questions.filter(x=> (x.sectionId||'sec_1')===sid).indexOf(q) === sec.count -1;
+          if (isLastInSection) {
+            const sumPrev = questions.filter(x=> (x.sectionId||'sec_1')===sid && x!==q).reduce((s,qq)=>s+(qq.points||per),0);
+            derived = Number((sec.points - sumPrev).toFixed(2));
+            if (derived <=0) derived = per;
+          } else {
+            derived = per;
+          }
+        } else {
+          derived = 0.5;
+        }
+        q.points = derived;
+        flags.push(flag('POINTS_DERIVED', `Q${q.no} points derived as ${derived} (E2 fallback).`, 'info', q.id));
+        q.flags = [...(q.flags||[]), 'POINTS_DERIVED'];
+      }
+    }
+    // Handle matching/group children: parent holds group total, children 0 unless per-item
+    // For now ensure roots sum logic; children already handled via parentId with 0 default? Keep as is.
+    // If parent has points and children have 0, no double count - invariant E3 checks roots only.
+  }
+
   questions.sort((a, b) => a.no - b.no || Number(Boolean(a.parentId)) - Number(Boolean(b.parentId)) || a.id.localeCompare(b.id));
 
   // 2A semantic validators (pure, 0 calls) — inside the single assembly funnel so
@@ -686,7 +763,9 @@ export function assembleAndValidateSections(
 
     const questionLineSet = new Set(questions.filter(q => q.sectionId === id).flatMap(q => spanLineNumbers([...q.spans, ...(q.options || []).flatMap(o => o.spans), ...(q.tables || []).flatMap(table => table.spans)])));
     const areaLines = sectionLines.filter(line => !questionLineSet.has(lineNoFromId(line.id)) && !keyLines.has(lineNoFromId(line.id)) && !isHeaderOrRowLine(line.text) && !isInstructionLine(line.text) && cleanSectionTitle(line.text) !== title);
-    const passage = areaLines.map(line => line.text.trim()).filter(Boolean).join('\n').trim();
+    const passageRaw = areaLines.map(line => line.text.trim()).filter(Boolean).join('\n').trim();
+    const passageExc = passageRaw ? exciseWatermarks(passageRaw) : { text: passageRaw, excised: false };
+    const passage = passageExc.text;
     const storedPassage = passage.split(/\r?\n/).length >= 2 || passage.length >= 120 ? passage : undefined;
 
     const pointHeader = headerLines.find(line => parseSectionPoints(line.text) !== undefined);
@@ -702,31 +781,48 @@ export function assembleAndValidateSections(
 /** A1: Image ID uniqueness — reassign sequentially in (page, y, x) order, updating refs. */
 export function reassignImageIdsSequential(doc: ExamDoc): ExamDoc {
   if (!doc.images || doc.images.length === 0) return doc;
-  // Sort by page, y, x
-  const sorted = [...doc.images].sort((a,b)=>{
-    if (a.page !== b.page) return a.page - b.page;
-    const ay = (a as any).y ?? a.bbox?.y ?? 0;
-    const by = (b as any).y ?? b.bbox?.y ?? 0;
+  // Sort by page, y, x with original index for stable tie-break
+  const indexed = doc.images.map((img, idx) => ({ img, originalIdx: idx }));
+  const sorted = [...indexed].sort((a,b)=>{
+    if (a.img.page !== b.img.page) return a.img.page - b.img.page;
+    const ay = (a.img as any).y ?? a.img.bbox?.y ?? 0;
+    const by = (b.img as any).y ?? b.img.bbox?.y ?? 0;
     if (ay !== by) return ay - by;
-    const ax = a.bbox?.x ?? 0;
-    const bx = b.bbox?.x ?? 0;
-    return ax - bx;
+    const ax = a.img.bbox?.x ?? 0;
+    const bx = b.img.bbox?.x ?? 0;
+    if (ax !== bx) return ax - bx;
+    return a.originalIdx - b.originalIdx;
   });
-  const mapping = new Map<string,string>();
-  sorted.forEach((img, idx)=>{
-    const newId = `img_${String(idx+1).padStart(3,'0')}`;
-    mapping.set(img.id, newId);
+  // Assign new ids sequentially to each occurrence (handles duplicate old ids)
+  const newIdByOriginalIdx = new Map<number, string>();
+  sorted.forEach((item, newIdx)=>{
+    const newId = `img_${String(newIdx+1).padStart(3,'0')}`;
+    newIdByOriginalIdx.set(item.originalIdx, newId);
   });
-  const newImages = doc.images.map(img=> ({ ...img, id: mapping.get(img.id) || img.id }));
+  const newImages = doc.images.map((img, idx)=> ({ ...img, id: newIdByOriginalIdx.get(idx)! }));
+  // For question refs, map old id occurrences in order: first ref to old id maps to first new id for that old id, etc.
+  const oldIdOccurrenceToNew = new Map<string, string[]>();
+  sorted.forEach((item) => {
+    const oldId = item.img.id;
+    const newId = newIdByOriginalIdx.get(item.originalIdx)!;
+    const list = oldIdOccurrenceToNew.get(oldId) || [];
+    list.push(newId);
+    oldIdOccurrenceToNew.set(oldId, list);
+  });
+  const usedCount = new Map<string, number>();
   const newQuestions = doc.questions.map(q=> ({
     ...q,
-    images: q.images.map(ref=> ({ ...ref, imageId: mapping.get(ref.imageId) || ref.imageId }))
+    images: q.images.map(ref=> {
+      const list = oldIdOccurrenceToNew.get(ref.imageId);
+      if (!list) return ref;
+      const count = usedCount.get(ref.imageId) || 0;
+      // Use next occurrence in round-robin; if refs exceed occurrences, cycle to first
+      const newId = list[count % list.length];
+      usedCount.set(ref.imageId, count+1);
+      return { ...ref, imageId: newId };
+    })
   }));
-  // Also need to update vision labels hints? But we handle via mapping
-  // Update image labels where relevant? Keep as is but id changed
-  const newDoc = { ...doc, images: newImages, questions: newQuestions };
-  // Also update image.label.questionRef if it references old id? No, it references question id, not image id
-  return newDoc;
+  return { ...doc, images: newImages, questions: newQuestions };
 }
 interface RenamedImageOccurrence {
   image: ImageAsset;

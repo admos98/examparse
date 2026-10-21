@@ -119,15 +119,101 @@ export function expandWireV2(raw: any): any {
   return { questions, sections, meta, __wireFormat: 'v2' };
 }
 
-/** Unwrap envelopes, then expand wire v2; v1 payloads pass through unchanged. */
-export function unwrapStructureData(data: any): any {
+/** B2 — segment wire v2 expander: {seg,action,type,points,options,answerSpans,images,confidence} → questions */
+function expandSegmentWire(raw: any, segments: Array<{ seg: string; range: [number, number]; hint?: string }>): any {
+  if (!raw || typeof raw !== 'object') return raw;
+  const segActions: any[] = Array.isArray(raw.seg) ? raw.seg : Array.isArray(raw.segments) ? raw.segments : Array.isArray(raw.actions) ? raw.actions : [];
+  if (!segActions.length) return raw;
+  const bySeg = new Map(segments.map(s => [s.seg, s]));
+  const questions: any[] = [];
+  const skipped = new Set<string>();
+  for (let i = 0; i < segActions.length; i++) {
+    const a = segActions[i];
+    if (!a || !a.seg || skipped.has(a.seg)) continue;
+    const seg = bySeg.get(a.seg);
+    if (!seg) continue;
+    const action = String(a.action || 'accept').toLowerCase();
+    const t = a.type || a.t;
+    const type = WIRE_TYPES[t] || t || 'unknown';
+    const points = (a.points ?? a.v);
+    const confidence = typeof a.confidence === 'number' ? a.confidence : typeof a.c === 'number' ? a.c / 10 : 0.85;
+    if (action === 'drop') continue;
+    if (action === 'merge-next') {
+      const nextAction = segActions[i + 1];
+      const nextSeg = nextAction ? bySeg.get(nextAction.seg) : undefined;
+      if (nextSeg) {
+        // Merge current + next segment spans
+        skipped.add(nextSeg.seg);
+        const mergedSpan: [number, number] = [seg.range[0], nextSeg.range[1]];
+        questions.push({
+          n: a.n ?? nextAction?.n ?? questions.length + 1,
+          p: [mergedSpan],
+          t: type !== 'unknown' ? Object.keys(WIRE_TYPES).find(k => WIRE_TYPES[k] === type) || '?' : '?',
+          ...(points !== undefined ? { v: points } : {}),
+          ...(a.options || a.o ? { o: a.options || a.o } : {}),
+          c: Math.round(confidence * 10),
+          ...(a.answerSpans || a.a ? { a: a.answerSpans || a.a } : {}),
+          ...(a.images || a.i ? { i: a.images || a.i } : {}),
+        });
+        continue;
+      }
+    }
+    if (action === 'split') {
+      // Split segment at second printed number boundary — naive: mid of range
+      const mid = Math.floor((seg.range[0] + seg.range[1]) / 2);
+      // Find split line as first line with printed number after start
+      // For now use mid as split point; assembly's gap completion will extend
+      const spans1: [number, number] = [seg.range[0], mid];
+      const spans2: [number, number] = [mid + 1, seg.range[1]];
+      questions.push({
+        n: a.n ?? questions.length + 1,
+        p: [spans1],
+        t: type !== 'unknown' ? Object.keys(WIRE_TYPES).find(k => WIRE_TYPES[k] === type) || '?' : '?',
+        ...(points !== undefined ? { v: points } : {}),
+        c: Math.round(confidence * 10),
+      });
+      questions.push({
+        n: (a.n ?? questions.length) + 1,
+        p: [spans2],
+        t: type !== 'unknown' ? Object.keys(WIRE_TYPES).find(k => WIRE_TYPES[k] === type) || '?' : '?',
+        c: Math.round(confidence * 10),
+      });
+      continue;
+    }
+    // accept / relabel: use segment range as p
+    questions.push({
+      n: a.n ?? a.no ?? seg.range[0], // fallback to range start
+      p: [[seg.range[0], seg.range[1]]],
+      t: type !== 'unknown' ? Object.keys(WIRE_TYPES).find(k => WIRE_TYPES[k] === type) || '?' : (seg as any).kind === 'group-parent' ? 'a' : '?',
+      ...(points !== undefined ? { v: points } : {}),
+      ...(a.options || a.o ? { o: a.options || a.o } : {}),
+      ...(a.answerSpans || a.a ? { a: a.answerSpans || a.a } : {}),
+      ...(a.images || a.i ? { i: a.images || a.i } : {}),
+      c: Math.round(confidence * 10),
+    });
+  }
+  return { q: questions, s: raw.s || raw.sections, m: raw.m || raw.meta, __wireFormat: 'v2-seg' };
+}
+
+/** Unwrap envelopes, then expand wire v2 / segment wire; v1 payloads pass through unchanged. */
+export function unwrapStructureData(data: any, opts?: { segments?: Array<{ seg: string; range: [number, number] }> }): any {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return expandWireV2(data);
+  // B2: segment wire detection — if segments provided and raw contains seg/actions, use segment expander
+  if (opts?.segments && (Array.isArray((data as any).seg) || Array.isArray((data as any).segments) || Array.isArray((data as any).actions))) {
+    const segExpanded = expandSegmentWire(data, opts.segments);
+    if (Array.isArray(segExpanded?.q) && segExpanded.q.length) return expandWireV2(segExpanded);
+  }
   let unwrapped = data;
-  if (!Array.isArray(data.questions) && !Array.isArray(data.q)) {
+  // Also unwrap segActions nested in result/data/exam
+  if (!Array.isArray(data.questions) && !Array.isArray(data.q) && !Array.isArray((data as any).seg)) {
     for (const key of ['result', 'data', 'exam', 'output'] as const) {
       const env = data[key];
-      if (env && typeof env === 'object' && !Array.isArray(env) && (Array.isArray(env.questions) || Array.isArray(env.q))) {
+      if (env && typeof env === 'object' && !Array.isArray(env) && (Array.isArray(env.questions) || Array.isArray(env.q) || Array.isArray((env as any).seg))) {
         unwrapped = { ...data, ...env, meta: env.meta ?? data.meta, m: env.m ?? data.m };
+        if (opts?.segments && (Array.isArray((unwrapped as any).seg) || Array.isArray((unwrapped as any).segments))) {
+          const segExpanded2 = expandSegmentWire(unwrapped, opts.segments);
+          if (Array.isArray(segExpanded2?.q) && segExpanded2.q.length) return expandWireV2(segExpanded2);
+        }
         break;
       }
     }
@@ -201,6 +287,10 @@ export interface StructurePassParams {
   /** D — escalation model for sections whose lines are >40% locally garbled (one routed call per section, ≤2 per pass). */
   escalationProviderConfig?: any;
   garbledEscalationBudget?: { count: number; max: number };
+  /** B2 — deterministic segments wire v2 (advisory, never executive). When present, model labels/classifies/corrects per segment. */
+  segments?: Array<{ seg: string; kind: string; range: [number, number]; n?: number; childNos?: number[]; hint: string; preview: string }>;
+  /** B4 — when true, skip segment wire and use legacy free-span flow */
+  segmentFallback?: boolean;
 }
 
 export interface StructureGuidance {
@@ -477,10 +567,36 @@ async function parseStructureResponse(response: any): Promise<any> {
   return data;
 }
 
-function responseTripwires(data: any, plan: SectionPlan, sourceLines: SourceLine[], keyLines: Set<number>): string[] {
+export function responseTripwires(data: any, plan: SectionPlan, sourceLines: SourceLine[], keyLines: Set<number>, opts?: { segments?: Array<{ seg: string; range: [number, number] }>; segActions?: any[] }): string[] {
   if ((data as any)?._isAck) return [];
   const tripwires: string[] = [];
-  const questions = Array.isArray(data?.questions) ? data.questions : [];
+  // B3 seg handling: validate seg actions when segments wire used
+  if (opts?.segments && opts?.segActions) {
+    const segIds = new Set(opts.segments.map(s=>s.seg));
+    const seenSeg = new Set<string>();
+    const confidences: number[] = [];
+    for (const a of opts.segActions) {
+      if (!a?.seg) { tripwires.push('seg action missing seg id'); continue; }
+      if (!segIds.has(a.seg)) tripwires.push(`seg ${a.seg} not in manifest`);
+      if (seenSeg.has(a.seg)) tripwires.push(`duplicate seg ${a.seg}`);
+      seenSeg.add(a.seg);
+      const validActions = ['accept','relabel','split','merge-next','drop'];
+      if (a.action && !validActions.includes(String(a.action).toLowerCase())) tripwires.push(`invalid seg action ${a.action} for ${a.seg}`);
+      const conf = typeof a.confidence === 'number' ? a.confidence : typeof a.c === 'number' ? a.c/10 : undefined;
+      if (conf !== undefined) {
+        if (conf < 0 || conf > 1) tripwires.push(`confidence out of range for ${a.seg}`);
+        confidences.push(conf);
+      }
+    }
+    const unaddressed = [...segIds].filter(id=>!seenSeg.has(id));
+    if (unaddressed.length && unaddressed.length > opts.segments.length * 0.5) {
+      tripwires.push(`missing seg actions for ${unaddressed.slice(0,3).join(',')}${unaddressed.length>3?'...':''}`);
+    }
+    if (confidences.length && confidences.reduce((s,c)=>s+c,0)/confidences.length < 0.6) {
+      tripwires.push('low avg confidence seg actions');
+    }
+  }
+  const questions = Array.isArray(data?.questions) ? data.questions : Array.isArray((data as any)?.q) ? (data as any).q : [];
   const seen = new Set<number>();
   const lineCount = sourceLines.reduce((maximum, line) => Math.max(maximum, Number(line.id.replace(/\D/g, '')) || 0), 0);
   const keyStart = keyLines.size ? [...keyLines].reduce((minimum, line) => Math.min(minimum, line), Infinity) : Infinity;
@@ -571,12 +687,118 @@ export function sectionGarbledRatio(lines: SourceLine[]): number {
 }
 export const GARBLED_ESCALATION_RATIO = 0.4;
 
+/** B3 — segment-level recovery helpers (≤3 segs/round +±1 neighbours) */
+export function getSegmentSubsetForPlan(segments: Array<{ seg: string; range: [number, number]; hint?: string }>, plan: { start: number; end: number }): Array<{ seg: string; range: [number, number]; hint?: string }> {
+  if (!segments?.length) return [];
+  return segments.filter(s => s.range[0] >= plan.start && s.range[1] <= plan.end || s.range[0] <= plan.end && s.range[1] >= plan.start);
+}
+export function selectRecoverySegments(segments: Array<{ seg: string; range: [number, number]; n?: number; kind?: string }>, missingNumbers: number[], opts?: { perRound?: number }): Array<{ seg: string; range: [number, number] }> {
+  const perRound = opts?.perRound ?? 3;
+  // Map missing numbers to segment indices via printedNo or range hint
+  const segIndexById = new Map(segments.map((s,i)=>[s.seg,i]));
+  const targetIdxs = new Set<number>();
+  for (const n of missingNumbers) {
+    // Find segment whose n matches or whose hint contains n, or whose range start matches expected line
+    let idx = segments.findIndex(s => s.n === n);
+    if (idx === -1) {
+      // fallback: find by scanning source line association (use first segment whose range contains expected line if available)
+      idx = segments.findIndex(s => String(s.seg) === `S${n}`);
+    }
+    if (idx !== -1) targetIdxs.add(idx);
+  }
+  // If no direct match, take first perRound missing segments in order
+  if (!targetIdxs.size) {
+    for (let i=0;i<Math.min(perRound, segments.length);i++) targetIdxs.add(i);
+  }
+  // Limit to perRound ordered
+  const ordered = [...targetIdxs].sort((a,b)=>a-b).slice(0, perRound);
+  // Expand ±1 neighbours
+  const expanded = new Set<number>();
+  for (const idx of ordered) {
+    for (let d=-1; d<=1; d++) {
+      const nb = idx + d;
+      if (nb >=0 && nb < segments.length) expanded.add(nb);
+    }
+  }
+  return [...expanded].sort((a,b)=>a-b).map(i=>segments[i]);
+}
+export async function runSegmentRecovery(params: StructurePassParams, missingNumbers: number[], segments: Array<{ seg: string; range: [number, number]; hint?: string; preview?: string }>): Promise<{ questions: any[]; usage: any; flags: any[] }> {
+  // B3: at most 2 rounds, ≤3 segs/round +±1 neighbours, budget aware
+  const allSegments = segments || params.segments || [];
+  if (!allSegments.length || !missingNumbers.length) return { questions: [], usage: { inputTokens:0, outputTokens:0 }, flags: [] };
+  let recovered: any[] = [];
+  let totalUsage = { inputTokens:0, outputTokens:0, cachedTokens:0 };
+  const flags: any[] = [];
+  const budget = params.recoveryBudget || (params.recoveryBudget = { count: 0 });
+  for (let round=1; round<=2; round++) {
+    const remaining = missingNumbers.filter(n=> !recovered.some((q:any)=> rawQuestionNumber(q, params.sourceLines)===n));
+    if (!remaining.length) break;
+    const segsThisRound = selectRecoverySegments(allSegments as any, remaining, { perRound: 3 });
+    if (!segsThisRound.length || budget.count >= 8) break;
+    budget.count++;
+    // Build LAS for segs + neighbours slice (use source lines covered by segs)
+    const lineNos = new Set<number>();
+    for (const s of segsThisRound) for (let n=s.range[0]; n<=s.range[1]; n++) lineNos.add(n);
+    const lines = params.sourceLines.filter(l=> lineNos.has(Number(l.id.replace(/\D/g,''))));
+    const segWire = segsThisRound.map(s=> ({ seg: s.seg, range: s.range, hint: (s as any).hint }));
+    const segActionsNeeded = segsThisRound.map(s=> s.seg).join(',');
+    const keyLines = enumerateExpectedQuestionNos(params.sourceLines).keyTerritory.lineNos;
+    const las = formatLas(lines, keyLines);
+    const segBlock = `\nSEGMENTS RECOVERY ROUND ${round} (${segsThisRound.length} segs ±1 neighbours: ${segActionsNeeded})\n${segsThisRound.map(s=> `${s.seg} [${s.range[0]}-${s.range[1]}]`).join('\n')}`;
+    const text = `CONFIG: ${JSON.stringify({ latex: params.latexEnabled, languageHint: params.languageHint || null })}\nREQUIRED PRINTED QUESTIONS: ${remaining.join(', ')}\n${segBlock}\nSOURCE:\n${las}\nFor each segment output {seg,action,type,points,options,answerSpans,images,confidence}`;
+    const label = `Structure Segment Recovery Round ${round} (${segsThisRound.length} segs)`;
+    const request: any = { role: 'fast', system: structureSystemPrompt(params), text, maxOutputTokens: Math.min(params.maxBudgetTokens||16384, 4096), label, providerConfig: params.providerConfig };
+    const resp = await LLMAdapter.execute(request, { onDelta: (ch:string,full:string)=> params.onLiveText?.(label, ch as any, full), onInfo: (note:string)=> params.onLiveText?.(label,'info',note), salvagePartial:true } as any);
+    totalUsage.inputTokens += resp.usage.inputTokens||0; totalUsage.outputTokens += resp.usage.outputTokens||0; totalUsage.cachedTokens += resp.usage.cachedTokens||0;
+    const data = await parseStructureResponse(resp);
+    // B3 tripwires for seg handling during recovery
+    const segActions = (resp.json as any)?.seg || (resp.json as any)?.segments || [];
+    const planStub = { id: `seg-recovery-${round}`, index: round, title: `Segment Recovery ${round}`, start: Math.min(...segsThisRound.map(s=>s.range[0])), end: Math.max(...segsThisRound.map(s=>s.range[1])), expected: remaining };
+    const trip = responseTripwires(data, planStub as any, params.sourceLines, keyLines, { segments: allSegments as any, segActions });
+    if (trip.length >= 3) {
+      flags.push({ code: 'SEG_RECOVERY_TRIPWIRES', severity: 'warn', message: `Segment recovery round ${round} tripwires: ${trip.join('; ')}` });
+    }
+    const added = Array.isArray(data?.questions) ? data.questions : Array.isArray((data as any)?.q) ? (data as any).q : [];
+    if (added.length) recovered.push(...added);
+  }
+  return { questions: recovered, usage: totalUsage, flags };
+}
+
 async function runSectionCall(params: StructurePassParams, plan: SectionPlan, allPlans: SectionPlan[], targetNumbers: number[], phase: string, priorQuestions: any[], priorSections: any[]): Promise<{ questions: any[]; sections: any[]; meta: any; usage: any; rawText: string; label: string; attempts: number; tripwires: string[]; escalated?: boolean; garbledRatio?: number }> {
   const keyLines = enumerateExpectedQuestionNos(params.sourceLines).keyTerritory.lineNos;
-  const sectionLines = params.sourceLines.filter(line => {
-    const n = Number(line.id.replace(/\D/g, ''));
-    return n >= plan.start && n <= plan.end;
-  });
+  // B2 segment subset: when wire present, restrict to segment lines within plan (not whole section range)
+  let sectionLines: typeof params.sourceLines;
+  let segmentSubset: Array<{ seg: string; range: [number, number]; hint?: string; preview?: string; kind?: string; n?: number }> | undefined;
+  if (params.segments && !params.segmentFallback && params.segments.length) {
+    const subsets = getSegmentSubsetForPlan(params.segments as any, plan);
+    if (subsets.length) {
+      segmentSubset = subsets;
+      const allowed = new Set<number>();
+      for (const s of subsets) for (let n=s.range[0]; n<=s.range[1]; n++) allowed.add(n);
+      sectionLines = params.sourceLines.filter(line => {
+        const n = Number(line.id.replace(/\D/g, ''));
+        return allowed.has(n);
+      });
+      // Fallback to full plan range if segment filtering yields empty (should not happen)
+      if (!sectionLines.length) {
+        sectionLines = params.sourceLines.filter(line => {
+          const n = Number(line.id.replace(/\D/g, ''));
+          return n >= plan.start && n <= plan.end;
+        });
+        segmentSubset = undefined;
+      }
+    } else {
+      sectionLines = params.sourceLines.filter(line => {
+        const n = Number(line.id.replace(/\D/g, ''));
+        return n >= plan.start && n <= plan.end;
+      });
+    }
+  } else {
+    sectionLines = params.sourceLines.filter(line => {
+      const n = Number(line.id.replace(/\D/g, ''));
+      return n >= plan.start && n <= plan.end;
+    });
+  }
   // D — a mostly-garbled section is routed ONCE to the escalation model (budgeted), never silently.
   const garbledRatio = sectionGarbledRatio(sectionLines);
   const escalationBudget = params.garbledEscalationBudget;
@@ -593,11 +815,17 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
   const lines = [...new Map([...sectionLines, ...relevantKeyLines].map(line => [line.id, line])).values()].sort((a, b) => Number(a.id.replace(/\D/g, '')) - Number(b.id.replace(/\D/g, '')));
   const manifest = params.images.filter(img => img.anchorLine && img.anchorLine >= plan.start && img.anchorLine <= plan.end).map(img => ({ id: img.id, page: img.page, nearLine: img.anchorLine }));
   const las = formatLas(lines, keyLines);
+  // B2 segment subset wire for this section (advisory-never-executive)
+  let segmentBlockSec = '';
+  if (segmentSubset && segmentSubset.length) {
+    const segLines = segmentSubset.map(s => `${s.seg} [${s.range[0]}-${s.range[1]}] ${s.kind || ''} n=${(s as any).n ?? '-'} hint=${s.hint || ''} preview="${(s.preview || '').replace(/"/g,"'").slice(0,80)}"`).join('\n');
+    segmentBlockSec = `\nSEGMENTS (section subset, advisory):\n${segLines}\nFor each seg output {seg,action,type,points,options,answerSpans,images,confidence} (do not emit free-form p spans; use seg ids).`;
+  }
   const rangeText = targetNumbers.length ? `REQUIRED PRINTED QUESTIONS: ${targetNumbers.join(', ')}. Do not omit any listed number; output only these questions plus the section spans.` : 'Output all questions from this section.';
   const keyPreamble = keyLines.size ? 'Lines after the key marker are the official answer key; use them ONLY for answer spans. [KEY] lines are excluded from the question hunt.\n' : '';
   const sessionMemory = priorQuestions.length ? `SESSION MEMORY: already parsed numbers ${priorQuestions.map(q => rawQuestionNumber(q, params.sourceLines)).filter(Boolean).join(',')}; section ids ${priorSections.map(s => s.id).join(',')}. Do not repeat existing question numbers.\n` : '';
   const retryHint = phase.includes('hint') ? `\nYour previous output missed ${targetNumbers.join(', ')}; output ONLY the missing numbers, with valid spans.\n` : '';
-  const text = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: params.latexEnabled, languageHint: params.languageHint || null })}\n${sessionMemory}${rangeText}${retryHint}\nSECTION ${plan.index}/${allPlans.length} ${plan.title} (${plan.start}-${plan.end})\nIMAGE MANIFEST: ${JSON.stringify(manifest)}\nSOURCE:\n${las}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}`;
+  const text = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: params.latexEnabled, languageHint: params.languageHint || null })}\n${sessionMemory}${rangeText}${retryHint}\nSECTION ${plan.index}/${allPlans.length} ${plan.title} (${plan.start}-${plan.end})\nIMAGE MANIFEST: ${JSON.stringify(manifest)}\nSOURCE:\n${las}${segmentBlockSec}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}${segmentBlockSec ? ' + seg' : ''}`;
   const budget = params.maxBudgetTokens || 16384;
   const maxOutputTokens = Math.min(budget, Math.max(2048, Math.ceil(Math.max(lines.length * 12, lines.reduce((s, l) => s + l.text.length, 0) / 3.2 * 0.3) * 1.25)));
   const label = `${phase.startsWith('recovery') ? `Structure Recovery ${phase}: ${plan.id}` : `Structure Section: ${plan.id} [${plan.index}/${allPlans.length}] ${plan.title}`}${escalate ? ' (garbled → escalation model)' : ''}`;
@@ -610,7 +838,9 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
   await params.onCallUsage?.({ label, ...response.usage });
   if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label, rawText: response.rawText, reasoningText: response.reasoningText, finishReason: response.finishReason, usage: response.usage, complete: true });
   const data = await parseStructureResponse(response);
-  const tripwires = responseTripwires(data, { ...plan, expected: targetNumbers }, params.sourceLines, keyLines);
+  // B3 seg tripwire handling: pass segActions when segment wire present
+  const segActions = (data as any)?.seg || (data as any)?.segments || (data as any)?.actions || (response.json as any)?.seg || [];
+  const tripwires = responseTripwires(data, { ...plan, expected: targetNumbers } as any, params.sourceLines, keyLines, segmentSubset ? { segments: segmentSubset as any, segActions } : undefined);
   let questions = sanitizeRawSectionQuestions(data, plan, params.sourceLines, keyLines);
   let sections = Array.isArray(data?.sections) ? data.sections.map((s: any) => ({ ...s, id: plan.id, index: plan.index, spans: Array.isArray(s.spans) ? s.spans : [] })) : [];
   if (!sections.length) sections = [{ id: plan.id, index: plan.index, spans: [[plan.start, plan.end]], kind: plan.title }];
@@ -730,6 +960,26 @@ async function runSectionedStructurePass(params: StructurePassParams, options: {
       await runPlan(plan, missingForSection, `recovery-${round}`, true);
     }
   }
+  // B3 segment-level recovery (≤3 segs/round +±1 neighbours) when segments wire is active and coverage still missing
+  if (params.segments && !params.segmentFallback && params.segments.length) {
+    const postSectionCoverage = evaluateCoverage(expected, rawCoverageQuestions(mergedQuestions, params.sourceLines), meta.totalPoints);
+    if (postSectionCoverage.missing.length) {
+      const segRes = await runSegmentRecovery(params as any, postSectionCoverage.missing, params.segments as any);
+      if (segRes.questions.length) {
+        const deduped = segRes.questions.filter((q:any)=> {
+          const id = rawQuestionIdentity(q, params.sourceLines);
+          if (!id) return true;
+          return !mergedQuestions.some((m:any)=> rawQuestionIdentity(m, params.sourceLines)===id);
+        });
+        mergedQuestions.push(...deduped);
+        if (segRes.usage.inputTokens || segRes.usage.outputTokens) {
+          inputTokens += segRes.usage.inputTokens||0; outputTokens += segRes.usage.outputTokens||0; cachedTokens += segRes.usage.cachedTokens||0;
+        }
+        if (segRes.flags.length) flags.push(...segRes.flags);
+        flags.push({ code: 'SEG_RECOVERY_USED', severity: 'info', message: `Segment recovery: ${deduped.length} question(s) recovered via ≤3 segs/round ±1 neighbours (rounds up to 2).` });
+      }
+    }
+  }
   const finalCoverage = evaluateCoverage(expected, rawCoverageQuestions(mergedQuestions, params.sourceLines), meta.totalPoints);
   const parsedAnyQuestions = rawCoverageQuestions(mergedQuestions, params.sourceLines).length > 0;
   const coverageFlags = makeCoverageFlags(mergedQuestions, params.sourceLines, expected, meta.totalPoints);
@@ -796,7 +1046,13 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
   const isGemini = providerConfig?.kind === 'gemini';
 
   const keyPreamble = keyTerritory.lineNos.size ? `Lines after line ${keyTerritory.markerLine} are the official answer key; use them ONLY for answer spans. [KEY] lines are excluded from the question hunt.\n\n` : '';
-  let userPrompt = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint: languageHint || null })}\nIMAGE MANIFEST: ${JSON.stringify(manifestEntries)}\nSOURCE:\n${lasText}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}`;
+  // B2: segment wire (deterministic-before-LLM) — when present, model only labels/classifies/corrects
+  let segmentBlock = '';
+  if (params.segments && !params.segmentFallback) {
+    const segLines = params.segments.map(s => `${s.seg} [${s.range[0]}-${s.range[1]}] ${s.kind} n=${s.n ?? '-'} hint=${s.hint} preview="${s.preview.replace(/"/g, "'")}"`).join('\n');
+    segmentBlock = `\n\nSEGMENTS (deterministic, 100% coverage, advisory-never-executive — you ONLY label/correct, never invent spans):\n${segLines}\nFor each segment, output one object in "seg": [{"seg":"S1","action":"accept|relabel|split|merge-next|drop","type":"m|f|b|s|l|a|u|n|d|?","points":1,"options":[["a",1]],"answerSpans":[1],"images":["img_001"],"confidence":9}] where confidence 0-9 (9=certain). accept=relabel use segment lines as question spans; split=one segment is two questions; merge-next=merge with next; drop=header/passage/instruction. Do not emit free-form p spans; use only seg ids.`;
+  }
+  let userPrompt = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint: languageHint || null })}\nIMAGE MANIFEST: ${JSON.stringify(manifestEntries)}\nSOURCE:\n${lasText}${segmentBlock}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}${params.segments && !params.segmentFallback ? ' + seg' : ''}`;
 
   // For non-Gemini providers, embed a compact JSON schema directly in user prompt
   if (!isGemini) {
@@ -913,7 +1169,27 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
   };
   let response = await LLMAdapter.execute(request, streamOpts(request.label));
   if (params.journalEnabled && params.journalKey) await appendJournalCall(params.journalKey, { ts: new Date().toISOString(), label: request.label, rawText: response.rawText, reasoningText: response.reasoningText, finishReason: response.finishReason, usage: response.usage, complete: true });
-  let data: any = unwrapStructureData(response.json);
+  // B2/B4: segment-aware unwrap with confidence+fallback (>20% mismatch → legacy)
+  let data: any;
+  let segmentFallbackUsed = false;
+  if (params.segments && !params.segmentFallback) {
+    data = unwrapStructureData(response.json, { segments: params.segments as any });
+    const segActions = (response.json as any)?.seg || (response.json as any)?.segments || (response.json as any)?.actions;
+    if (Array.isArray(segActions) && segActions.length) {
+      const avgConf = segActions.reduce((s: number, a: any) => s + (typeof a.confidence === 'number' ? a.confidence : typeof a.c === 'number' ? a.c / 10 : 0.85), 0) / segActions.length;
+      const mismatch = Math.abs(segActions.length - params.segments.length) / params.segments.length;
+      const lowConf = segActions.filter((a: any) => (typeof a.confidence === 'number' ? a.confidence : typeof a.c === 'number' ? a.c / 10 : 0.85) < 0.6).length / segActions.length;
+      if (avgConf < 0.6 || mismatch > 0.2 || lowConf > 0.2) {
+        const legacy = unwrapStructureData(response.json);
+        if (Array.isArray(legacy?.questions) && legacy.questions.length) {
+          data = legacy;
+          segmentFallbackUsed = true;
+        }
+      }
+    }
+  } else {
+    data = unwrapStructureData(response.json);
+  }
   const totalUsage = { ...response.usage };
   let finalFinishReason = response.finishReason;
   let finalRawText = response.rawText;

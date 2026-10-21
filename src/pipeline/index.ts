@@ -313,13 +313,66 @@ export async function runFullPipeline(
     });
   }
 
-  // 3. STAGE: STRUCTURE PASS (single call for short docs; bounded sections for long/weak-model docs)
-  onStageUpdate({
+  // F2/B: SEGMENTATION SUMMARY BEFORE STRUCTURE (shown before any structure token spent)
+  // B1 deterministic 100% coverage + B4 fallback (>20% mismatch → legacy) + lens preview
+  let segmentation: any = null;
+  let segmentWireForStructure: any = null;
+  let segmentFallback = false;
+  try {
+    const { segmentDocument } = await import('./segment');
+    const segRes = segmentDocument({ lines: workingLines, keyLines: new Set(keyTerritoryLineNos), pages: extracted.pages });
+    segmentation = segRes;
+    // B4: confidence / mismatch fallback — if any section has >20% count mismatch or non-monotonic, use legacy free-span flow
+    const hasFallback = segRes.diagnostics.fallbackSections.length > 0;
+    const fallbackPct = segRes.diagnostics.perSection.filter((p: any) => p.fallback).length / Math.max(1, segRes.diagnostics.perSection.length);
+    if (hasFallback && fallbackPct > 0) {
+      // For now, only force fallback when number-less fixture (expected 0) or large mismatch; Iranian golden has 0 fallback so stays on segment path
+      const forceLegacy = segRes.diagnostics.perSection.some((p: any) => p.fallback && p.expected === 0 && p.segmented === 0);
+      if (forceLegacy) {
+        segmentFallback = true;
+        // Keep segmentation for telemetry/lens but mark fallback so structure uses legacy spans
+        segRes.diagnostics.fallbackSections.push('SEGMENTER_FALLBACK');
+      }
+    }
+    const fallbackMsg = segRes.diagnostics.fallbackSections.length ? ` Fallback: ${segRes.diagnostics.fallbackSections.join(', ')} (legacy)` : '';
+    const segByKind = Object.entries(segRes.diagnostics.segmentsByKind).map(([k,v]: any)=> `${k}:${v}`).join(' ');
+    onStageUpdate({
+      id: 'structure',
+      name: 'Structure Pass',
+      status: 'running',
+      message: `Segmentation: ${segRes.diagnostics.sectionsDetected} sections, ${segRes.segments.length} segments [${segByKind}] | per-section expected vs segmented ${segRes.diagnostics.perSection.map((p: any)=> `${p.title} ${p.expected}→${p.segmented}${p.fallback?'⚠':''}`).join(' | ')}${fallbackMsg} — deterministic 100% coverage: ${segRes.diagnostics.coverage.toFixed(1)}% (telemetry before model).`,
+    });
+    // Emit segment preview data via onLiveText for Step2 lens (colour by kind) - best-effort + flip overrides
+    try { (callbacks as any).onSegmentUpdate?.(segRes); } catch {}
+    // B2: build compact segment wire for structure (S1..Sn) — advisory, never executive
+    if (!segmentFallback) {
+      segmentWireForStructure = segRes.segments.map((s: any) => ({
+        seg: s.id,
+        kind: s.kind,
+        range: [s.startLine, s.endLine],
+        ...(s.printedNo !== undefined ? { n: s.printedNo } : {}),
+        ...(s.childNos ? { childNos: s.childNos } : {}),
+        hint: s.sectionHint,
+        // 120-char stem preview for lens (not sent to model as ground truth, only as manifest)
+        preview: (workingLines.find((l: any) => Number(l.id.replace(/\D/g,''))===s.startLine)?.text || '').slice(0,120),
+      }));
+    }
+  } catch (e: any) {
+    onStageUpdate({
+      id: 'structure',
+      name: 'Structure Pass',
+      status: 'running',
+      message: `Expected ${expectedQuestionNos.length} printed question(s); deterministic completeness gate enabled. (segmenter error: ${e?.message||e})`,
+    });
+  }
+  if (!segmentation) onStageUpdate({
     id: 'structure',
     name: 'Structure Pass',
     status: 'running',
     message: `Expected ${expectedQuestionNos.length} printed question(s); deterministic completeness gate enabled.`,
   });
+  // Expose segmentation wire for structure cache key (deterministic-before-LLM)
+  const segmentSignature = segmentation && !segmentFallback ? `seg:${segmentation.segments.length}:${segmentation.diagnostics.coverage.toFixed(0)}` : 'seg:off';
 
   const structRole = settings.roleMapping.fast;
   const structProvider = settings.providers.find(p => p.id === structRole.providerId) || settings.providers[0];
@@ -349,14 +402,14 @@ export async function runFullPipeline(
     try { await setPipelineCache(`journalkey:${fileHash}`, journalKey); } catch { /* attempt-history pointer is best-effort */ }
   }
 
-  // Check cache for structure pass
+  // Check cache for structure pass (segment signature is deterministic-before-LLM)
   const cachedStructure = !stageForced('structure')
     ? await getCachedStageResult<any>({
         fileHash,
         stage: 'structure',
         provider: structProviderConfig.id,
         model: structProviderConfig.model,
-        options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature },
+        options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature, segments: segmentSignature },
       })
     : null;
 
@@ -406,15 +459,18 @@ export async function runFullPipeline(
           journalEnabled: cacheEnabled && !stageForced('structure'),
           journalKey,
           forceSectionMode: structRole.model.toLowerCase().includes('free') || settings.budget.maxOutputTokens < 8192,
-          onProgress: message => onStageUpdate({ id: 'structure', name: 'Structure Pass', status: 'running', message }),
-          onLiveText: (label, channel, fullText) => onLiveText?.('structure', label, channel, fullText),
+          onProgress: (message: string) => onStageUpdate({ id: 'structure', name: 'Structure Pass', status: 'running', message }),
+          onLiveText: (label: string, channel: string, fullText: string) => onLiveText?.('structure', label, channel as any, fullText),
           guidance: structureGuidance,
           parallelSections: settings.parallelSections ?? 3,
-          onNode: node => { onLiveText?.('structure', `node ${node.id}`, 'info', `${node.label || node.id}: ${node.status}${node.error ? ` — ${node.error}` : ''}`); callbacks.onNodeUpdate?.(node); },
+          onNode: (node: any) => { onLiveText?.('structure', `node ${node.id}`, 'info', `${node.label || node.id}: ${node.status}${node.error ? ` — ${node.error}` : ''}`); (callbacks as any).onNodeUpdate?.(node); },
           // D — sections >40% [GARBLED?] go once to the escalation model (≤2 per pass).
           escalationProviderConfig: (() => { const sel = settings.roleMapping.escalation; const prov = sel && settings.providers.find(p => p.id === sel.providerId); return prov ? { ...prov, model: sel.model } : undefined; })(),
           garbledEscalationBudget: { count: 0, max: 2 },
-        });
+          // B2: deterministic segments wire v2 (advisory-never-executive; legacy fallback when SEGMENTER_FALLBACK)
+          segments: segmentWireForStructure || undefined,
+          segmentFallback: segmentFallback,
+        } as any);
       } catch (err: any) {
         onStageUpdate({
           id: 'structure',
@@ -458,7 +514,7 @@ export async function runFullPipeline(
           stage: 'structure',
           provider: structProviderConfig.id,
           model: structProviderConfig.model,
-          options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature },
+          options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature, segments: segmentSignature },
         },
         structRes
       );

@@ -5,11 +5,18 @@
  * No model calls.
  */
 import { SourceLine } from '../types';
-import { detectSectionHeaders, lineNumber, parsePrintedNumberFromStem, normalizeForMatching } from './quality';
+import { detectSectionHeaders, lineNumber, parsePrintedNumberFromStem, normalizeForMatching, matchingView } from './quality';
 import { isInstructionText, isBarePageNumber } from './cleanup';
 import { headerAnchors, isSkippedLine, classifyLines } from './ownership';
 
 export type SegmentKind = 'question'|'group-parent'|'passage'|'instruction'|'header'|'unknown';
+
+export interface IntraLineItem {
+  no: number;
+  marker: string;
+  charStart: number;
+  charEnd: number;
+}
 
 export interface Segment {
   id: string; // S1..Sn
@@ -18,9 +25,49 @@ export interface Segment {
   endLine: number;
   printedNo?: number;
   childNos?: number[];
+  parentSegmentId?: string;
+  charStart?: number;
+  charEnd?: number;
   sectionHint: string;
   lines: number[]; // inclusive line numbers
   sectionId?: string;
+}
+
+const INTRA_LINE_PERSIAN = 'الف|ب|پ|ت|ث|ج|چ|د|ه|و';
+const INTRA_LINE_MULTI_RE = new RegExp(
+  `(^|\\s)(?:\\((\\d{1,3})\\)|(\\d{1,3})\\s*[.):-])\\s*(?:\\(([a-j])\\)|([a-j])[).:]|\\((${INTRA_LINE_PERSIAN})\\)|(${INTRA_LINE_PERSIAN})[).:])(?=\\s|$)`,
+  'gi',
+);
+
+/**
+ * Deterministic intra-line splitter: detects lines containing ≥2 ascending `N. x)` occurrences
+ * (e.g. `63. a) Ferdowsi…. 64. b) Watching TV…… 65. c) Sport……… 66. d) Clean energy…`)
+ * and returns exact UTF-16 `[charStart, charEnd]` offsets into `text`.
+ */
+const INTRA_LINE_FAST_RE = /(?:^|\s)(?:\([0-9۰-۹٠-٩０-９]{1,3}\)|[0-9۰-۹٠-٩０-９]{1,3}\s*[.):-])\s*(?:\([a-jالفبپتثجچدهو]\)|[a-jالفبپتثجچدهو][).:])/i;
+
+export function findIntraLineMultiNumbers(text: string): IntraLineItem[] {
+  if (!text || !INTRA_LINE_FAST_RE.test(text)) return [];
+  const view = matchingView(text);
+  const raw: Array<{ no: number; marker: string; origStart: number }> = [];
+  INTRA_LINE_MULTI_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = INTRA_LINE_MULTI_RE.exec(view.text))) {
+    const no = Number(m[2] || m[3]);
+    const marker = (m[4] || m[5] || m[6] || m[7] || '').toLowerCase();
+    if (!Number.isInteger(no) || no < 1 || no > 300 || !marker) continue;
+    const normStart = m.index + (m[1] || '').length;
+    raw.push({ no, marker, origStart: view.originalOffset(normStart) });
+  }
+  if (raw.length < 2) return [];
+  for (let i = 1; i < raw.length; i++) {
+    if (raw[i].no <= raw[i - 1].no) return [];
+  }
+  return raw.map((item, idx) => {
+    const start = idx === 0 && !text.slice(0, item.origStart).trim() ? 0 : item.origStart;
+    const end = idx + 1 < raw.length ? raw[idx + 1].origStart : text.length;
+    return { no: item.no, marker: item.marker, charStart: start, charEnd: end };
+  });
 }
 
 export interface SegmentDiagnostics {
@@ -303,8 +350,40 @@ export function segmentDocument(params: {
       const linesSlice = bodyLines.slice(idx, endIdx).map(lineNumber);
       const line = bodyLines[idx];
       const groupInfo = isGroupParentLine(line.text);
+      const intraMulti = findIntraLineMultiNumbers(line.text);
       const qn = isQuestionStart(line);
-      if (groupInfo.isGroup) {
+      if (intraMulti.length >= 2) {
+        const parentId = mkId();
+        const lineNo = lineNumber(line);
+        initialQuestionSegments.push({
+          id: parentId,
+          kind: 'group-parent',
+          startLine: linesSlice[0],
+          endLine: linesSlice[linesSlice.length-1],
+          printedNo: intraMulti[0].no,
+          childNos: intraMulti.map(it => it.no),
+          charStart: intraMulti[0].charStart,
+          charEnd: intraMulti[0].charEnd,
+          sectionHint: range.title,
+          lines: linesSlice,
+          sectionId: `sec_${ranges.indexOf(range)+1}`,
+        });
+        for (const childItem of intraMulti.slice(1)) {
+          initialQuestionSegments.push({
+            id: `${parentId}_c${childItem.no}`,
+            kind: 'question',
+            parentSegmentId: parentId,
+            startLine: lineNo,
+            endLine: lineNo,
+            printedNo: childItem.no,
+            charStart: childItem.charStart,
+            charEnd: childItem.charEnd,
+            sectionHint: range.title,
+            lines: [lineNo],
+            sectionId: `sec_${ranges.indexOf(range)+1}`,
+          });
+        }
+      } else if (groupInfo.isGroup) {
         // group-parent owns its line plus shared pool lines until next question
         // But our slice includes until next question, which matches spec: parent owns shared lines
         initialQuestionSegments.push({
@@ -435,7 +514,7 @@ export function segmentDocument(params: {
   }
 
   // Assert invariants: contiguous, non-overlapping, ordered, cover 100%
-  segments.sort((a,b)=>a.startLine-b.startLine);
+  segments.sort((a,b)=>a.startLine-b.startLine || Number(Boolean(a.parentSegmentId)) - Number(Boolean(b.parentSegmentId)) || (a.charStart ?? -1) - (b.charStart ?? -1));
   // Check coverage
   const sortedTerritoryLines = territory.map(lineNumber).sort((a,b)=>a-b);
   const covered = segments.flatMap(s=>s.lines).sort((a,b)=>a-b);
@@ -446,11 +525,12 @@ export function segmentDocument(params: {
     // Throw bug as spec says coverage hole is thrown bug, not flag
     const missing = [...territorySet].filter(n=>!coveredSet.has(n));
     const extra = [...coveredSet].filter(n=>!territorySet.has(n));
-    throw new Error(`SEGMENTER_COVERAGE_BUG: missing ${missing.slice(0,5)} extra ${extra.slice(0,5)} (territory ${sortedTerritoryLines.length} covered ${covered.length})`);
+    throw new Error(`SEGMENTER_COVERAGE_BUG: missing ${missing.slice(0,5)} extra ${extra.slice(0,5)} (territory ${sortedTerritoryLines.length} covered ${coveredSet.size})`);
   }
-  // Check contiguous non-overlapping ordering already via sort and unique
-  for (let i=1;i<segments.length;i++) if (segments[i].startLine <= segments[i-1].endLine) {
-    throw new Error(`SEGMENTER_OVERLAP_BUG: ${segments[i-1].id} [${segments[i-1].startLine}-${segments[i-1].endLine}] overlaps ${segments[i].id} [${segments[i].startLine}-${segments[i].endLine}]`);
+  // Check contiguous non-overlapping ordering on non-child root segments
+  const rootSegments = segments.filter(s => !s.parentSegmentId);
+  for (let i=1;i<rootSegments.length;i++) if (rootSegments[i].startLine <= rootSegments[i-1].endLine) {
+    throw new Error(`SEGMENTER_OVERLAP_BUG: ${rootSegments[i-1].id} [${rootSegments[i-1].startLine}-${rootSegments[i-1].endLine}] overlaps ${rootSegments[i].id} [${rootSegments[i].startLine}-${rootSegments[i].endLine}]`);
   }
 
   // Diagnostics per section
@@ -459,7 +539,7 @@ export function segmentDocument(params: {
     segmentsByKind: { 'question':0,'group-parent':0,'passage':0,'instruction':0,'header':0,'unknown':0 },
     perSection: [],
     fallbackSections: [],
-    coverage: territory.length ? (covered.length/territory.length)*100 : 100,
+    coverage: territory.length ? (coveredSet.size/territory.length)*100 : 100,
   };
   for (const s of segments) diagnostics.segmentsByKind[s.kind]++;
 
@@ -510,7 +590,9 @@ function bodyLinesCount(range: {start:number,end:number}, territory: SourceLine[
   for (const l of territory) {
     const n = lineNumber(l);
     if (n>=range.start && n<=range.end) {
-      if (isQuestionStart(l) !== undefined) cnt++;
+      const intra = findIntraLineMultiNumbers(l.text);
+      if (intra.length >= 2) cnt += intra.length;
+      else if (isQuestionStart(l) !== undefined) cnt++;
       else if (isGroupParentLine(l.text).isGroup) cnt++;
     }
   }

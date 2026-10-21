@@ -28,7 +28,7 @@ import {
   loadExamDoc,
   saveExamDoc,
 } from '../store';
-import { duplicateExamDoc, exportExamJson, partialExportIssues } from '../utils/examExport';
+import { annotateLibrarySummaries, duplicateExamDoc, exportExamJson, partialExportIssues } from '../utils/examExport';
 import { ConfirmCard, Modal } from '../design/primitives';
 import { loadSettings } from '../store';
 import { answerLibraryQuestion } from '../pipeline/multiExamChat';
@@ -42,6 +42,7 @@ interface Props {
   onExamRenamed: (doc: ExamDoc) => void;
   onExamDeleted: (id: string) => void;
   onGoToImport: () => void;
+  initialSummaries?: ExamSummary[];
 }
 
 type SortMode = 'newest' | 'oldest' | 'name' | 'quality-desc' | 'quality-asc';
@@ -54,9 +55,12 @@ export const LibraryView: React.FC<Props> = ({
   onExamRenamed,
   onExamDeleted,
   onGoToImport,
+  initialSummaries,
 }) => {
-  const [legacyNotice, setLegacyNotice] = useState(() => localStorage.getItem('examparse_legacy_notice_seen') !== '1');
-  const [summaries, setSummaries] = useState<ExamSummary[]>([]);
+  const [legacyNotice, setLegacyNotice] = useState(() =>
+    typeof localStorage !== 'undefined' ? localStorage.getItem('examparse_legacy_notice_seen') !== '1' : true,
+  );
+  const [summaries, setSummaries] = useState<ExamSummary[]>(() => initialSummaries || []);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<SortMode>('newest');
@@ -127,36 +131,21 @@ export const LibraryView: React.FC<Props> = ({
   };
 
   const visible = useMemo(() => {
+    const annotatedAll = annotateLibrarySummaries(summaries, sort);
     const q = search.trim().toLowerCase();
     let filtered = q
-      ? summaries.filter(s =>
-          [s.displayName, s.subject || '', s.grade || '', s.fileName]
+      ? annotatedAll.filter(s =>
+          [s.displayName, s.subject || '', s.grade || '', s.fileName, s.modelUsed || '']
             .join(' ')
             .toLowerCase()
             .includes(q)
         )
-      : [...summaries];
+      : annotatedAll;
     if (qualityFilter !== 'all') {
       filtered = filtered.filter(s => {
-        const sc = (s as any).qualityScore ?? 0;
+        const sc = s.qualityScore ?? 0;
         return qualityFilter === 'needs-review' ? sc < 80 : sc >= 80;
       });
-    }
-    switch (sort) {
-      case 'oldest':
-        filtered.sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
-        break;
-      case 'name':
-        filtered.sort((a, b) => a.displayName.localeCompare(b.displayName));
-        break;
-      case 'quality-desc':
-        filtered.sort((a, b) => ((b as any).qualityScore ?? 0) - ((a as any).qualityScore ?? 0));
-        break;
-      case 'quality-asc':
-        filtered.sort((a, b) => ((a as any).qualityScore ?? 0) - ((b as any).qualityScore ?? 0));
-        break;
-      default:
-        filtered.sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0));
     }
     return filtered;
   }, [summaries, search, sort, qualityFilter]);
@@ -214,12 +203,12 @@ export const LibraryView: React.FC<Props> = ({
       setPendingExport(doc);
       return;
     }
-    exportExamJson(doc);
+    exportExamJson(doc, { siblingSummaries: summaries });
   };
 
   const confirmPendingExport = () => {
     if (!pendingExport) return;
-    exportExamJson(pendingExport);
+    exportExamJson(pendingExport, { siblingSummaries: summaries });
     setPendingExport(null);
   };
 
@@ -405,9 +394,27 @@ export const LibraryView: React.FC<Props> = ({
               const summaryMissing = Array.isArray(s.missingQuestionNos) ? s.missingQuestionNos : [];
               const summaryDuplicates = Array.isArray(s.duplicateQuestionNos) ? s.duplicateQuestionNos : [];
               const q = qualityLabel((s as any).qualityScore ?? 0);
+              const parsedCount = s.parsedQuestionCount ?? s.questionCount;
+              const expectedCount = s.expectedQuestionCount && s.expectedQuestionCount > 0 ? s.expectedQuestionCount : parsedCount;
+              const questionRatio = `${parsedCount}/${expectedCount}`;
+              const pointsRatio =
+                s.pointsParsed !== undefined
+                  ? s.pointsExpected !== undefined
+                    ? `${s.pointsParsed}/${s.pointsExpected}`
+                    : `${s.pointsParsed}`
+                  : undefined;
+              const healthChip: 'green' | 'amber' | 'red' | 'PARTIAL' =
+                s.healthState || (s.complete === true ? 'green' : 'PARTIAL');
+              const healthChipCls =
+                healthChip === 'green'
+                  ? 'border-[var(--ok)] bg-[var(--ok-soft)] text-[var(--ok)]'
+                  : healthChip === 'amber'
+                    ? 'border-[var(--warn)] bg-[var(--warn-soft)] text-[var(--warn-ink)]'
+                    : 'border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]';
               return (
                 <div
                   key={s.id}
+                  data-library-entry={s.id}
                   className="p-4 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper-raised)]  space-y-2.5"
                 >
                   <div className="flex items-start justify-between gap-3">
@@ -443,7 +450,26 @@ export const LibraryView: React.FC<Props> = ({
                       ) : (
                         <div className="font-semibold text-base text-[var(--ink)]  truncate">
                           {s.displayName}
-                          {s.complete !== true && <span title={`Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`} className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)] align-middle">PARTIAL — {s.parsedQuestionCount ?? s.questionCount}/{s.expectedQuestionCount ?? '?'}</span>}
+                          {s.isLatest && (
+                            <span
+                              data-library-latest="true"
+                              className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--ok-soft)] text-[var(--ok)] border border-[var(--ok)] align-middle"
+                            >
+                              Latest
+                            </span>
+                          )}
+                          <span
+                            data-library-health={healthChip}
+                            title={`Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`}
+                            className={`ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] border align-middle ${healthChipCls}`}
+                          >
+                            {healthChip}
+                          </span>
+                          {s.complete !== true && healthChip !== 'PARTIAL' && (
+                            <span className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)] align-middle">
+                              PARTIAL — {questionRatio}
+                            </span>
+                          )}
                           {isActive && (
                             <span className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)] align-middle">
                               open
@@ -480,11 +506,13 @@ export const LibraryView: React.FC<Props> = ({
 
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="text-[length:var(--type-12)] text-[var(--ink-2)] flex flex-wrap gap-x-3 gap-y-1">
+                      <span title={s.createdAt}>{formatDate(s.createdAt)}</span>
+                      <span>{questionRatio} questions</span>
+                      {pointsRatio !== undefined && <span>{pointsRatio} pts</span>}
+                      {s.modelUsed && <span className="font-mono">{s.modelUsed}</span>}
                       <span>{s.pages} pages</span>
-                      <span>{s.questionCount} questions</span>
                       <span>{s.imageCount} images</span>
                       <span>{s.sectionCount} sections</span>
-                      <span title={s.createdAt}>{formatDate(s.createdAt)}</span>
                       <span className="font-mono text-[var(--ok)] ">
                         ${s.totalCostUsd.toFixed(4)} lifetime · {s.totalTokens.toLocaleString()} toks
                       </span>

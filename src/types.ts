@@ -192,6 +192,7 @@ export interface ExamDoc {
    */
   partial?: boolean;
   usage: UsageRecord[];
+  modelInfo?: { fast?: string; escalation?: string; vision?: string };
   /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */
   guidanceTokens?: number;
   verdicts?: Record<string, any[]>;
@@ -357,6 +358,7 @@ export interface LLMRequest {
     defaultHeaders?: Record<string, string>;
     model: string;
     agentBudgetId?: string;
+    agentMaxCalls?: number;
     disableReasoning?: boolean;
     structuredOutputs?: boolean;
     extraBodyJson?: string;

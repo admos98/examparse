@@ -80,6 +80,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
   const pageImages: string[] = [];
 
   let globalLineNumber = 1;
+  let rawAssetCounter = 0;
   let imagesFound = 0; let imagesMerged = 0; let candidatesKept = 0;
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
@@ -338,8 +339,8 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           }
         }
 
-        // A1: allocate from ONE monotonically increasing counter across whole document
-        const assetId = `img_${String(images.length + pageAssets.length + 1).padStart(3, '0')}`; // global counter via images.length ensures uniqueness; reassignment after merging guarantees (page,y,x) order
+        // Temporary unique token prior to fragment merge; canonical img_001..img_NNN assigned once after ALL pages merge.
+        const assetId = `raw_img_${++rawAssetCounter}`;
 
         // Find nearest source line by y-coordinate on this page
         const pageLines = lines.filter(l => l.page === pageNum);
@@ -423,23 +424,8 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
     }
   }
 
-  // A1: after fragment merging reassign ids sequentially in (page,y,x) order
-  if (images.length > 1) {
-    const sorted = [...images].sort((a,b)=>{
-      if (a.page !== b.page) return a.page - b.page;
-      const ay = (a as any).y ?? a.bbox?.y ?? 0;
-      const by = (b as any).y ?? b.bbox?.y ?? 0;
-      if (ay !== by) return ay - by;
-      return (a.bbox?.x ?? 0) - (b.bbox?.x ?? 0);
-    });
-    const mapping = new Map<string,string>();
-    sorted.forEach((img, idx)=> mapping.set(img.id, `img_${String(idx+1).padStart(3,'0')}`));
-    for (const img of images) {
-      const newId = mapping.get(img.id);
-      if (newId) img.id = newId;
-    }
-    // Note: question images refs don't exist yet at extraction time; vision hints updated later via same mapping if needed
-  }
+  // Fix 5: assign sequential image IDs ONCE after all fragment merging from a single counter in (page, reading order).
+  assignExtractedImageIdsInPlace(images);
 
   return {
     lines,
@@ -451,6 +437,72 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
     scannedPageIndices,
     pageImages,
   };
+}
+
+/**
+ * Assign sequential `img_001..img_NNN` IDs ONCE after fragment merging from a single counter
+ * in `(page, y, x)` reading order using object identity (never colliding pre-merge string keys),
+ * updating `duplicateOf` references to canonical post-merge IDs.
+ */
+export function assignExtractedImageIds<T extends ImageAsset>(input: T[]): T[] {
+  const cloned = input.map(item => ({ ...item }));
+  assignExtractedImageIdsInPlace(cloned);
+  return cloned;
+}
+
+function assignExtractedImageIdsInPlace<T extends ImageAsset>(images: T[]): void {
+  if (!images.length) return;
+  const indexed = images.map((img, origIdx) => ({ img, origIdx, oldId: img.id }));
+  indexed.sort((a, b) => {
+    if (a.img.page !== b.img.page) return a.img.page - b.img.page;
+    const ay = (a.img as any).y ?? a.img.bbox?.y ?? 0;
+    const by = (b.img as any).y ?? b.img.bbox?.y ?? 0;
+    if (ay !== by) return ay - by;
+    const ax = a.img.bbox?.x ?? 0;
+    const bx = b.img.bbox?.x ?? 0;
+    if (ax !== bx) return ax - bx;
+    return a.origIdx - b.origIdx;
+  });
+
+  const newIdByObj = new Map<T, string>();
+  indexed.forEach((entry, idx) => {
+    newIdByObj.set(entry.img, `img_${String(idx + 1).padStart(3, '0')}`);
+  });
+
+  // Resolve any pre-merge duplicateOf reference to the canonical earliest asset (by sha, dHash, or oldId occurrence)
+  for (let i = 0; i < indexed.length; i++) {
+    const cur = indexed[i];
+    const newId = newIdByObj.get(cur.img)!;
+    cur.img.id = newId;
+    if (cur.img.duplicateOf) {
+      const target = indexed.slice(0, i).find(prev =>
+        prev.img.sha === cur.img.sha ||
+        prev.oldId === cur.img.duplicateOf ||
+        (Boolean(prev.img.dHash) && prev.img.dHash === cur.img.dHash)
+      );
+      cur.img.duplicateOf = target ? newIdByObj.get(target.img) : undefined;
+    }
+  }
+
+  // Keep `images` array in canonical reading order
+  images.splice(0, images.length, ...indexed.map(e => e.img));
+}
+
+/**
+ * Pure multi-page strip-merge + post-merge single-counter ID assignment pipeline used by PDF extraction.
+ */
+export function mergeExtractedPageImages(
+  pages: Array<{ page: number; pageAssets: ImageAsset[]; scale?: number }>,
+): ImageAsset[] {
+  const merged: ImageAsset[] = [];
+  for (const { page, pageAssets, scale = 1 } of pages) {
+    const groups = mergeAdjacentImageGeometry(pageAssets, scale);
+    for (const group of groups) {
+      const first = group.assets[0];
+      merged.push({ ...first, page, bbox: group.bbox });
+    }
+  }
+  return assignExtractedImageIds(merged);
 }
 
 /**

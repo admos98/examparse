@@ -4,7 +4,7 @@
  * META_TOTAL reconciliation → ownership map / ORPHAN_LINES. Pure, 0 model calls.
  */
 import type { ExamSection, Flag, Question, SourceLine } from '../types';
-import { assembleAndValidateSections } from './assemble';
+import { assembleAndValidateSections, canonicalizeSections } from './assemble';
 import { computeOwnership, orphanFlag, reassignSectionsByContainment, splitSectionsAtHeaders, type OwnershipMap } from './ownership';
 import { reconcileMetaTotal } from './quality';
 
@@ -51,12 +51,18 @@ export function applyLocalGates(params: {
     if (q && !q.flags?.includes('SECTION_AMBIGUOUS')) q.flags = [...(q.flags || []), 'SECTION_AMBIGUOUS'];
   }
 
+  const canonical = canonicalizeSections(sectionAssembly.sections, questions);
+  questions = canonical.questions;
+  for (const f of canonical.flags) {
+    if (!flags.some(existing => existing.code === f.code)) flags.push(f);
+  }
+
   const metaTotal = reconcileMetaTotal(params.metaTotalPoints, params.lines, keyLines, questions);
   if (metaTotal.flag) flags.push({ id: `flag_${metaTotal.flag.code}`, severity: metaTotal.flag.severity, code: metaTotal.flag.code, message: metaTotal.flag.message });
 
-  const ownership = computeOwnership({ lines: params.lines, questions, sections: sectionAssembly.sections, keyLines });
+  const ownership = computeOwnership({ lines: params.lines, questions, sections: canonical.sections, keyLines });
   const orphan = orphanFlag(ownership);
   if (orphan) flags.push({ id: 'flag_ORPHAN_LINES', severity: orphan.severity, code: orphan.code, message: orphan.message });
 
-  return { questions, sections: sectionAssembly.sections, totalPoints: metaTotal.totalPoints, flags, ownership, splits: sectionSplit.splits.length, reassigned: containment.reassigned.length, ambiguous: containment.ambiguous.length };
+  return { questions, sections: canonical.sections, totalPoints: metaTotal.totalPoints, flags, ownership, splits: sectionSplit.splits.length, reassigned: containment.reassigned.length, ambiguous: containment.ambiguous.length };
 }

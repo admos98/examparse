@@ -514,9 +514,14 @@ export interface ExamSummary {
   sectionCount: number;
   imageCount: number;
   ocrUsed: boolean;
-  qualityScore: number;
+  qualityScore?: number;
   totalCostUsd: number;
   totalTokens: number;
+  fileHash?: string;
+  pointsParsed?: number;
+  pointsExpected?: number;
+  healthState?: 'green' | 'amber' | 'red' | 'PARTIAL';
+  modelUsed?: string;
 }
 
 /** Enumerate stored exams WITHOUT restoring image blobs, newest first. */

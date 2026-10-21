@@ -11,7 +11,7 @@ import { extractDocument, ExtractedDocument } from './extract';
 import { tagFurniture, extractionDiagnostics } from './extractionQuality';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
-import { labelImagesBatched } from './vision';
+import { labelImagesBatched, fallbackImageKind } from './vision';
 import { assembleAndValidateQuestions, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
 import { validateSemantic } from './semanticValidators';
 import { buildCriticQueue, runCritic, recordVerdicts } from './critic';
@@ -538,8 +538,17 @@ export async function runFullPipeline(
   const questionHints = computeImageQuestionHints(updatedImages, structureData.rawQuestions || [], workingLines);
   updatedImages = updatedImages.map(img => {
     const hint = questionHints[img.id];
-    if (!hint || img.label?.role === 'decoration' || img.label?.kind === 'decoration') return img;
-    return { ...img, label: { ...(img.label || {}), role: img.label?.role || 'stem', questionRef: img.label?.questionRef || hint.questionRef } };
+    if (!hint || hint.page !== img.page || img.label?.role === 'decoration' || img.label?.kind === 'decoration') return img;
+    return {
+      ...img,
+      label: {
+        ...(img.label || {}),
+        role: img.label?.role || 'stem',
+        kind: img.label?.kind || fallbackImageKind(img),
+        questionRef: img.label?.questionRef || hint.questionRef,
+        source: img.label ? (img.label as any).source : 'geometry',
+      } as any,
+    };
   });
   let visionStageFlags: any[] = [];
   const visionCandidates = updatedImages.filter(img => img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
@@ -644,12 +653,23 @@ export async function runFullPipeline(
     ...(visionStageFlags || []),
   ].map((f: any, i: number) => ({ ...f, id: f.id || `flag_pipeline_${i + 1}` }));
 
-  // Attach locally hinted / vision-confirmed assets. Parent/group references are resolved before children.
+  // Attach locally hinted / vision-confirmed assets. Geometry-only labels require strict same-page (±0) spans; cross-page requires vision.
+  const workingLinePageByNo = new Map(workingLines.map(l => [Number(String(l.id).replace(/\D/g, '')), l.page]));
   for (const img of updatedImages) {
     if (img.label?.questionRef && img.label.role !== 'decoration' && img.label.kind !== 'decoration') {
       const matchQ = finalQuestions.find(q => q.id === img.label?.questionRef || q.label === img.label?.questionRef || String(q.no) === img.label?.questionRef);
-      if (matchQ && !matchQ.images.some(ref => ref.imageId === img.id)) {
-        matchQ.images.push({ imageId: img.id, role: img.label.role || 'stem', anchorLine: img.anchorLine });
+      const isGeometryOnly = (img.label as any).source === 'geometry';
+      const hasSamePageSpan = matchQ ? matchQ.spans.some(([s, e]) => {
+        for (let ln = s; ln <= e; ln++) if (workingLinePageByNo.get(ln) === img.page) return true;
+        return false;
+      }) : false;
+      if (matchQ && (!isGeometryOnly || hasSamePageSpan)) {
+        if (!matchQ.images.some(ref => ref.imageId === img.id)) {
+          matchQ.images.push({ imageId: img.id, role: img.label.role || 'stem', anchorLine: img.anchorLine });
+        }
+      } else if (isGeometryOnly && !hasSamePageSpan) {
+        // Cross-page geometry fallback is disallowed — clear forced ref so asset stays in unplaced tray
+        delete img.label;
       }
     }
     for (const imageFlag of img.imageFlags || []) {

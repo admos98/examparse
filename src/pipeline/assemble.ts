@@ -5,11 +5,12 @@
  */
 import { z } from 'zod';
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine } from '../types';
-import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks } from './quality';
+import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, enumerateExpectedQuestionNos, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
 import { validateSemantic, semanticConfidenceDeduction, semanticIssuesFor } from './semanticValidators';
 import { completeGapsRaw } from './ownership';
 import { isContentJunk, isFenceProtected } from './cleanup';
+import { findIntraLineMultiNumbers } from './segment';
 
 export const SpanReferenceSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]);
 export const RawQuestionSchema = z.object({
@@ -19,6 +20,8 @@ export const RawQuestionSchema = z.object({
   parentId: z.string().optional(),
   sectionId: z.string().optional(),
   spans: z.array(SpanReferenceSchema),
+  charStart: z.number().int().min(0).optional(),
+  charEnd: z.number().int().min(0).optional(),
   points: z.number().optional(),
   type: z.enum(['mcq', 'truefalse', 'short', 'long', 'fillblank', 'matching', 'multi', 'numeric', 'diagram', 'essay', 'unknown']).optional(),
   options: z.array(z.object({ key: z.string().optional(), spans: z.array(SpanReferenceSchema) })).optional(),
@@ -101,35 +104,171 @@ function sliceOptionUnion(options: any[], sourceLines: SourceLine[]): string {
 }
 
 type Marker = { start: number; end: number; key: string; display?: string };
-const LATIN = 'a-h';
-const PERSIAN_MARKERS = 'الف|ب|پ|ت|ث|ج|چ|ح|خ|د|ذ|ر|ز|ژ|س|ش|ص|ض|ط|ظ|ع|غ|ف|ق|ک|گ|ل|م|ن|و|ه|ی';
+const LATIN = 'a-j';
+const PERSIAN_MARKERS = 'الف|ب|پ|ت|ث|ج|چ|د|ه|و';
+const PERSIAN_SERIES: readonly (readonly string[])[] = [
+  ['الف', 'ب', 'ج', 'د', 'ه', 'و'],
+  ['الف', 'ب', 'پ', 'ت', 'ث', 'ج', 'چ'],
+];
 const OPTION_MARKER = new RegExp(`(^|\\s)(?:\\(([${LATIN}])\\)|([${LATIN}])[).:]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:])(?=\\s|$)`, 'gim');
+const LEADING_OPTION_MARKER_RE = new RegExp(`^\\s*(?:\\(([${LATIN}])\\)|([${LATIN}])[).:]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:])(?:\\s+|$)`, 'i');
+
+export function normalizeOptionText(text: string): string {
+  return text.replace(/`/g, "'").trim();
+}
+
+/**
+ * Trim trailing duplicated fragment of parent instruction / points note from an option string
+ * (e.g. `"giraffe 1/5 (یک کلمه اضافه است)"` against parent instruction `"… 1/5 (یک کلمه اضافه است)"`).
+ */
+export function trimOptionInstructionResidue(
+  optionText: string,
+  referenceInstruction: string,
+): { text: string; trimmed: boolean } {
+  const cleaned = normalizeOptionText(optionText);
+  if (!cleaned || !referenceInstruction) return { text: cleaned, trimmed: false };
+  const normRef = normalizeForMatching(referenceInstruction);
+  if (!normRef) return { text: cleaned, trimmed: false };
+
+  const view = matchingView(cleaned);
+  const v = view.text;
+  const candidateStarts: number[] = [];
+  for (let i = 1; i < v.length; i++) {
+    if ((/\s/.test(v[i - 1]) && !/\s/.test(v[i])) || v[i] === '(') {
+      candidateStarts.push(i);
+    }
+  }
+
+  for (const startIdx of candidateStarts) {
+    const rawHead = cleaned.slice(0, view.originalOffset(startIdx)).trim();
+    const rawTail = cleaned.slice(view.originalOffset(startIdx)).trim();
+    if (!rawHead || !rawTail) continue;
+    const normTail = normalizeForMatching(rawTail);
+    if (normTail.length < 4) continue;
+    const isInstructionShaped =
+      /[()（）]/.test(rawTail) ||
+      /(?:^|\s)\d+\s*[/٫.]\s*\d+(?:\s|$)/.test(normTail) ||
+      /اضافه|بارم|نمره|\bextra\b|\bpoint/i.test(normTail) ||
+      normTail.split(/\s+/).length >= 5;
+    if (!isInstructionShaped) continue;
+
+    // Direct normalized substring match OR bidi-reordered score + parenthetical match
+    let matchesRef = normRef.includes(normTail);
+    if (!matchesRef) {
+      const scoreStripped = normTail
+        .replace(/^\d+\s*[/٫.]\s*\d+\s*/, '')
+        .replace(/\s*\d+\s*[/٫.]\s*\d+$/, '')
+        .trim();
+      const scoreMatch = normTail.match(/\d+\s*[/٫.]\s*\d+/);
+      if (scoreStripped.length >= 4 && normRef.includes(scoreStripped) && (!scoreMatch || normRef.includes(scoreMatch[0]))) {
+        matchesRef = true;
+      }
+    }
+    if (matchesRef) {
+      return { text: normalizeOptionText(rawHead), trimmed: true };
+    }
+  }
+  return { text: cleaned, trimmed: false };
+}
+
+export function stripLeadingOptionMarker(text: string): string {
+  if (!text) return '';
+  if (!/^\s*[(（]?[a-jA-JＡ-Ｊالفبپتثجچدهو][).:）：]?/.test(text)) return normalizeOptionText(text);
+  const view = matchingView(text);
+  const m = LEADING_OPTION_MARKER_RE.exec(view.text);
+  if (!m) return normalizeOptionText(text);
+  return normalizeOptionText(text.slice(view.originalOffset(m[0].length)));
+}
+
+function selectOrderedMarkers(candidates: Marker[]): Marker[] {
+  if (candidates.length === 0) return [];
+  // 1. Ordered Latin sequence starting at 'a' (tie-break to later run so stem prose before real options never wins)
+  let bestLatin: Marker[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i].key !== 'a') continue;
+    const seq: Marker[] = [candidates[i]];
+    for (let j = i + 1; j < candidates.length; j++) {
+      if (candidates[j].key === String.fromCharCode(97 + seq.length)) seq.push(candidates[j]);
+    }
+    if (seq.length >= bestLatin.length) bestLatin = seq;
+  }
+  if (bestLatin.length >= 2) return bestLatin;
+
+  // 2. Ordered Persian sequence starting strictly at 'الف'
+  let bestFa: Marker[] = [];
+  for (const series of PERSIAN_SERIES) {
+    for (let i = 0; i < candidates.length; i++) {
+      if (candidates[i].key !== series[0]) continue;
+      const seq: Marker[] = [candidates[i]];
+      for (let j = i + 1; j < candidates.length && seq.length < series.length; j++) {
+        if (candidates[j].key === series[seq.length]) seq.push(candidates[j]);
+      }
+      if (seq.length >= bestFa.length) bestFa = seq;
+    }
+  }
+  if (bestFa.length >= 2) return bestFa;
+  return [];
+}
 
 function findOptionMarkers(text: string): Marker[] {
-  const found: Marker[] = [];
+  if (!text || findIntraLineMultiNumbers(text).length >= 2) return [];
+  const rawFound: Marker[] = [];
   const view = matchingView(text);
   OPTION_MARKER.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = OPTION_MARKER.exec(view.text))) {
     const markerStart = match.index + (match[1] || '').length;
     const key = (match[2] || match[3] || match[4] || match[5] || '').toLowerCase();
-    found.push({ start: view.originalOffset(markerStart), end: view.originalOffset(OPTION_MARKER.lastIndex), key });
+    rawFound.push({ start: view.originalOffset(markerStart), end: view.originalOffset(OPTION_MARKER.lastIndex), key });
   }
-  if (found.length === 0) {
+  const ordered = selectOrderedMarkers(rawFound);
+  if (ordered.length >= 2) return ordered;
+  if (rawFound.length === 0) {
     const pairs = [...view.text.matchAll(/(?:^|[\s/])(true|false|درست|نادرست)(?=\s|$|[).:/])/g)];
     const keys = pairs.map(m => m[1]);
     if ((keys.includes('true') && keys.includes('false')) || (keys.includes('درست') && keys.includes('نادرست'))) {
-      for (const m of pairs) { const start = m.index! + m[0].length - m[1].length; found.push({ start: view.originalOffset(start), end: view.originalOffset(start + m[1].length), key: m[1], display: text.slice(view.originalOffset(start), view.originalOffset(start + m[1].length)) }); }
+      return pairs.map(m => {
+        const start = m.index! + m[0].length - m[1].length;
+        return { start: view.originalOffset(start), end: view.originalOffset(start + m[1].length), key: m[1], display: text.slice(view.originalOffset(start), view.originalOffset(start + m[1].length)) };
+      });
     }
   }
-  return found;
+  return [];
+}
+
+function findLineStartOptionMarker(line: string): Marker | undefined {
+  if (!line || findIntraLineMultiNumbers(line).length >= 2) return undefined;
+  const view = matchingView(line);
+  const m = LEADING_OPTION_MARKER_RE.exec(view.text);
+  if (!m) return undefined;
+  const key = (m[1] || m[2] || m[3] || m[4] || '').toLowerCase();
+  const leadingWs = (line.match(/^\s*/)?.[0] || '').length;
+  return { start: leadingWs, end: view.originalOffset(m[0].length), key };
+}
+
+/** Deterministic inline option splitter: returns ≥2 non-empty ordered parts with markers stripped, else []. */
+export function splitInlineOptions(text: string): Array<{ key: string; text: string }> {
+  if (!text) return [];
+  const markers = findOptionMarkers(text);
+  if (markers.length < 2) return [];
+  const parts = markers.map((marker, index) => {
+    const next = markers[index + 1];
+    const rawBody = text.slice(marker.end, next ? next.start : text.length);
+    const body = stripLeadingOptionMarker(rawBody);
+    const value = marker.display && (!body || normalizeForMatching(body) === '/')
+      ? normalizeOptionText(marker.display)
+      : body;
+    return { key: String.fromCharCode(97 + index), text: value };
+  });
+  return parts.length >= 2 && parts.every(p => p.text.length > 0) ? parts : [];
 }
 
 /** Remove only text following explicit option markers; never delete ordinary stem words that match an option. */
 export function decontaminateOptionMarkup(text: string): string {
   return text.split(/\r?\n/).flatMap(line => {
+    if (findIntraLineMultiNumbers(line).length >= 2) return [line];
     // Explicit letter markers only: a stem such as "True or false: …" must not be cut at the word "True".
-    const first = findOptionMarkers(line).filter(marker => !marker.display)[0];
+    const first = findOptionMarkers(line).filter(marker => !marker.display)[0] ?? findLineStartOptionMarker(line);
     if (!first) return [line];
     const stemPrefix = line.slice(0, first.start).trimEnd();
     return stemPrefix ? [stemPrefix] : [];
@@ -139,19 +278,27 @@ export function decontaminateOptionMarkup(text: string): string {
 function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[]): { options?: Question['options']; failed: boolean } {
   if (!options || options.length === 0) return { options, failed: false };
   const text = sliceOptionUnion(options, sourceLines);
-  const markers = findOptionMarkers(text);
-  if (markers.length < 2) return { options, failed: false };
-  if (markers.length !== options.length) return { options, failed: true };
-  const segments = markers.map((marker, index) => {
-    const next = markers[index + 1];
-    const body = text.slice(marker.end, next ? next.start : text.length).trim();
-    return marker.display && (!body || normalizeForMatching(body) === '/') ? marker.display : body;
-  });
-  const ordered = [...options].sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
-  return {
-    options: ordered.map((option, index) => ({ ...option, text: segments[index] })),
-    failed: false,
-  };
+  const inlineParts = splitInlineOptions(text);
+  if (inlineParts.length >= 2) {
+    const ordered = [...options].sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
+    const pooledSpans = normalizedSpans(ordered.flatMap(o => o.spans));
+    return {
+      options: inlineParts.map((part, index) => ({
+        key: ordered[index]?.key && inlineParts.length === ordered.length ? ordered[index].key : part.key,
+        spans: ordered[index]?.spans && inlineParts.length === ordered.length ? ordered[index].spans : pooledSpans,
+        text: part.text,
+      })),
+      failed: false,
+    };
+  }
+  // No inline sequence found: strip leading markers (e.g. "a. item") on distinct per-option spans;
+  // NEVER fall back to duplicating a single unsplit blob across keys.
+  const cleaned = options.map(opt => ({ ...opt, text: stripLeadingOptionMarker(opt.text || '') }));
+  const distinctNonEmpty = new Set(cleaned.map(o => normalizeForMatching(o.text || '').trim()).filter(Boolean));
+  if (cleaned.length >= 2 && distinctNonEmpty.size >= 2) {
+    return { options: cleaned, failed: false };
+  }
+  return { options: [], failed: true };
 }
 
 function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
@@ -177,11 +324,12 @@ export function decontaminateStem(
       continue;
     }
     const markers = findOptionMarkers(line);
+    const firstMarker = markers[0] ?? findLineStartOptionMarker(line);
     const number = parsePrintedNumberFromStem(line);
     // Keep the stem prefix of an option line when it is this question's printed line or an
     // un-numbered continuation (gap-completed "He ___ to school. a) go b) went" lines).
-    if ((number === printedNo || number === undefined) && markers.length > 0 && line.slice(0, markers[0].start).trim()) {
-      output.push(line.slice(0, markers[0].start).trimEnd());
+    if ((number === printedNo || number === undefined) && firstMarker && line.slice(0, firstMarker.start).trim()) {
+      output.push(line.slice(0, firstMarker.start).trimEnd());
     }
   }
   return decontaminateOptionMarkup(output.join('\n'));
@@ -351,8 +499,52 @@ function assembleAndValidateQuestionsInner(
     for (const [k, v] of completed.synthesized) synthesizedByKey.set(k, v);
   }
 
+  // Fix 2 — expand intra-line multi-number lines (`63. a) ... 64. b) ... 65. c) ... 66. d) ...`)
+  // into parent (first number, whole task) + 1 child per additional number inheriting parent section/type.
+  {
+    const existingNos = new Set(rawList.map(r => Number(r?.no)).filter(n => Number.isFinite(n)));
+    const expandedList: any[] = [];
+    const byLineNo = lineIndexFor(sourceLines).byNo;
+    rawList.forEach((item, rIdx) => {
+      expandedList.push(item);
+      if (!item || typeof item !== 'object' || item.parentId) return;
+      const itemSpans = normalizedSpans(item.spans);
+      for (const ln of spanLineNumbers(itemSpans)) {
+        const srcLine = byLineNo.get(ln);
+        if (!srcLine || srcLine.furniture || keyLines.has(ln)) continue;
+        const multi = findIntraLineMultiNumbers(srcLine.text);
+        if (multi.length < 2 || multi[0].no !== Number(item.no)) continue;
+        const parentId = typeof item.id === 'string' && item.id ? item.id : `q${Number(item.no) || rIdx + 1}`;
+        item.id = parentId;
+        if (item.charStart === undefined && item.charEnd === undefined && itemSpans.length === 1 && itemSpans[0][0] === itemSpans[0][1]) {
+          item.charStart = multi[0].charStart;
+          item.charEnd = multi[0].charEnd;
+        }
+        for (const childItem of multi.slice(1)) {
+          if (existingNos.has(childItem.no)) continue;
+          existingNos.add(childItem.no);
+          expandedList.push({
+            id: `${parentId}_c${childItem.no}`,
+            no: childItem.no,
+            label: String(childItem.no),
+            parentId,
+            sectionId: item.sectionId,
+            type: item.type || 'matching',
+            spans: [[ln, ln]] as LineSpan[],
+            charStart: childItem.charStart,
+            charEnd: childItem.charEnd,
+            points: 0,
+            confidence: item.confidence,
+          });
+        }
+      }
+    });
+    rawList = expandedList;
+  }
+
   const pagesForWatermark = new Set(sourceLines.map(l=>l.page)).size;
   const learnedWatermarks = computeLearnedWatermarks(sourceLines, pagesForWatermark);
+  const lineById = lineIndexFor(sourceLines).byNo;
   let watermarkExcisionCount = 0;
   rawList.forEach((rawInput, idx) => {
     const raw = rawInput && typeof rawInput === 'object' ? { ...rawInput } : {};
@@ -396,9 +588,6 @@ function assembleAndValidateQuestionsInner(
     });
     let perQuestionWatermark = false;
     // A2: watermark excision on option slices BEFORE splitting (excision then split)
-    // We apply excision to the union text handling inside splitOptionTexts by pre-cleaning lines? Simplest: excise each rawOption text before split via temporary lines?
-    // Here we excise the union after rawOptions creation but before split by cleaning sourceLines copy for option union?
-    // Instead we excise after split per-option (still counts as stripped) and also ensure split uses excised text
     const split = splitOptionTexts(rawOptions, sourceLines);
     let assembledOptions = split.options || [];
     // Apply watermark excision to each option text (after split)
@@ -409,10 +598,15 @@ function assembleAndValidateQuestionsInner(
     });
     const optionSplitFailed = split.failed;
     if (optionSplitFailed) {
-      flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(sliceOptionUnion(rawOptions, sourceLines)).length}) did not match ${rawOptions.length} option spans; original option text retained.`, 'warn', qId));
+      flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(sliceOptionUnion(rawOptions, sourceLines)).length}) did not match ${rawOptions.length} option spans; unsplit option blob discarded.`, 'warn', qId));
+    }
+    const effectiveType = raw.type || 'unknown';
+    const optionsMissingForMcq = effectiveType === 'mcq' && assembledOptions.length < 2;
+    if (optionsMissingForMcq) {
+      assembledOptions = [];
+      flags.push(flag('OPTIONS_MISSING', `Question ${raw.label || qId}: MCQ has no valid split options; set options=[] instead of duplicating unsplit text.`, 'warn', qId));
     }
     // D — rewrite rights: fenced by default (garbled, number-free, non-key lines inside the question only).
-    const lineById = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
     const requestedRewrites: Array<{ line: number; text: string }> = Array.isArray(raw.rewrites) ? raw.rewrites.filter((r: any) => r && Number.isInteger(r.line) && typeof r.text === 'string') : [];
     const acceptedRewrites: Array<{ line: number; text: string }> = [];
     if (rewritePolicy === 'open') acceptedRewrites.push(...requestedRewrites);
@@ -424,29 +618,69 @@ function assembleAndValidateQuestionsInner(
         else { acceptedRewrites.push(rewrite); flags.push(flag('REWRITE_APPLIED', `Question ${raw.label || qId}: garbled L${String(rewrite.line).padStart(4, '0')} rendered from the model's rewrite; original retained for one-click revert.`, 'info', qId, `flag_REWRITE_APPLIED_${qId}_${rewrite.line}`)); }
       }
     }
-    const originalStemRaw = sliceSourceSpans(spans, sourceLines, acceptedRewrites);
+    // Intra-line char offset slicing (from segmenter or multi-number child expansion)
+    let resolvedCharStart: number | undefined = typeof raw.charStart === 'number' ? raw.charStart : undefined;
+    let resolvedCharEnd: number | undefined = typeof raw.charEnd === 'number' ? raw.charEnd : undefined;
+    if (resolvedCharStart === undefined && spans.length === 1 && spans[0][0] === spans[0][1]) {
+      const singleLine = lineById.get(spans[0][0]);
+      if (singleLine) {
+        const matchItem = findIntraLineMultiNumbers(singleLine.text).find(it => it.no === originalNo);
+        if (matchItem) { resolvedCharStart = matchItem.charStart; resolvedCharEnd = matchItem.charEnd; }
+      }
+    }
+    const hasIntraSlice = resolvedCharStart !== undefined && resolvedCharEnd !== undefined && spans.length === 1 && spans[0][0] === spans[0][1];
+    const originalStemRaw = hasIntraSlice
+      ? (lineById.get(spans[0][0])?.text || '').slice(resolvedCharStart, resolvedCharEnd).trim()
+      : sliceSourceSpans(spans, sourceLines, acceptedRewrites);
     const originalExc = exciseWatermarksWithLearned(originalStemRaw, learnedWatermarks);
     const originalStem = originalExc.text;
     if (originalExc.excised) { watermarkExcisionCount += originalExc.count; perQuestionWatermark = true; }
     const printedBeforeCleanup = parsePrintedNumberFromStem(originalStem) ?? originalNo;
-    let stem = decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
+    let stem = hasIntraSlice
+      ? originalStem
+      : decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
     const stemExc = exciseWatermarksWithLearned(stem, learnedWatermarks);
     if (stemExc.excised) { stem = stemExc.text; watermarkExcisionCount += stemExc.count; perQuestionWatermark = true; }
+    let optionResidueTrimmed = false;
+    if (assembledOptions.length > 0 && stem.trim()) {
+      assembledOptions = assembledOptions.map(opt => {
+        const tr = trimOptionInstructionResidue(opt.text || '', stem);
+        if (tr.trimmed) optionResidueTrimmed = true;
+        return tr.trimmed ? { ...opt, text: tr.text } : opt;
+      });
+      if (optionResidueTrimmed) {
+        flags.push(flag('OPTION_RESIDUE_TRIMMED', `Question ${raw.label || qId}: trimmed trailing parent instruction fragment from option text.`, 'info', qId));
+      }
+    }
     if (!stem.trim()) errors.push('Assembled stem is empty');
     const gapKey = String(raw.id || `#${idx}`);
     if (absorbedByKey.has(gapKey)) flags.push(flag('GAP_ABSORBED', `Question ${raw.label || qId}: ${absorbedByKey.get(gapKey)!.length} unclaimed line(s) after the model's anchor were absorbed locally (${absorbedByKey.get(gapKey)!.slice(0, 6).map(n => `L${String(n).padStart(4, '0')}`).join(', ')}${absorbedByKey.get(gapKey)!.length > 6 ? ', …' : ''}).`, 'info', qId));
     if (synthesizedByKey.has(gapKey)) flags.push(flag('OPTIONS_SYNTHESIZED', `Question ${raw.label || qId}: ${synthesizedByKey.get(gapKey)} option(s) split locally from printed markers the model did not return.`, 'info', qId));
 
-    // D3: printed source numbering is authoritative over a model's shifted label/no.
-    const printedNo = parsePrintedNumberFromStem(stem) ?? parsePrintedNumberFromStem(originalStem);
+    // D3 + Fix 2: validate assembled question number against printed number in first span line & stem.
+    const firstSpanLineObj = spans[0]?.[0] !== undefined ? lineById.get(spans[0][0]) : undefined;
+    const firstLinePrintedNo = !hasIntraSlice && firstSpanLineObj && !firstSpanLineObj.furniture
+      ? parsePrintedNumberFromStem(firstSpanLineObj.text.split(/\r?\n/)[0] || '')
+      : undefined;
+    const spanSourceLines = spanLineNumbers(spans).map(n => lineById.get(n)).filter((l): l is SourceLine => Boolean(l));
+    const childCoveredOnSpan = Boolean(raw.parentId) && enumerateExpectedQuestionNos(spanSourceLines).numbers.includes(originalNo);
+    const printedNo = childCoveredOnSpan
+      ? originalNo
+      : (firstLinePrintedNo ?? parsePrintedNumberFromStem(stem) ?? parsePrintedNumberFromStem(originalStem));
     let no = originalNo;
     let label = String(raw.label || originalNo);
     const numberingCorrected = printedNo !== undefined && printedNo !== originalNo;
+    const firstLineSlipped = !childCoveredOnSpan && firstLinePrintedNo !== undefined && firstLinePrintedNo !== originalNo;
     if (printedNo !== undefined) {
       no = printedNo;
       if (numberingCorrected || normalizeForMatching(label).replace(/[.)\s]/g, '') !== String(printedNo)) {
         label = String(printedNo);
-        if (numberingCorrected) flags.push(flag('NUMBERING_CORRECTED', `Question numbering corrected locally: ${originalNo} → ${printedNo}.`, 'info', qId));
+        if (numberingCorrected) {
+          flags.push(flag('NUMBERING_CORRECTED', `Question numbering corrected locally: ${originalNo} → ${printedNo}.`, 'info', qId));
+        }
+        if (firstLineSlipped) {
+          flags.push(flag('NUMBER_SLIPPED_CORRECTED', `Question emitted ${originalNo} when first span line printed ${firstLinePrintedNo}; renumbered to ${firstLinePrintedNo}.`, 'warn', qId));
+        }
       }
     }
 
@@ -502,6 +736,9 @@ function assembleAndValidateQuestionsInner(
     confidence = Math.max(0.05, Math.min(0.98, confidence));
     const questionFlags = [...(Array.isArray(raw.flags) ? raw.flags.map(String) : [])];
     if (optionSplitFailed && !questionFlags.includes('OPTION_SPLIT_FAILED')) questionFlags.push('OPTION_SPLIT_FAILED');
+    if (optionsMissingForMcq && !questionFlags.includes('OPTIONS_MISSING')) questionFlags.push('OPTIONS_MISSING');
+    if (firstLineSlipped && !questionFlags.includes('NUMBER_SLIPPED_CORRECTED')) questionFlags.push('NUMBER_SLIPPED_CORRECTED');
+    if (optionResidueTrimmed && !questionFlags.includes('OPTION_RESIDUE_TRIMMED')) questionFlags.push('OPTION_RESIDUE_TRIMMED');
     if (unknownImageRefs.length) questionFlags.push('IMAGE_REFERENCE_UNRESOLVED');
     if (overlaps) questionFlags.push('SPAN_OVERLAP');
     if (absorbedByKey.has(gapKey) && !questionFlags.includes('GAP_ABSORBED')) questionFlags.push('GAP_ABSORBED');
@@ -519,8 +756,8 @@ function assembleAndValidateQuestionsInner(
       spans,
       stem,
       points: typeof raw.points === 'number' ? raw.points : undefined,
-      type: raw.type || 'unknown',
-      options: assembledOptions.length ? assembledOptions : undefined,
+      type: effectiveType,
+      options: assembledOptions.length ? assembledOptions : (optionsMissingForMcq ? [] : undefined),
       answer,
       rewrites: acceptedRewrites,
       images: questionImages,
@@ -704,7 +941,7 @@ export interface AssembleSectionsResult { sections: ExamSection[]; flags: Flag[]
 export function assembleAndValidateSections(
   rawSections: any[],
   sourceLines: SourceLine[],
-  questions: Question[],
+  questions: Question[] = [],
   keyTerritoryLineNos: number[] | Set<number> = []
 ): AssembleSectionsResult {
   const flags: Flag[] = [];
@@ -775,7 +1012,61 @@ export function assembleAndValidateSections(
     if (points !== undefined && Math.abs(points - sectionSum) > 0.51) flags.push(flag('SECTION_POINTS_MISMATCH', `Section ${indexValue} question points sum (${sectionSum}) differs from header points (${points}).`, 'info'));
     return { id, index: indexValue, title, instructions: trimmed.text || undefined, points, passage: storedPassage, spans };
   });
-  return { sections: provisional, flags };
+  const canonical = canonicalizeSections(provisional, questions);
+  return { sections: canonical.sections, flags: [...flags, ...canonical.flags] };
+}
+
+/** Fix 4 — Canonical section identity: sort by first span line, index 1..n, remap missing sectionIds, flag SECTION_ORDER_CANONICALIZED if changed. */
+export function canonicalizeSections(
+  sections: ExamSection[],
+  questions: Question[] = [],
+): { sections: ExamSection[]; questions: Question[]; changed: boolean; flags: Flag[] } {
+  if (!sections.length) return { sections, questions, changed: false, flags: [] };
+  const firstSpanLine = (s: ExamSection) => s.spans?.length ? Math.min(...s.spans.map(sp => sp[0])) : Infinity;
+  let idChanged = false;
+  const allocatedIds = new Set<string>();
+  const deduped = sections.map(sec => {
+    let id = sec.id || 'sec_1';
+    if (allocatedIds.has(id)) {
+      let suffix = 2;
+      while (allocatedIds.has(`${id}_${suffix}`)) suffix++;
+      id = `${id}_${suffix}`;
+      idChanged = true;
+    }
+    allocatedIds.add(id);
+    return id === sec.id ? sec : { ...sec, id };
+  });
+
+  const sorted = [...deduped].sort((a, b) => {
+    const da = firstSpanLine(a);
+    const db = firstSpanLine(b);
+    if (da !== db) return da - db;
+    return (a.index || 0) - (b.index || 0);
+  });
+
+  const orderChanged = sorted.some((s, i) => s.id !== sections[i].id || s.index !== i + 1);
+  const canonical = sorted.map((s, i) => (s.index === i + 1 ? s : { ...s, index: i + 1 }));
+  const validIds = new Set(canonical.map(s => s.id));
+
+  let remappedAny = false;
+  const remappedQuestions = questions.map(q => {
+    if (!q.sectionId || validIds.has(q.sectionId)) return q;
+    const qLine = q.spans?.[0]?.[0];
+    const containing = qLine !== undefined
+      ? canonical.find(s => s.spans.some(([start, end]) => qLine >= start && qLine <= end))
+      : undefined;
+    const nearest = containing ?? (qLine !== undefined
+      ? [...canonical].sort((a, b) => Math.abs(firstSpanLine(a) - qLine) - Math.abs(firstSpanLine(b) - qLine))[0]
+      : canonical[0]);
+    remappedAny = true;
+    return nearest ? { ...q, sectionId: nearest.id } : q;
+  });
+
+  const changed = idChanged || orderChanged || remappedAny;
+  const outFlags: Flag[] = changed
+    ? [flag('SECTION_ORDER_CANONICALIZED', 'Section order and 1..n indices were canonicalized locally by source span position.', 'info', undefined, 'flag_SECTION_ORDER_CANONICALIZED')]
+    : [];
+  return { sections: canonical, questions: remappedQuestions, changed, flags: outFlags };
 }
 
 /** A1: Image ID uniqueness — reassign sequentially in (page, y, x) order, updating refs. */

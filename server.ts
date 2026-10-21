@@ -643,8 +643,20 @@ function summarizeStoredExam(doc: any): any {
     let passScore = 5; for (const q of qs) { if (q.text && /passage|reading.*text|listen/i.test(q.text) && (!q.sourceLineIds || q.sourceLineIds.length === 0)) { passScore = 0; break; } }
     qualityScore = Math.max(0, Math.min(100, covScore + ptsScore + optScore + imgScore + numScore + confScore + orphanScore + passScore));
   } catch { qualityScore = 0; }
+  const isPartialDoc = Boolean((doc as any)?.partial === true || (doc?.flags || []).some((f: any) => f.code === 'PARTIAL_EXAM'));
+  const healthState: 'green' | 'amber' | 'red' | 'PARTIAL' = isPartialDoc
+    ? 'PARTIAL'
+    : ((health.state as 'green' | 'amber' | 'red') || (health.complete ? 'green' : 'amber'));
+  const modelUsed =
+    doc?.modelInfo?.fast ||
+    usage.find((u: any) => u?.role === 'standard' || u?.role === 'fast')?.model ||
+    usage.find((u: any) => u?.role === 'escalation')?.model ||
+    usage.find((u: any) => Boolean(u?.model))?.model ||
+    doc?.modelInfo?.escalation ||
+    undefined;
   return {
     id: doc.id,
+    fileHash: doc.fileHash || undefined,
     displayName: getDisplayName(doc),
     subject: doc.meta?.subject,
     grade: doc.meta?.grade,
@@ -656,6 +668,10 @@ function summarizeStoredExam(doc: any): any {
     questionCount: Array.isArray(doc.questions) ? doc.questions.length : 0,
     expectedQuestionCount: health.expectedCount,
     parsedQuestionCount: health.parsedCount,
+    pointsParsed: health.pointsParsed,
+    pointsExpected: (health as any).pointsExpected ?? doc.meta?.totalPoints,
+    healthState,
+    modelUsed,
     coveragePercent: health.coveragePercent,
     missingQuestionNos: health.missing,
     duplicateQuestionNos: health.duplicates,
@@ -1076,8 +1092,13 @@ app.post('/api/llm', async (req: Request, res: Response) => {
   const consumeAgentCall = () => {
     if (!budgetId) return;
     const file = path.join(JOURNALS_DIR, `agent_budget_${budgetId}.json`);
-    const budget = readJsonFile(file, { calls: 0, maxOutputTokens: payload.maxOutputTokens || 1024 });
-    if (budget.calls >= 6) throw new Error('Assistant model-call bound reached (6); stopped safely.');
+    const requestedMaxCalls = Number(payload.providerConfig?.agentMaxCalls);
+    const maxCalls = Number.isFinite(requestedMaxCalls) && requestedMaxCalls > 0
+      ? Math.min(100, Math.max(1, Math.floor(requestedMaxCalls)))
+      : 6;
+    const budget = readJsonFile(file, { calls: 0, maxOutputTokens: payload.maxOutputTokens || 1024, maxCalls });
+    const bound = budget.maxCalls || maxCalls;
+    if (budget.calls >= bound) throw new Error(`Assistant model-call bound reached (${bound}); stopped safely.`);
     budget.calls++; atomicWriteJson(file, budget);
   };
   if (budgetId) {

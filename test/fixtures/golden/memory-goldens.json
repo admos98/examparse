@@ -105,6 +105,20 @@
       "sectionCount": 4,
       "rtl": false,
       "isLong": false
+    },
+    "gauntlet-lazy": {
+      "pages": 5,
+      "lines": 73,
+      "expectedQs": 20,
+      "languagesDetected": [
+        "fa",
+        "en"
+      ],
+      "hasKeyPages": true,
+      "hasImages": 0,
+      "sectionCount": 4,
+      "rtl": true,
+      "isLong": false
     }
   },
   "skillSelection": {
@@ -114,7 +128,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "english-mcq": {
@@ -123,7 +137,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "scanned-noisy": {
@@ -132,7 +146,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "two-column": {
@@ -141,7 +155,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "image-heavy": {
@@ -150,7 +164,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "giant-120": {
@@ -159,7 +173,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "separate-keyfile": {
@@ -168,7 +182,7 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
       "omitted": 3
     },
     "pathological-model": {
@@ -177,7 +191,16 @@
         "verify-and-repair-exam",
         "answer-key-handling"
       ],
-      "totalTokens": 591,
+      "totalTokens": 674,
+      "omitted": 3
+    },
+    "gauntlet-lazy": {
+      "selected": [
+        "image-placement",
+        "verify-and-repair-exam",
+        "answer-key-handling"
+      ],
+      "totalTokens": 674,
       "omitted": 3
     }
   },

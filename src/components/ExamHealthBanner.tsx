@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import { ExamDoc } from '../types';
 import { getExamHealth } from '../pipeline/quality';
+import { computeDocOwnership } from '../pipeline/ownership';
 import { computeQualityScore, qualityColor } from '../utils/qualityScore';
 
-export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onExplainScore?: (filter?: string)=>void }> = ({ doc, className = '', onExplainScore }) => {
+export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onExplainScore?: (filter?: string)=>void; /** B3 — jump to the first orphan line in Step 2. */ onJumpToSource?: (lineNo: number) => void }> = ({ doc, className = '', onExplainScore, onJumpToSource }) => {
   // getExamHealth throws if doc is incomplete (e.g. missing source.lines) — degrade to partial instead of white-screen
   let health: ReturnType<typeof getExamHealth>;
   try { health = getExamHealth(doc); } catch {
@@ -19,6 +20,8 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
     : health.state === 'red'
       ? 'border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]   '
       : 'border-[var(--warn)] bg-[var(--warn-soft)] text-[var(--warn-ink)]   ';
+  // B3 — orphan lines are recomputed from the current doc so edits in Step 4 move the number (the stored list is the parse-time snapshot).
+  const liveOrphans = React.useMemo(() => { try { return computeDocOwnership(doc).orphanLineNos; } catch { return doc.source?.orphanLineNos || []; } }, [doc]);
   const points = health.pointsExpected === undefined ? `${health.pointsParsed}` : `${health.pointsParsed} / ${health.pointsExpected}`;
   const partialCoverage = health.missing.length > 0 || health.duplicates.length > 0 || (health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51);
   const noQuestionsParsed = (doc.questions || []).length === 0;
@@ -31,7 +34,7 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
 
   return <div role="status" aria-live="polite" className={`rounded-[10px] border px-4 py-3 text-xs ${colors} ${className}`}>
     <div className="flex items-center justify-between gap-3">
-      <div className="font-bold">{health.state === 'green' ? 'Exam health: complete' : noQuestionsParsed ? 'PARTIAL EXAM — no questions parsed' : partialCoverage ? `PARTIAL EXAM — ${health.coveragePercent.toFixed(0)}% printed-number coverage` : health.state === 'red' ? 'PARTIAL EXAM — completeness is below 80%' : 'Exam health: review required'}</div>
+      <div className="font-bold">{health.state === 'green' ? 'Exam health: complete' : noQuestionsParsed ? 'PARTIAL EXAM — no questions parsed' : partialCoverage ? `PARTIAL EXAM — ${health.coveragePercent.toFixed(0)}% printed-number coverage` : health.state === 'red' ? 'PARTIAL EXAM — completeness is below 80%' : (health.hollowQuestions?.length || 0) > 0 ? `PARTIAL EXAM — ${health.hollowQuestions.length} question(s) failed local validators after repair` : 'Exam health: review required'}</div>
       <button
         onClick={()=> setShowBreakdown(!showBreakdown)}
         className={`shrink-0 px-2.5 py-1 rounded-[6px] border text-xs font-bold ${qTone} hover:opacity-90 transition`}
@@ -50,6 +53,15 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
       {health.unresolvedImageRefs.length > 0 && <span>{health.unresolvedImageRefs.length} unresolved image reference(s)</span>}
       {health.lowConfidenceCount > 0 && <span>{health.lowConfidenceCount} low-confidence question(s)</span>}
       {(health.parentLinkIssueCount || 0) > 0 && <span className="font-semibold">{health.parentLinkIssueCount} invalid nested-question link(s)</span>}
+      {(health.hollowQuestions?.length || 0) > 0 && <span className="font-semibold" title={health.hollowQuestions.map(h => `${h.label}: ${h.code}`).join(', ')}>{health.hollowQuestions.length} hollow/unverified question(s)</span>}
+      {liveOrphans.length > 0 && (() => {
+        const first = liveOrphans[0];
+        const rate = (quality?.details?.orphanRate ?? 0) * 100; // same denominator as the quality score (exam territory, non-skip lines)
+        return <span className={rate > 2 ? 'font-semibold' : ''} title="Exam-territory lines owned by no question or section (ORPHAN_LINES) — recomputed live after edits">
+          {liveOrphans.length} orphan line(s) ({rate.toFixed(1)}%)
+          {onJumpToSource && first !== undefined && <button onClick={() => onJumpToSource(first)} className="ms-1 underline hover:opacity-80">jump to L{String(first).padStart(4, '0')}</button>}
+        </span>;
+      })()}
     </div>
     {showBreakdown && (
       <div className="mt-3 p-3 rounded-[10px] bg-[var(--paper-raised)]  border border-[var(--rule)]  text-xs">
@@ -60,7 +72,8 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
           <button onClick={()=> onExplainScore?.('options')} className="text-start hover:underline">Options {quality.optionsCleanliness}/15 — blobs {quality.details.optionBlobCount}</button>
           <button onClick={()=> onExplainScore?.('images')} className="text-start hover:underline">Images {quality.imagePlacement}/15 — unplaced {quality.details.unplacedImages}</button>
           <button onClick={()=> onExplainScore?.('numbering')} className="text-start hover:underline">Numbering {quality.numbering}/10 — dup {quality.details.duplicateNumbers}</button>
-          <button onClick={()=> onExplainScore?.('confidence')} className="text-start hover:underline">Confidence {quality.confidence}/10 — low {quality.details.lowConfidenceCount}</button>
+          <button onClick={()=> onExplainScore?.('confidence')} className="text-start hover:underline">Confidence {quality.confidence}/6 — low {quality.details.lowConfidenceCount}</button>
+          <button onClick={()=> onExplainScore?.('orphan')} className="text-start hover:underline">Orphan lines {quality.orphan}/4 — {quality.details.orphanLines} line(s), {(quality.details.orphanRate * 100).toFixed(1)}%</button>
           <button onClick={()=> onExplainScore?.('passage')} className="text-start hover:underline col-span-2">Passage {quality.passage}/5 — {quality.details.passageMissing ? 'missing for reading/listening' : 'ok'}</button>
         </div>
         <div className="mt-2 text-[length:var(--type-12)] text-[var(--ink-2)]">Explain-my-score: clicking an item jumps to the exact questions/images causing it.</div>

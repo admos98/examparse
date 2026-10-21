@@ -6,7 +6,7 @@ import { LLMRequest, Question, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { T3_REPAIR_SYSTEM } from './prompts';
 import { applyMergePatch } from './patch';
-import { RawQuestionSchema, assembleTables, sanitizeSpansAgainstSource, sliceSourceSpans } from './assemble';
+import { RawQuestionSchema, assembleTables, lineNoFromId, rewriteRejection, sanitizeSpansAgainstSource, sliceSourceSpans, spanLineNumbers } from './assemble';
 
 export interface RepairResult {
   repairedQuestions: Question[];
@@ -15,6 +15,9 @@ export interface RepairResult {
   appliedCount?: number;
   rejectedCount?: number;
   restrictedCount?: number;
+  /** D — rewrite requests the fence refused (garbled-only, number-free, inside spans, ≤140 chars, never key). */
+  rewritesRejected?: number;
+  rewritesApplied?: number;
 }
 
 export async function runEscalationRepair(params: {
@@ -143,15 +146,33 @@ export async function runEscalationRepair(params: {
   let appliedCount = 0;
   let rejectedCount = 0;
   let restrictedCount = 0;
+  let rewritesRejected = 0;
+  let rewritesApplied = 0;
+  const lineByNo = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
   const repairedCandidates = allQuestions.map(q => {
     if (!patchMap.has(q.id)) return q;
     appliedCount++;
     const patch = patchMap.get(q.id);
     const merged = applyMergePatch(q, patch);
-    const newRewrites = merged.rewrites || q.rewrites;
     let restricted = false;
 
     const safeQuestionSpans = sanitizeSpansAgainstSource(merged.spans || q.spans, sourceLines, keyLineNos);
+    // D — the repair channel obeys the same rewrite fence as the structure pass: only locally
+    // garbled, digit-free, non-key lines inside the question's own spans, ≤140 chars.
+    let newRewrites = q.rewrites;
+    if (Array.isArray(merged.rewrites)) {
+      const allowed = new Set(spanLineNumbers(safeQuestionSpans.spans));
+      const previously = new Set((q.rewrites || []).map(r => `${r.line}:${r.text}`));
+      const kept = merged.rewrites.filter((r: any) => {
+        if (!r || !Number.isInteger(r.line) || typeof r.text !== 'string') { rewritesRejected++; return false; }
+        if (previously.has(`${r.line}:${r.text}`)) return true;
+        const reason = rewriteRejection(r, lineByNo.get(r.line), keyLineNos, allowed);
+        if (reason) { rewritesRejected++; return false; }
+        rewritesApplied++;
+        return true;
+      });
+      newRewrites = kept.length ? kept : undefined;
+    }
     restricted ||= safeQuestionSpans.clippedKeyLines || safeQuestionSpans.clippedMissingLines;
     if (!safeQuestionSpans.spans.length) {
       rejectedCount++;
@@ -219,5 +240,7 @@ export async function runEscalationRepair(params: {
     appliedCount,
     rejectedCount,
     restrictedCount,
+    rewritesRejected,
+    rewritesApplied,
   };
 }

@@ -92,6 +92,10 @@ export interface PreflightEstimate {
     imageTokens: number;
     visionCalls: number;
     ocrCalls: number;
+    /** A5 — Stage 2.5 cleanup judgment (0 when disabled/cached). */
+    cleanupCalls: number;
+    cleanupTokens: number;
+    cleanupCostUsd: number;
   };
 }
 
@@ -100,6 +104,7 @@ export interface PreflightStageModels {
   ocrModel?: string;
   visionModel?: string;
   repairModel?: string;
+  cleanupModel?: string;
 }
 
 export function calculatePreflightEstimate(params: {
@@ -114,6 +119,8 @@ export function calculatePreflightEstimate(params: {
   stageModels?: PreflightStageModels;
   maxImagesPerVisionCall?: number;
   providerKey?: string;
+  /** A5 — pre-computed cleanup call shape from estimateCleanupCall(); omit when cleanup is off or cached. */
+  cleanup?: { chunks: number; inputTokens: number; outputTokens: number };
 }): PreflightEstimate {
   const {
     text,
@@ -127,6 +134,7 @@ export function calculatePreflightEstimate(params: {
     stageModels,
     maxImagesPerVisionCall = 16,
     providerKey = 'default',
+    cleanup,
   } = params;
 
   // 1. Structure text input tokens (priced at structure model)
@@ -156,8 +164,18 @@ export function calculatePreflightEstimate(params: {
   const ocrOutputTokens = scannedPagesCount * 400;
   const visionOutputTokens = images.length * 20;
 
-  const estimatedInputTokens = textTokens + ocrTokens + imageTokens;
-  const estimatedOutputTokens = structureOutputTokens + ocrOutputTokens + visionOutputTokens;
+  // 4. Cleanup judgment (A5): one small call per ≤400 judged lines, priced at the cleanup role model
+  const cleanupModel = stageModels?.cleanupModel || structureModel;
+  const cleanupRate = costTable[cleanupModel] || { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 };
+  const cleanupCalls = cleanup?.chunks || 0;
+  const cleanupInput = cleanupCalls ? cleanup!.inputTokens : 0;
+  const cleanupOutput = cleanupCalls ? cleanup!.outputTokens : 0;
+  const cleanupCost =
+    (cleanupInput / 1_000_000) * cleanupRate.inputCostPerMillion +
+    (cleanupOutput / 1_000_000) * cleanupRate.outputCostPerMillion;
+
+  const estimatedInputTokens = textTokens + ocrTokens + imageTokens + cleanupInput;
+  const estimatedOutputTokens = structureOutputTokens + ocrOutputTokens + visionOutputTokens + cleanupOutput;
   const estimatedTotalTokens = estimatedInputTokens + estimatedOutputTokens;
 
   // Cost per stage
@@ -171,7 +189,7 @@ export function calculatePreflightEstimate(params: {
     (imageTokens / 1_000_000) * visionRate.inputCostPerMillion +
     (visionOutputTokens / 1_000_000) * visionRate.outputCostPerMillion;
 
-  const estimatedCostUsd = structureCost + ocrCost + visionCost;
+  const estimatedCostUsd = structureCost + ocrCost + visionCost + cleanupCost;
 
   const exceedsBudget = maxUsdPerRun > 0 && estimatedCostUsd > maxUsdPerRun;
   const warning50Percent = maxUsdPerRun > 0 && estimatedCostUsd > maxUsdPerRun * 0.5;
@@ -188,6 +206,9 @@ export function calculatePreflightEstimate(params: {
       imageTokens,
       visionCalls,
       ocrCalls,
+      cleanupCalls,
+      cleanupTokens: cleanupInput + cleanupOutput,
+      cleanupCostUsd: cleanupCost,
     },
   };
 }

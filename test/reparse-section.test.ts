@@ -27,7 +27,7 @@ function fixture(): ExamDoc {
   const lines = [
     { id: "L0001", page: 1, text: "Writing" },
     { id: "L0002", page: 1, text: "۱. مي‌شود؟ Original exact stem" },
-    { id: "L0003", page: 1, text: "۲. يكي ديگر؟" },
+    { id: "L0003", page: 1, text: "۲. يكي ديگر از پرسش‌های اين بخش؟" },
     { id: "L0004", page: 1, text: "Reading" },
     { id: "L0005", page: 1, text: "۳. Outside section — untouched" },
     { id: "L0006", page: 2, text: "راهنمای تصحیح" },
@@ -469,6 +469,8 @@ test("a human edit during preparation rejects the candidate before it becomes pe
 
 test("confirmed local candidate can commit at the six-call bound without another provider call, and a capped confirmation still cannot mutate", async () => {
   const h = setup();
+  // This test pins the historical 6/12 bound explicitly (E3 raised the defaults to 30/200).
+  h.runtime.getSettings().agentLimits = { maxModelCalls: 6, maxToolExecutions: 12 };
   const s = await runAgentTurn(
     h.runtime,
     newAgentSession(h.doc.id),
@@ -550,6 +552,6 @@ test("tool-bound turn does not spend calls preparing a candidate it could not su
   assert.ok(h.preparations <= 1, `preparations ${h.preparations} should be 0 or 1 with dedup`);
   assert.ok(s.pending === undefined || s.pending?.name === 'reparse_section');
   assert.equal(h.snapshots.length, 0);
-  assert.ok(s.executions <= 13);
+  assert.ok((s.weightedExecutions ?? s.executions) <= 13);
   assert.ok(s.events.at(-1)!.text.includes('Bounds reached') || s.events.at(-1)!.text.includes('Replace section') || s.events.some(e=>e.text.includes('Bounds reached')));
 });

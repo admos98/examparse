@@ -3,13 +3,16 @@
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
  * with content-hash caching, token thrift enforcement, and live stage status.
  */
-import { AppSettings, ExamDoc, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
+import { AppSettings, ExamDoc, LineTag, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
+import { CLEANUP_VERSION, runCleanupStage, cleanupKeySignature } from './cleanup';
+import { computeOwnership, orphanFlag } from './ownership';
+import { applyLocalGates } from './gates';
 import { extractDocument, ExtractedDocument } from './extract';
 import { tagFurniture, extractionDiagnostics } from './extractionQuality';
 import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
 import { labelImagesBatched } from './vision';
-import { assembleAndValidateQuestions, assembleAndValidateSections, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
+import { assembleAndValidateQuestions, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
 import { validateSemantic } from './semanticValidators';
 import { buildCriticQueue, runCritic, recordVerdicts } from './critic';
 import { consensusTriggerForSection, diffConsensus, resolveConsensusModel, CONSENSUS_CAPS } from './consensus';
@@ -19,7 +22,7 @@ import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpecte
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
-import { appendUsageRecord, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
+import { appendUsageRecord, getPipelineCache, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
 import { calculateActualCost, updateTokenCalibration } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 import { PARSER_VERSION } from './prompts';
@@ -260,6 +263,56 @@ export async function runFullPipeline(
   const expectedQuestionNos = expectedEnumeration.numbers;
   const keyTerritoryLineNos = [...expectedEnumeration.keyTerritory.lineNos].sort((a, b) => a - b);
 
+  // 2.5 STAGE: CLEANUP — AI judges lines, deterministic code tags them; nothing is deleted or edited.
+  const cleanupEnabled = settings.cleanupEnabled !== false;
+  let cleanupStats: NonNullable<ExamDoc['source']['cleanupStats']> | undefined;
+  let cleanupOverrides: Record<string, LineTag> = {};
+  const cleanupFlags: any[] = [];
+  let cleanupSignature = 'off';
+  {
+    // The local pre-pass always runs (deterministic, 0 calls); the Settings toggle governs the AI judgment only.
+    const cleanupStageName = 'Cleanup (Stage 2.5)';
+    onStageUpdate({ id: 'cleanup', name: cleanupStageName, status: 'running', message: cleanupEnabled ? 'Local pre-pass: furniture, page numbers, key territory, headers…' : 'AI cleanup disabled in Settings — local pre-pass only (0 calls)…' });
+    const cleanupSel = settings.roleMapping.cleanup || settings.roleMapping.fast;
+    const cleanupProvider = settings.providers.find(p => p.id === cleanupSel.providerId) || settings.providers[0];
+    const cleanupProviderConfig = cleanupEnabled && cleanupProvider ? { ...cleanupProvider, model: cleanupSel.model } : undefined;
+    try { cleanupOverrides = (await getPipelineCache<Record<string, LineTag>>(`cleanupOverrides:${fileHash}`)) || {}; } catch { cleanupOverrides = {}; }
+    const cleanupCacheParams = { fileHash, stage: 'cleanup' as const, provider: cleanupProviderConfig?.id || 'none', model: cleanupProviderConfig?.model || 'none', options: { linesHash, version: CLEANUP_VERSION } };
+    const cachedCleanup = !stageForced('cleanup') ? await getCachedStageResult<{ aiVerdicts: any[]; usage: any }>(cleanupCacheParams) : null;
+    const t0 = Date.now();
+    const cleanupResult = await runCleanupStage({
+      lines: workingLines, keyLines: new Set(keyTerritoryLineNos), pages: extracted.pages, expectedNumbers: expectedQuestionNos, overrides: cleanupOverrides,
+      enabled: cleanupEnabled,
+      cachedVerdicts: cleanupEnabled ? cachedCleanup?.aiVerdicts : undefined,
+      caller: cleanupProviderConfig ? async req => {
+        const response = await LLMAdapter.execute(
+          { role: 'cleanup', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: cleanupProviderConfig },
+          { onDelta: (channel, full) => onLiveText?.('cleanup', req.label, channel, full), onInfo: note => onLiveText?.('cleanup', req.label, 'info', note) },
+        );
+        return { rawText: response.rawText, json: response.json, usage: response.usage };
+      } : undefined,
+      onProgress: message => onStageUpdate({ id: 'cleanup', name: cleanupStageName, status: 'running', message }),
+    });
+    workingLines = cleanupResult.lines;
+    cleanupStats = cleanupResult.stats;
+    cleanupFlags.push(...cleanupResult.flags.map((f, i) => ({ id: `flag_${f.code}_${i + 1}`, code: f.code, severity: f.severity, message: f.message })));
+    cleanupSignature = cleanupKeySignature({ enabled: cleanupEnabled, model: cleanupProviderConfig?.model, overrides: cleanupOverrides });
+    let cleanupCost = 0;
+    if (cleanupResult.calls && cleanupProviderConfig) {
+      cleanupCost = calculateActualCost(cleanupResult.usage.inputTokens, cleanupResult.usage.outputTokens, cleanupProviderConfig.model, settings.costTable);
+      const rec: UsageRecord = { ts: new Date().toISOString(), role: 'cleanup', provider: cleanupProviderConfig.name, model: cleanupProviderConfig.model, inputTokens: cleanupResult.usage.inputTokens, outputTokens: cleanupResult.usage.outputTokens, costUsd: cleanupCost, label: `Cleanup (${cleanupResult.calls} call${cleanupResult.calls > 1 ? 's' : ''})` };
+      usageRecords.push(rec); appendUsageRecord(rec); onUsageUpdate?.(rec);
+      if (!cleanupResult.stats.aiSkipped) await writeStageCache(cleanupCacheParams, { aiVerdicts: cleanupResult.aiVerdicts, usage: cleanupResult.usage });
+    }
+    const st = cleanupResult.stats;
+    onStageUpdate({
+      id: 'cleanup', name: cleanupStageName,
+      status: cleanupResult.cached ? 'cached' : st.aiSkipped ? 'completed-with-problems' : 'completed',
+      durationMs: Date.now() - t0, inputTokens: cleanupResult.usage.inputTokens, outputTokens: cleanupResult.usage.outputTokens, costUsd: cleanupCost,
+      message: `${st.source === 'off' ? 'AI cleanup disabled — local tags only (0 calls) · ' : st.source === 'cached' ? 'Verdicts from cache (0 calls) · ' : st.aiSkipped ? 'AI cleanup skipped after retry — local tags only · ' : cleanupResult.calls ? `${cleanupResult.calls} call(s) · ` : 'local tags only (no provider) · '}judged ${st.judged} · junk ${st.junk} · suspect ${st.suspect} · fence-saved ${st.fenceSaved} · prompt lines ${st.linesBefore}→${st.linesAfter} (≈${st.tokensBefore}→${st.tokensAfter} tok).`,
+    });
+  }
+
   // 3. STAGE: STRUCTURE PASS (single call for short docs; bounded sections for long/weak-model docs)
   onStageUpdate({
     id: 'structure',
@@ -303,7 +356,7 @@ export async function runFullPipeline(
         stage: 'structure',
         provider: structProviderConfig.id,
         model: structProviderConfig.model,
-        options: { latex: settings.thrift.latexNormalization, linesHash },
+        options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature },
       })
     : null;
 
@@ -358,6 +411,9 @@ export async function runFullPipeline(
           guidance: structureGuidance,
           parallelSections: settings.parallelSections ?? 3,
           onNode: node => { onLiveText?.('structure', `node ${node.id}`, 'info', `${node.label || node.id}: ${node.status}${node.error ? ` — ${node.error}` : ''}`); callbacks.onNodeUpdate?.(node); },
+          // D — sections >40% [GARBLED?] go once to the escalation model (≤2 per pass).
+          escalationProviderConfig: (() => { const sel = settings.roleMapping.escalation; const prov = sel && settings.providers.find(p => p.id === sel.providerId); return prov ? { ...prov, model: sel.model } : undefined; })(),
+          garbledEscalationBudget: { count: 0, max: 2 },
         });
       } catch (err: any) {
         onStageUpdate({
@@ -402,7 +458,7 @@ export async function runFullPipeline(
           stage: 'structure',
           provider: structProviderConfig.id,
           model: structProviderConfig.model,
-          options: { latex: settings.thrift.latexNormalization, linesHash },
+          options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature },
         },
         structRes
       );
@@ -526,6 +582,7 @@ export async function runFullPipeline(
 
   let finalQuestions = assembled.questions;
   let allFlags: any[] = [
+    ...cleanupFlags,
     ...(structureData.flags || []),
     ...assembled.flags,
     ...(visionStageFlags || []),
@@ -615,6 +672,9 @@ export async function runFullPipeline(
       finalQuestions = repairRes.repairedQuestions;
       if (repairRes.rejectedCount) allFlags.push({ id: `flag_repair_rejected_${allFlags.length + 1}`, severity: 'error', code: 'REPAIR_SPAN_REJECTED', message: `${repairRes.rejectedCount} repaired question(s) were excluded because no safe question spans remained outside answer-key territory.` });
       if (repairRes.restrictedCount) allFlags.push({ id: `flag_repair_restricted_${allFlags.length + 1}`, severity: 'warn', code: 'REPAIR_SPAN_RESTRICTED', message: `${repairRes.restrictedCount} repaired item(s) had unsafe or answer-key spans clipped locally; review the remaining source anchors.` });
+      // D — rewrite fence on the repair channel (same rules as the structure pass).
+      if (repairRes.rewritesRejected) allFlags.push({ id: `flag_repair_rewrite_rejected_${allFlags.length + 1}`, severity: 'info', code: 'REWRITE_REJECTED', message: `${repairRes.rewritesRejected} repair rewrite(s) rejected by the fence (not locally garbled, carried digits/markers, outside spans, >140 chars or key territory); original text kept.` });
+      if (repairRes.rewritesApplied) allFlags.push({ id: `flag_repair_rewrite_applied_${allFlags.length + 1}`, severity: 'info', code: 'REWRITE_APPLIED', message: `${repairRes.rewritesApplied} garbled line(s) rendered from repair rewrites; originals retained for one-click revert in Step 4.` });
 
       // Merge shapeMismatch flag from repair
       if (repairRes.shapeMismatch) {
@@ -678,6 +738,26 @@ export async function runFullPipeline(
     });
   }
 
+  // C2 — error validators are re-run after repair: fixed items lose their flag, survivors stay honest.
+  {
+    const errorCodes = new Set(['STEM_HOLLOW', 'OPTIONS_MISSING']);
+    const still = new Map<string, string[]>();
+    for (const issue of validateSemantic(finalQuestions, [], q => sliceSourceSpans(q.spans, workingLines))) {
+      if (issue.severity === 'error' && issue.questionId) still.set(issue.questionId, [...(still.get(issue.questionId) || []), issue.code]);
+    }
+    for (const q of finalQuestions) {
+      const keep = new Set(still.get(q.id) || []);
+      const before = q.flags || [];
+      q.flags = before.filter(code => !errorCodes.has(code) || keep.has(code));
+      for (const code of keep) if (!q.flags.includes(code)) q.flags.push(code);
+    }
+    allFlags = allFlags.filter(f => !(errorCodes.has(f.code) && f.questionId && !still.get(f.questionId)?.includes(f.code)));
+    const survivors = [...still.entries()];
+    if (survivors.length && assembled.failingQuestions.length) {
+      allFlags.push({ id: 'flag_repair_survivors', severity: 'error', code: 'REPAIR_SURVIVORS', message: `${survivors.length} question(s) still fail local validators after escalation repair: ${survivors.slice(0, 10).map(([id, codes]) => `${finalQuestions.find(q => q.id === id)?.label || id} (${codes.join('/')})`).join(', ')}${survivors.length > 10 ? ', …' : ''}. Shown as PARTIAL in Step 4.` });
+    }
+  }
+
   // 6.5 External Answer Key File Integration (If attached by user)
   if (options?.answerKeyFile) {
     try {
@@ -697,23 +777,22 @@ export async function runFullPipeline(
     }
   }
 
+  // B/C — shared local gates: section split at inner headers, containment reassignment, META_TOTAL, ownership.
+  const gates = applyLocalGates({ questions: finalQuestions, rawSections: structureData.sections || [], lines: workingLines, keyLines: keyTerritoryLineNos, metaTotalPoints: totalDeclaredPoints });
+  finalQuestions = gates.questions;
+  const reconciledTotalPoints = gates.totalPoints;
+  allFlags.push(...gates.flags.filter(f => f.code !== 'ORPHAN_LINES'));
+  if (reconciledTotalPoints !== totalDeclaredPoints) allFlags = allFlags.filter(f => f.code !== 'POINTS_MISMATCH');
+
   // Local completeness and section hygiene run after every structure outcome, including cache/resume/chunk/repair paths.
-  const coverage = evaluateCoverage(expectedQuestionNos, finalQuestions, totalDeclaredPoints);
+  const coverage = evaluateCoverage(expectedQuestionNos, finalQuestions, reconciledTotalPoints);
   if (coverage.missing.length && !allFlags.some(f => f.code === 'COVERAGE_MISSING')) allFlags.push({ id: 'flag_coverage_missing', severity: 'error', code: 'COVERAGE_MISSING', message: `Missing printed question numbers: ${coverage.missing.join(', ')}.` });
   if (coverage.duplicates.length && !allFlags.some(f => f.code === 'COVERAGE_DUPLICATE')) allFlags.push({ id: 'flag_coverage_duplicate', severity: 'warn', code: 'COVERAGE_DUPLICATE', message: `Duplicate printed question numbers: ${coverage.duplicates.join(', ')}.` });
-  if (!coverage.pointsMatch && !allFlags.some(f => f.code === 'POINTS_MISMATCH')) allFlags.push({ id: 'flag_points_mismatch', severity: 'warn', code: 'POINTS_MISMATCH', message: `Points sum ${coverage.pointsParsed} does not match header ${totalDeclaredPoints}; deficit ${coverage.pointDeficit}.` });
+  if (!coverage.pointsMatch && !allFlags.some(f => f.code === 'POINTS_MISMATCH')) allFlags.push({ id: 'flag_points_mismatch', severity: 'warn', code: 'POINTS_MISMATCH', message: `Points sum ${coverage.pointsParsed} does not match header ${reconciledTotalPoints}; deficit ${coverage.pointDeficit}.` });
   if (coverage.missing.length && !allFlags.some(f => f.code === 'PARTIAL_COVERAGE')) allFlags.push({ id: 'flag_partial_coverage', severity: 'error', code: 'PARTIAL_COVERAGE', message: `Recovery exhausted with ${coverage.missing.length} missing question(s): ${coverage.missing.join(', ')}.` });
   if (!finalQuestions.length && !allFlags.some(f => f.code === 'STRUCTURE_EMPTY')) allFlags.push({ id: 'flag_structure_empty', severity: 'error', code: 'STRUCTURE_EMPTY', message: 'No questions were reconstructed; the document remains incomplete.' });
 
-  // Fill undeclared section ids locally from the question's source span.
-  finalQuestions = finalQuestions.map(question => {
-    if (question.sectionId) return question;
-    const firstLine = question.spans[0]?.[0];
-    const section = structureData.sections?.find((candidate: any) => (candidate.spans || []).some((span: any) => firstLine >= span[0] && firstLine <= span[1]));
-    return section ? { ...question, sectionId: section.id } : question;
-  });
-  const sectionAssembly = assembleAndValidateSections(structureData.sections, workingLines, finalQuestions, keyTerritoryLineNos);
-  allFlags.push(...sectionAssembly.flags.map((f, i) => ({ ...f, id: f.id || `flag_section_${i + 1}` })));
+  const sectionAssembly = { sections: gates.sections };
 
   // 2A (d)/(e): section-aware semantic validators, now that sections exist.
   for (const issue of validateSemantic(finalQuestions, sectionAssembly.sections)) {
@@ -895,6 +974,11 @@ export async function runFullPipeline(
   const diagnostics = extractionDiagnostics(workingLines, extracted.pages, updatedImages,
     extracted.scannedPageIndices.filter(page => workingLines.some(line => line.page === page)), extracted.diagnostics);
   for (const page of diagnostics.emptyPages) allFlags.push({ id: `extraction_empty_${page}`, code: 'EXTRACTION_PAGE_EMPTY', severity: 'error', message: `Page ${page} has no extracted or OCR text. Review import.` });
+  // B3 (after consensus/critic) — ownership map → ORPHAN_LINES (info ≤2%, warn above).
+  const ownership = computeOwnership({ lines: workingLines, questions: finalQuestions, sections: sectionAssembly.sections, keyLines: keyTerritoryLineNos });
+  const orphan = orphanFlag(ownership);
+  if (orphan) allFlags.push({ id: 'flag_ORPHAN_LINES', severity: orphan.severity, code: orphan.code, message: orphan.message });
+
   let examDoc: ExamDoc = {
     id: examId,
     fileHash,
@@ -909,7 +993,7 @@ export async function runFullPipeline(
       term: structureData.meta?.term,
       year: structureData.meta?.year,
       durationMinutes: structureData.meta?.durationMinutes,
-      totalPoints: structureData.meta?.totalPoints,
+      totalPoints: reconciledTotalPoints,
       language,
       direction: langDirection,
     },
@@ -926,6 +1010,9 @@ export async function runFullPipeline(
       pageThumbKeys: extracted.pageThumbKeys || [],
       expectedQuestionNos,
       keyTerritoryLineNos,
+      orphanLineNos: ownership.orphanLineNos,
+      ...(cleanupStats ? { cleanupStats } : {}),
+      ...(Object.keys(cleanupOverrides).length ? { cleanupOverrides } : {}),
     },
     flags: allFlags,
     usage: usageRecords,
@@ -950,6 +1037,7 @@ export async function runFullPipeline(
       job.ladderPath = [
         'extract',
         ...(ocrUsed ? ['ocr'] : []),
+        'cleanup',
         'structure',
         ...(structureData.callUsage?.length ? structureData.callUsage.map((call: any) => String(call.label || 'structure')) : []),
         ...(updatedImages.length ? ['vision'] : []),

@@ -1,4 +1,5 @@
 import { applyExamMutation } from '../pipeline/patch';
+import { decontaminateStem } from '../pipeline/assemble';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Edit3,
@@ -39,6 +40,8 @@ interface Props {
   onProceedToExamView: () => void;
   retryRequest?: number;
   onRetryRequestHandled?: () => void;
+  /** B3 — orphan jump to Step 2 (only when the import is still open in this session). */
+  onJumpToSource?: (lineNo: number) => void;
 }
 
 export const Step4Review: React.FC<Props> = ({
@@ -48,6 +51,7 @@ export const Step4Review: React.FC<Props> = ({
   onProceedToExamView,
   retryRequest = 0,
   onRetryRequestHandled,
+  onJumpToSource,
 }) => {
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
   const [patchModalQuestion, setPatchModalQuestion] = useState<Question | null>(null);
@@ -130,6 +134,16 @@ export const Step4Review: React.FC<Props> = ({
     const updated: ExamDoc = { ...examDoc, questions: nextQuestions, images: nextImages };
     onUpdateDoc(updated);
     saveExamDoc(updated);
+  };
+
+  // D — one-click revert of a model rewrite: drop the rewrite and re-slice the stem from the ORIGINAL lines.
+  const handleRevertRewrite = (qId: string, lineNo?: number) => {
+    const q = examDoc.questions.find(item => item.id === qId);
+    if (!q) return;
+    const remaining = (q.rewrites || []).filter(r => lineNo !== undefined && r.line !== lineNo);
+    const stem = decontaminateStem(q.spans, (q.options || []).flatMap(o => o.spans || []), examDoc.source.lines, q.no, remaining.length ? remaining : undefined);
+    const flags = remaining.length ? q.flags : (q.flags || []).filter(code => code !== 'REWRITE_APPLIED');
+    handleUpdateQuestion(qId, { rewrites: remaining.length ? remaining : undefined, stem, flags });
   };
 
   // Update a question in examDoc
@@ -436,7 +450,7 @@ export const Step4Review: React.FC<Props> = ({
         </div>
       </div>
 
-      <ExamHealthBanner doc={examDoc} onExplainScore={(f)=> { if(f) setFilterType(f); setScoreExplain('Quality score: coverage 30 + points 15 + options 15 + images 15 + numbering 10 + confidence 10 + passage 5'); }} />
+      <ExamHealthBanner doc={examDoc} onJumpToSource={onJumpToSource} onExplainScore={(f)=> { if(f) setFilterType(f); setScoreExplain('Quality score: coverage 30 + points 15 + options 15 + images 15 + numbering 10 + confidence 6 + orphan lines 4 + passage 5'); }} />
       {/* Proactive suggestions (F1): silent-by-default, dismissible, ≤3 chips */}
       {(() => {
         const chips = computeSuggestions(examDoc).filter(c=> !dismissedChips.has(c.id));
@@ -446,7 +460,7 @@ export const Step4Review: React.FC<Props> = ({
             <button onClick={()=> {
               if (c.id==='missing') handleRetryMissingCoverage();
               else if (c.id==='unplaced') setShowImageManager(true);
-              else if (c.id==='quality') setScoreExplain((()=>{ const q=computeQualityScore(examDoc); return `Coverage ${q.coverage}/30, Points ${q.points}/15, Options ${q.optionsCleanliness}/15, Images ${q.imagePlacement}/15, Numbering ${q.numbering}/10, Confidence ${q.confidence}/10, Passage ${q.passage}/5 = Total ${q.total}/100`; })());
+              else if (c.id==='quality') setScoreExplain((()=>{ const q=computeQualityScore(examDoc); return `Coverage ${q.coverage}/30, Points ${q.points}/15, Options ${q.optionsCleanliness}/15, Images ${q.imagePlacement}/15, Numbering ${q.numbering}/10, Confidence ${q.confidence}/6, Orphan lines ${q.orphan}/4, Passage ${q.passage}/5 = Total ${q.total}/100`; })());
             }} className="font-medium hover:underline cursor-pointer">{c.label}</button>
             <button onClick={()=> setDismissedChips(s=> new Set([...s, c.id]))} className="opacity-80 hover:opacity-100 cursor-pointer"><X className="w-3 h-3" /></button>
           </span>
@@ -724,6 +738,13 @@ export const Step4Review: React.FC<Props> = ({
                           >
                             {((q.confidence ?? 1) * 100).toFixed(0)}% conf
                           </span>
+                          {/* Per-question validator/funnel flags (C1/B2/D): error codes red, the rest muted. */}
+                          {(q.flags || []).length > 0 && (q.flags || []).slice(0, 4).map(code => {
+                            const isError = code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS';
+                            const label = code === 'GAP_ABSORBED' ? 'gap absorbed' : code === 'REWRITE_APPLIED' ? 'rewrite' : code === 'OPTIONS_SYNTHESIZED' ? 'options synthesized' : code === 'SECTION_REASSIGNED' ? 'section reassigned' : code.toLowerCase().replace(/_/g, ' ');
+                            return <span key={code} title={code} className={`px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] border ${isError ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger-soft)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{label}</span>;
+                          })}
+                          {(q.flags || []).length > 4 && <span className="text-[length:var(--type-12)] text-[var(--ink-2)]" title={(q.flags || []).slice(4).join(', ')}>+{(q.flags || []).length - 4}</span>}
                           {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded-[6px] bg-[var(--paper)] px-2 py-1 text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)]  ">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
                         </div>
 
@@ -782,6 +803,22 @@ export const Step4Review: React.FC<Props> = ({
                         ) : (
                           <div className="text-xs text-[var(--ink)]  whitespace-pre-wrap leading-relaxed">
                             {q.stem}
+                          </div>
+                        )}
+                        {/* D — rewrites are rendering-only: show original ⮕ rewrite with one-click revert. */}
+                        {(q.rewrites || []).length > 0 && (
+                          <div className="mt-1.5 space-y-1 rounded-[6px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">
+                            <div className="font-semibold">REWRITE_APPLIED — {(q.rewrites || []).length} garbled line(s) rendered from the model's rewrite (original retained)</div>
+                            {(q.rewrites || []).map(r => {
+                              const original = examDoc.source.lines.find(l => Number(l.id.replace(/\D/g, '')) === r.line)?.text || '';
+                              return (
+                                <div key={r.line} className="flex items-start gap-2">
+                                  <span className="font-mono shrink-0">L{String(r.line).padStart(4, '0')}</span>
+                                  <span className="min-w-0 flex-1 break-words"><span className="line-through opacity-70">{original}</span> ⮕ <span className="font-medium">{r.text}</span></span>
+                                  <button onClick={() => handleRevertRewrite(q.id, r.line)} className="shrink-0 rounded-[4px] border border-[var(--warn)] px-1.5 py-0.5 hover:bg-[var(--paper)]">Revert</button>
+                                </div>
+                              );
+                            })}
                           </div>
                         )}
                       </div>

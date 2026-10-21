@@ -638,10 +638,11 @@ export const SettingsModal: React.FC<Props> = ({
                 </div>
 
                 <div className="space-y-4">
-                  {(['fast', 'standard', 'escalation', 'vision', 'agent', 'critic', 'consensus'] as const).map(role => {
+                  {(['fast', 'cleanup', 'standard', 'escalation', 'vision', 'agent', 'critic', 'consensus'] as const).map(role => {
                     const sel = current.roleMapping[role] || current.roleMapping.fast;
                     const labelMap: Record<string, string> = {
                       agent: 'Assistant (defaults to Fast until configured)',
+                      cleanup: 'Cleanup (Stage 2.5 line judgment — defaults to Fast; cheapest model is fine)',
                       fast: 'Fast (Structure Pass — Span references)',
                       standard: 'Standard (General questions)',
                       escalation: 'Escalation (Repair failing items & ambiguity)',
@@ -833,6 +834,19 @@ export const SettingsModal: React.FC<Props> = ({
                           thrift: { ...prev.thrift, cacheEnabled: e.target.checked },
                         }))
                       }
+                      className="w-4 h-4 rounded-[6px] text-[var(--accent-ink)]"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between p-3.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] ">
+                    <div>
+                      <div className="font-medium text-[var(--ink)] ">Cleanup Judgment (Stage 2.5)</div>
+                      <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">One cheap AI call tags junk/header lines before structure (fewer prompt tokens). Off = local regex tags only; never deletes or edits lines.</div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={current.cleanupEnabled !== false}
+                      onChange={e => setCurrent(prev => ({ ...prev, cleanupEnabled: e.target.checked }))}
                       className="w-4 h-4 rounded-[6px] text-[var(--accent-ink)]"
                     />
                   </div>

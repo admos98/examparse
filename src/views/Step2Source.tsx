@@ -8,8 +8,10 @@ import {
   ArrowRight,
   ImageIcon,
 } from 'lucide-react';
-import { ImageAsset, SourceLine } from '../types';
-import { getImageBlob } from '../store';
+import { ImageAsset, LineTag, SourceLine } from '../types';
+import { getImageBlob, getPipelineCache, setPipelineCache } from '../store';
+import { runCleanupStage, isPromptOmitted } from '../pipeline/cleanup';
+import { enumerateExpectedQuestionNos } from '../pipeline/quality';
 
 interface Props {
   diagnostics?: import('../pipeline/extractionQuality').ExtractionDiagnostics;
@@ -20,7 +22,26 @@ interface Props {
   pageThumbKeys?: string[];
   images: ImageAsset[];
   onProceedToAnalyze: () => void;
+  /** A4 — Cleanup lens: overrides are stored per file hash and respected by the pipeline. */
+  fileHash?: string;
+  /** Post-parse lines carrying AI verdict tags (when the open exam matches this import). */
+  taggedLines?: SourceLine[];
+  /** Line number to scroll to (Step 4 → Step 2 orphan jump). */
+  focusLine?: number;
+  /** B3 — lines the last parse left unowned (ORPHAN_LINES); enables the Orphan lens. */
+  orphanLineNos?: number[];
 }
+
+type CleanupLens = 'all' | 'kept' | 'junk' | 'suspect' | 'orphan';
+const JUNK_TAGS = new Set<LineTag>(['junk', 'pagenum', 'furniture']);
+export function lensMatches(line: SourceLine, lens: CleanupLens, orphanLineNos?: Set<number>): boolean {
+  if (lens === 'all') return true;
+  if (lens === 'orphan') return Boolean(orphanLineNos?.has(Number(line.id.replace(/\D/g, ''))));
+  if (lens === 'junk') return Boolean(line.tag && JUNK_TAGS.has(line.tag));
+  if (lens === 'suspect') return line.tag === 'suspect-junk' || Boolean(line.garbled);
+  return !(line.tag && JUNK_TAGS.has(line.tag)) && line.tag !== 'suspect-junk';
+}
+const TAG_LABEL: Record<string, string> = { keep: 'KEEP', junk: 'JUNK', 'suspect-junk': 'SUSPECT', furniture: 'FURNITURE', pagenum: 'PAGE#', key: 'KEY', header: 'HDR', instruction: 'INSTR', question: 'Q', option: 'OPT', passage: 'PASSAGE', dialogue: 'DIALOGUE', 'table-row': 'ROW' };
 
 export const Step2Source: React.FC<Props> = ({
   diagnostics,
@@ -31,11 +52,79 @@ export const Step2Source: React.FC<Props> = ({
   pageThumbKeys = [],
   images = [],
   onProceedToAnalyze,
+  fileHash,
+  taggedLines,
+  focusLine,
+  orphanLineNos,
 }) => {
   const [showLineIds, setShowLineIds] = useState(true);
-  const [activePage, setActivePage] = useState<number>(1);
+  const [activePage, setActivePage] = useState<number>(() => (focusLine ? (lines.find(l => Number(l.id.replace(/\D/g, '')) === focusLine)?.page || 1) : 1));
   const [searchQuery, setSearchQuery] = useState('');
   const [thumbUrls, setThumbUrls] = useState<string[]>([]);
+  // A4 — Cleanup lens state: local pre-pass tags (0 calls) or the post-parse AI tags, plus user overrides.
+  const [lens, setLens] = useState<CleanupLens>('all');
+  const [overrides, setOverrides] = useState<Record<string, LineTag>>({});
+  const [tagged, setTagged] = useState<SourceLine[]>(lines);
+  const [cleanupNote, setCleanupNote] = useState('');
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      if (!fileHash) return;
+      const stored = (await getPipelineCache<Record<string, LineTag>>(`cleanupOverrides:${fileHash}`)) || {};
+      if (mounted) setOverrides(stored);
+    })();
+    return () => { mounted = false; };
+  }, [fileHash]);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const base = taggedLines && taggedLines.length === lines.length ? taggedLines : lines;
+      const keyLines = enumerateExpectedQuestionNos(lines).keyTerritory.lineNos;
+      if (taggedLines && taggedLines.length === lines.length && Object.keys(overrides).length === 0) {
+        if (mounted) { setTagged(base); setCleanupNote('AI verdicts from the last parse'); }
+        return;
+      }
+      const result = await runCleanupStage({ lines: base, keyLines, pages, enabled: false, overrides });
+      if (!mounted) return;
+      // Keep AI tags from the parse where no local/user verdict exists.
+      const merged = result.lines.map((l, i) => (!l.tag && base[i]?.tag ? { ...l, tag: base[i].tag, tagSource: base[i].tagSource, tagConf: base[i].tagConf } : l));
+      setTagged(merged);
+      setCleanupNote(`${taggedLines ? 'AI verdicts + ' : ''}local pre-pass (0 calls) · junk ${result.stats.junk} · ${Object.keys(overrides).length} override(s)`);
+    })();
+    return () => { mounted = false; };
+  }, [lines, taggedLines, overrides, pages]);
+
+  // Jumping to a line (Step 4 → Step 2) switches to its page, clears a narrowing lens/search, then scrolls.
+  useEffect(() => {
+    if (!focusLine) return;
+    const page = lines.find(l => Number(l.id.replace(/\D/g, '')) === focusLine)?.page;
+    if (page && page !== activePage) setActivePage(page);
+    setLens('all');
+    setSearchQuery('');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusLine, lines]);
+  useEffect(() => {
+    if (!focusLine) return;
+    const el = document.getElementById(`las-line-${focusLine}`);
+    el?.scrollIntoView({ block: 'center' });
+  }, [focusLine, tagged, activePage, lens, searchQuery]);
+
+  const setOverride = async (lineNo: number, tag: LineTag | '') => {
+    const next = { ...overrides };
+    if (tag) next[String(lineNo)] = tag; else delete next[String(lineNo)];
+    setOverrides(next);
+    if (fileHash) { try { await setPipelineCache(`cleanupOverrides:${fileHash}`, next); } catch { /* local-only until storage is back */ } }
+  };
+  const orphanSet = React.useMemo(() => new Set(orphanLineNos || []), [orphanLineNos]);
+  const lensCounts = {
+    all: tagged.length,
+    kept: tagged.filter(l => lensMatches(l, 'kept')).length,
+    junk: tagged.filter(l => lensMatches(l, 'junk')).length,
+    suspect: tagged.filter(l => lensMatches(l, 'suspect')).length,
+    orphan: orphanSet.size,
+  };
 
   // Resolve page thumbnails through thumb blobs like regular images (A3).
   useEffect(() => {
@@ -57,15 +146,15 @@ export const Step2Source: React.FC<Props> = ({
   for (let p = 1; p <= pages; p++) {
     linesByPage[p] = [];
   }
-  for (const line of lines) {
+  for (const line of tagged) {
     if (!linesByPage[line.page]) linesByPage[line.page] = [];
     linesByPage[line.page].push(line);
   }
 
-  // Filter lines if search query is active
-  const filteredLines = searchQuery.trim()
-    ? lines.filter(l => l.text.toLowerCase().includes(searchQuery.toLowerCase()))
-    : (linesByPage[activePage] || lines);
+  // Filter lines if search query is active, then by the Cleanup lens
+  const filteredLines = (searchQuery.trim()
+    ? tagged.filter(l => l.text.toLowerCase().includes(searchQuery.toLowerCase()))
+    : (linesByPage[activePage] || tagged)).filter(l => lensMatches(l, lens, orphanSet));
 
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-4">
@@ -98,7 +187,20 @@ export const Step2Source: React.FC<Props> = ({
         </div>
 
         {/* Search & Gutter Toggle */}
-        <div className="flex items-center gap-2 text-xs">
+        <div className="flex items-center gap-2 text-xs flex-wrap">
+          {/* A4 — Cleanup lens */}
+          <div role="group" aria-label="Cleanup lens" title={cleanupNote} className="flex items-center rounded-[6px] border border-[var(--rule)] overflow-hidden">
+            {(['all', 'kept', 'junk', 'suspect', ...(orphanSet.size ? ['orphan'] : [])] as CleanupLens[]).map(value => (
+              <button
+                key={value}
+                onClick={() => setLens(value)}
+                aria-pressed={lens === value}
+                className={`px-2.5 py-1.5 text-xs capitalize cursor-pointer ${lens === value ? 'bg-[var(--accent)] text-[var(--on-accent)]' : 'hover:bg-[var(--paper)] text-[var(--ink)]'}`}
+              >
+                {value} <span className="opacity-70">{lensCounts[value]}</span>
+              </button>
+            ))}
+          </div>
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-[var(--ink-2)] absolute start-2.5 top-2.5" />
             <input
@@ -204,21 +306,52 @@ export const Step2Source: React.FC<Props> = ({
                 No lines found on this page.
               </div>
             ) : (
-              filteredLines.map(line => (
+              filteredLines.map(line => {
+                const lineNo = Number(line.id.replace(/\D/g, ''));
+                const omitted = isPromptOmitted(line);
+                const override = overrides[String(lineNo)];
+                const isFocus = focusLine === lineNo;
+                return (
                 <div
                   key={line.id}
-                  className="flex items-start gap-3 hover:bg-[var(--paper-raised)] px-1 py-0.5 rounded-[6px] transition group"
+                  id={`las-line-${lineNo}`}
+                  className={`flex items-start gap-3 hover:bg-[var(--paper-raised)] px-1 py-0.5 rounded-[6px] transition group ${isFocus ? 'ring-1 ring-[var(--accent)]' : ''} ${omitted ? 'opacity-60' : ''}`}
                 >
                   {showLineIds && (
                     <span className="text-[var(--ink-2)]  select-none shrink-0 w-12 font-medium text-[length:var(--type-12)] group-hover:text-[var(--accent-ink)]">
                       [{line.id}]
                     </span>
                   )}
-                  <span className="text-[var(--ink)] whitespace-pre-wrap break-words leading-relaxed flex-1">
+                  {orphanSet.has(lineNo) && <span title="Owned by no question or section in the last parse (ORPHAN_LINES)" className="select-none shrink-0 text-[length:var(--type-12)] px-1 rounded-[4px] border border-[var(--warn)] text-[var(--warn-ink)]">ORPHAN</span>}
+                  {(line.tag || line.garbled) && (
+                    <span
+                      title={`${line.tag ? `${line.tag} (${line.tagSource || 'local'}${line.tagConf !== undefined ? ` · conf ${line.tagConf}` : ''})` : ''}${line.garbled ? ' · low readability [GARBLED?]' : ''}${omitted ? ' · omitted from structure prompts' : ''}`}
+                      className={`select-none shrink-0 text-[length:var(--type-12)] px-1 rounded-[4px] border ${line.tag === 'junk' ? 'border-[var(--danger)] text-[var(--danger)]' : line.tag === 'suspect-junk' || line.garbled ? 'border-[var(--warn)] text-[var(--warn-ink)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}
+                    >
+                      {line.tag ? TAG_LABEL[line.tag] || line.tag : ''}{line.garbled ? (line.tag ? ' ?' : 'GARBLED?') : ''}
+                    </span>
+                  )}
+                  <span className={`whitespace-pre-wrap break-words leading-relaxed flex-1 ${omitted ? 'line-through text-[var(--ink-2)]' : 'text-[var(--ink)]'}`}>
                     {line.text}
                   </span>
+                  {fileHash && (
+                    <select
+                      aria-label={`Cleanup override for ${line.id}`}
+                      value={override || ''}
+                      onChange={e => void setOverride(lineNo, e.target.value as LineTag | '')}
+                      className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 text-[length:var(--type-12)] border border-[var(--rule)] rounded-[4px] bg-[var(--paper)] px-1"
+                      style={override ? { opacity: 1 } : undefined}
+                    >
+                      <option value="">auto</option>
+                      <option value="keep">keep</option>
+                      <option value="junk">junk</option>
+                      <option value="header">header</option>
+                      <option value="instruction">instruction</option>
+                    </select>
+                  )}
                 </div>
-              ))
+                );
+              })
             )}
           </div>
         </div>

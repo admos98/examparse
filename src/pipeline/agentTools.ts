@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AppSettings, ExamDoc } from "../types";
-import { healthSummary, ToolRegistry } from "./agent";
+import { ActionQueueItem, healthSummary, ToolRegistry } from "./agent";
 import {
   applyValidatedQuestionPatch,
   QuestionMergePatchSchema,
@@ -280,9 +280,40 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
             else if (enumRes.keyTerritory.lineNos.has(expectedLine)) cause = 'key-territory leak';
             else cause = 'section swallowed or not emitted';
           }
-          return { number:n, expectedLine, lineText: lineText?.slice(0,120), neighbours: neighbours.map(q=>({no:q.no, label:q.label, sectionId:q.sectionId})), section: sec?.title, cause, sourceSlice: lineText };
+          return { number:n, expectedLine, lineText: lineText?.slice(0,120), neighbours: neighbours.map(q=>({no:q.no, label:q.label, sectionId:q.sectionId})), section: sec?.title, sectionId: sec?.id, cause, sourceSlice: lineText };
         });
-        return { ok:true, summary:`Diagnosed ${numbers.length} missing numbers`, data: result };
+        // E2 — canonical deterministic action queue. The harness executor validates each
+        // item against the registry + document state and runs read/mutate items between
+        // model turns; destructive items stop at the usual confirmation card.
+        const queue: ActionQueueItem[] = [];
+        const splitParents = new Set<string>();
+        const acceptByParent = new Map<string, number[]>();
+        const reparseSections = new Set<string>();
+        for (const r of result) {
+          if (r.cause.startsWith('group-parent')) {
+            const parent = doc.questions.find(q => q.spans.some(([a,b]) => r.expectedLine !== undefined && r.expectedLine >= a && r.expectedLine <= b) && new RegExp(`\\(${r.number}\\)`).test(q.stem || ''))
+              || doc.questions.find(q => new RegExp(`\\(${r.number}\\)`).test(q.stem || ''));
+            if (parent && !splitParents.has(parent.id)) {
+              splitParents.add(parent.id);
+              queue.push({ tool: 'split_group_children', args: { parentQuestionId: parent.id }, rationale: `Q${parent.no} enumerates (${r.number}) on its number line — children are deterministic shells`, riskClass: 'mutate' });
+            }
+          } else if (r.cause.startsWith('sub-part')) {
+            const prev = r.neighbours.find((q: { no: number }) => q.no < r.number);
+            const prevQ = prev ? doc.questions.find(q => q.no === prev.no) : undefined;
+            if (prevQ) acceptByParent.set(prevQ.id, [...(acceptByParent.get(prevQ.id) || []), r.number]);
+          } else if (r.cause.startsWith('section swallowed') && r.sectionId) {
+            reparseSections.add(r.sectionId);
+          }
+        }
+        for (const [parentQuestionId, childNumbers] of acceptByParent) {
+          const parent = doc.questions.find(q => q.id === parentQuestionId)!;
+          queue.push({ tool: 'accept_group_representation', args: { parentQuestionId, childNumbers }, rationale: `${childNumbers.join(',')} are lettered sub-parts of Q${parent.no}; represent them by the parent`, riskClass: 'mutate' });
+        }
+        for (const sectionId of reparseSections) {
+          const sec = doc.sections.find(s => s.id === sectionId);
+          queue.push({ tool: 'reparse_section', args: { sectionId }, rationale: `Section ${sec?.title || sectionId} swallowed its numbers; a validated candidate needs confirmation`, riskClass: 'destructive' });
+        }
+        return { ok:true, summary:`Diagnosed ${numbers.length} missing numbers: ${result.map((r: { number: number; cause: string }) => `${r.number}=${r.cause.split('?')[0].split(' (')[0]}`).join('; ').slice(0, 200)}`, data: result, actionQueue: queue };
       },
     },
     get_open_issues: {

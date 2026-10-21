@@ -370,7 +370,10 @@ export const Step3Analyze: React.FC<Props> = ({
       onAnalysisComplete(resultDoc);
     } catch (err: any) {
       setIsAnalyzing(false);
-      setErrorMsg(`Analysis failed: ${err.message || err}`);
+      // Surface the underlying cause (save path no longer throws for quality reasons;
+      // anything reaching here is a real pipeline/storage failure).
+      console.error('Analysis failed:', err);
+      setErrorMsg(`Analysis failed: ${err?.message || err}`);
     }
   };
 

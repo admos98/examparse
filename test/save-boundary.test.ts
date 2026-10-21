@@ -135,17 +135,43 @@ test('G3 funnel: complete doc passes all I1-I10', () => {
   assert.equal(violations.filter(v=>v.severity==='error').length, 0);
 });
 
-test('G3 C2 hard gate: saveExamDoc throws INVARIANT_GATE_BLOCKED when not partial', async () => {
+test('G3 C2 save boundary: violating doc is persisted as PARTIAL, never rejected', async () => {
   const { saveExamDoc } = await import('../src/store/index');
-  // Mock fetch to avoid network; we test via validate gate directly
   const doc = makeDoc();
-  doc.questions[0].stem = '' as any; // I1 violation
-  const { validateExamInvariants: v } = await import('../src/pipeline/quality');
-  const gate = v(doc);
+  doc.questions[0].stem = '' as any; // I1 violation (fixture preserved)
+  const gate = validateExamInvariants(doc);
   assert.ok(gate.violations.some(x=>x.code==='I1'));
   assert.equal(gate.ok, false);
-  // saveExamDoc would throw INVARIANT_GATE_BLOCKED — we verify gate logic without actual fetch
   assert.ok(gate.violations.some(x=>x.severity==='error'));
+
+  const originalFetch = globalThis.fetch;
+  let stored: any;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const method = init?.method || (typeof input === 'object' && input && 'method' in input ? (input as any).method : 'GET');
+    if (url.startsWith('/api/exams/')) {
+      if (method === 'PUT') {
+        stored = JSON.parse(String(init?.body));
+        return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{"error":"not found"}', { status: 404, headers: { 'Content-Type': 'application/json' } });
+    }
+    return method === 'GET'
+      ? new Response('{"error":"not found"}', { status: 404, headers: { 'Content-Type': 'application/json' } })
+      : new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    // Demote-not-throw contract: persistence is not endorsement, so the save resolves.
+    await saveExamDoc(doc);
+    assert.ok(stored, 'violating doc is still persisted');
+    assert.equal(stored.partial, true, 'stored doc carries the partial marker');
+    const partialFlag = stored.flags.find((flag: any) => flag.code === 'PARTIAL_EXAM');
+    assert.ok(partialFlag, 'stored doc carries a PARTIAL_EXAM banner');
+    assert.match(partialFlag.message, /questions 1\b/, 'banner names the violating question number');
+    assert.equal(stored.flags.filter((flag: any) => flag.code === 'PARTIAL_EXAM').length, 1, 'no duplicate PARTIAL_EXAM flags');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('G3 provenance invariant-fix trace', () => {

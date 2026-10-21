@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { ExamDoc } from '../types';
-import { getExamHealth } from '../pipeline/quality';
+import { getExamHealth, invariantViolationQuestionNos, validateExamInvariants } from '../pipeline/quality';
 import { computeDocOwnership } from '../pipeline/ownership';
 import { computeQualityScore, qualityColor } from '../utils/qualityScore';
 
@@ -14,6 +14,11 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
   try { quality = computeQualityScore(doc); } catch {
     quality = { total:0, coverage:0, points:0, optionsCleanliness:0, imagePlacement:0, numbering:0, confidence:0, passage:0, details:{ coveragePercent:0, pointDeficit:0, optionBlobCount:0, unplacedImages:0, duplicateNumbers:0, missingNumbers:0, lowConfidenceCount:0, passageMissing:false } } as any;
   }
+  // C2: the save boundary demotes instead of rejecting; "complete" may only be claimed
+  // when live invariants are also clean (a saved partial marker alone is not acted on here).
+  let invariantViolations: ReturnType<typeof validateExamInvariants>['violations'] = [];
+  try { invariantViolations = validateExamInvariants(doc).violations.filter(violation => violation.severity === 'error'); } catch { invariantViolations = []; }
+  const invariantNos = invariantViolationQuestionNos(doc, invariantViolations);
   const [showBreakdown, setShowBreakdown] = useState(false);
   const colors = health.state === 'green'
     ? 'border-[var(--ok)] bg-[var(--ok-soft)] text-[var(--ok)]   '
@@ -34,7 +39,7 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
 
   return <div role="status" aria-live="polite" className={`rounded-[10px] border px-4 py-3 text-xs ${colors} ${className}`}>
     <div className="flex items-center justify-between gap-3">
-      <div className="font-bold">{health.state === 'green' ? 'Exam health: complete' : noQuestionsParsed ? 'PARTIAL EXAM — no questions parsed' : partialCoverage ? `PARTIAL EXAM — ${health.coveragePercent.toFixed(0)}% printed-number coverage` : health.state === 'red' ? 'PARTIAL EXAM — completeness is below 80%' : (health.hollowQuestions?.length || 0) > 0 ? `PARTIAL EXAM — ${health.hollowQuestions.length} question(s) failed local validators after repair` : 'Exam health: review required'}</div>
+      <div className="font-bold">{health.state === 'green' && invariantViolations.length === 0 ? 'Exam health: complete' : invariantViolations.length > 0 ? `PARTIAL EXAM — invariant violations [${[...new Set(invariantViolations.map(violation => violation.code))].join(', ')}] on ${invariantNos.length ? `questions ${invariantNos.join(', ')}` : 'document-level checks'}` : noQuestionsParsed ? 'PARTIAL EXAM — no questions parsed' : partialCoverage ? `PARTIAL EXAM — ${health.coveragePercent.toFixed(0)}% printed-number coverage` : health.state === 'red' ? 'PARTIAL EXAM — completeness is below 80%' : (health.hollowQuestions?.length || 0) > 0 ? `PARTIAL EXAM — ${health.hollowQuestions.length} question(s) failed local validators after repair` : 'Exam health: review required'}</div>
       <button
         onClick={()=> setShowBreakdown(!showBreakdown)}
         className={`shrink-0 px-2.5 py-1 rounded-[6px] border text-xs font-bold ${qTone} hover:opacity-90 transition`}

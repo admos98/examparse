@@ -185,6 +185,12 @@ export interface ExamDoc {
     cleanupStats?: { judged: number; junk: number; suspect: number; fenceSaved: number; aiSkipped: boolean; linesBefore: number; linesAfter: number; tokensBefore: number; tokensAfter: number; source: 'off' | 'local' | 'ai' | 'cached' };
   };
   flags: Flag[];
+  /**
+   * Persisted demotion marker: true when the save boundary found error-severity
+   * invariant violations. Persistence is never refused for this — completeness and
+   * export affordances read this + the PARTIAL_EXAM flag.
+   */
+  partial?: boolean;
   usage: UsageRecord[];
   /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */
   guidanceTokens?: number;

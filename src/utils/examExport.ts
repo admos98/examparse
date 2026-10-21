@@ -3,7 +3,7 @@
  * Used by Step5Exam and the Exam Library so both share identical semantics.
  */
 import { ExamDoc, getDisplayName, sanitizeFileName } from '../types';
-import { getExamHealth } from '../pipeline/quality';
+import { getExamHealth, invariantViolationQuestionNos, validateExamInvariants } from '../pipeline/quality';
 import { stripCredentialFields } from './validation';
 import { buildParseReport, type ParseReport } from '../pipeline/provenance';
 
@@ -48,15 +48,27 @@ export function buildExportDoc(doc: ExamDoc): any {
 
 /** Return factual completeness findings so the calling view can use ConfirmCard instead of a native dialog. */
 export function partialExportIssues(doc: ExamDoc): string[] {
+  // Export keeps the teeth the save boundary gave up: a demoted PARTIAL doc — or any doc
+  // whose residual error violations were never confirmed — always routes through the
+  // in-product partial-export confirmation. This reads invariants live, so it also catches
+  // docs saved before the marker existed.
+  const errorViolations = validateExamInvariants(doc).violations.filter(violation => violation.severity === 'error');
+  const violationNos = invariantViolationQuestionNos(doc, errorViolations);
+  const invariantIssues = errorViolations.length
+    ? [`invariant violations: ${[...new Set(errorViolations.map(violation => violation.code))].join(', ')}${violationNos.length ? ` (questions ${violationNos.join(', ')})` : ''}`]
+    : [];
   const health = getExamHealth(doc);
-  if (health.complete) return [];
+  if (health.complete && invariantIssues.length === 0) return [];
   return [
-    health.missing.length ? `missing questions: ${health.missing.join(', ')}` : '',
-    health.duplicates.length ? `duplicate question numbers: ${health.duplicates.join(', ')}` : '',
-    health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51 ? `points deficit: ${health.pointDeficit}` : '',
-    health.unplacedImages.length ? `${health.unplacedImages.length} unplaced image(s)` : '',
-    health.unresolvedImageRefs.length ? `${health.unresolvedImageRefs.length} unresolved image reference(s)` : '',
-    (health.parentLinkIssueCount || 0) ? `${health.parentLinkIssueCount} invalid nested-question link(s)` : '',
+    ...invariantIssues,
+    ...(health.complete ? [] : [
+      health.missing.length ? `missing questions: ${health.missing.join(', ')}` : '',
+      health.duplicates.length ? `duplicate question numbers: ${health.duplicates.join(', ')}` : '',
+      health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51 ? `points deficit: ${health.pointDeficit}` : '',
+      health.unplacedImages.length ? `${health.unplacedImages.length} unplaced image(s)` : '',
+      health.unresolvedImageRefs.length ? `${health.unresolvedImageRefs.length} unresolved image reference(s)` : '',
+      (health.parentLinkIssueCount || 0) ? `${health.parentLinkIssueCount} invalid nested-question link(s)` : '',
+    ]),
   ].filter(Boolean);
 }
 

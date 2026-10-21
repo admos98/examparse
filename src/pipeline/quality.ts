@@ -963,6 +963,47 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
   return { ok, violations, flags };
 }
 
+/** Printed numbers of the questions implicated by violations (for banners and export issues). */
+export function invariantViolationQuestionNos(doc: ExamDoc, violations: InvariantViolation[]): number[] {
+  const nos: number[] = [];
+  for (const violation of violations) {
+    if (!violation.questionId) continue;
+    const question = (doc.questions || []).find(item => item.id === violation.questionId);
+    if (question && typeof question.no === 'number' && !nos.includes(question.no)) nos.push(question.no);
+  }
+  return nos.sort((left, right) => left - right);
+}
+
+/**
+ * Save-boundary demotion (C2): invariant errors NEVER reject a save. They mark the
+ * document visibly PARTIAL — persisted `partial` marker plus a PARTIAL_EXAM flag that
+ * names the violating codes and printed question numbers. Completeness/export
+ * affordances read this marker; the user's work is always persisted.
+ * Idempotent: an existing PARTIAL_EXAM flag is updated in place, never duplicated.
+ */
+export function markPartialForInvariantViolations(doc: ExamDoc, violations: InvariantViolation[]): ExamDoc {
+  const errors = violations.filter(violation => violation.severity === 'error');
+  if (errors.length === 0) return doc;
+  const codes = [...new Set(errors.map(violation => violation.code))];
+  const nos = invariantViolationQuestionNos(doc, errors);
+  const scope = nos.length ? `questions ${nos.join(', ')}` : 'document-level checks';
+  const message = `Partial exam: invariant violation(s) [${codes.join(', ')}] on ${scope}. Saved for review; export requires confirmation.`;
+  const flags: Flag[] = [...(doc.flags || [])];
+  const index = flags.findIndex(flag => flag.code === 'PARTIAL_EXAM');
+  const demoted: Flag = {
+    id: index >= 0 ? flags[index].id : 'flag_PARTIAL_EXAM',
+    code: 'PARTIAL_EXAM',
+    severity: 'warn',
+    message,
+    ...(nos.length === 1 ? { questionId: errors.find(violation => violation.questionId)?.questionId } : {}),
+  };
+  if (index >= 0) flags[index] = { ...flags[index], ...demoted };
+  else flags.push(demoted);
+  doc.flags = flags;
+  doc.partial = true;
+  return doc;
+}
+
 /** Stable optimistic-concurrency fingerprint; transient object URLs and usage are not exam content. */
 export function examContentRevision(doc: ExamDoc): string {
   return JSON.stringify([doc.questions, doc.sections, (doc.images || []).map(({ dataUrl, ...image }) => image), doc.meta, doc.displayName, doc.nameSource, doc.flags, { lines: doc.source?.lines, expectedQuestionNos: doc.source?.expectedQuestionNos, keyTerritoryLineNos: doc.source?.keyTerritoryLineNos }]);

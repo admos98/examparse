@@ -18,7 +18,7 @@ import { buildCriticQueue, runCritic, recordVerdicts } from './critic';
 import { consensusTriggerForSection, diffConsensus, resolveConsensusModel, CONSENSUS_CAPS } from './consensus';
 import { tracesForDoc } from './provenance';
 import { LLMAdapter } from '../providers/adapter';
-import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, parsePrintedNumberFromStem } from './quality';
+import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, markPartialForInvariantViolations, parsePrintedNumberFromStem, validateExamInvariants } from './quality';
 import { runEscalationRepair } from './repair';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
@@ -1080,6 +1080,12 @@ export async function runFullPipeline(
   // C5: resolve extraction collisions only after assembly, when source-page context
   // can safely rewrite question references as well as image metadata and flags.
   examDoc = validateAndFixDuplicateImageIds(examDoc).doc;
+
+  // C2 — a finished parse always persists. Any error-severity violation that survived the
+  // deterministic fixes demotes this doc to visibly PARTIAL (persisted `partial` marker +
+  // PARTIAL_EXAM flag naming the questions). saveExamDoc itself never rejects for quality.
+  const saveGate = validateExamInvariants(examDoc);
+  if (!saveGate.ok) examDoc = markPartialForInvariantViolations(examDoc, saveGate.violations);
 
   await saveExamDoc(examDoc);
 

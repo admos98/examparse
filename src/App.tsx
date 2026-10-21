@@ -135,7 +135,10 @@ export default function App() {
       if (!existing) await saveExamDoc(draft);
       setExamDoc(existing || draft);
       await refreshSummaries();
-    })().catch(() => setStorageError(t('The imported exam could not be saved locally. Check the data folder.', 'ذخیره محلی آزمون واردشده ممکن نشد. پوشه داده را بررسی کنید.')));
+    })().catch((err: any) => {
+      console.error('Import draft could not be saved locally:', err);
+      setStorageError(`${t('The imported exam could not be saved locally. Check the data folder.', 'ذخیره محلی آزمون واردشده ممکن نشد. پوشه داده را بررسی کنید.')} (${err?.message || err})`);
+    });
     setImportedFileHash(fileHash || null);
     setRawFile(file);
     setAnswerKeyFile(keyFile || null);
@@ -145,7 +148,10 @@ export default function App() {
 
   const handleDemoLoaded = (demo: ExamDoc, persist = true) => {
     setAssistantMode('closed');
-    if (persist) void saveExamDoc(demo).then(refreshSummaries).catch(() => setStorageError(t('The sample exam could not be saved locally.', 'ذخیره آزمون نمونه ممکن نشد.')));
+    if (persist) void saveExamDoc(demo).then(refreshSummaries).catch((err: any) => {
+      console.error('Sample exam could not be saved locally:', err);
+      setStorageError(`${t('The sample exam could not be saved locally.', 'ذخیره آزمون نمونه ممکن نشد.')} (${err?.message || err})`);
+    });
     setExamDoc(demo);
     setImportedFileHash(null);
     setExtractedDoc({

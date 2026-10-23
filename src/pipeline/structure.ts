@@ -9,6 +9,7 @@ import { T1_GEMINI_SCHEMA, T1_STRUCTURE_SYSTEM } from './prompts';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { appendJournalCall, loadJournal, markJournalComplete } from './journal';
 import { evaluateCoverage, enumerateExpectedQuestionNos, normalizeForMatching, matchingView, parsePrintedNumberFromStem, detectSectionHeaders } from './quality';
+import { clipSpansBeforeLine, coerceLineSpan, isOffsetSpan, sliceNormalizedLineByOffsets, spanEndLine, spanStartLine } from './spans';
 import { renderCleanView } from './cleanup';
 
 
@@ -450,10 +451,21 @@ function shortSourceText(spans: any, sourceLines: SourceLine[], maxLines = 20): 
   const map = sourceLineTextByNumber(sourceLines);
   const output: string[] = [];
   let remaining = maxLines;
-  for (const span of spans) {
-    if (!Array.isArray(span) || span.length < 2 || remaining <= 0) continue;
-    const start = Number(span[0]); const end = Math.min(Number(span[1]), start + remaining - 1);
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) continue;
+  for (const raw of spans) {
+    if (remaining <= 0) break;
+    const span = coerceLineSpan(raw);
+    if (!span) continue;
+    if (isOffsetSpan(span)) {
+      const text = map.get(span.line);
+      if (text !== undefined) {
+        const sliced = sliceNormalizedLineByOffsets(text, span.start, span.end).text;
+        if (sliced) output.push(sliced);
+      }
+      remaining--;
+      continue;
+    }
+    const start = span[0];
+    const end = Math.min(span[1], start + remaining - 1);
     for (let n = start; n <= end && remaining > 0; n++) {
       const text = map.get(n);
       if (text !== undefined) output.push(text);
@@ -474,10 +486,11 @@ function rawCoverageQuestions(rawQuestions: any[], sourceLines: SourceLine[]): a
   return rawQuestions.filter(q => {
     if (!Array.isArray(q?.spans)) return false;
     let checked = 0;
-    for (const span of q.spans) {
-      if (!Array.isArray(span) || span.length < 2) continue;
-      const start = Number(span[0]); const end = Number(span[1]);
-      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) continue;
+    for (const raw of q.spans) {
+      const span = coerceLineSpan(raw);
+      if (!span) continue;
+      const start = spanStartLine(span);
+      const end = spanEndLine(span);
       for (let n = start; n <= end && checked < 5_000; n++, checked++) if (!keyLines.has(n)) return true;
     }
     return false;
@@ -487,8 +500,10 @@ function rawCoverageQuestions(rawQuestions: any[], sourceLines: SourceLine[]): a
 function rawQuestionIdentity(q: any, sourceLines: SourceLine[]): string | undefined {
   const number = rawQuestionNumber(q, sourceLines);
   if (number === undefined) return undefined;
-  const firstSpan = Array.isArray(q?.spans) ? q.spans.find((span: any) => Array.isArray(span) && Number.isFinite(Number(span[0]))) : undefined;
-  return `${number}@${firstSpan ? Number(firstSpan[0]) : 'unknown'}`;
+  const firstCoerced = Array.isArray(q?.spans)
+    ? q.spans.map((span: any) => coerceLineSpan(span)).find(Boolean)
+    : undefined;
+  return `${number}@${firstCoerced ? spanStartLine(firstCoerced) : 'unknown'}`;
 }
 
 function mergeRawByPrintedNumber(existing: any[], additions: any[], sourceLines: SourceLine[]): any[] {
@@ -607,8 +622,11 @@ export function responseTripwires(data: any, plan: SectionPlan, sourceLines: Sou
     if (number !== undefined && seen.has(number)) duplicates = true;
     if (number !== undefined) seen.add(number);
     const spans: any[] = [...(Array.isArray(q?.spans) ? q.spans : []), ...(Array.isArray(q?.options) ? q.options.flatMap((o: any) => Array.isArray(o?.spans) ? o.spans : []) : []), ...(Array.isArray(q?.tables) ? q.tables.flatMap((t: any) => Array.isArray(t?.spans) ? t.spans : []) : [])];
-    for (const span of spans) if (!Array.isArray(span) || span[0] < 1 || span[1] > lineCount || span[0] > span[1]) outOfBounds = true;
-    for (const span of spans) if (Array.isArray(span) && Number(span[1]) >= keyStart) keyQuestionSpan = true;
+    for (const raw of spans) {
+      const sp = coerceLineSpan(raw);
+      if (!sp || spanStartLine(sp) < 1 || spanEndLine(sp) > lineCount || spanStartLine(sp) > spanEndLine(sp)) outOfBounds = true;
+      if (sp && spanEndLine(sp) >= keyStart) keyQuestionSpan = true;
+    }
     if (q?.sectionId && declaredIds.size && !declaredIds.has(String(q.sectionId)) && q.sectionId !== plan.id) undeclaredSection = true;
   }
   const emitted = questions.map((q: any) => rawQuestionNumber(q, sourceLines)).filter((n: any) => n !== undefined);
@@ -641,14 +659,8 @@ export function responseTripwires(data: any, plan: SectionPlan, sourceLines: Sou
   return tripwires;
 }
 
-function clipSpansBeforeKey(spans: any, sourceMin: number, sourceMax: number, keyStart: number): Array<[number, number]> {
-  if (!Array.isArray(spans)) return [];
-  return spans.flatMap((span: any) => {
-    if (!Array.isArray(span) || span.length < 2) return [];
-    const start = Math.max(sourceMin, Number(span[0]));
-    const end = Math.min(sourceMax, keyStart - 1, Number(span[1]));
-    return Number.isFinite(start) && Number.isFinite(end) && start <= end ? [[start, end] as [number, number]] : [];
-  });
+function clipSpansBeforeKey(spans: any, sourceMin: number, sourceMax: number, keyStart: number) {
+  return clipSpansBeforeLine(spans, sourceMin, sourceMax, keyStart);
 }
 
 function sanitizeRawSectionQuestions(data: any, plan: SectionPlan, sourceLines: SourceLine[], keyLines: Set<number>): any[] {
@@ -666,7 +678,10 @@ function sanitizeRawSectionQuestions(data: any, plan: SectionPlan, sourceLines: 
     const identity = rawQuestionIdentity(q, sourceLines);
     if (identity && seen.has(identity)) return [];
     if (identity) seen.add(identity);
-    const inKey = (Array.isArray(q.spans) ? q.spans : []).some((span: any) => Array.isArray(span) && Number(span[1]) >= keyStart);
+    const inKey = (Array.isArray(q.spans) ? q.spans : []).some((raw: any) => {
+      const sp = coerceLineSpan(raw);
+      return sp ? spanEndLine(sp) >= keyStart : false;
+    });
     if (inKey) return [];
     q.spans = clipSpansBeforeKey(q.spans, sourceMin, sourceMax, keyStart);
     if (!q.spans.length) return [];

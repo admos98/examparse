@@ -1,5 +1,6 @@
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
+import { formatSpans } from '../pipeline/spans';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Edit3,
@@ -579,7 +580,7 @@ export const Step4Review: React.FC<Props> = ({
                     </div>
                   )) : <div className="mt-1.5 text-[var(--ink-2)]">No trace recorded for this question.</div>}
                   {verdicts.map((v: any, i: number) => <div key={`v${i}`} className="mt-1 text-[var(--ink-2)]">Critic note: {v.note}</div>)}
-                  {q.spans?.length ? <div className="mt-1 text-[var(--ink-2)]">Source: lines {q.spans.map((sp: any) => `${sp[0]}–${sp[1]}`).join(', ')} (Step 2)</div> : null}
+                  {q.spans?.length ? <div className="mt-1 text-[var(--ink-2)]">Source: lines {formatSpans(q.spans)} (Step 2)</div> : null}
                 </details>
               );
             })}
@@ -666,7 +667,7 @@ export const Step4Review: React.FC<Props> = ({
             if (!children.length) return null;
             return <div className={`${depth === 1 ? 'ms-4 border-s-2 border-[var(--accent)] ps-3 ' : 'ms-4 border-s border-[var(--accent)] ps-3 '} space-y-2`}>
               {children.map((child, childIndex) => <div key={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
-                <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span><span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {child.spans.map(([start, end]) => `L${start}..L${end}`).join(', ')}</span></div><button onClick={() => setActiveQuestionId(activeQuestionId === child.id ? null : child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{activeQuestionId === child.id ? 'Close edit' : 'Edit child'}</button></div>
+                <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span><span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {formatSpans(child.spans)}</span></div><button onClick={() => setActiveQuestionId(activeQuestionId === child.id ? null : child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{activeQuestionId === child.id ? 'Close edit' : 'Edit child'}</button></div>
                 {activeQuestionId === child.id ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
                 {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
                 {child.answer?.text && <div className="mt-2 border-t border-[var(--accent)] pt-2"><b>Answer:</b> {child.answer.text}</div>}
@@ -726,7 +727,7 @@ export const Step4Review: React.FC<Props> = ({
                           )}
 
                           <span className="text-[length:var(--type-12)] text-[var(--ink-2)] font-mono">
-                            spans: {q.spans.map(([s, e]) => `L${s}..L${e}`).join(', ')}
+                            spans: {formatSpans(q.spans)}
                           </span>
 
                           <span

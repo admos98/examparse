@@ -55,7 +55,9 @@ test('B2 chaos: spans as strings', ()=>{
   const res = assembleAndValidateQuestions(raw as any, source);
   assert.ok(Array.isArray(res.questions));
   // Should not have half-written doc: either 0 questions or valid
-  assert.ok(res.questions.length===0 || res.questions[0].spans.length===0 || res.questions[0].spans[0][0]===1);
+  const firstSpan = res.questions[0]?.spans?.[0];
+  const firstLine = Array.isArray(firstSpan) ? firstSpan[0] : firstSpan?.line;
+  assert.ok(res.questions.length===0 || res.questions[0].spans.length===0 || firstLine===1);
 });
 
 test('B2 chaos: no=0/negative/9999 filtered', ()=>{

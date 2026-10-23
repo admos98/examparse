@@ -4,10 +4,11 @@
  * output = candidate segments covering 100% of exam-territory lines.
  * No model calls.
  */
-import { SourceLine } from '../types';
-import { detectSectionHeaders, lineNumber, parsePrintedNumberFromStem, normalizeForMatching, matchingView } from './quality';
+import { OffsetSpan, SourceLine } from '../types';
+import { detectSectionHeaders, isReadTheTextInstruction, lineNumber, parsePrintedNumberFromStem, normalizeForMatching, normalizeStoredText, matchingView } from './quality';
 import { isInstructionText, isBarePageNumber } from './cleanup';
 import { headerAnchors, isSkippedLine, classifyLines } from './ownership';
+import { carveGroupChildSpans } from './spans';
 
 export type SegmentKind = 'question'|'group-parent'|'passage'|'instruction'|'header'|'unknown';
 
@@ -28,6 +29,8 @@ export interface Segment {
   parentSegmentId?: string;
   charStart?: number;
   charEnd?: number;
+  /** Unified Part B1 sub-line offset span for multi-number & shared-line group children. */
+  offsetSpan?: OffsetSpan;
   sectionHint: string;
   lines: number[]; // inclusive line numbers
   sectionId?: string;
@@ -50,8 +53,9 @@ const INTRA_LINE_MULTI_RE = new RegExp(
 const INTRA_LINE_FAST_RE = /(?:^|\s)(?:\([0-9۰-۹٠-٩０-９]{1,3}\)|[0-9۰-۹٠-٩０-９]{1,3}\s*[.):-])\s*(?:\([a-jالفبپتثجچدهو]\)|[a-jالفبپتثجچدهو][).:])/i;
 
 export function findIntraLineMultiNumbers(text: string): IntraLineItem[] {
-  if (!text || !INTRA_LINE_FAST_RE.test(text)) return [];
-  const view = matchingView(text);
+  const rawStr = text || '';
+  if (!rawStr || !INTRA_LINE_FAST_RE.test(rawStr)) return [];
+  const view = matchingView(rawStr);
   const raw: Array<{ no: number; marker: string; origStart: number }> = [];
   INTRA_LINE_MULTI_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
@@ -69,8 +73,8 @@ export function findIntraLineMultiNumbers(text: string): IntraLineItem[] {
   const sourceOrdered = raw.map((item, index) => ({
     no: item.no,
     marker: item.marker,
-    charStart: index === 0 && !text.slice(0, item.origStart).trim() ? 0 : item.origStart,
-    charEnd: index + 1 < raw.length ? raw[index + 1].origStart : text.length,
+    charStart: index === 0 && !rawStr.slice(0, item.origStart).trim() ? 0 : item.origStart,
+    charEnd: index + 1 < raw.length ? raw[index + 1].origStart : rawStr.length,
   }));
   // Papers may lay out a numbered row right-to-left (e.g. 66, 65, 64, 63).
   // Logical parent/child order remains ascending while each offset still slices its original item.
@@ -85,36 +89,46 @@ export interface SegmentDiagnostics {
   coverage: number; // 0-100
 }
 
+function isRowSubInstruction(text: string): boolean {
+  if (isReadTheTextInstruction(text)) return true;
+  const norm = normalizeForMatching(text).trim();
+  if (!norm || norm.length > 240) return false;
+  const iranianSubInstructionRe = /(?:کامل\s+کنید|پاسخ\s+دهید|انتخاب\s+کنید|بنویسید|مشخص\s+کنید|پیدا\s+کنید|مرتب\s+کنید|وصل\s+کنید)/u;
+  return /^(?:[الفبپتجد]\s*[).\-:]|\d{1,2}(?:\s*[./]\s*\d{1,2})?\s*\.?\s+)[\p{Script=Arabic}]/u.test(norm) && iranianSubInstructionRe.test(norm);
+}
+
 function isGroupParentLine(text: string): { isGroup: boolean; parentNo?: number; childNos: number[] } {
   const nums: number[] = [];
   for (const m of text.matchAll(/\((\d{1,3})\)/g)) nums.push(Number(m[1]));
-  if (nums.length >= 2 && nums.every(n=>n>=1&&n<=300) && /\((\d{1,3})\)\s*\((\d{1,3})\)/.test(text)) {
+  if (nums.length >= 2 && nums.every(n => n >= 1 && n <= 300) && /\((\d{1,3})\)\s*\((\d{1,3})\)/.test(text)) {
     return { isGroup: true, parentNo: nums[0], childNos: nums };
   }
   return { isGroup: false, childNos: [] };
 }
 
 function isQuestionStart(line: SourceLine): number | undefined {
+  if (isRowSubInstruction(line.text)) return undefined;
   const n = parsePrintedNumberFromStem(line.text);
   if (n !== undefined) return n;
-  // Also check parenthesized start like "(15) " at line start?
   const v = normalizeForMatching(line.text).trim();
   const m = v.match(/^\(?(\d{1,3})\)?\s*[.)\-:]/);
   if (m) {
     const num = Number(m[1]);
-    if (num>=1&&num<=300) return num;
+    if (num >= 1 && num <= 300) return num;
   }
   return undefined;
 }
 
 function isPassageCandidate(line: SourceLine): boolean {
+  if (line.furniture) return false;
   if (isQuestionStart(line) !== undefined) return false;
-  if (isInstructionText(line.text)) return false;
+  if (isInstructionText(line.text) || isRowSubInstruction(line.text)) return false;
   if (line.tag === 'instruction' || line.tag === 'header') return false;
-  // prose lines: not option marker, length moderate
   const t = line.text.trim();
   if (t.length < 15) return false;
-  if (/^\s*(?:[a-h]|[الفبپتثجچ])\s*[).]/i.test(normalizeForMatching(t))) return false;
+  const norm = normalizeForMatching(t);
+  if (/^\s*(?:[a-j]|[الفبپتثجچ])\s*[).]/i.test(norm)) return false;
+  if (/(?:باسمه\s*تعالی|سؤالات\s+امتحان|سوالات\s+امتحان|تاریخ\s+امتحان\s*:|مرکز\s+سنجش\s+و\s+پایش|ادامه\s*(?:ی)?\s*(?:سؤالات|سوالات)?\s*در\s+صفحه|ردیف\s+سؤالات|ردیف\s+سوالات|aee\.medu\.ir|www[.-]kanoon)/iu.test(norm)) return false;
   if (/^\s*\(\d+\)/.test(t)) return false;
   return true;
 }
@@ -200,167 +214,140 @@ export function segmentDocument(params: {
       if (isGroup || qn !== undefined) questionIdxSet.add(i);
     }
     const firstQIdx = [...questionIdxSet].sort((a,b)=>a-b)[0];
-    // Helper to detect instruction run
-    const emitInstructionRun = (start: number): number => {
-      let end = start;
-      while (end < bodyLines.length && isInstructionText(bodyLines[end].text) && !questionIdxSet.has(end)) end++;
-      // If start..end-1 are instruction and length>=1, emit one segment (group consecutive instruction lines)
-      if (end > start) {
-        const lines = bodyLines.slice(start, end).map(lineNumber);
-        segments.push({
-          id: mkId(),
-          kind: 'instruction',
-          startLine: lines[0],
-          endLine: lines[lines.length-1],
-          sectionHint: range.title,
-          lines,
-          sectionId: `sec_${ranges.indexOf(range)+1}`,
-        });
-        return end;
-      }
-      return start;
-    };
-    // Pre-question prefix handling
-    if (firstQIdx !== undefined && firstQIdx > 0) {
-      // Process prefix 0..firstQIdx-1 as header/passage/instruction/unknown
-      let p = 0;
-      while (p < firstQIdx) {
-        // Check instruction first
-        if (isInstructionText(bodyLines[p].text)) {
-          const nxt = emitInstructionRun(p);
-          if (nxt > p) { p = nxt; continue; }
+    const sectionIdForRange = `sec_${ranges.indexOf(range)+1}`;
+    const isReadingSection = /reading|listening|درک|شنیداری/i.test(range.title) || /reading|listening/i.test(range.kind);
+    const isInstructionAt = (idx: number) =>
+      (isInstructionText(bodyLines[idx].text) || isRowSubInstruction(bodyLines[idx].text)) && !questionIdxSet.has(idx);
+
+    // Emit contiguous non-question segments (instruction / passage / unknown) over bodyLines[fromIdx .. toIdx).
+    const buildNonQuestionSegments = (fromIdx: number, toIdx: number, forcePassageEligible = false): Segment[] => {
+      const out: Segment[] = [];
+      let p = fromIdx;
+      let sawReadPrompt = forcePassageEligible;
+      while (p < toIdx) {
+        if (isReadTheTextInstruction(bodyLines[p].text)) sawReadPrompt = true;
+        if (isInstructionAt(p)) {
+          let end = p;
+          while (end < toIdx && isInstructionAt(end)) {
+            if (isReadTheTextInstruction(bodyLines[end].text)) sawReadPrompt = true;
+            end++;
+          }
+          const nums = bodyLines.slice(p, end).map(lineNumber);
+          out.push({
+            id: mkId(),
+            kind: 'instruction',
+            startLine: nums[0],
+            endLine: nums[nums.length - 1],
+            sectionHint: range.title,
+            lines: nums,
+            sectionId: sectionIdForRange,
+          });
+          p = end;
+          continue;
         }
-        // Check passage: run of ≥3 consecutive non-instruction prose lines avg ≥40 chars inside Reading/Listening
-        const isReading = /reading|listening|درک|شنیداری/i.test(range.title) || /reading|listening/i.test(range.kind);
+
+        const passageAllowed = isReadingSection || sawReadPrompt;
         let runEnd = p;
-        while (runEnd < firstQIdx && isPassageCandidate(bodyLines[runEnd])) runEnd++;
-        // Determine run length from p to runEnd-1
+        while (runEnd < toIdx && isPassageCandidate(bodyLines[runEnd])) runEnd++;
         const runLen = runEnd - p;
-        if (isReading && runLen >= 3) {
+        if (passageAllowed && runLen >= 3) {
           const runLines = bodyLines.slice(p, runEnd);
           const avg = avgLength(runLines);
-          // Check avg ≥40 or dialogue run
           const dialogueCheck = runLines.every(l => /^\s*[A-Z]:/.test(l.text.trim()) || /^\s*(A|B)\s*:/i.test(l.text.trim()));
-          if (avg >= 40 || dialogueCheck) {
+          if (avg >= 35 || dialogueCheck || sawReadPrompt) {
             const nums = runLines.map(lineNumber);
-            segments.push({
+            out.push({
               id: mkId(),
               kind: 'passage',
               startLine: nums[0],
-              endLine: nums[nums.length-1],
+              endLine: nums[nums.length - 1],
               sectionHint: range.title,
               lines: nums,
-              sectionId: `sec_${ranges.indexOf(range)+1}`,
+              sectionId: sectionIdForRange,
+              ruleChain: sawReadPrompt ? ['c3:read-the-text-passage'] : ['segment:passage'],
             });
             p = runEnd;
             continue;
           }
         }
-        // If not passage, treat single line as unknown or instruction?
-        // Group consecutive unknown lines before next instruction/passage/question into one unknown segment
-        let unkEnd = p+1;
-        // extend unknown until next instruction or question or passage-eligible run
-        while (unkEnd < firstQIdx && !isInstructionText(bodyLines[unkEnd].text) && !questionIdxSet.has(unkEnd)) {
-          // Peek ahead if remaining could be passage run, break to allow passage detection
-          const remaining = firstQIdx - unkEnd;
-          if (isReading && remaining >=3) {
-            // check if from unkEnd there is passage run
+
+        let unkEnd = p + 1;
+        while (unkEnd < toIdx && !isInstructionAt(unkEnd) && !questionIdxSet.has(unkEnd)) {
+          if (passageAllowed && toIdx - unkEnd >= 3) {
             let look = unkEnd;
-            let cnt=0;
-            while (look < firstQIdx && isPassageCandidate(bodyLines[look])) { cnt++; look++; }
-            if (cnt>=3 && avgLength(bodyLines.slice(unkEnd, look))>=40) break;
+            let cnt = 0;
+            while (look < toIdx && isPassageCandidate(bodyLines[look])) { cnt++; look++; }
+            if (cnt >= 3 && (avgLength(bodyLines.slice(unkEnd, look)) >= 35 || sawReadPrompt)) break;
           }
           unkEnd++;
         }
         const unkLines = bodyLines.slice(p, unkEnd).map(lineNumber);
-        segments.push({
+        out.push({
           id: mkId(),
           kind: 'unknown',
           startLine: unkLines[0],
-          endLine: unkLines[unkLines.length-1],
+          endLine: unkLines[unkLines.length - 1],
           sectionHint: range.title,
           lines: unkLines,
-          sectionId: `sec_${ranges.indexOf(range)+1}`,
+          sectionId: sectionIdForRange,
         });
         p = unkEnd;
       }
+      return out;
+    };
+
+    if (firstQIdx !== undefined && firstQIdx > 0) {
+      for (const s of buildNonQuestionSegments(0, firstQIdx)) segments.push(s);
       cur = firstQIdx;
     } else if (firstQIdx === undefined) {
-      // No questions in this section: entire body is passage/instruction/unknown?
-      // Try to detect passage for whole body if reading/listening and length qualifies, else unknown
-      const isReading = /reading|listening|درک|شنیداری/i.test(range.title) || /reading|listening/i.test(range.kind);
-      let p = 0;
-      while (p < bodyLines.length) {
-        if (isInstructionText(bodyLines[p].text)) {
-          const nxt = emitInstructionRun(p);
-          if (nxt > p) { p = nxt; continue; }
-        }
-        // Attempt passage run
-        let runEnd = p;
-        while (runEnd < bodyLines.length && isPassageCandidate(bodyLines[runEnd])) runEnd++;
-        const runLen = runEnd - p;
-        if (isReading && runLen >=3 && avgLength(bodyLines.slice(p, runEnd)) >= 40) {
-          const nums = bodyLines.slice(p, runEnd).map(lineNumber);
-          segments.push({
-            id: mkId(),
-            kind: 'passage',
-            startLine: nums[0],
-            endLine: nums[nums.length-1],
-            sectionHint: range.title,
-            lines: nums,
-            sectionId: `sec_${ranges.indexOf(range)+1}`,
-          });
-          p = runEnd;
-          continue;
-        }
-        // unknown
-        let unkEnd = p+1;
-        while (unkEnd < bodyLines.length && !isInstructionText(bodyLines[unkEnd].text)) unkEnd++;
-        // but if next is instruction, we stop before
-        if (unkEnd > p+1 && isInstructionText(bodyLines[unkEnd-1].text)) unkEnd--;
-        // Actually we want to group until next instruction
-        // Simplify single unknown segment for rest if no structure
-        if (unkEnd === p+1) {
-          // check if next is instruction, then just single unknown line
-        }
-        // For no-question sections, group all remaining unknown as one?
-        const unkLines = bodyLines.slice(p, unkEnd).map(lineNumber);
-        // If unkLines is whole body and not reading, still unknown
-        segments.push({
-          id: mkId(),
-          kind: 'unknown',
-          startLine: unkLines[0],
-          endLine: unkLines[unkLines.length-1],
-          sectionHint: range.title,
-          lines: unkLines,
-          sectionId: `sec_${ranges.indexOf(range)+1}`,
-        });
-        p = unkEnd;
-      }
+      for (const s of buildNonQuestionSegments(0, bodyLines.length)) segments.push(s);
       continue;
     } else {
       cur = firstQIdx;
     }
 
-    // Now cur points to first question
-    // Second pass: detect matching pool pattern: numbered one-line items followed by lettered block
-    // We'll first build initial question segments assuming each question owns until next question
-    // Then detect pattern and transform
+    // Second pass: build question segments while honoring hard mid-section boundaries (Part C3:
+    // read-the-text instructions + following >=3 prose lines become section-owned PASSAGE segments).
     const initialQuestionSegments: Segment[] = [];
     const questionIndices = [...questionIdxSet].sort((a,b)=>a-b);
-    // Need to map questionIndices to bodyLines positions
     for (let qi=0; qi<questionIndices.length; qi++) {
       const idx = questionIndices[qi];
       const nextIdx = questionIndices[qi+1];
       const endIdx = nextIdx !== undefined ? nextIdx : bodyLines.length;
-      const linesSlice = bodyLines.slice(idx, endIdx).map(lineNumber);
       const line = bodyLines[idx];
       const groupInfo = isGroupParentLine(line.text);
       const intraMulti = findIntraLineMultiNumbers(line.text);
       const qn = isQuestionStart(line);
+
+      // Find any hard mid-section boundary inside (idx + 1 .. endIdx):
+      // 1) Read-the-text instruction (Persian/English) or Iranian row sub-instruction;
+      // 2) Or inside Reading/Listening, an instruction followed by >=3 prose lines.
+      let qStopIdx = endIdx;
+      for (let k = idx + 1; k < endIdx; k++) {
+        const cand = bodyLines[k];
+        if (isReadTheTextInstruction(cand.text) || isRowSubInstruction(cand.text)) {
+          qStopIdx = k;
+          break;
+        }
+        if (isReadingSection && isInstructionAt(k)) {
+          let look = k + 1;
+          while (look < endIdx && isInstructionAt(look)) look++;
+          let proseCnt = 0;
+          while (look + proseCnt < endIdx && isPassageCandidate(bodyLines[look + proseCnt])) proseCnt++;
+          if (proseCnt >= 3) {
+            qStopIdx = k;
+            break;
+          }
+        }
+      }
+
+      const linesSlice = bodyLines.slice(idx, qStopIdx).map(lineNumber);
       if (intraMulti.length >= 2) {
         const parentId = mkId();
         const lineNo = lineNumber(line);
+        const parentOffsetSpan: OffsetSpan | undefined = linesSlice.length === 1
+          ? { line: lineNo, start: intraMulti[0].charStart, end: intraMulti[0].charEnd }
+          : undefined;
         initialQuestionSegments.push({
           id: parentId,
           kind: 'group-parent',
@@ -370,9 +357,10 @@ export function segmentDocument(params: {
           childNos: intraMulti.slice(1).map(it => it.no),
           charStart: intraMulti[0].charStart,
           charEnd: intraMulti[0].charEnd,
+          offsetSpan: parentOffsetSpan,
           sectionHint: range.title,
           lines: linesSlice,
-          sectionId: `sec_${ranges.indexOf(range)+1}`,
+          sectionId: sectionIdForRange,
         });
         for (const childItem of intraMulti.slice(1)) {
           initialQuestionSegments.push({
@@ -384,14 +372,13 @@ export function segmentDocument(params: {
             printedNo: childItem.no,
             charStart: childItem.charStart,
             charEnd: childItem.charEnd,
+            offsetSpan: { line: lineNo, start: childItem.charStart, end: childItem.charEnd },
             sectionHint: range.title,
             lines: [lineNo],
-            sectionId: `sec_${ranges.indexOf(range)+1}`,
+            sectionId: sectionIdForRange,
           });
         }
       } else if (groupInfo.isGroup) {
-        // group-parent owns its line plus shared pool lines until next question
-        // But our slice includes until next question, which matches spec: parent owns shared lines
         initialQuestionSegments.push({
           id: mkId(),
           kind: 'group-parent',
@@ -401,7 +388,7 @@ export function segmentDocument(params: {
           childNos: groupInfo.childNos,
           sectionHint: range.title,
           lines: linesSlice,
-          sectionId: `sec_${ranges.indexOf(range)+1}`,
+          sectionId: sectionIdForRange,
         });
       } else if (qn !== undefined) {
         initialQuestionSegments.push({
@@ -412,92 +399,49 @@ export function segmentDocument(params: {
           printedNo: qn,
           sectionHint: range.title,
           lines: linesSlice,
-          sectionId: `sec_${ranges.indexOf(range)+1}`,
+          sectionId: sectionIdForRange,
         });
+      }
+
+      if (qStopIdx < endIdx) {
+        const sawRead = isReadTheTextInstruction(bodyLines[qStopIdx].text);
+        for (const midSeg of buildNonQuestionSegments(qStopIdx, endIdx, sawRead)) {
+          initialQuestionSegments.push(midSeg);
+        }
       }
     }
 
-    // Transform for matching pool: detect consecutive single-line questions followed by lettered block >=3
-    // The lettered block is currently inside the last question's lines (since it owns until next section/question)?
-    // But in our initialQuestionSegments, lettered block would be part of last question's tail until next question (which may not exist)
-    // For pattern where questions are single lines and then pool lines are lettered, the pool lines are currently owned by last question
-    // We need to split pool out as separate parent.
-    // Detect: find sequence where question segments are each single-line (lines length 1) and consecutive, count >=2, and next lines are lettered definitions >=3
-    // However our current segmentation already grouped pool into last question; we need to re-split.
-    // Simpler: after initialQuestionSegments, examine tail lines of each question for lettered pattern and reassign.
-    // For now, handle simple case: if we have N questions each with single line, and there exists a run of lettered lines after them within same section body but not part of any question start (since lettered lines are not question starts), that run would be inside last question's lines. We should split it.
-    // Find lettered run: lines where /^\s*(?:[a-h]|[الفبپتثجچ])\s*[).]/i.test
-    const letteredPattern = /^\s*(?:[a-h]|[الفبپتثجچحخهعغفقکگلمنوهی])\s*[).:]/i;
-    // Attempt to detect pool after questions
-    // For each initial segment that is question and has lines length >1, check if suffix lines are lettered block >=3
+    // Transform for matching pool: detect consecutive single-line questions followed by lettered block >=3 (a..j)
+    const letteredPattern = /^\s*(?:[a-j]|[الفبپتثجچحخهعغفقکگلمنوهی])\s*[).:]/i;
+    const isColumnHeaderB = (txt: string) => /^\s*B\s*$/u.test(txt.trim());
     const transformed: Segment[] = [];
     for (let i=0;i<initialQuestionSegments.length;i++) {
       const seg = initialQuestionSegments[i];
-      // Check suffix lettered lines inside seg
-      const suffixStartIdx = seg.lines.findIndex(ln => {
+      if (seg.kind !== 'question' || seg.lines.length <= 1) {
+        transformed.push(seg);
+        continue;
+      }
+      const suffixStartIdx = seg.lines.findIndex((ln, idxInSeg) => {
+        if (idxInSeg === 0) return false;
         const l = byNo.get(ln);
-        return l && letteredPattern.test(normalizeForMatching(l.text)) && seg.lines.indexOf(ln) > 0;
+        return Boolean(l && letteredPattern.test(normalizeForMatching(l.text.trimStart())));
       });
       if (suffixStartIdx > 0) {
-        const letteredLines = seg.lines.slice(suffixStartIdx);
-        const isPool = letteredLines.length >=3 && letteredLines.every(ln => {
+        // Include optional standalone "B" column header line right before the lettered pool.
+        let poolSplitIdx = suffixStartIdx;
+        if (poolSplitIdx > 1) {
+          const prevLn = seg.lines[poolSplitIdx - 1];
+          const prevLine = byNo.get(prevLn);
+          if (prevLine && isColumnHeaderB(prevLine.text)) poolSplitIdx -= 1;
+        }
+        const letteredOnly = seg.lines.slice(suffixStartIdx);
+        const poolLines = seg.lines.slice(poolSplitIdx);
+        const isPool = letteredOnly.length >= 3 && letteredOnly.every(ln => {
           const l = byNo.get(ln);
-          return l && letteredPattern.test(normalizeForMatching(l.text.trimStart()));
+          return Boolean(l && letteredPattern.test(normalizeForMatching(l.text.trimStart())));
         });
         if (isPool) {
-          // Handle preceding single-line questions (matching pool)
-          let runStart = i;
-          while (runStart > 0 && initialQuestionSegments[runStart-1].lines.length===1) runStart--;
-          // Wait runStart at i? Actually we need to include previous singles
-          // Let's collect previous single-line questions plus current seg's first line as item?
-          // Current seg's first line is also an item (question). So run includes current seg's first line.
-          // So items = from runStart to i inclusive? But pool lines are suffix of seg, so current seg's first line is item, pool is separate.
-          // So items lines are startLines of those question segs.
-          // Simpler: if pool detected and there is at least 2 preceding single-line questions before seg, then group them.
-          let precedingSingles = 0;
-          for (let k=i-1;k>=0;k--) {
-            if (initialQuestionSegments[k].kind==='question' && initialQuestionSegments[k].lines.length===1) precedingSingles++;
-            else break;
-          }
-          if (precedingSingles >=1) {
-            // We have at least 1 preceding single + current item = at least 2 items
-            const totalItems = precedingSingles + 1;
-            if (totalItems >=2 && letteredLines.length >=3) {
-              // Create parent segment for pool
-              // Need to adjust previous singles to be children, current seg split into item + parent
-              // Create parent segment id
-              const poolSeg: Segment = {
-                id: mkId(),
-                kind: 'group-parent',
-                startLine: letteredLines[0],
-                endLine: letteredLines[letteredLines.length-1],
-                printedNo: undefined,
-                childNos: [],
-                sectionHint: range.title,
-                lines: letteredLines,
-                sectionId: `sec_${ranges.indexOf(range)+1}`,
-              };
-              // Adjust current seg to only its first line (item)
-              const itemLines = seg.lines.slice(0, suffixStartIdx);
-              const itemSeg: Segment = {
-                ...seg,
-                lines: itemLines,
-                endLine: itemLines[itemLines.length-1],
-              };
-              // Replace last precedingSingles transformed entries if they were already pushed?
-              // Instead, we will have not yet pushed previous singles? Actually we are iterating, they are in transformed if we pushed them.
-              // To simplify, we will push itemSeg and poolSeg, and mark previous singles as children (they already pushed).
-              // But we need to retroactively adjust precedingSingles segments to have parentId? However segment structure doesn't have parentId; spec says parent+children structure directly (children get item line; pool belongs to parent). At segmentation level, parent vs children are separate segments, no parentId needed yet.
-              // So just push itemSeg then poolSeg
-              // And preceding singles remain as they were (question)
-              transformed.push(itemSeg);
-              transformed.push(poolSeg);
-              continue;
-            }
-          }
-          // fallback: split anyway without preceding grouping
-          const itemLines = seg.lines.slice(0, suffixStartIdx);
-          const poolLines = letteredLines;
+          const itemLines = seg.lines.slice(0, poolSplitIdx);
           if (itemLines.length) {
             transformed.push({ ...seg, lines: itemLines, endLine: itemLines[itemLines.length-1] });
           }
@@ -506,9 +450,11 @@ export function segmentDocument(params: {
             kind: 'group-parent',
             startLine: poolLines[0],
             endLine: poolLines[poolLines.length-1],
+            printedNo: undefined,
+            childNos: [],
             sectionHint: range.title,
             lines: poolLines,
-            sectionId: `sec_${ranges.indexOf(range)+1}`,
+            sectionId: sectionIdForRange,
           });
           continue;
         }

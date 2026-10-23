@@ -10,6 +10,7 @@ import {
   assembleAndValidateSections,
   spanLineNumbers,
 } from "./assemble";
+import { spanEndLine, spansContainLine, spanStartLine } from "./spans";
 import {
   enumerateExpectedQuestionNos,
   evaluateCoverage,
@@ -51,7 +52,7 @@ export function sectionSource(doc: ExamDoc, sectionId: string) {
   const lines = doc.source.lines.filter(
     (l) =>
       !key.has(lineNumber(l)) &&
-      section.spans.some(([a, b]) => lineNumber(l) >= a && lineNumber(l) <= b),
+      spansContainLine(section.spans, lineNumber(l)),
   );
   const safe = new Set(lines.filter((l) => !l.furniture).map(lineNumber));
   if (!safe.size) throw new AgentOperationError("emptySection");
@@ -89,12 +90,15 @@ export function applySectionCandidate(doc: ExamDoc, input: unknown): ExamDoc {
     ];
     if (
       !raw.spans.length ||
-      spans.some(
-        ([a, b]) =>
+      spans.some((sp) => {
+        const a = spanStartLine(sp);
+        const b = spanEndLine(sp);
+        return (
           b < a ||
           b - a > 5000 ||
-          spanLineNumbers([[a, b]]).some((n) => !available.has(n)),
-      ) ||
+          spanLineNumbers([sp]).some((n) => !available.has(n))
+        );
+      }) ||
       !spanLineNumbers(raw.spans).some((n) => safe.has(n)) ||
       raw.rewrites?.length ||
       raw.images?.some(

@@ -15,6 +15,51 @@ import {
   normalizeForMatching,
   examContentRevision,
 } from "./quality";
+import { detectShapeProblemQuestions } from "./forms";
+
+/** Part D2 — Executor confidence floor for shape-class questions. */
+export const EXECUTOR_CONFIDENCE_FLOOR = 0.6;
+
+export function detectLowConfidenceShapeQuestions(doc: ExamDoc): Array<{
+  questionId: string;
+  no: number;
+  confidence: number;
+  reasons: string[];
+}> {
+  const shapeByQ = new Map<string, string[]>(
+    detectShapeProblemQuestions(doc).map((p) => [p.questionId, [...p.kinds]]),
+  );
+  const out: Array<{ questionId: string; no: number; confidence: number; reasons: string[] }> = [];
+  for (const q of doc.questions || []) {
+    if (q.confidence >= EXECUTOR_CONFIDENCE_FLOOR) continue;
+    const reasons = [...(shapeByQ.get(q.id) || [])];
+    for (const fl of q.flags || []) {
+      if (
+        (fl === "STEM_OVERLONG" ||
+          fl === "OPTION_DUPLICATE" ||
+          fl === "OPTIONS_MISSING" ||
+          fl === "OPTION_SPLIT_FAILED" ||
+          fl.startsWith("INVARIANT_I12")) &&
+        !reasons.includes(fl)
+      ) {
+        reasons.push(fl);
+      }
+    }
+    if (reasons.length > 0) {
+      out.push({ questionId: q.id, no: q.no, confidence: q.confidence, reasons });
+    }
+  }
+  return out;
+}
+
+export function formatNeedsHumanLine(
+  items: Array<{ questionId: string; no: number; confidence: number; reasons: string[] }>,
+): string | undefined {
+  if (!items.length) return undefined;
+  return `needs-human: ${items
+    .map((it) => `Q${it.no} (${it.questionId}, conf ${it.confidence.toFixed(2)} < ${EXECUTOR_CONFIDENCE_FLOOR}: ${it.reasons.join("/")})`)
+    .join("; ")}`;
+}
 
 /**
  * D2 — the hardcoded assistant prompt keeps ROLE, RULES and TOOL PHILOSOPHY only.
@@ -129,6 +174,7 @@ export function compactResult(value: unknown, call = "get_questions"): string {
 }
 export function healthSummary(doc: ExamDoc) {
   const h = getExamHealth(doc);
+  const shapeProblems = detectShapeProblemQuestions(doc).length;
   return {
     expected: h.expectedCount,
     parsed: h.parsedCount,
@@ -138,7 +184,8 @@ export function healthSummary(doc: ExamDoc) {
     unplacedImages: h.unplacedImages.length,
     unresolvedImages: h.unresolvedImageRefs.length,
     lowConfidence: h.lowConfidenceCount,
-    state: h.state,
+    shapeProblems,
+    state: h.state === "green" && shapeProblems > 0 ? ("amber" as const) : h.state,
   };
 }
 export interface AgentGuidanceSummary {
@@ -314,17 +361,19 @@ export function computeActionFingerprint(
   doc: ExamDoc,
 ): string {
   const target =
-    typeof args.sectionId === "string"
-      ? args.sectionId
-      : typeof args.parentQuestionId === "string"
-        ? args.parentQuestionId
-        : typeof args.questionId === "string"
-          ? args.questionId
-          : Array.isArray(args.childNumbers)
-            ? `children:${args.childNumbers.join(",")}`
-            : Array.isArray(args.numbers)
-              ? `numbers:${args.numbers.join(",")}`
-              : JSON.stringify(args);
+    args.scope === "exam"
+      ? "exam"
+      : typeof args.sectionId === "string"
+        ? args.sectionId
+        : typeof args.parentQuestionId === "string"
+          ? args.parentQuestionId
+          : typeof args.questionId === "string"
+            ? args.questionId
+            : Array.isArray(args.childNumbers)
+              ? `children:${args.childNumbers.join(",")}`
+              : Array.isArray(args.numbers)
+                ? `numbers:${args.numbers.join(",")}`
+                : JSON.stringify(args);
   return `${tool}:${target}:${examContentRevision(doc)}`;
 }
 export function missingSetFingerprint(missing: number[], doc: ExamDoc): string {
@@ -347,6 +396,7 @@ const LADDER_RUNGS: Record<string, string> = {
   diagnose_missing: "L2",
   get_source_lines: "L2",
   get_question_index: "L2",
+  canonicalize_question: "L2",
   split_group_children: "L2",
   accept_group_representation: "L2",
   reparse_section: "L3",
@@ -438,6 +488,11 @@ export interface AgentSession {
   preconditionsWaived?: string[];
   /** B5 — exactly what memory was injected this turn, shown in the transcript/UI. */
   guidanceDigest?: string;
+  /** D2 — open low-confidence shape-class items surfaced as needs-human after local canonicalization. */
+  needsHuman?: {
+    line: string;
+    openQuestions: Array<{ questionId: string; no: number; confidence: number; reasons: string[] }>;
+  };
 }
 export interface AgentTool {
   description: string;
@@ -1059,7 +1114,32 @@ export async function runAgentTurn(
           noteStep(call.name);
           if (call.name === 'get_exam_health') {
             const fresh = (call.args as any)?.fresh === true;
-            result = getCachedHealth(fresh);
+            const currentDoc = runtime.getDoc();
+            const shapeProbs = Object.hasOwn(runtime.registry, "canonicalize_question")
+              ? detectShapeProblemQuestions(currentDoc)
+              : [];
+            const shapeQueue: ActionQueueItem[] = (shapeProbs.length > 6
+              ? [{
+                  tool: "canonicalize_question",
+                  args: { scope: "exam" },
+                  rationale: `${shapeProbs.length} questions have deterministic shape problems`,
+                  riskClass: "mutate" as const,
+                }]
+              : shapeProbs.map((p) => ({
+                  tool: "canonicalize_question",
+                  args: { questionId: p.questionId },
+                  rationale: `Q${p.no} shape problem (${p.kinds.join(", ")})`,
+                  riskClass: "mutate" as const,
+                }))
+            ).filter((item) => {
+              const fp = computeActionFingerprint(item.tool, item.args, currentDoc);
+              return !turnLedger.executedFingerprints.has(fp) && !turnLedger.refusedFingerprints.has(fp);
+            });
+            const healthObj: any = getCachedHealth(fresh || shapeQueue.length > 0);
+            if (shapeQueue.length > 0) {
+              healthObj.actionQueue = shapeQueue;
+            }
+            result = healthObj;
             if ((result as any).cached) {
               // Mark as cached in observation
               (result as any).ageMs = Date.now() - (session.healthCache?.ts || Date.now());
@@ -1154,11 +1234,50 @@ export async function runAgentTurn(
       event(session, "assistant", `Executor: ${from} returned ${valid.length} action(s) — ${valid.map((a) => `${a.tool}${a.riskClass === 'destructive' ? ' (needs confirmation)' : ''}`).join(' → ')}. Running locally, zero model calls.`);
       return runExecutor(from);
     };
-    /** E2/E3 — drain session.task.executorQueue between model turns; one re-observation; one delta report. */
+    let emittedNeedsHumanLine: string | undefined;
+    /** E2/E3 + D2 — drain session.task.executorQueue between model turns; auto-canonicalize low-conf shape questions; emit needs-human if still <0.6. */
     const runExecutor = async (from: string): Promise<"done" | "return"> => {
       const task = session.task;
       if (!task?.executorQueue?.length) return "done";
-      const healthBefore = healthSummary(runtime.getDoc());
+      const docStart = runtime.getDoc();
+      const healthBefore = healthSummary(docStart);
+      const trackedLowConfIds = new Set<string>(
+        detectLowConfidenceShapeQuestions(docStart).map((it) => it.questionId),
+      );
+      for (const qItem of task.executorQueue) {
+        if (qItem.tool === "canonicalize_question") {
+          if (typeof qItem.args?.questionId === "string") {
+            const qObj = docStart.questions.find((q) => q.id === qItem.args.questionId);
+            if (qObj && qObj.confidence < EXECUTOR_CONFIDENCE_FLOOR) trackedLowConfIds.add(qObj.id);
+          } else if (qItem.args?.scope === "exam") {
+            for (const qObj of docStart.questions) {
+              if (qObj.confidence < EXECUTOR_CONFIDENCE_FLOOR) trackedLowConfIds.add(qObj.id);
+            }
+          }
+        }
+      }
+
+      // D2 — Ensure any un-queued low-confidence shape-class questions are canonicalized automatically in this pass.
+      if (Object.hasOwn(runtime.registry, "canonicalize_question") && !runtime.readOnly?.()) {
+        for (const lc of detectLowConfidenceShapeQuestions(docStart)) {
+          const alreadyInQueue = task.executorQueue.some(
+            (it) =>
+              it.tool === "canonicalize_question" &&
+              (it.args?.scope === "exam" || it.args?.questionId === lc.questionId),
+          );
+          if (alreadyInQueue) continue;
+          const fp = computeActionFingerprint("canonicalize_question", { questionId: lc.questionId }, docStart);
+          if (turnLedger.executedFingerprints.has(fp) || turnLedger.refusedFingerprints.has(fp)) continue;
+          task.executorQueue.push({
+            tool: "canonicalize_question",
+            args: { questionId: lc.questionId },
+            rationale: `D2 confidence floor: Q${lc.no} (${lc.confidence.toFixed(2)} < ${EXECUTOR_CONFIDENCE_FLOOR}) has shape problem (${lc.reasons.join(", ")})`,
+            riskClass: "mutate",
+          });
+          trackedLowConfIds.add(lc.questionId);
+        }
+      }
+
       const ran: Array<{ tool: string; summary: string; ok: boolean }> = [];
       let paused: string | undefined;
       noteStep(`executor:${task.executorQueue.length}`);
@@ -1182,6 +1301,36 @@ export async function runAgentTurn(
       const healthAfter = observe();
       spend('read');
       task.healthTrajectory.push(healthAfter);
+
+      // D2 — Check if any canonicalized / shape-class low-confidence questions remain below floor afterward.
+      const docAfter = runtime.getDoc();
+      const postLowConf = detectLowConfidenceShapeQuestions(docAfter);
+      const stillBelowFloor = docAfter.questions
+        .filter((q) => trackedLowConfIds.has(q.id) && q.confidence < EXECUTOR_CONFIDENCE_FLOOR)
+        .map((q) => {
+          const found = postLowConf.find((p) => p.questionId === q.id);
+          return {
+            questionId: q.id,
+            no: q.no,
+            confidence: q.confidence,
+            reasons: found?.reasons.length ? found.reasons : (q.flags?.length ? q.flags : ["low-confidence"]),
+          };
+        });
+      const needsHumanLine = !paused ? formatNeedsHumanLine(stillBelowFloor) : undefined;
+      if (needsHumanLine) {
+        emittedNeedsHumanLine = needsHumanLine;
+        session.needsHuman = { line: needsHumanLine, openQuestions: stillBelowFloor };
+        for (const item of stillBelowFloor) {
+          turnLedger.executedFingerprints.add(
+            computeActionFingerprint("canonicalize_question", { questionId: item.questionId }, docAfter),
+          );
+        }
+        syncLedgerToBrief();
+        brief().establishedFacts = dedupePush(brief().establishedFacts, needsHumanLine, 10);
+      } else {
+        session.needsHuman = undefined;
+      }
+
       const delta = {
         parsed: healthAfter.parsed - healthBefore.parsed,
         missing: healthAfter.missing.length - healthBefore.missing.length,
@@ -1196,18 +1345,55 @@ export async function runAgentTurn(
           before: { parsed: healthBefore.parsed, missing: healthBefore.missing.length, state: healthBefore.state },
           after: { parsed: healthAfter.parsed, missing: healthAfter.missing.length, state: healthAfter.state },
           delta,
+          ...(needsHumanLine ? { needsHuman: needsHumanLine } : {}),
         },
         // E5 — one worked follow-up so the model does not re-plan what the executor already did.
-        example: healthAfter.missing.length === 0 && !task.executorQueue.length
-          ? `Reply in chat only: "Executor ran ${ran.map((r) => r.tool).join(', ') || 'nothing'}; missing ${healthBefore.missing.length} → ${healthAfter.missing.length}. ${healthAfter.state === 'green' ? 'Verified green.' : `Health ${healthAfter.state}: points ${healthAfter.points}/${healthAfter.totalPoints ?? '?'} — set points on the new children or report partial.`}"`
-          : `Do not repeat ${ran.map((r) => r.tool).join('/') || 'the queue'}. Next rung: ${task.brief?.nextPlanned || nextRungFor(ran.at(-1)?.tool || from)}.`,
+        example: needsHumanLine && healthAfter.missing.length === 0 && !task.executorQueue.length
+          ? `Reply in chat only with the executor summary and "${needsHumanLine}" — do not burn another budget window on low-confidence items.`
+          : healthAfter.missing.length === 0 && !task.executorQueue.length
+            ? `Reply in chat only: "Executor ran ${ran.map((r) => r.tool).join(', ') || 'nothing'}; missing ${healthBefore.missing.length} → ${healthAfter.missing.length}. ${healthAfter.state === 'green' ? 'Verified green.' : `Health ${healthAfter.state}: points ${healthAfter.points}/${healthAfter.totalPoints ?? '?'} — set points on the new children or report partial.`}"`
+            : `Do not repeat ${ran.map((r) => r.tool).join('/') || 'the queue'}. Next rung: ${task.brief?.nextPlanned || nextRungFor(ran.at(-1)?.tool || from)}.`,
       };
       session.observations.push(compactResult(report, from));
-      event(session, "assistant", `Executor delta: parsed ${healthBefore.parsed} → ${healthAfter.parsed}, missing ${healthBefore.missing.length} → ${healthAfter.missing.length}, points ${healthBefore.points} → ${healthAfter.points}${paused ? ` · paused (${paused}), ${task.executorQueue.length} queued` : ''}.`);
+      event(
+        session,
+        "assistant",
+        `Executor delta: parsed ${healthBefore.parsed} → ${healthAfter.parsed}, missing ${healthBefore.missing.length} → ${healthAfter.missing.length}, points ${healthBefore.points} → ${healthAfter.points}${paused ? ` · paused (${paused}), ${task.executorQueue.length} queued` : ''}.${needsHumanLine ? `\n${needsHumanLine}` : ''}`,
+      );
       brief().establishedFacts = dedupePush(brief().establishedFacts, `executor(${from}): ${ran.map((r) => `${r.tool}${r.ok ? '' : '✗'}`).join(',') || 'none'} → missing ${healthBefore.missing.length}→${healthAfter.missing.length}`, 10);
       await save();
       return paused === "confirm" ? "return" : "done";
     };
+    // Part D2 — Auto-canonicalize low-confidence shape-class questions before burning model calls/windows.
+    if (!confirmedCall && Object.hasOwn(runtime.registry, "canonicalize_question") && !runtime.readOnly?.()) {
+      const docForFloor = runtime.getDoc();
+      const autoFloorItems = detectLowConfidenceShapeQuestions(docForFloor)
+        .map((lc) => ({
+          tool: "canonicalize_question",
+          args: { questionId: lc.questionId },
+          rationale: `D2 confidence floor: Q${lc.no} (${lc.confidence.toFixed(2)} < ${EXECUTOR_CONFIDENCE_FLOOR}) has shape problem (${lc.reasons.join(", ")})`,
+          riskClass: "mutate" as const,
+        }))
+        .filter((item) => {
+          const fp = computeActionFingerprint(item.tool, item.args, docForFloor);
+          return !turnLedger.executedFingerprints.has(fp) && !turnLedger.refusedFingerprints.has(fp);
+        });
+      if (autoFloorItems.length > 0) {
+        const floorOut = await enqueueAndRun(autoFloorItems, "confidence-floor");
+        if (floorOut === "return") return session;
+        // If canonicalization ran and items STILL remain below floor with no missing numbers, report needs-human immediately without burning budget windows.
+        const postFloorHealth = healthSummary(runtime.getDoc());
+        if (emittedNeedsHumanLine && postFloorHealth.missing.length === 0 && !session.task?.executorQueue?.length && !fixIt) {
+          event(
+            session,
+            "assistant",
+            `${verificationText(session.before!, postFloorHealth, false, language())}\n${emittedNeedsHumanLine}`,
+          );
+          await reportJobEnd(session, runtime, postFloorHealth);
+          return session;
+        }
+      }
+    }
     // E3 — a resumed task continues its checkpointed queue before any model call.
     if (!confirmedCall && session.task?.executorQueue?.length) {
       const r = await runExecutor("resume");
@@ -1334,10 +1520,12 @@ export async function runAgentTurn(
         ? healthSummary(runtime.getDoc())
         : observe();
     const before = session.before!;
+    const finalVerif = verificationText(before, health, bounded, language());
+    const alreadyHasNeedsHuman = session.events.some((e) => e.kind === "assistant" && emittedNeedsHumanLine && e.text.includes(emittedNeedsHumanLine));
     event(
       session,
       "assistant",
-      verificationText(before, health, bounded, language()),
+      emittedNeedsHumanLine && !alreadyHasNeedsHuman ? `${finalVerif}\n${emittedNeedsHumanLine}` : finalVerif,
     );
     // D3 — assistant task end is a job completion point: the harness journals the run
     // and may schedule ONE reflection call. Advisory only: failures never break the turn.

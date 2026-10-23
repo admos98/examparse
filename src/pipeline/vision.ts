@@ -8,6 +8,7 @@ import { LLMAdapter } from '../providers/adapter';
 import { T2_IMAGE_LABELING_SYSTEM } from './prompts';
 import { getImageBlob } from '../store';
 import { Question } from '../types';
+import { spanLineNumbers, spanStartLine } from './spans';
 
 /** Fallback kind: 'photo' for raster crops unless vector/diagram-detected; never blanket 'diagram'. */
 export function fallbackImageKind(img: Partial<ImageAsset> & { vectorDetected?: boolean; diagramDetected?: boolean }): 'photo' | 'diagram' {
@@ -280,8 +281,10 @@ export async function labelImagesBatched(params: {
         const page = img.page;
         // nearest questions by anchor line distance
         const byDist = [...extra].sort((a,b)=>{
-          const da = a.spans[0]?.[0] ? Math.abs((a.spans[0][0]) - (img.anchorLine||0)) : 9999;
-          const db = b.spans[0]?.[0] ? Math.abs((b.spans[0][0]) - (img.anchorLine||0)) : 9999;
+          const aStart = a.spans?.[0] ? spanStartLine(a.spans[0]) : undefined;
+          const bStart = b.spans?.[0] ? spanStartLine(b.spans[0]) : undefined;
+          const da = aStart ? Math.abs(aStart - (img.anchorLine||0)) : 9999;
+          const db = bStart ? Math.abs(bStart - (img.anchorLine||0)) : 9999;
           return da - db;
         }).filter(q=> !candidates.some(c=>c.ref===q.label));
         for (const q of byDist.slice(0, 4 - candidates.length)) {
@@ -327,11 +330,9 @@ export async function labelImagesBatched(params: {
   const questionPagesByRef = new Map<string, Set<number>>();
   for (const q of ((params as any).questions || []) as Question[]) {
     const pages = new Set<number>();
-    for (const [s, e] of q.spans || []) {
-      for (let ln = s; ln <= e; ln++) {
-        const p = linePageByNo.get(ln);
-        if (p !== undefined) pages.add(p);
-      }
+    for (const ln of spanLineNumbers(q.spans)) {
+      const p = linePageByNo.get(ln);
+      if (p !== undefined) pages.add(p);
     }
     if (pages.size) {
       questionPagesByRef.set(String(q.no), pages);

@@ -7,6 +7,8 @@ import type { ExamSection, Flag, Question, SourceLine } from '../types';
 import { assembleAndValidateSections, canonicalizeSections } from './assemble';
 import { computeOwnership, orphanFlag, reassignSectionsByContainment, splitSectionsAtHeaders, type OwnershipMap } from './ownership';
 import { reconcileMetaTotal } from './quality';
+import { coerceLineSpan, spansContainLine, spanStartLine } from './spans';
+import { canonicalizeForms } from './forms';
 
 export interface LocalGatesResult {
   questions: Question[];
@@ -35,8 +37,10 @@ export function applyLocalGates(params: {
   for (const split of sectionSplit.splits) flags.push({ id: `flag_SECTION_SPLIT_LOCAL_${split.sectionId}_${split.atLine}`, severity: 'info', code: 'SECTION_SPLIT_LOCAL', message: `Section ${split.sectionId} contained header “${split.title}” at L${String(split.atLine).padStart(4, '0')}; split locally.` });
   questions = questions.map(question => {
     if (question.sectionId && sectionSplit.sections.some((s: any) => s.id === question.sectionId)) return question;
-    const firstLine = question.spans[0]?.[0];
-    const section = sectionSplit.sections.find((candidate: any) => (candidate.spans || []).some((span: any) => firstLine >= span[0] && firstLine <= span[1]));
+    const firstLine = question.spans[0] ? spanStartLine(question.spans[0]) : undefined;
+    const section = firstLine !== undefined
+      ? sectionSplit.sections.find((candidate: any) => spansContainLine((candidate.spans || []).map(coerceLineSpan).filter(Boolean), firstLine))
+      : undefined;
     return section ? { ...question, sectionId: section.id } : question;
   });
   const sectionAssembly = assembleAndValidateSections(sectionSplit.sections, params.lines, questions, keyLines);
@@ -57,12 +61,27 @@ export function applyLocalGates(params: {
     if (!flags.some(existing => existing.code === f.code)) flags.push(f);
   }
 
+  // Part C1/C3 — Run idempotent form canonicalizer registry with finalized sections so
+  // section-owned passage tails and form rules are guaranteed across all pipeline entrypoints.
+  const formRes = canonicalizeForms({
+    questions,
+    sourceLines: params.lines,
+    sections: canonical.sections,
+  });
+  questions = formRes.questions;
+  const finalSections = formRes.sections;
+  for (const cf of formRes.flags) {
+    if (!flags.some(existing => existing.code === cf.code && existing.questionId === cf.questionId)) {
+      flags.push(cf);
+    }
+  }
+
   const metaTotal = reconcileMetaTotal(params.metaTotalPoints, params.lines, keyLines, questions);
   if (metaTotal.flag) flags.push({ id: `flag_${metaTotal.flag.code}`, severity: metaTotal.flag.severity, code: metaTotal.flag.code, message: metaTotal.flag.message });
 
-  const ownership = computeOwnership({ lines: params.lines, questions, sections: canonical.sections, keyLines });
+  const ownership = computeOwnership({ lines: params.lines, questions, sections: finalSections, keyLines });
   const orphan = orphanFlag(ownership);
   if (orphan) flags.push({ id: 'flag_ORPHAN_LINES', severity: orphan.severity, code: orphan.code, message: orphan.message });
 
-  return { questions, sections: canonical.sections, totalPoints: metaTotal.totalPoints, flags, ownership, splits: sectionSplit.splits.length, reassigned: containment.reassigned.length, ambiguous: containment.ambiguous.length };
+  return { questions, sections: finalSections, totalPoints: metaTotal.totalPoints, flags, ownership, splits: sectionSplit.splits.length, reassigned: containment.reassigned.length, ambiguous: containment.ambiguous.length };
 }

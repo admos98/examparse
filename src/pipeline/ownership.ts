@@ -13,8 +13,9 @@
  * assembled docs for the ownership map used by health, quality score and bench.
  */
 import type { ExamDoc, ExamSection, LineSpan, Question, SourceLine } from '../types';
-import { detectSectionHeaders, lineNumber, normalizeForMatching, parsePrintedNumberFromStem } from './quality';
+import { detectSectionHeaders, exciseWatermarks, isReadTheTextInstruction, lineNumber, normalizeForMatching, parsePrintedNumberFromStem } from './quality';
 import { isBarePageNumber, isInstructionText, isOptionMarkerLine, isTotalPointsLine } from './cleanup';
+import { coerceLineSpan, compressLineNumbers, spanHasOffsets, spanLineNumbers } from './spans';
 
 export const GAP_ABSORB_CAP = 30;
 export const TAIL_ABSORB_CAP = 8;
@@ -40,28 +41,21 @@ export interface GapCompletionResult {
 }
 
 function spanLines(spans: LineSpan[] | undefined): number[] {
-  const out = new Set<number>();
-  for (const s of Array.isArray(spans) ? spans : []) {
-    if (!Array.isArray(s)) continue; // tolerate malformed spans from older/foreign docs
-    const [a, b] = s;
-    if (Number.isInteger(a) && Number.isInteger(b) && b >= a && b - a < 5000) for (let n = a; n <= b; n++) out.add(n);
-  }
-  return [...out].sort((x, y) => x - y);
+  return spanLineNumbers(spans);
 }
 function compress(lines: number[]): LineSpan[] {
-  const out: LineSpan[] = [];
-  for (const n of [...new Set(lines)].sort((a, b) => a - b)) {
-    const last = out[out.length - 1];
-    if (last && last[1] + 1 === n) last[1] = n; else out.push([n, n]);
-  }
-  return out;
+  return compressLineNumbers(lines);
 }
 function rawSpans(spans: unknown): LineSpan[] {
   if (!Array.isArray(spans)) return [];
   const out: LineSpan[] = [];
   for (const s of spans) {
-    if (Array.isArray(s) && s.length >= 2) { const a = Number(s[0]), b = Number(s[1]); if (Number.isInteger(a) && Number.isInteger(b) && a > 0 && b >= a) out.push([a, b]); }
-    else if (typeof s === 'number' && Number.isInteger(s) && s > 0) out.push([s, s]);
+    if (typeof s === 'number' && Number.isInteger(s) && s > 0) {
+      out.push([s, s]);
+      continue;
+    }
+    const coerced = coerceLineSpan(s);
+    if (coerced) out.push(coerced);
   }
   return out;
 }
@@ -70,7 +64,12 @@ function rawSpans(spans: unknown): LineSpan[] {
 export function isSkippedLine(line: SourceLine): boolean {
   if (line.furniture || line.tag === 'furniture' || line.tag === 'pagenum' || line.tag === 'junk' || !line.text.trim()) return true;
   // Even without cleanup tags: bare page numbers, URL-only and watermark-only lines are never question content.
-  return isBarePageNumber(line.text) || /^(?:https?:\/\/|www[.-])\S+$/i.test(line.text.trim()) || !normalizeForMatching(line.text).trim();
+  return (
+    isBarePageNumber(line.text) ||
+    /^(?:https?:\/\/|www[.-])\S+$/i.test(line.text.trim()) ||
+    !normalizeForMatching(line.text).trim() ||
+    !exciseWatermarks(line.text).text.trim()
+  );
 }
 
 export type BarrierKind = 'printed-number' | 'header' | 'instruction' | 'passage' | 'key' | 'total' | 'closing';
@@ -95,18 +94,23 @@ export function headerAnchors(lines: SourceLine[]): Array<{ title: string; heade
 export function classifyLines(lines: SourceLine[], keyLines: Set<number>): Map<number, LineClass> {
   const headers = new Set(headerAnchors(lines).map(h => h.headerLine));
   const out = new Map<number, LineClass>();
+  const iranianSubInstructionRe = /(?:کامل\s+کنید|پاسخ\s+دهید|انتخاب\s+کنید|بنویسید|مشخص\s+کنید|پیدا\s+کنید|مرتب\s+کنید|وصل\s+کنید)/u;
   for (const line of lines) {
     const n = lineNumber(line);
     const skipped = isSkippedLine(line);
     let barrier: BarrierKind | undefined;
     if (keyLines.has(n) || line.tag === 'key') barrier = 'key';
     else if (!skipped) {
+      const norm = normalizeForMatching(line.text).trim();
+      const isRowInstruction =
+        isReadTheTextInstruction(line.text) ||
+        (/^(?:[الفبپتجد]\s*[).\-:]|\d{1,2}(?:\s*[./]\s*\d{1,2})?\s*\.?)\s*[\p{Script=Arabic}]/u.test(norm) && iranianSubInstructionRe.test(norm));
       if (headers.has(n) || line.tag === 'header') barrier = 'header';
       else if (isTotalPointsLine(line.text)) barrier = 'total';
-      else if (CLOSING_RE.test(normalizeForMatching(line.text).trim())) barrier = 'closing';
+      else if (CLOSING_RE.test(norm)) barrier = 'closing';
       else if (line.tag === 'passage') barrier = 'passage';
-      else if (line.tag === 'instruction' || (isInstructionText(line.text) && parsePrintedNumberFromStem(line.text) === undefined)) barrier = 'instruction';
-      else if (parsePrintedNumberFromStem(line.text) !== undefined || /\(\d{1,3}\)\s*\(\d{1,3}\)/.test(normalizeForMatching(line.text))) barrier = 'printed-number';
+      else if (line.tag === 'instruction' || isRowInstruction || (isInstructionText(line.text) && parsePrintedNumberFromStem(line.text) === undefined)) barrier = 'instruction';
+      else if (parsePrintedNumberFromStem(line.text) !== undefined || /\(\d{1,3}\)\s*\(\d{1,3}\)/.test(norm)) barrier = 'printed-number';
     }
     out.set(n, { line: n, barrier, sectionLevel: barrier === 'header' || barrier === 'instruction' || barrier === 'passage' || barrier === 'total' || barrier === 'closing', optionMarker: !skipped && isOptionMarkerLine(line.text), skipped });
   }
@@ -133,6 +137,10 @@ function hasIntraLineMultiNumbers(text: string): boolean {
 function optionMarkerKeys(text: string): string[] {
   if (hasIntraLineMultiNumbers(text)) return [];
   const v = normalizeForMatching(text);
+  // Guard 2-turn uppercase speaker dialogue (`A: ... B: ...` without `C:`).
+  if (/(?:^|\s)A\s*:/u.test(text) && /(?:^|\s)B\s*:/u.test(text) && !/(?:^|\s)[Cc]\s*[).:]/u.test(text)) {
+    if (!/\b(?:true|false|درست|نادرست)\b/iu.test(v)) return [];
+  }
   const re = /(?:^|\s)(?:\(([a-j])\)|([a-j])[).:]|\((الف|ب|پ|ت|ث|ج|چ|د|ه|و)\)|(الف|ب|پ|ت|ث|ج|چ|د|ه|و)[).:])(?=\s|$)/gi;
   const raw: string[] = [];
   for (const m of v.matchAll(re)) raw.push((m[1] || m[2] || m[3] || m[4] || '').toLowerCase());
@@ -205,7 +213,9 @@ export function completeGapsRaw(
 
   for (const entry of owned) {
     const q = raw[entry.idx];
-    const stemLines = spanLines(rawSpans(q.spans));
+    const parsedQSpans = rawSpans(q.spans);
+    if (parsedQSpans.some(spanHasOffsets)) continue;
+    const stemLines = spanLines(parsedQSpans);
     const last = entry.lines[entry.lines.length - 1];
     const lastLine = byNo.get(last);
     const sectionId = typeof q.sectionId === 'string' ? q.sectionId : undefined;

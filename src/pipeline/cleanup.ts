@@ -11,7 +11,7 @@
  * (the pipeline passes the LLM adapter; tests pass a scripted mock).
  */
 import type { LineTag, LineTagSource, SourceLine } from '../types';
-import { detectSectionHeaders, lineNumber, normalizeForMatching, parsePrintedNumberFromStem } from './quality';
+import { detectSectionHeaders, exciseWatermarks, lineNumber, normalizeForMatching, parsePrintedNumberFromStem } from './quality';
 
 export const CLEANUP_VERSION = 'cleanup-v1';
 export const CLEANUP_CHUNK_LINES = 400;
@@ -49,7 +49,7 @@ const OPTION_MARKER_ANY = /(?:^|\s)(?:\(?[a-h][).:]|\([a-h]\)|\((?:الف|ب|پ|
 const BLANK_MARKER = /……|…{2,}|\.\.\.|_{2,}|-{3,}|\(\s*\)|\(\s*\.+\s*\)/;
 const GROUP_ENUM = /\(\d{1,3}\)\s*\(\d{1,3}\)/;
 const URL_ONLY = /^(?:https?:\/\/|www[.-])\S+$/i;
-const INSTRUCTION_RE = /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|circle\b|underline\b|دستورالعمل|به سوالات|به پرسش|گزینه|جاهای خالی|جمله|کلمات|با توجه به|متن زیر|مکالمه)/i;
+const INSTRUCTION_RE = /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|circle\b|underline\b|دستورالعمل|به سوالات|به پرسش|گزینه|جاهای خالی|جملات|جمله|کلمات|با توجه به|متن زیر|مکالمه|پاسخ\s+صحیح|دانش\s*اموز\s*عزیز|در\s+این\s+قسمت|در\s+سوالهای|توجه\s*:)/i;
 const TOTAL_POINTS_RE = /(?:جمع\s*نمره|جمع\s*نمرات|نمره\s*کل|total\s*(?:points|marks|score))/i;
 
 /** A line that carries a printed question number (leading, parenthesised, or a (15)(16) group line). */
@@ -144,7 +144,7 @@ export function localCleanupPrepass(
     let tag: LineTag | undefined;
     if (keyLines.has(n)) tag = 'key';
     else if (line.furniture) tag = 'furniture';
-    else if (!normalized && text.trim()) tag = 'furniture'; // watermark-only (lexicon strips it to nothing)
+    else if ((!normalized || !exciseWatermarks(text).text.trim()) && text.trim()) tag = 'furniture'; // watermark-only (lexicon strips it to nothing)
     else if (URL_ONLY.test(text.trim())) tag = 'furniture';
     else if (pages >= 2 && normalized.length >= 3 && (textPages.get(normalized)?.size || 0) >= repeatedThreshold && !headerLines.has(n)) tag = 'furniture';
     else if (isBarePageNumber(text)) {

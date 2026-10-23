@@ -1,6 +1,7 @@
 import React from 'react';
 import { ExamDoc, Question, getDisplayName } from '../types';
 import { decontaminateOptionMarkup, extractSafeTableRows } from '../pipeline/assemble';
+import { formatSpans } from '../pipeline/spans';
 import { toPersianDigits } from '../utils/numbers';
 import { buildQuestionTree } from '../utils/questionTree';
 import { ExamSheet } from '../design/ExamSheet';
@@ -91,7 +92,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
         <DirectionalText text={option.text || ''} fallback={fallbackDir} />
       </div>)}</div> : null}
       {mode === 'paper' && ['short', 'long', 'essay'].includes(q.type) && <div className="ep-writing-lines" style={{ height: q.type === 'essay' ? '80px' : '40px' }} />}
-      {mode === 'review' && <div className="ep-review-note"><span>{t('Source lines', 'خطوط منبع')}: {q.spans.map(([start, end]) => `L${start}..L${end}`).join(', ')}</span><span>{t('Confidence', 'اطمینان')}: {(q.confidence * 100).toFixed(0)}%</span></div>}
+      {mode === 'review' && <div className="ep-review-note"><span>{t('Source lines', 'خطوط منبع')}: {formatSpans(q.spans)}</span><span>{t('Confidence', 'اطمینان')}: {(q.confidence * 100).toFixed(0)}%</span></div>}
       {nested.map((child, index) => renderQuestion(child, children, depth + 1, index))}
     </article>;
   };

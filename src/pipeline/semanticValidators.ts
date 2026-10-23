@@ -4,6 +4,7 @@
 import type { ExamSection, Question } from '../types';
 import { normalizeForMatching } from './quality';
 import { isOptionMarkerLine } from './cleanup';
+import { spanLineNumbers } from './spans';
 
 export interface SemanticIssue {
   code: 'ANSWER_ANCHOR_SUSPECT' | 'STEM_SHAPE_SUSPECT' | 'OPTION_DUPLICATE' | 'PASSAGE_DETACHED' | 'PASSAGE_CONTAINS_STEM' | 'SECTION_SPAN_OUTSIDE' | 'STEM_HOLLOW' | 'OPTIONS_MISSING' | 'OPTIONS_UNVERIFIED';
@@ -24,11 +25,6 @@ function answerContainsNumber(text: string, no: number): boolean {
 }
 
 /** (a)–(e) validators over assembled questions. */
-function spanLineNumbers(spans: Array<[number, number]>): number[] {
-  const out: number[] = [];
-  for (const [a, b] of spans || []) for (let n = a; n <= b; n++) out.push(n);
-  return out;
-}
 
 /** C1 — non-number characters left in a stem once its printed number / parent reference and digits are removed. */
 export function stemLetterCount(stem?: string): number {

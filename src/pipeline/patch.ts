@@ -6,6 +6,7 @@ import { LLMRequest, Question, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { T4_QUESTION_PATCH_SYSTEM } from './prompts';
 import { sliceSourceSpans, assembleAndValidateQuestions, SpanReferenceSchema } from './assemble';
+import { spanBounds } from './spans';
 import { z } from 'zod';
 export const QuestionMergePatchSchema = z.object({
   no: z.number().int().min(1).max(300).optional(), label: z.string().max(100).optional(),
@@ -57,12 +58,9 @@ export async function regenerateQuestionPatch(params: {
   const { question, sourceLines, instruction, providerConfig, maxOutputTokens } = params;
 
   // Extract question spans + ±5 context lines around it
-  let minLine = Infinity;
-  let maxLine = -Infinity;
-  for (const [start, end] of question.spans) {
-    minLine = Math.min(minLine, start);
-    maxLine = Math.max(maxLine, end);
-  }
+  const bounds = spanBounds(question.spans);
+  const minLine = bounds ? bounds[0] : Infinity;
+  const maxLine = bounds ? bounds[1] : -Infinity;
 
   const idToIdxMap = new Map<number, number>();
   sourceLines.forEach((l, idx) => {

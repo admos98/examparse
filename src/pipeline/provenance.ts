@@ -12,6 +12,8 @@ export interface QuestionTrace {
   guidance: { playbookIds: string[]; skillIds: string[] };
   confidenceMath: { base: number; deductions: Array<{ reason: string; amount: number }>; final: number };
   verdicts: CriticVerdict[]; // last 3
+  /** Deterministic source/rule receipt; optional on legacy records. */
+  builtBy?: { lineStart: number; lineEnd: number; ruleChain: string[]; ruleConfidence: number };
 }
 
 export function buildTrace(params: {
@@ -30,6 +32,7 @@ export function buildTrace(params: {
     guidance: params.guidance || { playbookIds: [], skillIds: [] },
     confidenceMath: params.confidenceMath || { base: q.confidence, deductions: [], final: q.confidence },
     verdicts: (params.verdicts || []).slice(-3),
+    ...(q.receipt ? { builtBy: { lineStart: q.receipt.lineStart, lineEnd: q.receipt.lineEnd, ruleChain: [...q.receipt.ruleChain], ruleConfidence: q.receipt.ruleConfidence } } : {}),
   };
 }
 
@@ -58,6 +61,11 @@ export function traceTimeline(trace: QuestionTrace): Array<{ en: string; fa: str
     fa: `تجزیه‌شده توسط ${trace.origin.callLabel} (${trace.origin.model})${trace.origin.journalResumed ? ' — از ژورنال بازیابی شد، ۰ فراخوانی' : ''}.`,
   }];
   for (const t of trace.transforms) lines.push({ en: `${t.kind}: ${t.detail}`, fa: `${t.kind}: ${t.detail}` });
+  if (trace.builtBy) {
+    const displayRule = (rule: string) => rule === 'question-start' ? 'seg-number' : rule === 'watermark-excised' ? 'excision' : rule;
+    const chain = trace.builtBy.ruleChain.map(displayRule).join(' → ');
+    lines.push({ en: `Built by: ${chain} · conf ${Math.round(trace.builtBy.ruleConfidence)}`, fa: `ساخته‌شده با: ${chain} · اطمینان ${Math.round(trace.builtBy.ruleConfidence)}` });
+  }
   const cm = trace.confidenceMath;
   lines.push({
     en: `Confidence ${cm.final.toFixed(2)} = base ${cm.base.toFixed(2)}${cm.deductions.map(d => ` − ${d.amount.toFixed(2)} (${d.reason})`).join('')}.`,

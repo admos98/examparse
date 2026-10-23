@@ -642,7 +642,7 @@ export async function runFullPipeline(
     structureData.rawQuestions || [],
     workingLines,
     totalDeclaredPoints,
-    { keyTerritoryLineNos, imageIds: updatedImages.map(img => img.id), unresolvedImageIds }
+    { keyTerritoryLineNos, imageIds: updatedImages.map(img => img.id), unresolvedImageIds, segmentReceipts: segmentation?.segments || [], sections: structureData.sections || [] }
   );
 
   let finalQuestions = assembled.questions;

@@ -793,6 +793,7 @@ export const Step4Review: React.FC<Props> = ({
 
                       {/* Stem Text (Editable) */}
                       <div>
+                        {q.receipt && <div className="mb-1 text-[length:var(--type-12)] font-mono text-[var(--ink-2)]" aria-label="Deterministic parse provenance">Built by: {q.receipt.ruleChain.map(rule => rule === 'question-start' ? 'seg-number' : rule === 'watermark-excised' ? 'excision' : rule).join(' → ')} · conf {Math.round(q.receipt.ruleConfidence)}</div>}
                         {isExpanded ? (
                           <textarea
                             rows={3}

@@ -530,7 +530,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       },
     },
     get_trace: {
-      description: "{questionId} → 2F provenance trace JSON (≤600 tok): origin, transforms, guidance, confidence math, verdicts",
+      description: "{questionId} → 2F provenance trace JSON (≤600 tok): origin, transforms, deterministic builtBy receipt, guidance, confidence math, verdicts",
       schema: questionId,
       access: "read",
       execute: ({ questionId }) => {
@@ -541,6 +541,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           questionId: q.id, no: q.no,
           origin: { callLabel: "structure", model: "unknown", journalResumed: false },
           transforms: [], guidance: { playbookIds: [], skillIds: [] },
+          ...(q.receipt ? { builtBy: { lineStart: q.receipt.lineStart, lineEnd: q.receipt.lineEnd, ruleChain: q.receipt.ruleChain, ruleConfidence: q.receipt.ruleConfidence } } : {}),
           confidenceMath: { base: q.confidence, deductions: [], final: q.confidence },
           verdicts: (dossier?.verdicts || {})[questionId] || [],
         };

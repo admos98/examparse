@@ -115,7 +115,7 @@ function extractOptionLetter(text: string): string | undefined {
 export interface SectionHeaderCandidate { title: string; headerLine: number; kind: string; start: number; rawTitle: string }
 const HEADER_KEYWORDS = [
   { re: /listening/i, title: 'Listening', kind: 'Listening' },
-  { re: /vocabulary/i, title: 'Vocabulary', kind: 'Vocabulary' },
+  { re: /vocabulary|(?:^|\s)ocabulary\s+v/i, title: 'Vocabulary', kind: 'Vocabulary' },
   { re: /grammar/i, title: 'Grammar', kind: 'Grammar' },
   { re: /reading/i, title: 'Reading', kind: 'Reading' },
   { re: /writing/i, title: 'Writing', kind: 'Writing' },
@@ -134,6 +134,14 @@ export function detectSectionHeaders(lines: SourceLine[]): SectionHeaderCandidat
     if (line.furniture) continue;
     const text = line.text;
     const norm = normalizeForMatching(text);
+    const optionMarkers = [...norm.matchAll(/(?:^|\s)(?:\([a-d]\)|[a-d][).:]|\((?:الف|ب|ج|د)\)|(?:الف|ب|ج|د)[).:])(?=\s|$)/gi)];
+    if (optionMarkers.length >= 2) continue; // option choices such as 'can read / was reading' are not a section header
+    // A Persian numbered passage instruction is a Reading section header even when OCR drops the English title.
+    if (/^\s*\d{1,2}\s+متن\s+زیر\s+را\s*بخوان/.test(norm)) {
+      const ln = lineNumber(line);
+      candidates.push({ title: 'Reading', headerLine: ln, kind: 'Reading', start: ln, rawTitle: text.trim() });
+      continue;
+    }
     // Iranian layout: row-numbered header like "2 | Vocabulary | 4" or "ردیف ... Listening ..."
     // Check for pipe-separated header with known keyword
     for (const kw of HEADER_KEYWORDS) {
@@ -197,7 +205,7 @@ export function enumerateExpectedQuestionNos(lines: SourceLine[]): ExpectedQuest
       }
     }
     // Explicit grouped labels and dotted dialogue slots
-    for (const m of value.matchAll(/\((\d{1,3})\)|(?:\.{2,}|…+)(\d{1,3})(?=\.{2,}|…+)/g)) {
+    for (const m of value.matchAll(/\((\d{1,3})\)|(?:\.{2,}|…+)\s*(\d{1,3})\s*(?=(?:\.{2,}|…+))/g)) {
       const num = Number(m[1] || m[2]);
       if (!num) continue;
       const idx = m.index || 0;
@@ -465,10 +473,9 @@ export interface MetaTotalReconciliation {
   flag?: { code: 'META_TOTAL_CORRECTED' | 'META_TOTAL_UNCHECKED'; severity: 'info' | 'warn'; message: string };
   totals: DocumentTotals;
 }
-/** C1 — the document wins over the model's meta.totalPoints; a total below the question sum is always raised. */
-export function reconcileMetaTotal(metaTotal: number | undefined, lines: SourceLine[], keyLines: Set<number> | number[], questions: Array<{ points?: number; parentId?: string }>): MetaTotalReconciliation {
+/** C1 — source-declared total wins; question-point mismatches are reported, never repaired by changing the total. */
+export function reconcileMetaTotal(metaTotal: number | undefined, lines: SourceLine[], keyLines: Set<number> | number[], _questions: Array<{ points?: number; parentId?: string }> = []): MetaTotalReconciliation {
   const totals = extractDocumentTotals(lines, keyLines);
-  const questionSum = Number(questions.filter(q => !q.parentId).reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2));
   let total = metaTotal;
   let flag: MetaTotalReconciliation['flag'];
   if (totals.documentTotal !== undefined) {
@@ -478,10 +485,6 @@ export function reconcileMetaTotal(metaTotal: number | undefined, lines: SourceL
     }
   } else {
     flag = { code: 'META_TOTAL_UNCHECKED', severity: 'info', message: `No total-points line, key total or complete section header points found; meta total ${metaTotal ?? '—'} is unchecked.` };
-  }
-  if (questionSum > 0 && total !== undefined && total + 0.01 < questionSum) {
-    flag = { code: 'META_TOTAL_CORRECTED', severity: 'warn', message: `Total points ${total} were below the parsed question sum ${questionSum}; raised to the question sum.` };
-    total = questionSum;
   }
   return { totalPoints: total, flag, totals };
 }

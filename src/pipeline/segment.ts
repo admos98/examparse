@@ -31,6 +31,9 @@ export interface Segment {
   sectionHint: string;
   lines: number[]; // inclusive line numbers
   sectionId?: string;
+  /** Deterministic rule provenance for the segment, independent of the model. */
+  ruleChain?: string[];
+  ruleConfidence?: number;
 }
 
 const INTRA_LINE_PERSIAN = 'الف|ب|پ|ت|ث|ج|چ|د|ه|و';
@@ -60,14 +63,18 @@ export function findIntraLineMultiNumbers(text: string): IntraLineItem[] {
     raw.push({ no, marker, origStart: view.originalOffset(normStart) });
   }
   if (raw.length < 2) return [];
-  for (let i = 1; i < raw.length; i++) {
-    if (raw[i].no <= raw[i - 1].no) return [];
-  }
-  return raw.map((item, idx) => {
-    const start = idx === 0 && !text.slice(0, item.origStart).trim() ? 0 : item.origStart;
-    const end = idx + 1 < raw.length ? raw[idx + 1].origStart : text.length;
-    return { no: item.no, marker: item.marker, charStart: start, charEnd: end };
-  });
+  const ascending = raw.every((item, index) => index === 0 || item.no > raw[index - 1].no);
+  const descending = raw.every((item, index) => index === 0 || item.no < raw[index - 1].no);
+  if (!ascending && !descending) return [];
+  const sourceOrdered = raw.map((item, index) => ({
+    no: item.no,
+    marker: item.marker,
+    charStart: index === 0 && !text.slice(0, item.origStart).trim() ? 0 : item.origStart,
+    charEnd: index + 1 < raw.length ? raw[index + 1].origStart : text.length,
+  }));
+  // Papers may lay out a numbered row right-to-left (e.g. 66, 65, 64, 63).
+  // Logical parent/child order remains ascending while each offset still slices its original item.
+  return sourceOrdered.sort((a, b) => a.no - b.no);
 }
 
 export interface SegmentDiagnostics {
@@ -78,12 +85,11 @@ export interface SegmentDiagnostics {
   coverage: number; // 0-100
 }
 
-function isGroupParentLine(text: string): { isGroup: boolean; childNos: number[] } {
+function isGroupParentLine(text: string): { isGroup: boolean; parentNo?: number; childNos: number[] } {
   const nums: number[] = [];
   for (const m of text.matchAll(/\((\d{1,3})\)/g)) nums.push(Number(m[1]));
-  if (nums.length >= 2 && nums.every(n=>n>=1&&n<=300)) {
-    // also need to ensure line contains at least two parenthesized numbers close together
-    if (/\((\d{1,3})\)\s*\((\d{1,3})\)/.test(text)) return { isGroup: true, childNos: nums };
+  if (nums.length >= 2 && nums.every(n=>n>=1&&n<=300) && /\((\d{1,3})\)\s*\((\d{1,3})\)/.test(text)) {
+    return { isGroup: true, parentNo: nums[0], childNos: nums };
   }
   return { isGroup: false, childNos: [] };
 }
@@ -361,7 +367,7 @@ export function segmentDocument(params: {
           startLine: linesSlice[0],
           endLine: linesSlice[linesSlice.length-1],
           printedNo: intraMulti[0].no,
-          childNos: intraMulti.map(it => it.no),
+          childNos: intraMulti.slice(1).map(it => it.no),
           charStart: intraMulti[0].charStart,
           charEnd: intraMulti[0].charEnd,
           sectionHint: range.title,
@@ -391,7 +397,7 @@ export function segmentDocument(params: {
           kind: 'group-parent',
           startLine: linesSlice[0],
           endLine: linesSlice[linesSlice.length-1],
-          printedNo: qn, // may be undefined for group enumeration line
+          printedNo: qn ?? groupInfo.parentNo,
           childNos: groupInfo.childNos,
           sectionHint: range.title,
           lines: linesSlice,
@@ -531,6 +537,18 @@ export function segmentDocument(params: {
   const rootSegments = segments.filter(s => !s.parentSegmentId);
   for (let i=1;i<rootSegments.length;i++) if (rootSegments[i].startLine <= rootSegments[i-1].endLine) {
     throw new Error(`SEGMENTER_OVERLAP_BUG: ${rootSegments[i-1].id} [${rootSegments[i-1].startLine}-${rootSegments[i-1].endLine}] overlaps ${rootSegments[i].id} [${rootSegments[i].startLine}-${rootSegments[i].endLine}]`);
+  }
+
+  // Rule receipts are local evidence, not model confidence. Children created from enumerations
+  // carry their own segmentation rule while retaining the parent's source range.
+  for (const segment of segments) {
+    const isChild = Boolean(segment.parentSegmentId);
+    segment.ruleChain = isChild
+      ? ['multi-number-split']
+      : segment.kind === 'group-parent' ? ['group-parent']
+      : segment.kind === 'question' ? ['question-start']
+      : [`segment-${segment.kind}`];
+    segment.ruleConfidence = isChild ? 90 : segment.kind === 'question' || segment.kind === 'group-parent' ? 85 : 75;
   }
 
   // Diagnostics per section

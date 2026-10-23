@@ -43,6 +43,15 @@ export interface ExamSection {
   spans: LineSpan[];
 }
 
+export interface QuestionReceipt {
+  lineStart: number;
+  lineEnd: number;
+  /** Deterministic rule ids in firing order; optional for legacy documents. */
+  ruleChain: string[];
+  /** Local rule score on a 0–100 scale, never a model confidence value. */
+  ruleConfidence: number;
+}
+
 export interface Question {
   id: string;
   label: string; // original label, e.g. "۱", "1.", "Q1"
@@ -89,6 +98,8 @@ export interface Question {
     text: string;
   }[]; // only normalized lines
   confidence: number; // 0..1 from model
+  /** Optional deterministic provenance; legacy persisted questions need not carry it. */
+  receipt?: QuestionReceipt;
   flags?: string[];
 }
 

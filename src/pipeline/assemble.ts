@@ -5,7 +5,7 @@
  */
 import { z } from 'zod';
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine } from '../types';
-import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, enumerateExpectedQuestionNos, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks } from './quality';
+import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, enumerateExpectedQuestionNos, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks, extractDocumentTotals } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
 import { validateSemantic, semanticConfidenceDeduction, semanticIssuesFor } from './semanticValidators';
 import { completeGapsRaw } from './ownership';
@@ -30,6 +30,7 @@ export const RawQuestionSchema = z.object({
   rewrites: z.array(z.object({ line: z.number().int().positive(), text: z.string() })).optional(),
   images: z.array(z.object({ imageId: z.string(), role: z.enum(['stem', 'option', 'table', 'decoration']).optional(), anchorLine: z.number().optional() })).optional(),
   confidence: z.number().min(0).max(1).optional(),
+  receipt: z.object({ lineStart: z.number().int().positive(), lineEnd: z.number().int().positive(), ruleChain: z.array(z.string()), ruleConfidence: z.number().min(0).max(100) }).optional(),
   flags: z.array(z.string()).optional(),
   stemText: z.never().optional(),
   fullStem: z.never().optional(),
@@ -110,8 +111,8 @@ const PERSIAN_SERIES: readonly (readonly string[])[] = [
   ['الف', 'ب', 'ج', 'د', 'ه', 'و'],
   ['الف', 'ب', 'پ', 'ت', 'ث', 'ج', 'چ'],
 ];
-const OPTION_MARKER = new RegExp(`(^|\\s)(?:\\(([${LATIN}])\\)|([${LATIN}])[).:]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:])(?=\\s|$)`, 'gim');
-const LEADING_OPTION_MARKER_RE = new RegExp(`^\\s*(?:\\(([${LATIN}])\\)|([${LATIN}])[).:]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:])(?:\\s+|$)`, 'i');
+const OPTION_MARKER = new RegExp(`(?:\\(([${LATIN}])\\)|([${LATIN}])[).:–—-]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:–—-])(?=\\s|$)`, 'gim');
+const LEADING_OPTION_MARKER_RE = new RegExp(`^\\s*(?:\\(([${LATIN}])\\)|([${LATIN}])[).:–—-]|\\((${PERSIAN_MARKERS})\\)|(${PERSIAN_MARKERS})[).:–—-])(?:\\s+|$)`, 'i');
 
 export function normalizeOptionText(text: string): string {
   return text.replace(/`/g, "'").trim();
@@ -181,32 +182,29 @@ export function stripLeadingOptionMarker(text: string): string {
 }
 
 function selectOrderedMarkers(candidates: Marker[]): Marker[] {
-  if (candidates.length === 0) return [];
-  // 1. Ordered Latin sequence starting at 'a' (tie-break to later run so stem prose before real options never wins)
-  let bestLatin: Marker[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    if (candidates[i].key !== 'a') continue;
-    const seq: Marker[] = [candidates[i]];
-    for (let j = i + 1; j < candidates.length; j++) {
-      if (candidates[j].key === String.fromCharCode(97 + seq.length)) seq.push(candidates[j]);
-    }
-    if (seq.length >= bestLatin.length) bestLatin = seq;
-  }
-  if (bestLatin.length >= 2) return bestLatin;
-
-  // 2. Ordered Persian sequence starting strictly at 'الف'
-  let bestFa: Marker[] = [];
-  for (const series of PERSIAN_SERIES) {
+  if (candidates.length < 2) return [];
+  const longestContiguous = (series: readonly string[]): Marker[] => {
+    let best: Marker[] = [];
     for (let i = 0; i < candidates.length; i++) {
       if (candidates[i].key !== series[0]) continue;
-      const seq: Marker[] = [candidates[i]];
-      for (let j = i + 1; j < candidates.length && seq.length < series.length; j++) {
-        if (candidates[j].key === series[seq.length]) seq.push(candidates[j]);
+      const run: Marker[] = [candidates[i]];
+      for (let j = i + 1; j < candidates.length; j++) {
+        const expected = series[run.length];
+        if (expected && candidates[j].key === expected) { run.push(candidates[j]); continue; }
+        // A skipped/reordered marker is an incomplete option sequence, not permission to fabricate.
+        if (series.includes(candidates[j].key)) run.length = 0;
+        break;
       }
-      if (seq.length >= bestFa.length) bestFa = seq;
+      if (run.length > best.length) best = run;
     }
+    return best.length >= 2 ? best : [];
+  };
+  const latin = longestContiguous(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']);
+  if (latin.length) return latin;
+  for (const series of PERSIAN_SERIES) {
+    const fa = longestContiguous(series);
+    if (fa.length) return fa;
   }
-  if (bestFa.length >= 2) return bestFa;
   return [];
 }
 
@@ -217,9 +215,14 @@ function findOptionMarkers(text: string): Marker[] {
   OPTION_MARKER.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = OPTION_MARKER.exec(view.text))) {
-    const markerStart = match.index + (match[1] || '').length;
-    const key = (match[2] || match[3] || match[4] || match[5] || '').toLowerCase();
-    rawFound.push({ start: view.originalOffset(markerStart), end: view.originalOffset(OPTION_MARKER.lastIndex), key });
+    const markerStart = match.index;
+    const originalStart = view.originalOffset(markerStart);
+    const originalEnd = view.originalOffset(OPTION_MARKER.lastIndex);
+    const markerText = text.slice(originalStart, originalEnd);
+    // Prevent a terminal word like “Sara.” from being parsed as a glued `a.` option.
+    if (/\.$/.test(markerText) && originalStart > 0 && /[A-Za-z\u0600-\u06FF]/.test(text[originalStart - 1])) continue;
+    const key = (match[1] || match[2] || match[3] || match[4] || '').toLowerCase();
+    rawFound.push({ start: originalStart, end: originalEnd, key });
   }
   const ordered = selectOrderedMarkers(rawFound);
   if (ordered.length >= 2) return ordered;
@@ -238,6 +241,8 @@ function findOptionMarkers(text: string): Marker[] {
 
 function findLineStartOptionMarker(line: string): Marker | undefined {
   if (!line || findIntraLineMultiNumbers(line).length >= 2) return undefined;
+  // Speaker labels such as “B: The windows …” are prose, not a single option marker.
+  if (/^\s*[A-Z]:\s+[A-Za-z]/.test(line)) return undefined;
   const view = matchingView(line);
   const m = LEADING_OPTION_MARKER_RE.exec(view.text);
   if (!m) return undefined;
@@ -275,9 +280,13 @@ export function decontaminateOptionMarkup(text: string): string {
   }).join('\n').trim();
 }
 
-function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[]): { options?: Question['options']; failed: boolean } {
-  if (!options || options.length === 0) return { options, failed: false };
-  const text = sliceOptionUnion(options, sourceLines);
+function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[], learnedWatermarks: string[] = []): { options?: Question['options']; failed: boolean; excisedCount: number; inlineSplit: boolean } {
+  if (!options || options.length === 0) return { options, failed: false, excisedCount: 0, inlineSplit: false };
+  // Excision is deliberately performed on the sliced union before marker detection.
+  // SourceLine.text is never modified: all offsets and receipts still refer to the original extraction.
+  const union = sliceOptionUnion(options, sourceLines);
+  const excisedUnion = exciseWatermarksWithLearned(union, learnedWatermarks);
+  const text = excisedUnion.text;
   const inlineParts = splitInlineOptions(text);
   if (inlineParts.length >= 2) {
     const ordered = [...options].sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
@@ -289,16 +298,36 @@ function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[
         text: part.text,
       })),
       failed: false,
+      excisedCount: excisedUnion.count,
+      inlineSplit: true,
     };
   }
   // No inline sequence found: strip leading markers (e.g. "a. item") on distinct per-option spans;
   // NEVER fall back to duplicating a single unsplit blob across keys.
-  const cleaned = options.map(opt => ({ ...opt, text: stripLeadingOptionMarker(opt.text || '') }));
+  const cleaned = options.map(opt => {
+    const excised = exciseWatermarksWithLearned(opt.text || '', learnedWatermarks);
+    return { ...opt, text: stripLeadingOptionMarker(excised.text) };
+  });
   const distinctNonEmpty = new Set(cleaned.map(o => normalizeForMatching(o.text || '').trim()).filter(Boolean));
   if (cleaned.length >= 2 && distinctNonEmpty.size >= 2) {
-    return { options: cleaned, failed: false };
+    return { options: cleaned, failed: false, excisedCount: excisedUnion.count, inlineSplit: false };
   }
-  return { options: [], failed: true };
+  return { options: [], failed: true, excisedCount: excisedUnion.count, inlineSplit: false };
+}
+
+function collapseAdjacentOptionDuplicates(options: NonNullable<Question['options']>): { options: NonNullable<Question['options']>; nonAdjacentDuplicates: string[] } {
+  const kept: NonNullable<Question['options']> = [];
+  const nonAdjacentDuplicates: string[] = [];
+  const seen = new Set<string>();
+  for (const option of options) {
+    const key = normalizeOptionText(option.text || '');
+    if (!key) { kept.push(option); continue; }
+    if (kept.length && normalizeOptionText(kept[kept.length - 1].text || '') === key) continue;
+    if (seen.has(key)) nonAdjacentDuplicates.push(key);
+    seen.add(key);
+    kept.push(option);
+  }
+  return { options: kept.map((option, index) => ({ ...option, key: String.fromCharCode(97 + index) })), nonAdjacentDuplicates };
 }
 
 function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
@@ -323,6 +352,8 @@ export function decontaminateStem(
       output.push(line);
       continue;
     }
+    // Dialogue speaker label is stem prose even when a following option union uses this line span.
+    if (/^\s*[A-Z]:\s+[A-Za-z]/.test(line)) { output.push(line); continue; }
     const markers = findOptionMarkers(line);
     const firstMarker = markers[0] ?? findLineStartOptionMarker(line);
     const number = parsePrintedNumberFromStem(line);
@@ -393,6 +424,8 @@ export interface AssembleOptions {
   semanticErrorsToRepair?: boolean;
   /** D: 'fenced' (default) only accepts rewrites on locally garbled, number-free lines; 'open' for user patches. */
   rewritePolicy?: 'fenced' | 'open';
+  /** Deterministic segmenter receipts; optional for legacy/recovery callers. */
+  segmentReceipts?: Array<{ id?: string; kind?: string; startLine: number; endLine: number; printedNo?: number; childNos?: number[]; parentSegmentId?: string; charStart?: number; charEnd?: number; ruleChain?: string[]; ruleConfidence?: number }>;
 }
 
 export const REWRITE_MAX_CHARS = 140;
@@ -455,6 +488,123 @@ function isSubset(a: Question, b: Question): boolean {
   return aLines.length > 0 && aLines.every(line => bLines.has(line));
 }
 
+function marksFromAnswerKey(lines: SourceLine[], keyLines: Set<number>): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const line of lines) {
+    if (!keyLines.has(lineNoFromId(line.id))) continue;
+    const text = normalizeForMatching(line.text);
+    const rangeRe = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*(\d{1,3})\s*(?:to|تا|[-–])\s*(\d{1,3})[\s\S]{0,100}?(?:each|هر\s*کدام)[\s\S]{0,24}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)?/gi;
+    for (const m of text.matchAll(rangeRe)) {
+      const start = Number(m[1]), end = Number(m[2]), mark = Number(m[3]);
+      if (!Number.isFinite(mark) || start < 1 || end < start || end - start > 150) continue;
+      for (let no = start; no <= end; no++) out.set(no, mark);
+    }
+    const grouped = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*(\d{1,3})\s*(?:and|و|،|,)\s*(\d{1,3})[\s\S]{0,60}?(?:each|هر\s*کدام)[\s\S]{0,20}?\(?\s*(\d+(?:\.\d+)?)\s*\)?/gi;
+    for (const m of text.matchAll(grouped)) {
+      const mark = Number(m[3]);
+      if (Number.isFinite(mark)) { out.set(Number(m[1]), mark); out.set(Number(m[2]), mark); }
+    }
+    const single = /(?:question|سوال)\s*(\d{1,3})\s*\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/gi;
+    for (const m of text.matchAll(single)) {
+      const mark = Number(m[2]);
+      if (Number.isFinite(mark)) out.set(Number(m[1]), mark);
+    }
+    const trailingParen = /(?:question|سوال)\s*(\d{1,3})[\s\S]{0,100}?(\d+(?:\.\d+)?)\s*\(\s*(?:marks?|points?|نمره)/gi;
+    for (const m of text.matchAll(trailingParen)) {
+      const mark = Number(m[2]);
+      if (Number.isFinite(mark) && mark > 0 && mark <= 20) out.set(Number(m[1]), mark);
+    }
+    const contextual = /(?:question|سوال)\s*(\d{1,3})[\s\S]{0,100}?(?:\(\s*(\d+(?:\.\d+)?)\s*\)\s*(?:marks?|points?|نمره)|(?<![\d.])(\d+(?:\.\d+)?)\s*(?:marks?|points?|نمره))/gi;
+    for (const m of text.matchAll(contextual)) {
+      const mark = Number(m[2] || m[3]);
+      if (Number.isFinite(mark) && mark > 0 && mark <= 20) out.set(Number(m[1]), mark);
+    }
+  }
+  return out;
+}
+
+function deriveAndReconcilePoints(params: {
+  questions: Question[]; lines: SourceLine[]; keyLines: Set<number>; total?: number; sections?: ExamSection[];
+}): { flags: Flag[]; rescaled: boolean; before?: number; after?: number } {
+  const roots = params.questions.filter(question => !question.parentId);
+  const keyMarks = marksFromAnswerKey(params.lines, params.keyLines);
+  const sourceHeaders = detectSectionHeaders(params.lines).map(header => ({
+    line: header.headerLine, title: header.title, points: parsePrintedPoints(header.rawTitle),
+  }));
+  const fixed = new Set<string>();
+  const derived = new Set<string>();
+  const flags: Flag[] = [];
+  // Preserve explicitly invalid negatives for the validation/reparse boundary; never mask them with defaults.
+  const unsafeExplicitPoints = new Set(roots.filter(q => !keyMarks.has(q.no) && typeof q.points === 'number' && q.points < 0).map(q => q.id));
+
+  // Source key values outrank section totals; model-supplied values are only provisional defaults.
+  for (const q of roots) {
+    const keyMark = keyMarks.get(q.no);
+    if (keyMark !== undefined) { q.points = keyMark; fixed.add(q.id); derived.add(q.id); }
+  }
+  const sections = params.sections || [];
+  for (const section of sections) {
+    const members = roots.filter(q => q.sectionId === section.id);
+    if (!members.length) continue;
+    let printedTotal = typeof section.points === 'number' && section.points > 0 ? section.points : undefined;
+    if (printedTotal === undefined) {
+      const first = section.spans?.length ? Math.min(...section.spans.map(span => span[0])) : undefined;
+      const header = sourceHeaders.find(candidate => candidate.points !== undefined && first !== undefined && Math.abs(candidate.line - first) <= 4);
+      printedTotal = header?.points;
+    }
+    if (printedTotal === undefined) continue;
+    const unmarked = members.filter(q => !fixed.has(q.id) && !unsafeExplicitPoints.has(q.id));
+    if (!unmarked.length) continue;
+    const reserved = members.filter(q => fixed.has(q.id) && !unsafeExplicitPoints.has(q.id)).reduce((sum, q) => sum + (q.points || 0), 0);
+    const remainder = Math.max(0, printedTotal - reserved);
+    const base = Math.floor((remainder / unmarked.length) * 100) / 100;
+    unmarked.forEach((q, index) => { q.points = index === unmarked.length - 1 ? Number((remainder - base * (unmarked.length - 1)).toFixed(2)) : base; fixed.add(q.id); derived.add(q.id); });
+  }
+
+  for (const q of roots) {
+    if (!fixed.has(q.id)) {
+      if (typeof q.points === 'number' && q.points < 0) continue;
+      if (!(typeof q.points === 'number' && Number.isFinite(q.points) && q.points > 0)) q.points = 0.5;
+      derived.add(q.id); // default/model candidate is the only rescalable class
+      flags.push(flag('POINTS_DERIVED', `Question ${q.label}: points defaulted from document evidence (0.5 before any document-total reconciliation).`, 'info', q.id));
+    }
+  }
+  for (const child of params.questions.filter(question => question.parentId)) child.points = 0;
+  const before = Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2));
+  let rescaled = false;
+  const target = params.total;
+  const adjustable = roots.filter(q => derived.has(q.id) && !fixed.has(q.id));
+  if (target !== undefined && target > 0 && Math.abs(before - target) > 0.51 && adjustable.length) {
+    const fixedSum = roots.filter(q => !adjustable.some(item => item.id === q.id)).reduce((sum, q) => sum + (q.points || 0), 0);
+    const adjustableSum = adjustable.reduce((sum, q) => sum + (q.points || 0), 0);
+    const residual = Math.max(0, target - fixedSum);
+    if (adjustableSum > 0) {
+      const scale = residual / adjustableSum;
+      adjustable.forEach(q => { q.points = Number(((q.points || 0) * scale).toFixed(2)); });
+      const afterRounded = adjustable.reduce((sum, q) => sum + (q.points || 0), 0);
+      const delta = Number((residual - afterRounded).toFixed(2));
+      if (adjustable.length) adjustable[adjustable.length - 1].points = Number(((adjustable[adjustable.length - 1].points || 0) + delta).toFixed(2));
+      rescaled = true;
+      flags.push(flag('POINTS_RESCALED', `Derived question points rescaled from ${before} to ${Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2))} to match the immutable document total ${target}; key/header-derived marks were held fixed.`, 'warn'));
+    }
+  }
+  for (const q of params.questions) {
+    const keyDerived = keyMarks.has(q.no);
+    const headerDerived = fixed.has(q.id) && !keyDerived;
+    const rule = keyDerived ? 'points-derived:key' : unsafeExplicitPoints.has(q.id) ? 'points-invalid-preserved' : headerDerived ? 'points-derived:header' : 'points-derived:default';
+    q.receipt = { ...(q.receipt || { lineStart: q.spans[0]?.[0] || 1, lineEnd: q.spans[q.spans.length - 1]?.[1] || q.spans[0]?.[0] || 1, ruleChain: [], ruleConfidence: 85 }), ruleChain: [...(q.receipt?.ruleChain || []), rule] };
+    if (rescaled && !fixed.has(q.id)) q.receipt.ruleChain.push('points-rescaled');
+  }
+  return { flags, rescaled, before, after: Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2)) };
+}
+
+function parsePrintedPoints(text: string): number | undefined {
+  const normalized = normalizeForMatching(text);
+  const match = normalized.match(/(?:\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:نمره|points?|marks?)\s*[:：]?\s*(\d+(?:\.\d+)?))/i);
+  const value = Number(match?.[1] || match?.[2]);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 export function assembleAndValidateQuestions(
   rawQuestions: any[],
   sourceLines: SourceLine[],
@@ -485,11 +635,76 @@ function assembleAndValidateQuestionsInner(
   const keyLines = new Set(options.keyTerritoryLineNos || []);
   sourceLines.filter(l => l.furniture).forEach(l => keyLines.add(lineNoFromId(l.id)));
   const allImageIds = options.imageIds ? new Set(options.imageIds) : null;
+  const sourceByNo = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
   const questionOverlap = new Set<string>();
   const rewritePolicy = options.rewritePolicy || 'fenced';
 
   // B2 — gap completion + option synthesis (pure, 0 calls) before any slicing.
   let rawList: any[] = Array.isArray(rawQuestions) ? rawQuestions : [];
+  // A group detected locally by the segmenter emits missing children before any assistant repair.
+  // Children retain source spans/character offsets and are ordinary optional question records.
+  for (const segment of options.segmentReceipts || []) {
+    if (segment.kind !== 'group-parent' || !segment.childNos?.length) continue;
+    const parentNo = Number(segment.printedNo);
+    let parent = rawList.find(q => Number(q?.no) === parentNo && !q?.parentId);
+    if (!parent && Number.isInteger(parentNo) && parentNo > 0) {
+      parent = { id: `q${parentNo}`, no: parentNo, label: String(parentNo), type: 'matching', spans: [[segment.startLine, segment.endLine]], confidence: 0.85 };
+      rawList.push(parent);
+    }
+    if (!parent) continue;
+    const parentId = String(parent.id || `q${parentNo}`);
+    parent.id = parentId;
+    // Intra-line enumerations need a one-line parent span so its character slice remains exact;
+    // parenthesized shared-pool groups instead own the full deterministic segment range.
+    if (typeof segment.charStart === 'number' && typeof segment.charEnd === 'number') {
+      parent.spans = [[segment.startLine, segment.startLine]];
+      parent.charStart = segment.charStart;
+      parent.charEnd = segment.charEnd;
+    } else {
+      parent.spans = normalizedSpans([...(Array.isArray(parent.spans) ? parent.spans : []), [segment.startLine, segment.endLine]]);
+    }
+    const explicitChildren = (options.segmentReceipts || []).filter(item => item.parentSegmentId === segment.id && item.printedNo !== undefined);
+    const childNos = explicitChildren.length ? explicitChildren.map(item => Number(item.printedNo)) : (segment.childNos || []).filter(no => Number(no) !== parentNo);
+    for (const no of childNos) {
+      if (!Number.isInteger(no) || Number(no) <= 0 || Number(no) === parentNo) continue;
+      let childSpans: LineSpan[] = [[segment.startLine, segment.endLine]];
+      let charStart: number | undefined;
+      let charEnd: number | undefined;
+      for (let ln = segment.startLine; ln <= segment.endLine; ln++) {
+        const groupLine = sourceByNo.get(ln);
+        if (!groupLine) continue;
+        const intra = findIntraLineMultiNumbers(groupLine.text).find(item => item.no === no);
+        const parens = [...groupLine.text.matchAll(/\((\d{1,3})\)/g)].map(match => ({ no: Number(match[1]), start: match.index || 0, end: (match.index || 0) + match[0].length }));
+        const markerIndex = parens.findIndex(item => item.no === no);
+        const marker = markerIndex >= 0 ? parens[markerIndex] : undefined;
+        const nextMarker = marker ? parens.slice(markerIndex + 1).find(item => item.no !== no) : undefined;
+        const ownStart = intra?.charStart ?? marker?.end;
+        const ownEnd = intra?.charEnd ?? (marker ? nextMarker?.start ?? groupLine.text.length : undefined);
+        if (ownStart !== undefined && ownEnd !== undefined && groupLine.text.slice(ownStart, ownEnd).replace(/[\s.。:：)）-]/g, '')) {
+          childSpans = [[ln, ln]]; charStart = ownStart; charEnd = ownEnd; break;
+        }
+      }
+      const existingChild = rawList.find(q => Number(q?.no) === no && q?.parentId === parentId);
+      if (existingChild) continue;
+      const existingRoot = rawList.find(q => Number(q?.no) === no && !q?.parentId && q !== parent);
+      if (existingRoot) {
+        const candidateLines = spanLineNumbers(normalizedSpans(existingRoot.spans));
+        const belongsToGroup = candidateLines.some(line => line >= segment.startLine && line <= segment.endLine);
+        if (!belongsToGroup) continue; // preserve a distinct repeated printed number for review
+        existingRoot.parentId = parentId;
+        existingRoot.sectionId ||= parent.sectionId;
+        existingRoot.type ||= parent.type || 'matching';
+        existingRoot.points = 0;
+        existingRoot.spans = childSpans;
+        if (charStart !== undefined) { existingRoot.charStart = charStart; existingRoot.charEnd = charEnd; }
+        else { delete existingRoot.charStart; delete existingRoot.charEnd; }
+        continue;
+      }
+      rawList.push({ id: `${parentId}_c${no}`, no, label: String(no), parentId, sectionId: parent.sectionId,
+        type: parent.type || 'matching', spans: childSpans, ...(charStart !== undefined ? { charStart, charEnd } : {}),
+        points: 0, confidence: parent.confidence || 0.85 });
+    }
+  }
   const absorbedByKey = new Map<string, number[]>();
   const synthesizedByKey = new Map<string, number>();
   if (options.gapCompletion !== false && rawList.length) {
@@ -588,14 +803,20 @@ function assembleAndValidateQuestionsInner(
     });
     let perQuestionWatermark = false;
     // A2: watermark excision on option slices BEFORE splitting (excision then split)
-    const split = splitOptionTexts(rawOptions, sourceLines);
+    const split = splitOptionTexts(rawOptions, sourceLines, learnedWatermarks);
     let assembledOptions = split.options || [];
-    // Apply watermark excision to each option text (after split)
+    if (split.excisedCount) { watermarkExcisionCount += split.excisedCount; perQuestionWatermark = true; }
+    // Also excise any residual in already-separated options (without changing source lines).
     assembledOptions = assembledOptions.map(opt => {
       const exc = exciseWatermarksWithLearned(opt.text || '', learnedWatermarks);
       if (exc.excised) { watermarkExcisionCount += exc.count; perQuestionWatermark = true; }
       return { ...opt, text: exc.text };
     });
+    const duplicateResult = collapseAdjacentOptionDuplicates(assembledOptions);
+    assembledOptions = duplicateResult.options;
+    if (duplicateResult.nonAdjacentDuplicates.length) {
+      flags.push(flag('OPTION_DUPLICATE', `Question ${raw.label || qId}: repeated non-adjacent option text retained for verifier review.`, 'warn', qId));
+    }
     const optionSplitFailed = split.failed;
     if (optionSplitFailed) {
       flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(sliceOptionUnion(rawOptions, sourceLines)).length}) did not match ${rawOptions.length} option spans; unsplit option blob discarded.`, 'warn', qId));
@@ -747,6 +968,21 @@ function assembleAndValidateQuestionsInner(
     if (confidence < 0.6) flags.push(flag('LOW_CONFIDENCE', `Question ${label} confidence calibrated to ${(confidence * 100).toFixed(0)}%.`, 'info', qId));
     if (unknownImageRefs.length) flags.push(flag('IMAGE_REFERENCE_UNRESOLVED', `Question ${label} references unresolved image(s): ${unknownImageRefs.map((i: any) => i.imageId).join(', ')}.`, 'warn', qId));
 
+    const segmentReceipt = (options.segmentReceipts || []).find(segment =>
+      (segment.printedNo === no || segment.printedNo === originalNo) && segment.startLine <= Math.max(...spanLineNumbers(spans)) && segment.endLine >= Math.min(...spanLineNumbers(spans))
+    ) || (options.segmentReceipts || []).find(segment => segment.parentSegmentId && segment.printedNo === no);
+    const receiptStart = Math.min(...spanLineNumbers(spans), ...rawOptions.flatMap(option => spanLineNumbers(option.spans)));
+    const receiptEnd = Math.max(...spanLineNumbers(spans), ...rawOptions.flatMap(option => spanLineNumbers(option.spans)));
+    const ruleChain = [...(segmentReceipt?.ruleChain || (raw.parentId ? ['multi-number-split'] : ['question-start']))];
+    if (absorbedByKey.has(gapKey)) ruleChain.push('gap-absorbed');
+    if (split.inlineSplit) ruleChain.push('inline-options');
+    if (perQuestionWatermark) ruleChain.push('watermark-excised');
+    const receipt = {
+      lineStart: Number.isFinite(receiptStart) ? receiptStart : (spans[0]?.[0] || 1),
+      lineEnd: Number.isFinite(receiptEnd) ? receiptEnd : (spans[spans.length - 1]?.[1] || spans[0]?.[0] || 1),
+      ruleChain,
+      ruleConfidence: Math.max(0, Math.min(100, Number(segmentReceipt?.ruleConfidence ?? 85))),
+    };
     const question: Question = {
       id: qId,
       label,
@@ -763,6 +999,7 @@ function assembleAndValidateQuestionsInner(
       images: questionImages,
       tables: assembledTables.length ? assembledTables : undefined,
       confidence,
+      receipt,
       flags: questionFlags,
     };
     questions.push(question);
@@ -889,9 +1126,12 @@ function assembleAndValidateQuestionsInner(
     }
   }
 
-  if (totalDeclaredPoints !== undefined && totalDeclaredPoints > 0) {
-    const sum = questions.reduce((acc, question) => acc + (question.points || 0), 0);
-    if (Math.abs(sum - totalDeclaredPoints) > 0.51) flags.push(flag('POINTS_MISMATCH', `Points sum (${sum}) does not match header total (${totalDeclaredPoints}); deficit ${Number((totalDeclaredPoints - sum).toFixed(2))}.`, 'warn'));
+  const documentTotal = extractDocumentTotals(sourceLines, keyLines).documentTotal ?? totalDeclaredPoints;
+  const pointDerivation = deriveAndReconcilePoints({ questions, lines: sourceLines, keyLines, total: documentTotal, sections: options.sections });
+  flags.push(...pointDerivation.flags);
+  if (documentTotal !== undefined && documentTotal > 0) {
+    const sum = questions.filter(question => !question.parentId).reduce((acc, question) => acc + (question.points || 0), 0);
+    if (Math.abs(sum - documentTotal) > 0.51) flags.push(flag('POINTS_MISMATCH', `Points sum (${sum}) does not match immutable document total (${documentTotal}); deficit ${Number((documentTotal - sum).toFixed(2))}.`, 'warn'));
   }
   const sortedNos = questions.filter(q => !q.parentId).map(q => q.no).sort((a, b) => a - b);
   for (let i = 0; i < sortedNos.length - 1; i++) if (sortedNos[i + 1] - sortedNos[i] > 1) flags.push(flag('NUMBERING_GAP', `Question numbering gap between #${sortedNos[i]} and #${sortedNos[i + 1]}.`, 'info'));
@@ -1169,26 +1409,30 @@ export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; f
   const duplicates = [...occurrenceCounts.entries()]
     .filter(([, count]) => count > 1)
     .map(([id]) => id);
-  if (duplicates.length === 0) return { doc, fixed: false, duplicates: [] };
+  const malformedSuffixIds = doc.images.filter(image => /_dup\d+$/.test(image.id)).map(image => image.id);
+  const affectedIds = [...new Set([...duplicates, ...malformedSuffixIds])];
+  if (affectedIds.length === 0) return { doc, fixed: false, duplicates: [] };
 
-  const duplicateIds = new Set(duplicates);
+  const affected = new Set(affectedIds);
   const reservedIds = new Set(doc.images.map(image => image.id));
   const nextOccurrenceById = new Map<string, number>();
   const allocatedIds = new Set<string>();
   const occurrencesByOriginalId = new Map<string, RenamedImageOccurrence[]>();
+  let nextNumber = doc.images.reduce((maximum, image) => {
+    const match = image.id.match(/(?:^|[_-])(\d+)(?:_dup\d+)?$/);
+    return match ? Math.max(maximum, Number(match[1])) : maximum;
+  }, 0) + 1;
+  const freshSequentialId = () => {
+    let id = '';
+    do { id = `img_${String(nextNumber++).padStart(3, '0')}`; } while (reservedIds.has(id) || allocatedIds.has(id));
+    return id;
+  };
 
   const images = doc.images.map((image, index) => {
     const occurrence = (nextOccurrenceById.get(image.id) || 0) + 1;
     nextOccurrenceById.set(image.id, occurrence);
     let id = image.id;
-    if (duplicateIds.has(image.id) && occurrence > 1) {
-      let suffix = occurrence;
-      id = `${image.id}_dup${suffix}`;
-      while (reservedIds.has(id) || allocatedIds.has(id)) {
-        suffix += 1;
-        id = `${image.id}_dup${suffix}`;
-      }
-    }
+    if ((duplicates.includes(image.id) && occurrence > 1) || /_dup\d+$/.test(image.id)) id = freshSequentialId();
     allocatedIds.add(id);
     const renamed = { ...image, id };
     const occurrences = occurrencesByOriginalId.get(image.id) || [];
@@ -1201,7 +1445,7 @@ export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; f
   const questions = doc.questions.map(question => ({
     ...question,
     images: question.images.map(reference => {
-      if (!duplicateIds.has(reference.imageId)) return reference;
+      if (!affected.has(reference.imageId)) return reference;
       const occurrences = occurrencesByOriginalId.get(reference.imageId);
       if (!occurrences?.length) return reference;
       const image = chooseImageOccurrence(occurrences, question, reference.anchorLine, pageByLine);
@@ -1212,14 +1456,14 @@ export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; f
   const flags: Flag[] = [
     ...doc.flags,
     {
-      id: `flag_image_duplicate_${duplicates.map(id => id.replace(/[^A-Za-z0-9_-]/g, '_')).join('_')}`,
+      id: `flag_image_duplicate_${affectedIds.map(id => id.replace(/[^A-Za-z0-9_-]/g, '_')).join('_')}`,
       code: 'IMAGE_ID_DUPLICATE',
       severity: 'warn',
-      message: `Duplicate imageId(s) detected: ${duplicates.join(', ')}. Renamed with page-aware question-reference updates.`,
+      message: `Duplicate or non-sequential duplicate imageId(s) detected: ${affectedIds.join(', ')}. Renamed to sequential ids with page-aware question-reference updates.`,
     },
   ];
 
-  return { doc: { ...doc, images, questions, flags }, fixed: true, duplicates };
+  return { doc: { ...doc, images, questions, flags }, fixed: true, duplicates: affectedIds };
 }
 
 /** Convert legacy/imported table HTML into inert cell strings (no attributes or raw markup survive). */

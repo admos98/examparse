@@ -1,6 +1,16 @@
 /** Deterministic completeness, key-territory, and exam-health helpers. */
-import { ExamDoc, ExamSection, Flag, ImageAsset, Question, SourceLine } from '../types';
+import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, OffsetSpan, Question, SourceLine } from '../types';
 import { buildQuestionTree } from '../utils/questionTree';
+
+function spanMinLine(span: LineSpan): number {
+  return Array.isArray(span) ? span[0] : (span as OffsetSpan).line;
+}
+function spanMaxLine(span: LineSpan): number {
+  return Array.isArray(span) ? span[1] : (span as OffsetSpan).line;
+}
+function spanIncludesLine(span: LineSpan, n: number): boolean {
+  return Array.isArray(span) ? n >= span[0] && n <= span[1] : (span as OffsetSpan).line === n;
+}
 
 /**
  * A1 — STORAGE-TIME NORMALIZATION (deterministic, zero invention):
@@ -36,9 +46,27 @@ export function normalizeForMatching(text: string): string {
 export const normalizeDigits = normalizeForMatching;
 
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+const MATCHING_VIEW_CACHE = new Map<string, { text: string; originalOffset: (offset: number) => number }>();
+const SIMPLE_ASCII_VIEW_RE = /^[\x21-\x7e]*(?: [\x21-\x7e]+)* ?$/;
 
 /** Offsets into the ORIGINAL, including NFKC expansions, marks and joiners. */
 export function matchingView(text: string): { text: string; originalOffset: (offset: number) => number } {
+  if (text.length <= 240) {
+    const cached = MATCHING_VIEW_CACHE.get(text);
+    if (cached) return cached;
+  }
+  if (SIMPLE_ASCII_VIEW_RE.test(text) && !/kanoon/i.test(text)) {
+    const lower = text.toLowerCase();
+    const fast = {
+      text: lower,
+      originalOffset: (offset: number) => (offset >= lower.length ? text.length : Math.max(0, offset)),
+    };
+    if (text.length <= 240) {
+      if (MATCHING_VIEW_CACHE.size >= 512) MATCHING_VIEW_CACHE.clear();
+      MATCHING_VIEW_CACHE.set(text, fast);
+    }
+    return fast;
+  }
   const starts: number[] = []; const ends: number[] = []; let copy = '';
   const segments = GRAPHEME_SEGMENTER.segment(text);
   for (const part of segments) {
@@ -56,7 +84,12 @@ export function matchingView(text: string): { text: string; originalOffset: (off
     const n = hit[0].length; copy = copy.slice(0, hit.index) + copy.slice(hit.index + n);
     starts.splice(hit.index, n); ends.splice(hit.index, n); watermark.lastIndex = hit.index;
   }
-  return { text: copy, originalOffset: offset => offset >= starts.length ? text.length : starts[Math.max(0, offset)] };
+  const view = { text: copy, originalOffset: (offset: number) => offset >= starts.length ? text.length : starts[Math.max(0, offset)] };
+  if (text.length <= 240) {
+    if (MATCHING_VIEW_CACHE.size >= 512) MATCHING_VIEW_CACHE.clear();
+    MATCHING_VIEW_CACHE.set(text, view);
+  }
+  return view;
 }
 
 export function lineNumber(line: SourceLine): number {
@@ -111,57 +144,99 @@ function extractOptionLetter(text: string): string | undefined {
   return undefined;
 }
 
-// Detect section headers for A2
+/**
+ * Part C3 — Recognizes Persian & English "read the following text/passage" instruction lines
+ * that act as hard segment boundaries before a section-owned PASSAGE block.
+ */
+export function isReadTheTextInstruction(text: string): boolean {
+  const norm = normalizeForMatching(text).trim();
+  if (!norm || norm.length > 220) return false;
+  // Never match a line carrying inline MCQ/TF option pairs.
+  const optionMarkers = [...norm.matchAll(/(?:^|\s)(?:\([a-d]\)|[a-d][).:]|\((?:الف|ب|ج|د)\)|(?:الف|ب|ج|د)[).:])(?=\s|$)/gi)];
+  if (optionMarkers.length >= 2) return false;
+  // Strip optional leading/trailing row numbers or point totals from Iranian table rows.
+  const core = norm
+    .replace(/^\s*(?:\(\d{1,2}\)|\d{1,2}(?:[./]\d{1,2})?)\s*[.)\-:|]?\s*/, '')
+    .replace(/\s*[|]?\s*\d{1,2}(?:[./]\d{1,2})?\s*$/, '')
+    .trim();
+  if (/^(?:متن(?:\s*های)?\s+زیر\s+را\s*(?:به\s+دقت\s+)?بخوان|با\s+توجه\s+به\s+متن(?:\s+زیر)?\b)/iu.test(core)) {
+    return true;
+  }
+  if (/^(?:read\s+the\s+(?:following\s+)?(?:passage|text|article|paragraph|story|extract)s?\b|carefully\s+read\s+the\s+(?:following\s+)?(?:passage|text)\b)/iu.test(core)) {
+    return true;
+  }
+  return false;
+}
+
+// Detect section headers for A2 & Part E1 (strict printed title headers only)
 export interface SectionHeaderCandidate { title: string; headerLine: number; kind: string; start: number; rawTitle: string }
 const HEADER_KEYWORDS = [
-  { re: /listening/i, title: 'Listening', kind: 'Listening' },
-  { re: /vocabulary|(?:^|\s)ocabulary\s+v/i, title: 'Vocabulary', kind: 'Vocabulary' },
-  { re: /grammar/i, title: 'Grammar', kind: 'Grammar' },
-  { re: /reading/i, title: 'Reading', kind: 'Reading' },
-  { re: /writing/i, title: 'Writing', kind: 'Writing' },
-  { re: /use of english/i, title: 'Use of English', kind: 'Other' },
-  { re: /language focus/i, title: 'Language Focus', kind: 'Other' },
-  { re: /شنیداری|بخش شنیداری/i, title: 'Listening', kind: 'Listening' },
-  { re: /واژگان/i, title: 'Vocabulary', kind: 'Vocabulary' },
-  { re: /دستور زبان|گرامر/i, title: 'Grammar', kind: 'Grammar' },
-  { re: /درک مطلب/i, title: 'Reading', kind: 'Reading' },
-  { re: /نوشتاری|نگارش/i, title: 'Writing', kind: 'Writing' },
+  { re: /\blistening\b/i, title: 'Listening', kind: 'Listening' },
+  { re: /\bvocabulary\b|(?:^|\s)ocabulary\s+v(?:\s|$)/i, title: 'Vocabulary', kind: 'Vocabulary' },
+  { re: /\bgrammar\b/i, title: 'Grammar', kind: 'Grammar' },
+  { re: /\breading\b/i, title: 'Reading', kind: 'Reading' },
+  { re: /\bwriting\b/i, title: 'Writing', kind: 'Writing' },
+  { re: /\bspeaking\b/i, title: 'Speaking', kind: 'Speaking' },
+  { re: /\buse of english\b/i, title: 'Use of English', kind: 'Other' },
+  { re: /\blanguage focus\b/i, title: 'Language Focus', kind: 'Other' },
+  { re: /(?:^|\s)(?:بخش\s+)?شنیداری(?:\s|$)/i, title: 'Listening', kind: 'Listening' },
+  { re: /(?:^|\s)(?:بخش\s+)?واژگان(?:\s|$)/i, title: 'Vocabulary', kind: 'Vocabulary' },
+  { re: /(?:^|\s)(?:دستور\s+زبان|گرامر)(?:\s|$)/i, title: 'Grammar', kind: 'Grammar' },
+  { re: /(?:^|\s)(?:بخش\s+)?درک\s+مطلب(?:\s|$)/i, title: 'Reading', kind: 'Reading' },
+  { re: /(?:^|\s)(?:نوشتاری|نگارش)(?:\s|$)/i, title: 'Writing', kind: 'Writing' },
+  { re: /(?:^|\s)(?:بخش\s+)?گفتاری(?:\s|$)/i, title: 'Speaking', kind: 'Speaking' },
 ];
+
+const ALLOWED_HEADER_TITLE_TOKEN_RE = /^(?:listening|comprehension|vocabulary|ocabulary|v|grammar|reading|writing|speaking|use|of|english|language|focus|and|&|\/|-|بخش|قسمت|شنیداری|واژگان|دستور|زبان|گرامر|درک|مطلب|نوشتاری|نگارش|گفتاری|اول|دوم|سوم|چهارم|پنجم|ششم|الف|ب|ج|د)$/iu;
+
+function isStrictPrintedTitleHeader(rawText: string, norm: string): boolean {
+  if (!norm || norm.length > 90) return false;
+  if (isReadTheTextInstruction(rawText)) return false;
+  if (/ردیف\s+سؤالات|ردیف\s+سوالات|راهنمای\s+تصحیح/u.test(norm)) return false;
+  // Numbered questions like "25. Writing response." or "(15) ..." are never section headers.
+  if (/^\s*(?:\(\d{1,3}\)|\d{1,3}\s*[.)\-:])\s+\S/u.test(norm)) return false;
+  // Prose instructions ending in sentence punctuation (. ? ! ؟) without Section/Part prefix are not title headers.
+  if (/[.?!؟]\s*$/u.test(norm) && !/^\s*(?:section|part|بخش)\b/iu.test(norm)) return false;
+
+  // Strip allowed header framing: Section/Part/بخش prefix, parenthesized points/marks, pipes, and row/point numerals.
+  let core = norm
+    .replace(/\(\s*[^)]{0,35}(?:marks?|points?|pts?|نمره|بارم)[^)]*\)/giu, ' ')
+    .replace(/\[\s*[^\]]{0,35}(?:marks?|points?|pts?|نمره|بارم)[^\]]*\]/giu, ' ')
+    .replace(/^\s*(?:section|part|بخش|قسمت)\s*(?:[A-Z0-9IVX]+|اول|دوم|سوم|چهارم|پنجم|ششم|الف|ب|ج|د)?\s*[:.\-–—|]?\s*/iu, ' ')
+    .replace(/[|]/g, ' ')
+    .replace(/^\s*\d{1,2}(?:[./]\d{1,2})?\s+/, ' ')
+    .replace(/\s+\d{1,2}(?:[./]\d{1,2})?\s*(?:points?|pts?|marks?|نمره|بارم)?\s*$/iu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!core) return false;
+  const tokens = core.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 6) return false;
+  return tokens.every(tok => ALLOWED_HEADER_TITLE_TOKEN_RE.test(tok));
+}
+
 export function detectSectionHeaders(lines: SourceLine[]): SectionHeaderCandidate[] {
   const sorted = [...lines].sort((a, b) => lineNumber(a) - lineNumber(b));
   const candidates: SectionHeaderCandidate[] = [];
   for (const line of sorted) {
-    if (line.furniture) continue;
+    if (line.furniture || line.tag === 'key') continue;
     const text = line.text;
     const norm = normalizeForMatching(text);
     const optionMarkers = [...norm.matchAll(/(?:^|\s)(?:\([a-d]\)|[a-d][).:]|\((?:الف|ب|ج|د)\)|(?:الف|ب|ج|د)[).:])(?=\s|$)/gi)];
-    if (optionMarkers.length >= 2) continue; // option choices such as 'can read / was reading' are not a section header
-    // A Persian numbered passage instruction is a Reading section header even when OCR drops the English title.
-    if (/^\s*\d{1,2}\s+متن\s+زیر\s+را\s*بخوان/.test(norm)) {
-      const ln = lineNumber(line);
-      candidates.push({ title: 'Reading', headerLine: ln, kind: 'Reading', start: ln, rawTitle: text.trim() });
-      continue;
-    }
-    // Iranian layout: row-numbered header like "2 | Vocabulary | 4" or "ردیف ... Listening ..."
-    // Check for pipe-separated header with known keyword
+    if (optionMarkers.length >= 2) continue;
+    if (!isStrictPrintedTitleHeader(text, norm)) continue;
+
     for (const kw of HEADER_KEYWORDS) {
       if (kw.re.test(text) || kw.re.test(norm)) {
-        // Heuristic: header lines are short (<80 chars) and contain keyword, not a question
-        // Also check for row-number pattern: contains '|' or is near top of section
-        const isQuestionLine = /^\s*(?:\(\d+\)|\d+[.)])\s+/.test(norm) && norm.length > 30;
-        if (isQuestionLine) continue;
-        // Also check if line is like "Section 1 Listening" etc.
-        // Use isSectionHeading helper logic
         const ln = lineNumber(line);
         candidates.push({ title: kw.title, headerLine: ln, kind: kw.kind, start: ln, rawTitle: text.trim() });
         break;
       }
     }
   }
-  // Deduplicate by headerLine and kind (keep first per line)
   const dedup = new Map<number, SectionHeaderCandidate>();
   for (const c of candidates) if (!dedup.has(c.headerLine)) dedup.set(c.headerLine, c);
-  return [...dedup.values()].sort((a,b)=>a.headerLine-b.headerLine);
+  return [...dedup.values()].sort((a, b) => a.headerLine - b.headerLine);
 }
 export function deriveSectionMapFromHeaders(lines: SourceLine[]): Array<{ title: string; headerLine: number; spanStart: number; kind: string }> {
   const headers = detectSectionHeaders(lines);
@@ -513,7 +588,7 @@ export interface ExamHealth {
 export function getExamHealth(doc: ExamDoc): ExamHealth {
   const expected = doc.source?.expectedQuestionNos || enumerateExpectedQuestionNos(doc.source?.lines || []).numbers;
   const sourceLines = doc.source?.lines || [];
-  const contentQuestions = (doc.questions || []).filter(q => !q.spans?.length || !sourceLines.length || q.spans.some(([a, b]) => sourceLines.some(l => !l.furniture && lineNumber(l) >= a && lineNumber(l) <= b)));
+  const contentQuestions = (doc.questions || []).filter(q => !q.spans?.length || !sourceLines.length || q.spans.some(sp => sourceLines.some(l => !l.furniture && spanIncludesLine(sp, lineNumber(l)))));
   // Check for group coverage via facts: if user has accepted group representation, we adjust expected
   // Look for flag or fact that marks group coverage
   // We will check doc.flags or doc.source? For now, check doc as any for groupCoverageFacts
@@ -594,8 +669,10 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
   };
 }
 
-export function isQuestionSpanKeySafe(spans: Array<[number, number]>, keyLineNos: Set<number>): boolean {
-  return spans.every(([start, end]) => {
+export function isQuestionSpanKeySafe(spans: LineSpan[], keyLineNos: Set<number>): boolean {
+  return spans.every(sp => {
+    const start = spanMinLine(sp);
+    const end = spanMaxLine(sp);
     for (let n = start; n <= end; n++) if (keyLineNos.has(n)) return false;
     return true;
   });
@@ -620,14 +697,18 @@ export function computeImageQuestionHints(
     const bounds = pageBounds.get(page);
     if (!bounds) return -Infinity;
     let maximum = -Infinity;
-    for (const [start, end] of spansFor(q)) {
+    for (const sp of spansFor(q)) {
+      const start = spanMinLine(sp);
+      const end = spanMaxLine(sp);
       const candidate = Math.min(end, bounds.end, upperBound);
       if (candidate >= Math.max(start, bounds.start)) maximum = Math.max(maximum, candidate);
     }
     return maximum;
   };
   const hasSpanOnPage = (q: typeof sortedQuestions[number], targetPage: number) => {
-    for (const [start, end] of spansFor(q)) {
+    for (const sp of spansFor(q)) {
+      const start = spanMinLine(sp);
+      const end = spanMaxLine(sp);
       for (let n = start; n <= end; n++) {
         if (lineByNo.get(n)?.page === targetPage) return true;
       }
@@ -643,7 +724,7 @@ export function computeImageQuestionHints(
     const page = img.page;
     const samePageQuestions = sortedQuestions.filter(q => hasSpanOnPage(q, page));
     if (!samePageQuestions.length) continue;
-    let candidates = samePageQuestions.filter(q => spansFor(q).some(([start, end]) => img.anchorLine! >= start && img.anchorLine! <= end));
+    let candidates = samePageQuestions.filter(q => spansFor(q).some(sp => spanIncludesLine(sp, img.anchorLine!)));
     // Prefer the parent group when it owns the containing range.
     const parentCandidate = candidates.find(q => !q.parentId);
     if (parentCandidate) candidates = [parentCandidate];
@@ -692,8 +773,8 @@ export function sectionRangesFromSections(sections: ExamSection[]): Array<{ id: 
       id: section.id,
       index: section.index,
       title: section.title || `Section ${section.index}`,
-      start: Math.min(...section.spans.map(s => s[0])),
-      end: Math.max(...section.spans.map(s => s[1])),
+      start: Math.min(...section.spans.map(spanMinLine)),
+      end: Math.max(...section.spans.map(spanMaxLine)),
     }];
   });
 }
@@ -703,35 +784,92 @@ export function sectionRangesFromSections(sections: ExamSection[]): Array<{ id: 
  * ───────────────────────────────────────────────────────────────── */
 
 export const WATERMARK_LEXICON = [
-  /مرکز\s*سنجش\s*و\s*پایش\s*کیفیت\s*آموزشی/gi,
+  /مرکز\s*سنجش\s*و\s*پایش\s*کیفیت\s*[آا]موزش[یى]/gi,
   /www[.\-]kanoon[.\-]ir/gi,
   /kanoon\.ir/gi,
   /aee\.medu\.ir/gi,
   /https?:\/\/\S+/gi,
-  /ادامه\s*سوالات\s*در\s*صفحه/gi,
+  /[»"]?\s*ادامه\s*(?:ی\s*)?س[وؤ]الات\s*در\s*صفحه(?:\s*(?:ی\s*)?(?:اول|د\s*وم|دوم|سوم|چهار\s*م|چهارم|پنجم|شش\s*م|ششم|هفتم|هشتم|\d+))?\s*[«"]?/gi,
 ];
 
+const WATERMARK_FAST_RE = /مرکز|kanoon|medu|https?:|ادامه|[\uFB50-\uFDFF\uFE70-\uFEFF]/i;
+const PRESENTATION_FORM_RE = /[\uFB50-\uFDFF\uFE70-\uFEFF]/;
+
+function excisePresentationFormWatermarks(input: string): { text: string; count: number } {
+  if (!PRESENTATION_FORM_RE.test(input)) return { text: input, count: 0 };
+  const view = matchingView(input);
+  if (!/مرکز|kanoon|medu|https?:|ادامه/i.test(view.text)) return { text: input, count: 0 };
+  const spans: Array<[number, number]> = [];
+  for (const re of WATERMARK_LEXICON) {
+    const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
+    const copy = new RegExp(re.source, flags);
+    for (const m of view.text.matchAll(copy)) {
+      if (m.index === undefined) continue;
+      const rawStart = view.originalOffset(m.index);
+      const rawEnd = view.originalOffset(m.index + m[0].length);
+      if (rawEnd > rawStart) spans.push([rawStart, rawEnd]);
+    }
+  }
+  if (!spans.length) return { text: input, count: 0 };
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of spans) {
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  let out = input;
+  for (let i = merged.length - 1; i >= 0; i--) {
+    const [s, e] = merged[i];
+    out = out.slice(0, s) + out.slice(e);
+  }
+  return { text: out, count: merged.length };
+}
+
 export function exciseWatermarks(text: string): { text: string; excised: boolean; count: number } {
+  if (!WATERMARK_FAST_RE.test(text)) {
+    const clean = /[ \t\r\n\u200c\u200d]{2}|^\s|\s$/.test(text)
+      ? text.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim()
+      : text;
+    return { text: clean, excised: false, count: 0 };
+  }
   let out = text;
   let count = 0;
+  const pf = excisePresentationFormWatermarks(out);
+  if (pf.count > 0) {
+    out = pf.text;
+    count += pf.count;
+  }
   for (const re of WATERMARK_LEXICON) {
     re.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    // count occurrences before replace
     const matches = out.match(re);
     if (matches) count += matches.length;
     out = out.replace(re, '');
   }
-  // Learned component placeholder: caller may supply learned substrings; we expose generic helper below.
+  if (count === 0) {
+    const clean = /[ \t\r\n\u200c\u200d]{2}|^\s|\s$/.test(text)
+      ? text.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim()
+      : text;
+    return { text: clean, excised: false, count: 0 };
+  }
   out = out.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim();
-  // Remove empty lines left by excision?
-  const excised = count > 0;
-  return { text: out, excised, count };
+  return { text: out, excised: true, count };
 }
 
 export function exciseWatermarksWithLearned(text: string, learned: string[]): { text: string; excised: boolean; count: number } {
+  if ((!learned || learned.length === 0) && !WATERMARK_FAST_RE.test(text)) {
+    const clean = /[ \t\r\n\u200c\u200d]{2}|^\s|\s$/.test(text)
+      ? text.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim()
+      : text;
+    return { text: clean, excised: false, count: 0 };
+  }
   let out = text;
   let count = 0;
+  const pf = excisePresentationFormWatermarks(out);
+  if (pf.count > 0) {
+    out = pf.text;
+    count += pf.count;
+  }
   for (const re of WATERMARK_LEXICON) {
     re.lastIndex = 0;
     const matches = out.match(re);
@@ -746,8 +884,14 @@ export function exciseWatermarksWithLearned(text: string, learned: string[]): { 
     if (matches) count += matches.length;
     out = out.replace(re, '');
   }
+  if (count === 0) {
+    const clean = /[ \t\r\n\u200c\u200d]{2}|^\s|\s$/.test(text)
+      ? text.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim()
+      : text;
+    return { text: clean, excised: false, count: 0 };
+  }
   out = out.replace(/[ \u200c\u200d]{2,}/g, ' ').replace(/\s{2,}/g, ' ').trim();
-  return { text: out, excised: count > 0, count };
+  return { text: out, excised: true, count };
 }
 
 /** Per-doc learned excision list: substrings ≥12 chars appearing inside lines on ≥40% of pages.
@@ -844,15 +988,35 @@ export interface InvariantViolation {
   severity: 'error' | 'warn';
 }
 
+export function isCanonicalTrueFalsePair(options?: Question['options']): boolean {
+  if (!options || options.length !== 2) return false;
+  const a = normalizeForMatching(options[0].text || '').trim().toLowerCase();
+  const b = normalizeForMatching(options[1].text || '').trim().toLowerCase();
+  if (!a || !b || a === b) return false;
+  const tfPole = (s: string): 't' | 'f' | null => {
+    if (/^(?:true|t|درست|صحیح|ص)$/iu.test(s)) return 't';
+    if (/^(?:false|f|نادرست|غلط|غ)$/iu.test(s)) return 'f';
+    return null;
+  };
+  const pa = tfPole(a);
+  const pb = tfPole(b);
+  return pa !== null && pb !== null && pa !== pb;
+}
+
 export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations: InvariantViolation[]; flags: Flag[] } {
   const violations: InvariantViolation[] = [];
   const flags: Flag[] = [];
   const watermarkRe = new RegExp(WATERMARK_LEXICON.map(r => r.source).join('|'), 'i');
+  const questionById = new Map((doc.questions || []).map(q => [q.id, q]));
 
-  // I1 no question with hollow stem (STEM_SUBSTANCE rules) — len<6 or matching/diagram+image waived
+  // I1 no question with hollow stem (STEM_SUBSTANCE rules) — len<6 or matching/diagram+image or non-hollow parent waived
   for (const q of doc.questions || []) {
     if (!q.stem || q.stem.trim().length < 6) {
-      if (q.type === 'matching' || q.type === 'diagram') {
+      const parent = q.parentId ? questionById.get(q.parentId) : undefined;
+      const inheritedFromParent = Boolean(parent && parent.stem && parent.stem.trim().length >= 6);
+      if (inheritedFromParent) {
+        // Group children such as "(16)" inherit group context from their non-hollow parent.
+      } else if (q.type === 'matching' || q.type === 'diagram') {
         // allow via images check later
       } else if ((q.images || []).length === 0) {
         violations.push({ code: 'I1', message: `Q${q.no} hollow stem`, questionId: q.id, severity: 'error' });
@@ -981,7 +1145,7 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
   if ((doc.source?.lines || []).length > 0) {
     const srcByNo = new Map((doc.source?.lines || []).map(l => [lineNumber(l), l]));
     for (const q of doc.questions || []) {
-      const firstLineNo = q.spans?.[0]?.[0];
+      const firstLineNo = q.spans?.[0] ? spanMinLine(q.spans[0]) : undefined;
       if (!firstLineNo) continue;
       const firstLine = srcByNo.get(firstLineNo);
       if (!firstLine || firstLine.furniture) continue;
@@ -989,7 +1153,9 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
       if (printedFirst === undefined || printedFirst === q.no) continue;
       if (q.parentId) {
         const spanLines: SourceLine[] = [];
-        for (const [s, e] of q.spans || []) {
+        for (const sp of q.spans || []) {
+          const s = spanMinLine(sp);
+          const e = spanMaxLine(sp);
           for (let n = s; n <= e; n++) {
             const ln = srcByNo.get(n);
             if (ln) spanLines.push(ln);
@@ -1002,8 +1168,112 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
       flags.push({ id: `flag_I11_${q.id}`, code: 'INVARIANT_I11_NUMBER_SLIP', severity: 'error', message: `Q${q.no} first span line prints ${printedFirst}, not ${q.no}`, questionId: q.id });
     }
   }
+  // I12 Part B3: fast question-only invariant check
+  const i12 = checkInvariantI12(doc.questions || []);
+  violations.push(...i12.violations);
+  flags.push(...i12.flags);
   const ok = violations.filter(v => v.severity === 'error').length === 0;
   return { ok, violations, flags };
+}
+
+/**
+ * Part B3 — Fast O(Q) check for Assembly Invariant I12:
+ * - No question may reference itself as parent
+ * - No two options of one question may have identical normalized text unless type is truefalse and pair is canonical
+ * - No option may include its whole stem text
+ * - No sibling questions may share an identical normalized stem
+ */
+export function checkInvariantI12(questions: Question[]): { violations: InvariantViolation[]; flags: Flag[] } {
+  const violations: InvariantViolation[] = [];
+  const flags: Flag[] = [];
+  for (const q of questions || []) {
+    if (q.parentId === q.id) {
+      violations.push({ code: 'I12', message: `Q${q.no} cannot be its own parent`, questionId: q.id, severity: 'error' });
+      flags.push({ id: `flag_I12_self_parent_${q.id}`, code: 'INVARIANT_I12_SELF_PARENT', severity: 'error', message: `Q${q.no} references itself as parent`, questionId: q.id });
+    }
+    const opts = q.options || [];
+    if (opts.length >= 2) {
+      if (q.type === 'truefalse' && isCanonicalTrueFalsePair(opts)) {
+        // Canonical TF pair is valid by definition.
+      } else {
+        const normOpts = opts
+          .map(o => normalizeForMatching(o.text || '').replace(/\s+/g, ' ').trim().toLowerCase())
+          .filter(Boolean);
+        const normStem = normalizeForMatching(q.stem || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const hasDupOpt = normOpts.length >= 2 && new Set(normOpts).size < normOpts.length;
+        const optContainsWholeStem = normStem.length >= 8 && normOpts.some(t => t === normStem || t.includes(normStem));
+        if (hasDupOpt || optContainsWholeStem) {
+          violations.push({
+            code: 'I12',
+            message: hasDupOpt
+              ? `Q${q.no} has identical normalized option texts`
+              : `Q${q.no} option includes whole stem text`,
+            questionId: q.id,
+            severity: 'error',
+          });
+          flags.push({
+            id: `flag_I12_opt_${q.id}`,
+            code: 'INVARIANT_I12_DUPLICATE_OPTIONS',
+            severity: 'error',
+            message: `Q${q.no} options are not distinct / clean of stem`,
+            questionId: q.id,
+          });
+        }
+      }
+    }
+  }
+  const siblingBuckets = new Map<string, Question[]>();
+  for (const q of questions || []) {
+    const bucketKey = q.parentId ? `parent:${q.parentId}` : `root:${q.sectionId || '__default__'}`;
+    const list = siblingBuckets.get(bucketKey) || [];
+    list.push(q);
+    siblingBuckets.set(bucketKey, list);
+  }
+  for (const siblings of siblingBuckets.values()) {
+    if (siblings.length < 2) continue;
+    const seenStems = new Map<string, Question>();
+    const flaggedSiblingIds = new Set<string>();
+    for (const q of siblings) {
+      const normStem = normalizeForMatching(q.stem || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!normStem) continue;
+      const first = seenStems.get(normStem);
+      if (first) {
+        if (!flaggedSiblingIds.has(first.id)) {
+          flaggedSiblingIds.add(first.id);
+          violations.push({
+            code: 'I12',
+            message: `Q${first.no} shares identical stem with sibling Q${q.no}`,
+            questionId: first.id,
+            severity: 'error',
+          });
+          flags.push({
+            id: `flag_I12_sib_${first.id}`,
+            code: 'INVARIANT_I12_SIBLING_IDENTICAL_STEM',
+            severity: 'error',
+            message: `Q${first.no} shares an identical stem with sibling Q${q.no}`,
+            questionId: first.id,
+          });
+        }
+        flaggedSiblingIds.add(q.id);
+        violations.push({
+          code: 'I12',
+          message: `Q${q.no} shares identical stem with sibling Q${first.no}`,
+          questionId: q.id,
+          severity: 'error',
+        });
+        flags.push({
+          id: `flag_I12_sib_${q.id}`,
+          code: 'INVARIANT_I12_DUPLICATE_SIBLING_STEM',
+          severity: 'error',
+          message: `Q${q.no} shares identical stem with sibling Q${first.no}`,
+          questionId: q.id,
+        });
+      } else {
+        seenStems.set(normStem, q);
+      }
+    }
+  }
+  return { violations, flags };
 }
 
 /** Printed numbers of the questions implicated by violations (for banners and export issues). */

@@ -1,5 +1,6 @@
 import { ExamDoc } from '../types';
 import { getExamHealth, lineNumber, detectSectionHeaders } from './quality';
+import { spanBounds } from './spans';
 import { PARSER_VERSION } from './prompts';
 import { computeQualityScore } from '../utils/qualityScore';
 
@@ -29,15 +30,16 @@ export function buildDossier(doc: ExamDoc, existing?: Dossier): Dossier {
   const health = getExamHealth(doc);
   // Structure map
   const structureMap: DossierSectionMap[] = (doc.sections || []).map(sec => {
-    const start = sec.spans?.length ? Math.min(...sec.spans.map(s=>s[0])) : 0;
-    const end = sec.spans?.length ? Math.max(...sec.spans.map(s=>s[1])) : 0;
+    const bounds = spanBounds(sec.spans);
+    const start = bounds ? bounds[0] : 0;
+    const end = bounds ? bounds[1] : 0;
     const qNos = doc.questions.filter(q=>q.sectionId===sec.id).map(q=>q.no).sort((a,b)=>a-b);
     const points = doc.questions.filter(q=>q.sectionId===sec.id).reduce((s,q)=>s+(q.points||0),0) || sec.points;
     return { id: sec.id, title: sec.title || `Section ${sec.index}`, kind: (sec as any).kind, lineRange: [start,end] as [number,number], questionNos: qNos, points };
   });
   // Question index
   const questionIndex: DossierQuestionIndex[] = doc.questions.map(q=>{
-    const spanRange = q.spans?.length ? [Math.min(...q.spans.map(s=>s[0])), Math.max(...q.spans.map(s=>s[1]))] as [number,number] : null;
+    const spanRange = spanBounds(q.spans);
     return { no: q.no, label: q.label, sectionId: q.sectionId, type: q.type, points: q.points, spanRange, hasImages: (q.images||[]).length>0, answerPresent: !!q.answer, confidence: q.confidence };
   }).sort((a,b)=>a.no-b.no);
   // Image index

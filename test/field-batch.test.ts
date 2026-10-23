@@ -46,7 +46,8 @@ test('field R1: speaker labels stay in dialogue stems and model-reported grouped
   const child = assembled.questions.find(question => question.no === 2);
   assert.equal(child?.parentId, 'q1');
   assert.equal(child?.points, 0);
-  assert.deepEqual(child?.spans, [[1,2]]);
+  assert.deepEqual(child?.spans, [{ line: 1, start: 7, end: 10 }]);
+  assert.equal(child?.stem, '(2)');
 });
 
 test('field R2: immutable document total beats a 52.5 question sum; defaults rescale to 48 rather than raising the total', () => {
@@ -104,15 +105,15 @@ test('field R4: duplicate pre-extracted ids are re-minted sequentially without _
   assert.ok(draft.images.every(item => !/_dup\d+$/.test(item.id)));
 });
 
-test('field corpus acceptance hard gate: English final passes 67/67, 9/9, 48, 8/8 and both groups pre-assistant', async () => {
+test('field corpus acceptance hard gate: English final passes 67/67, 8/8, 48, 12/12, shape 0/0/0 and both groups pre-assistant', async () => {
   const { results, ok } = await runCorpus({ strict: true, print: false });
   const exam = results.find(result => result.exam === 'english-final-13991009pq89w65173');
   assert.equal(ok, true, JSON.stringify(exam?.failures));
   assert.equal(exam?.recall, '67/67');
-  assert.equal(exam?.sections, '9/9');
+  assert.equal(exam?.sections, '8/8');
   assert.equal(exam?.total, '48');
-  assert.equal(exam?.spotChecks, '8/8');
+  assert.equal(exam?.spotChecks, '12/12');
+  assert.equal(exam?.shapeAuditLabel, '0/0/0');
   assert.equal(exam?.duplicateImageIds, 0);
-  assert.ok(exam?.preAssistantChildren.includes('15:16,17,18'));
-  assert.ok(exam?.preAssistantChildren.includes('63:64,65,66'));
+  assert.equal(exam?.preAssistantChildren, '15:16,17,18;63:64,65,66');
 });

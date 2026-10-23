@@ -7,6 +7,7 @@ import { LLMAdapter } from '../providers/adapter';
 import { T3_REPAIR_SYSTEM } from './prompts';
 import { applyMergePatch } from './patch';
 import { RawQuestionSchema, assembleTables, lineNoFromId, rewriteRejection, sanitizeSpansAgainstSource, sliceSourceSpans, spanLineNumbers } from './assemble';
+import { spanBounds, spanStartLine } from './spans';
 
 export interface RepairResult {
   repairedQuestions: Question[];
@@ -55,12 +56,9 @@ export async function runEscalationRepair(params: {
     let slice = '';
 
     if (q.spans && q.spans.length > 0) {
-      let minL = Infinity;
-      let maxL = -Infinity;
-      for (const [s, e] of q.spans) {
-        minL = Math.min(minL, s);
-        maxL = Math.max(maxL, e);
-      }
+      const bounds = spanBounds(q.spans);
+      const minL = bounds ? bounds[0] : 1;
+      const maxL = bounds ? bounds[1] : 1;
       const startIdx = Math.max(0, (idToIdxMap.get(minL) ?? 0) - 3);
       const endIdx = Math.min(sourceLines.length, (idToIdxMap.get(maxL) ?? (sourceLines.length - 1)) + 4);
       slice = sourceLines
@@ -74,7 +72,7 @@ export async function runEscalationRepair(params: {
       for (let i = qIndex - 1; i >= 0; i--) {
         const prevQ = allQuestions[i];
         if (prevQ.spans && prevQ.spans.length > 0) {
-          const lNum = prevQ.spans[0][0];
+          const lNum = spanStartLine(prevQ.spans[0]);
           const line = sourceLines.find(l => parseInt(l.id.replace(/\D/g, ''), 10) === lNum);
           if (line) {
             targetPage = line.page;

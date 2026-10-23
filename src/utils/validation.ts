@@ -6,7 +6,15 @@ export const MAX_EXAM_JSON_BYTES = 25 * 1024 * 1024;
 export const MAX_SETTINGS_JSON_BYTES = 1024 * 1024;
 export const SAFE_STORAGE_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const spanSchema = z.tuple([z.number().int().positive().max(1_000_000), z.number().int().positive().max(1_000_000)]).refine(([start, end]) => end >= start);
+const offsetSpanSchema = z.object({
+  line: z.number().int().positive().max(1_000_000),
+  start: z.number().int().nonnegative().max(1_000_000).optional(),
+  end: z.number().int().nonnegative().max(1_000_000).optional(),
+}).strict().refine(v => v.start === undefined || v.end === undefined || v.end >= v.start);
+const spanSchema = z.union([
+  z.tuple([z.number().int().positive().max(1_000_000), z.number().int().positive().max(1_000_000)]).refine(([start, end]) => end >= start),
+  offsetSpanSchema,
+]);
 const text = (max = 100_000) => z.string().max(max);
 
 const lineSchema = z.object({ id: z.string().regex(/^L\d{1,9}$/), page: z.number().int().min(1).max(10_000), text: text(100_000), y: z.number().finite().optional() }).passthrough();

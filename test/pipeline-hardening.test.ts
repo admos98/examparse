@@ -80,7 +80,7 @@ test('clips option and table spans out of answer-key territory while preserving 
     options: [{ key: 'a', spans: [[2, 4]] }, { key: 'b', spans: [[2, 2]] }],
     tables: [{ spans: [[3, 4]] }], answer: { spans: [[4, 4]] }, confidence: 0.9,
   }], source, undefined, { keyTerritoryLineNos: [3, 4] });
-  assert.ok(result.questions[0].options?.every(option => option.spans.every(([start, end]) => end < 3)));
+  assert.ok(result.questions[0].options?.every(option => option.spans.every(sp => (Array.isArray(sp) ? sp[1] : sp.line) < 3)));
   assert.equal(result.questions[0].tables, undefined);
   assert.deepEqual(result.questions[0].answer?.spans, [[4, 4]]);
 });

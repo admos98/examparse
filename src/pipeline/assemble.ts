@@ -4,15 +4,45 @@
  * fresh, cached, resumed, chunked, patched, and imported documents.
  */
 import { z } from 'zod';
-import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, Question, SourceLine } from '../types';
-import { normalizeForMatching, matchingView, parsePrintedNumberFromStem, enumerateExpectedQuestionNos, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks, extractDocumentTotals } from './quality';
+import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, OffsetSpan, Question, SourceLine } from '../types';
+import { normalizeForMatching, normalizeStoredText, matchingView, parsePrintedNumberFromStem, enumerateExpectedQuestionNos, detectSectionHeaders, exciseWatermarksWithLearned, computeLearnedWatermarks, exciseWatermarks, extractDocumentTotals, isReadTheTextInstruction, checkInvariantI12 } from './quality';
 import { buildQuestionTree } from '../utils/questionTree';
-import { validateSemantic, semanticConfidenceDeduction, semanticIssuesFor } from './semanticValidators';
+import { validateSemantic, semanticConfidenceDeduction } from './semanticValidators';
 import { completeGapsRaw } from './ownership';
-import { isContentJunk, isFenceProtected } from './cleanup';
+import { isContentJunk, isFenceProtected, isInstructionText } from './cleanup';
 import { findIntraLineMultiNumbers } from './segment';
+import {
+  carveGroupChildSpans,
+  carveGroupedAnswerSpans,
+  carveOptionsAcrossLines,
+  coerceLineSpan,
+  compressLineNumbers as compressSpanLines,
+  filterSpansByLines,
+  isOffsetSpan,
+  sliceNormalizedLineByOffsets,
+  spanBounds,
+  spanEndLine,
+  spanHasOffsets,
+  spanLineNumbers as spanLineNosFromSpans,
+  spansContainLine,
+  spanStartLine,
+  trimOffsetsOnLine,
+  maskWatermarksSameLength,
+} from './spans';
+import { canonicalizeForms } from './forms';
 
-export const SpanReferenceSchema = z.tuple([z.number().int().positive(), z.number().int().positive()]);
+export const OffsetSpanReferenceSchema = z.object({
+  line: z.number().int().positive(),
+  start: z.number().int().min(0).optional(),
+  end: z.number().int().min(0).optional(),
+}).strict().refine(v => v.start === undefined || v.end === undefined || v.end >= v.start, {
+  message: 'OffsetSpan end must be >= start',
+});
+
+export const SpanReferenceSchema = z.union([
+  z.tuple([z.number().int().positive(), z.number().int().positive()]),
+  OffsetSpanReferenceSchema,
+]);
 export const RawQuestionSchema = z.object({
   id: z.string().optional(),
   label: z.string().optional(),
@@ -63,12 +93,25 @@ export function normalizedSpans(spans: unknown): LineSpan[] {
   const out: LineSpan[] = [];
   let lineBudget = 5_000;
   for (const span of spans) {
-    let a: number; let b: number;
-    if (Array.isArray(span) && span.length >= 2) { a = Number(span[0]); b = Number(span[1]); }
-    else if (typeof span === 'number') { a = span; b = span; }
-    else continue;
+    if (typeof span === 'number') {
+      if (Number.isInteger(span) && span > 0 && lineBudget >= 1) {
+        out.push([span, span]);
+        lineBudget -= 1;
+      }
+      continue;
+    }
+    const coerced = coerceLineSpan(span);
+    if (!coerced) continue;
+    if (isOffsetSpan(coerced)) {
+      if (lineBudget >= 1) {
+        out.push(coerced);
+        lineBudget -= 1;
+      }
+      continue;
+    }
+    const [a, b] = coerced;
     const width = b - a + 1;
-    if (Number.isInteger(a) && Number.isInteger(b) && a > 0 && b >= a && width <= 5_000 && width <= lineBudget) {
+    if (width <= 5_000 && width <= lineBudget) {
       out.push([a, b]);
       lineBudget -= width;
     }
@@ -77,11 +120,14 @@ export function normalizedSpans(spans: unknown): LineSpan[] {
 }
 
 export function spanLineNumbers(spans: LineSpan[]): number[] {
-  const set = new Set<number>();
-  for (const [start, end] of spans) for (let n = start; n <= end; n++) set.add(n);
-  return [...set].sort((a, b) => a - b);
+  return spanLineNosFromSpans(spans);
 }
 
+/**
+ * Part B1 — Unified offset-aware source slicer.
+ * Slices whole-line `[start, end]` tuples and sub-line `{ line, start?, end? }` OffsetSpans
+ * through one path, honoring fenced line rewrites and excising watermarks automatically.
+ */
 export function sliceSourceSpans(
   spans: LineSpan[],
   sourceLines: SourceLine[],
@@ -90,18 +136,42 @@ export function sliceSourceSpans(
   if (!spans || spans.length === 0) return '';
   const lineMap = lineIndexFor(sourceLines).byNo;
   const rewriteMap = new Map<number, string>((rewrites || []).map(rewrite => [rewrite.line, rewrite.text]));
+  const seenSlices = new Set<string>();
   const output: string[] = [];
-  for (const lineNo of spanLineNumbers(spans)) {
-    const line = lineMap.get(lineNo);
-    if (rewriteMap.has(lineNo)) output.push(rewriteMap.get(lineNo)!);
-    else if (line && !line.furniture && !isContentJunk(line)) output.push(line.text);
-  }
-  return output.join('\n');
-}
 
-function sliceOptionUnion(options: any[], sourceLines: SourceLine[]): string {
-  const allSpans = options.flatMap(option => normalizedSpans(option?.spans));
-  return sliceSourceSpans(allSpans, sourceLines);
+  for (const raw of spans) {
+    const span = coerceLineSpan(raw);
+    if (!span) continue;
+    if (isOffsetSpan(span)) {
+      const key = `${span.line}:${span.start ?? ''}:${span.end ?? ''}`;
+      if (seenSlices.has(key)) continue;
+      seenSlices.add(key);
+      const line = lineMap.get(span.line);
+      if (rewriteMap.has(span.line)) {
+        const sliced = sliceNormalizedLineByOffsets(rewriteMap.get(span.line)!, span.start, span.end);
+        if (sliced.text) output.push(sliced.text);
+      } else if (line && !line.furniture && !isContentJunk(line)) {
+        const sliced = sliceNormalizedLineByOffsets(line.text, span.start, span.end);
+        if (sliced.text) output.push(sliced.text);
+      }
+      continue;
+    }
+    const [start, end] = span;
+    for (let lineNo = start; lineNo <= end; lineNo++) {
+      const key = `${lineNo}::`;
+      if (seenSlices.has(key)) continue;
+      seenSlices.add(key);
+      const line = lineMap.get(lineNo);
+      if (rewriteMap.has(lineNo)) {
+        const sliced = sliceNormalizedLineByOffsets(rewriteMap.get(lineNo)!);
+        if (sliced.text) output.push(sliced.text);
+      } else if (line && !line.furniture && !isContentJunk(line)) {
+        const sliced = sliceNormalizedLineByOffsets(line.text);
+        if (sliced.text) output.push(sliced.text);
+      }
+    }
+  }
+  return output.join('\n').trim();
 }
 
 type Marker = { start: number; end: number; key: string; display?: string };
@@ -225,7 +295,17 @@ function findOptionMarkers(text: string): Marker[] {
     rawFound.push({ start: originalStart, end: originalEnd, key });
   }
   const ordered = selectOrderedMarkers(rawFound);
-  if (ordered.length >= 2) return ordered;
+  if (ordered.length >= 2) {
+    if (
+      ordered.length === 2 &&
+      /^\s*A\s*:\s*$/u.test(text.slice(ordered[0].start, ordered[0].end)) &&
+      /^\s*B\s*:\s*$/u.test(text.slice(ordered[1].start, ordered[1].end)) &&
+      !/\b(?:true|false|درست|نادرست)\b/iu.test(view.text)
+    ) {
+      return [];
+    }
+    return ordered;
+  }
   if (rawFound.length === 0) {
     const pairs = [...view.text.matchAll(/(?:^|[\s/])(true|false|درست|نادرست)(?=\s|$|[).:/])/g)];
     const keys = pairs.map(m => m[1]);
@@ -280,54 +360,100 @@ export function decontaminateOptionMarkup(text: string): string {
   }).join('\n').trim();
 }
 
-function splitOptionTexts(options: Question['options'], sourceLines: SourceLine[], learnedWatermarks: string[] = []): { options?: Question['options']; failed: boolean; excisedCount: number; inlineSplit: boolean } {
+/**
+ * Part B2a — Unified offset-based option carver.
+ * Replaces legacy `sliceOptionUnion` + `splitOptionTexts` + `collapseAdjacentOptionDuplicates`:
+ * options sharing a source line receive disjoint `{ line, start, end }` OffsetSpans and are
+ * sliced directly through `sliceSourceSpans`.
+ */
+function carveOptionsByOffsets(
+  options: Question['options'],
+  sourceLines: SourceLine[],
+  learnedWatermarks: string[] = [],
+): { options?: Question['options']; preMarkerStemSpans?: LineSpan[]; failed: boolean; excisedCount: number; inlineSplit: boolean } {
   if (!options || options.length === 0) return { options, failed: false, excisedCount: 0, inlineSplit: false };
-  // Excision is deliberately performed on the sliced union before marker detection.
-  // SourceLine.text is never modified: all offsets and receipts still refer to the original extraction.
-  const union = sliceOptionUnion(options, sourceLines);
-  const excisedUnion = exciseWatermarksWithLearned(union, learnedWatermarks);
-  const text = excisedUnion.text;
-  const inlineParts = splitInlineOptions(text);
-  if (inlineParts.length >= 2) {
-    const ordered = [...options].sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
-    const pooledSpans = normalizedSpans(ordered.flatMap(o => o.spans));
+  const lineMap = lineIndexFor(sourceLines).byNo;
+
+  // If options already carry explicit disjoint OffsetSpans, slice each directly.
+  if (options.every(o => (o.spans || []).some(spanHasOffsets))) {
+    let excisedCount = 0;
+    const sliced = options.map(opt => {
+      const rawText = sliceSourceSpans(opt.spans, sourceLines);
+      const exc = exciseWatermarksWithLearned(rawText, learnedWatermarks);
+      excisedCount += exc.count;
+      return { ...opt, text: stripLeadingOptionMarker(exc.text) };
+    });
+    const distinct = new Set(sliced.map(o => normalizeForMatching(o.text || '').trim()).filter(Boolean));
+    if (sliced.length >= 2 && distinct.size >= 2) {
+      return { options: sliced, failed: false, excisedCount, inlineSplit: true };
+    }
+  }
+
+  const pooledLineNos = spanLineNumbers(options.flatMap(o => o.spans || []));
+  const candidateLines = pooledLineNos
+    .map(ln => ({ lineNo: ln, line: lineMap.get(ln) }))
+    .filter((entry): entry is { lineNo: number; line: SourceLine } => Boolean(entry.line && !entry.line.furniture && !isContentJunk(entry.line)))
+    .map(entry => ({ lineNo: entry.lineNo, text: entry.line.text }));
+
+  const carved = candidateLines.length > 0
+    ? carveOptionsAcrossLines(candidateLines, { allowMidAlphabetStart: true })
+    : null;
+
+  if (carved && carved.options.length >= 2) {
+    let excisedCount = 0;
+    const orderedInput = [...options].sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
+    const builtOptions = carved.options.map((part, idx) => {
+      const rawText = sliceSourceSpans(part.spans, sourceLines);
+      const exc = exciseWatermarksWithLearned(rawText, learnedWatermarks);
+      excisedCount += exc.count;
+      return {
+        key: orderedInput[idx]?.key && carved.options.length === orderedInput.length ? orderedInput[idx].key : part.key,
+        spans: part.spans,
+        text: normalizeOptionText(exc.text),
+      };
+    });
+    const sharedLine = carved.options.some((opt, idx) =>
+      idx > 0 && spanLineNumbers(opt.spans)[0] === spanLineNumbers(carved.options[idx - 1].spans)[0],
+    );
     return {
-      options: inlineParts.map((part, index) => ({
-        key: ordered[index]?.key && inlineParts.length === ordered.length ? ordered[index].key : part.key,
-        spans: ordered[index]?.spans && inlineParts.length === ordered.length ? ordered[index].spans : pooledSpans,
-        text: part.text,
-      })),
+      options: builtOptions,
+      preMarkerStemSpans: carved.stemSpans.length > 0 ? carved.stemSpans : undefined,
       failed: false,
-      excisedCount: excisedUnion.count,
-      inlineSplit: true,
+      excisedCount,
+      inlineSplit: sharedLine,
     };
   }
-  // No inline sequence found: strip leading markers (e.g. "a. item") on distinct per-option spans;
-  // NEVER fall back to duplicating a single unsplit blob across keys.
+
+  // Fallback for multi-line options without inline sequence (e.g. bare per-line options on distinct lines):
+  // carve leading option marker via OffsetSpan when present; NEVER duplicate one unsplit line across keys.
+  let excisedCount = 0;
   const cleaned = options.map(opt => {
-    const excised = exciseWatermarksWithLearned(opt.text || '', learnedWatermarks);
-    return { ...opt, text: stripLeadingOptionMarker(excised.text) };
+    let spans = opt.spans;
+    if (spans.length === 1 && !isOffsetSpan(spans[0]) && spans[0][0] === spans[0][1]) {
+      const ln = spans[0][0];
+      const src = lineMap.get(ln);
+      if (src) {
+        const norm = normalizeStoredText(src.text);
+        const masked = maskWatermarksSameLength(norm);
+        const lead = findLineStartOptionMarker(masked);
+        if (lead) {
+          const trimmed = trimOffsetsOnLine(masked, lead.end, norm.length);
+          if (trimmed.end > trimmed.start) {
+            spans = [{ line: ln, start: trimmed.start, end: trimmed.end }];
+          }
+        }
+      }
+    }
+    const rawText = sliceSourceSpans(spans, sourceLines);
+    const excised = exciseWatermarksWithLearned(rawText, learnedWatermarks);
+    excisedCount += excised.count;
+    return { ...opt, spans, text: stripLeadingOptionMarker(excised.text) };
   });
   const distinctNonEmpty = new Set(cleaned.map(o => normalizeForMatching(o.text || '').trim()).filter(Boolean));
   if (cleaned.length >= 2 && distinctNonEmpty.size >= 2) {
-    return { options: cleaned, failed: false, excisedCount: excisedUnion.count, inlineSplit: false };
+    return { options: cleaned, failed: false, excisedCount, inlineSplit: false };
   }
-  return { options: [], failed: true, excisedCount: excisedUnion.count, inlineSplit: false };
-}
-
-function collapseAdjacentOptionDuplicates(options: NonNullable<Question['options']>): { options: NonNullable<Question['options']>; nonAdjacentDuplicates: string[] } {
-  const kept: NonNullable<Question['options']> = [];
-  const nonAdjacentDuplicates: string[] = [];
-  const seen = new Set<string>();
-  for (const option of options) {
-    const key = normalizeOptionText(option.text || '');
-    if (!key) { kept.push(option); continue; }
-    if (kept.length && normalizeOptionText(kept[kept.length - 1].text || '') === key) continue;
-    if (seen.has(key)) nonAdjacentDuplicates.push(key);
-    seen.add(key);
-    kept.push(option);
-  }
-  return { options: kept.map((option, index) => ({ ...option, key: String.fromCharCode(97 + index) })), nonAdjacentDuplicates };
+  return { options: [], failed: true, excisedCount, inlineSplit: false };
 }
 
 function lineTextMap(sourceLines: SourceLine[]): Map<number, string> {
@@ -341,6 +467,10 @@ export function decontaminateStem(
   printedNo: number,
   rewrites?: { line: number; text: string }[]
 ): string {
+  // If stemSpans already carry sub-line OffsetSpans, slice directly via offset-aware sliceSourceSpans.
+  if (stemSpans.some(spanHasOffsets)) {
+    return decontaminateOptionMarkup(sliceSourceSpans(stemSpans, sourceLines, rewrites));
+  }
   const consumed = new Set(spanLineNumbers(optionSpans));
   const textMap = lineTextMap(sourceLines);
   for (const rewrite of rewrites || []) if (textMap.has(rewrite.line)) textMap.set(rewrite.line, rewrite.text);
@@ -352,36 +482,15 @@ export function decontaminateStem(
       output.push(line);
       continue;
     }
-    // Dialogue speaker label is stem prose even when a following option union uses this line span.
     if (/^\s*[A-Z]:\s+[A-Za-z]/.test(line)) { output.push(line); continue; }
     const markers = findOptionMarkers(line);
     const firstMarker = markers[0] ?? findLineStartOptionMarker(line);
     const number = parsePrintedNumberFromStem(line);
-    // Keep the stem prefix of an option line when it is this question's printed line or an
-    // un-numbered continuation (gap-completed "He ___ to school. a) go b) went" lines).
     if ((number === printedNo || number === undefined) && firstMarker && line.slice(0, firstMarker.start).trim()) {
       output.push(line.slice(0, firstMarker.start).trimEnd());
     }
   }
   return decontaminateOptionMarkup(output.join('\n'));
-}
-
-function splitGroupedAnswer(text: string, questionNo: number): { text: string; unmatched: boolean } {
-  const view = matchingView(text);
-  const normalized = view.text;
-  const matcher = /(^|\s)(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*)/g;
-  const markers: Array<{ start: number; bodyStart: number; no: number }> = [];
-  let m: RegExpExecArray | null;
-  while ((m = matcher.exec(normalized))) {
-    const start = m.index + (m[1] || '').length;
-    markers.push({ start, bodyStart: matcher.lastIndex, no: Number(m[2]) });
-  }
-  if (markers.length < 2) return { text, unmatched: false };
-  const selectedIndex = markers.findIndex(marker => marker.no === questionNo);
-  if (selectedIndex < 0) return { text, unmatched: true };
-  const selected = markers[selectedIndex];
-  const next = markers[selectedIndex + 1];
-  return { text: text.slice(view.originalOffset(selected.bodyStart), next ? view.originalOffset(next.start) : text.length).trim(), unmatched: false };
 }
 
 function escapeHtmlCell(text: string): string {
@@ -425,7 +534,7 @@ export interface AssembleOptions {
   /** D: 'fenced' (default) only accepts rewrites on locally garbled, number-free lines; 'open' for user patches. */
   rewritePolicy?: 'fenced' | 'open';
   /** Deterministic segmenter receipts; optional for legacy/recovery callers. */
-  segmentReceipts?: Array<{ id?: string; kind?: string; startLine: number; endLine: number; printedNo?: number; childNos?: number[]; parentSegmentId?: string; charStart?: number; charEnd?: number; ruleChain?: string[]; ruleConfidence?: number }>;
+  segmentReceipts?: Array<{ id?: string; kind?: string; startLine: number; endLine: number; printedNo?: number; childNos?: number[]; parentSegmentId?: string; charStart?: number; charEnd?: number; offsetSpan?: OffsetSpan; ruleChain?: string[]; ruleConfidence?: number }>;
 }
 
 export const REWRITE_MAX_CHARS = 140;
@@ -447,18 +556,16 @@ function flag(code: string, message: string, severity: Flag['severity'], questio
 }
 
 function compressLineNumbers(lines: number[]): LineSpan[] {
-  const out: LineSpan[] = [];
-  for (const n of lines) {
-    const last = out[out.length - 1];
-    if (last && last[1] + 1 === n) last[1] = n;
-    else out.push([n, n]);
-  }
-  return out;
+  return compressSpanLines(lines);
 }
 
 function sanitizeQuestionSpans(spans: LineSpan[], keyLines: Set<number>): { spans: LineSpan[]; clipped: boolean } {
-  const keptLines = spanLineNumbers(spans).filter(n => !keyLines.has(n));
-  return { spans: compressLineNumbers(keptLines), clipped: keptLines.length !== spanLineNumbers(spans).length };
+  const allLines = spanLineNumbers(spans);
+  const keptLines = allLines.filter(n => !keyLines.has(n));
+  return {
+    spans: filterSpansByLines(spans, n => !keyLines.has(n)),
+    clipped: keptLines.length !== allLines.length,
+  };
 }
 
 /** Restrict patched spans to actual source lines; question fields may not use answer-key lines. */
@@ -473,7 +580,7 @@ export function sanitizeSpansAgainstSource(
   const sourceIds = new Set(sourceLines.map(line => lineNoFromId(line.id)).filter(n => n > 0));
   const kept = allLines.filter(n => sourceIds.has(n) && (allowKeyLines || !keyLines.has(n)));
   return {
-    spans: compressLineNumbers(kept),
+    spans: filterSpansByLines(normalized, n => sourceIds.has(n) && (allowKeyLines || !keyLines.has(n))),
     clippedKeyLines: !allowKeyLines && allLines.some(n => keyLines.has(n)),
     clippedMissingLines: kept.length !== allLines.filter(n => allowKeyLines || !keyLines.has(n)).length,
   };
@@ -488,11 +595,21 @@ function isSubset(a: Question, b: Question): boolean {
   return aLines.length > 0 && aLines.every(line => bLines.has(line));
 }
 
+function normalizeRtlDecimalMarks(text: string): string {
+  return text
+    .replace(/\)\s*5\s*\(\s*[./]+/g, '(0.5) ')
+    .replace(/\(\s*5\s*\/\s*0\s*\)|\)\s*5\s*\/\s*0\s*\(/g, '(0.5)')
+    .replace(/\(\s*25\s*\/\s*0\s*\)|\)\s*25\s*\/\s*0\s*\(/g, '(0.25)')
+    .replace(/\(\s*75\s*\/\s*0\s*\)|\)\s*75\s*\/\s*0\s*\(/g, '(0.75)')
+    .replace(/\(\s*5\s*\/\s*1\s*\)|\)\s*5\s*\/\s*1\s*\(/g, '(1.5)')
+    .replace(/\(\s*5\s*\/\s*2\s*\)|\)\s*5\s*\/\s*2\s*\(/g, '(2.5)');
+}
+
 function marksFromAnswerKey(lines: SourceLine[], keyLines: Set<number>): Map<number, number> {
   const out = new Map<number, number>();
   for (const line of lines) {
     if (!keyLines.has(lineNoFromId(line.id))) continue;
-    const text = normalizeForMatching(line.text);
+    const text = normalizeRtlDecimalMarks(normalizeForMatching(line.text));
     const rangeRe = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*(\d{1,3})\s*(?:to|تا|[-–])\s*(\d{1,3})[\s\S]{0,100}?(?:each|هر\s*کدام)[\s\S]{0,24}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)?/gi;
     for (const m of text.matchAll(rangeRe)) {
       const start = Number(m[1]), end = Number(m[2]), mark = Number(m[3]);
@@ -548,7 +665,7 @@ function deriveAndReconcilePoints(params: {
     if (!members.length) continue;
     let printedTotal = typeof section.points === 'number' && section.points > 0 ? section.points : undefined;
     if (printedTotal === undefined) {
-      const first = section.spans?.length ? Math.min(...section.spans.map(span => span[0])) : undefined;
+      const first = section.spans?.length ? Math.min(...section.spans.map(spanStartLine)) : undefined;
       const header = sourceHeaders.find(candidate => candidate.points !== undefined && first !== undefined && Math.abs(candidate.line - first) <= 4);
       printedTotal = header?.points;
     }
@@ -592,8 +709,11 @@ function deriveAndReconcilePoints(params: {
     const keyDerived = keyMarks.has(q.no);
     const headerDerived = fixed.has(q.id) && !keyDerived;
     const rule = keyDerived ? 'points-derived:key' : unsafeExplicitPoints.has(q.id) ? 'points-invalid-preserved' : headerDerived ? 'points-derived:header' : 'points-derived:default';
-    q.receipt = { ...(q.receipt || { lineStart: q.spans[0]?.[0] || 1, lineEnd: q.spans[q.spans.length - 1]?.[1] || q.spans[0]?.[0] || 1, ruleChain: [], ruleConfidence: 85 }), ruleChain: [...(q.receipt?.ruleChain || []), rule] };
-    if (rescaled && !fixed.has(q.id)) q.receipt.ruleChain.push('points-rescaled');
+    const bounds = spanBounds(q.spans) || [1, 1];
+    const existingChain = q.receipt?.ruleChain || [];
+    const nextChain = existingChain.includes(rule) ? [...existingChain] : [...existingChain, rule];
+    if (rescaled && !fixed.has(q.id) && !nextChain.includes('points-rescaled')) nextChain.push('points-rescaled');
+    q.receipt = { ...(q.receipt || { lineStart: bounds[0], lineEnd: bounds[1], ruleChain: [], ruleConfidence: 85 }), ruleChain: nextChain };
   }
   return { flags, rescaled, before, after: Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2)) };
 }
@@ -642,7 +762,7 @@ function assembleAndValidateQuestionsInner(
   // B2 — gap completion + option synthesis (pure, 0 calls) before any slicing.
   let rawList: any[] = Array.isArray(rawQuestions) ? rawQuestions : [];
   // A group detected locally by the segmenter emits missing children before any assistant repair.
-  // Children retain source spans/character offsets and are ordinary optional question records.
+  // Part B2b/B2c: children receive disjoint OffsetSpans (`{ line, start, end }`) directly.
   for (const segment of options.segmentReceipts || []) {
     if (segment.kind !== 'group-parent' || !segment.childNos?.length) continue;
     const parentNo = Number(segment.printedNo);
@@ -654,55 +774,86 @@ function assembleAndValidateQuestionsInner(
     if (!parent) continue;
     const parentId = String(parent.id || `q${parentNo}`);
     parent.id = parentId;
-    // Intra-line enumerations need a one-line parent span so its character slice remains exact;
-    // parenthesized shared-pool groups instead own the full deterministic segment range.
-    if (typeof segment.charStart === 'number' && typeof segment.charEnd === 'number') {
-      parent.spans = [[segment.startLine, segment.startLine]];
-      parent.charStart = segment.charStart;
-      parent.charEnd = segment.charEnd;
+    if (segment.offsetSpan) {
+      parent.spans = [segment.offsetSpan];
+    } else if (typeof segment.charStart === 'number' && typeof segment.charEnd === 'number') {
+      parent.spans = [{ line: segment.startLine, start: segment.charStart, end: segment.charEnd }];
     } else {
       parent.spans = normalizedSpans([...(Array.isArray(parent.spans) ? parent.spans : []), [segment.startLine, segment.endLine]]);
     }
+    if (
+      Array.isArray(parent.options) &&
+      parent.options.length > 0 &&
+      findIntraLineMultiNumbers(sourceByNo.get(segment.startLine)?.text || '').length >= 2 &&
+      spanLineNumbers(parent.options.flatMap((o: any) => normalizedSpans(o?.spans))).every(n => n === segment.startLine)
+    ) {
+      parent.options = undefined;
+    }
     const explicitChildren = (options.segmentReceipts || []).filter(item => item.parentSegmentId === segment.id && item.printedNo !== undefined);
-    const childNos = explicitChildren.length ? explicitChildren.map(item => Number(item.printedNo)) : (segment.childNos || []).filter(no => Number(no) !== parentNo);
+    const childNos = explicitChildren.length
+      ? explicitChildren.map(item => Number(item.printedNo)).filter(no => no !== parentNo)
+      : (segment.childNos || []).filter(no => Number(no) !== parentNo);
+
+    const groupLines: Array<{ lineNo: number; text: string }> = [];
+    for (let ln = segment.startLine; ln <= segment.endLine; ln++) {
+      const gl = sourceByNo.get(ln);
+      if (gl && !gl.furniture && !keyLines.has(ln)) groupLines.push({ lineNo: ln, text: gl.text });
+    }
+    const carvedGroupChildren = carveGroupChildSpans(groupLines, parentNo, childNos);
+
     for (const no of childNos) {
       if (!Number.isInteger(no) || Number(no) <= 0 || Number(no) === parentNo) continue;
+      const explicitChildSeg = explicitChildren.find(item => Number(item.printedNo) === no);
       let childSpans: LineSpan[] = [[segment.startLine, segment.endLine]];
-      let charStart: number | undefined;
-      let charEnd: number | undefined;
-      for (let ln = segment.startLine; ln <= segment.endLine; ln++) {
-        const groupLine = sourceByNo.get(ln);
-        if (!groupLine) continue;
-        const intra = findIntraLineMultiNumbers(groupLine.text).find(item => item.no === no);
-        const parens = [...groupLine.text.matchAll(/\((\d{1,3})\)/g)].map(match => ({ no: Number(match[1]), start: match.index || 0, end: (match.index || 0) + match[0].length }));
-        const markerIndex = parens.findIndex(item => item.no === no);
-        const marker = markerIndex >= 0 ? parens[markerIndex] : undefined;
-        const nextMarker = marker ? parens.slice(markerIndex + 1).find(item => item.no !== no) : undefined;
-        const ownStart = intra?.charStart ?? marker?.end;
-        const ownEnd = intra?.charEnd ?? (marker ? nextMarker?.start ?? groupLine.text.length : undefined);
-        if (ownStart !== undefined && ownEnd !== undefined && groupLine.text.slice(ownStart, ownEnd).replace(/[\s.。:：)）-]/g, '')) {
-          childSpans = [[ln, ln]]; charStart = ownStart; charEnd = ownEnd; break;
+      if (explicitChildSeg?.offsetSpan) {
+        childSpans = [explicitChildSeg.offsetSpan];
+      } else if (explicitChildSeg && typeof explicitChildSeg.charStart === 'number' && typeof explicitChildSeg.charEnd === 'number') {
+        childSpans = [{ line: explicitChildSeg.startLine, start: explicitChildSeg.charStart, end: explicitChildSeg.charEnd }];
+      } else {
+        for (const gl of groupLines) {
+          const intra = findIntraLineMultiNumbers(gl.text).find(item => item.no === no);
+          if (intra) {
+            childSpans = [{ line: gl.lineNo, start: intra.charStart, end: intra.charEnd }];
+            break;
+          }
+        }
+        if (!childSpans.some(spanHasOffsets) && carvedGroupChildren.has(no)) {
+          childSpans = [carvedGroupChildren.get(no)!];
         }
       }
+
       const existingChild = rawList.find(q => Number(q?.no) === no && q?.parentId === parentId);
-      if (existingChild) continue;
+      if (existingChild) {
+        if (!normalizedSpans(existingChild.spans).some(spanHasOffsets) && childSpans.some(spanHasOffsets)) {
+          existingChild.spans = childSpans;
+        }
+        continue;
+      }
       const existingRoot = rawList.find(q => Number(q?.no) === no && !q?.parentId && q !== parent);
       if (existingRoot) {
         const candidateLines = spanLineNumbers(normalizedSpans(existingRoot.spans));
         const belongsToGroup = candidateLines.some(line => line >= segment.startLine && line <= segment.endLine);
-        if (!belongsToGroup) continue; // preserve a distinct repeated printed number for review
+        if (!belongsToGroup) continue;
         existingRoot.parentId = parentId;
         existingRoot.sectionId ||= parent.sectionId;
         existingRoot.type ||= parent.type || 'matching';
         existingRoot.points = 0;
         existingRoot.spans = childSpans;
-        if (charStart !== undefined) { existingRoot.charStart = charStart; existingRoot.charEnd = charEnd; }
-        else { delete existingRoot.charStart; delete existingRoot.charEnd; }
+        delete existingRoot.charStart;
+        delete existingRoot.charEnd;
         continue;
       }
-      rawList.push({ id: `${parentId}_c${no}`, no, label: String(no), parentId, sectionId: parent.sectionId,
-        type: parent.type || 'matching', spans: childSpans, ...(charStart !== undefined ? { charStart, charEnd } : {}),
-        points: 0, confidence: parent.confidence || 0.85 });
+      rawList.push({
+        id: `${parentId}_c${no}`,
+        no,
+        label: String(no),
+        parentId,
+        sectionId: parent.sectionId,
+        type: parent.type || 'matching',
+        spans: childSpans,
+        points: 0,
+        confidence: parent.confidence || 0.85,
+      });
     }
   }
   const absorbedByKey = new Map<string, number[]>();
@@ -714,8 +865,8 @@ function assembleAndValidateQuestionsInner(
     for (const [k, v] of completed.synthesized) synthesizedByKey.set(k, v);
   }
 
-  // Fix 2 — expand intra-line multi-number lines (`63. a) ... 64. b) ... 65. c) ... 66. d) ...`)
-  // into parent (first number, whole task) + 1 child per additional number inheriting parent section/type.
+  // Part B2b — expand intra-line multi-number lines (`63. a) ... 64. b) ... 65. c) ... 66. d) ...`)
+  // into parent + children expressed via OffsetSpan `{ line, start, end }`.
   {
     const existingNos = new Set(rawList.map(r => Number(r?.no)).filter(n => Number.isFinite(n)));
     const expandedList: any[] = [];
@@ -731,9 +882,15 @@ function assembleAndValidateQuestionsInner(
         if (multi.length < 2 || multi[0].no !== Number(item.no)) continue;
         const parentId = typeof item.id === 'string' && item.id ? item.id : `q${Number(item.no) || rIdx + 1}`;
         item.id = parentId;
-        if (item.charStart === undefined && item.charEnd === undefined && itemSpans.length === 1 && itemSpans[0][0] === itemSpans[0][1]) {
-          item.charStart = multi[0].charStart;
-          item.charEnd = multi[0].charEnd;
+        if (!itemSpans.some(spanHasOffsets) && itemSpans.length === 1 && spanStartLine(itemSpans[0]) === spanEndLine(itemSpans[0])) {
+          item.spans = [{ line: ln, start: multi[0].charStart, end: multi[0].charEnd }];
+        }
+        if (
+          Array.isArray(item.options) &&
+          item.options.length > 0 &&
+          spanLineNumbers(item.options.flatMap((o: any) => normalizedSpans(o?.spans))).every(n => n === ln)
+        ) {
+          item.options = undefined;
         }
         for (const childItem of multi.slice(1)) {
           if (existingNos.has(childItem.no)) continue;
@@ -745,9 +902,7 @@ function assembleAndValidateQuestionsInner(
             parentId,
             sectionId: item.sectionId,
             type: item.type || 'matching',
-            spans: [[ln, ln]] as LineSpan[],
-            charStart: childItem.charStart,
-            charEnd: childItem.charEnd,
+            spans: [{ line: ln, start: childItem.charStart, end: childItem.charEnd }] as LineSpan[],
             points: 0,
             confidence: item.confidence,
           });
@@ -777,11 +932,33 @@ function assembleAndValidateQuestionsInner(
     const proposedId = typeof raw.id === 'string' && raw.id ? raw.id : `q${Number(raw.no) || idx + 1}`;
     const qId = questions.some(question => question.id === proposedId) ? `${proposedId}_dup_${idx + 1}` : proposedId;
     const originalNo = Number.isFinite(Number(raw.no)) ? Number(raw.no) : idx + 1;
-    const originalSpans = normalizedSpans(raw.spans);
+    let originalSpans = normalizedSpans(raw.spans);
+    // Normalize legacy charStart/charEnd fields onto OffsetSpan at the input boundary.
+    if (
+      typeof raw.charStart === 'number' &&
+      typeof raw.charEnd === 'number' &&
+      originalSpans.length === 1 &&
+      !isOffsetSpan(originalSpans[0]) &&
+      originalSpans[0][0] === originalSpans[0][1]
+    ) {
+      originalSpans = [{ line: originalSpans[0][0], start: raw.charStart, end: raw.charEnd }];
+    } else if (
+      originalSpans.length === 1 &&
+      !isOffsetSpan(originalSpans[0]) &&
+      originalSpans[0][0] === originalSpans[0][1]
+    ) {
+      const singleLine = lineById.get(originalSpans[0][0]);
+      if (singleLine) {
+        const matchItem = findIntraLineMultiNumbers(singleLine.text).find(it => it.no === originalNo);
+        if (matchItem) {
+          originalSpans = [{ line: originalSpans[0][0], start: matchItem.charStart, end: matchItem.charEnd }];
+        }
+      }
+    }
     if (!originalSpans.length) errors.push(`Missing spans: Question ${raw.label || qId} has no valid source span references.`);
     else if (Array.isArray(raw.spans) && originalSpans.length < raw.spans.length) errors.push('One or more source spans were malformed or exceeded the safe range limit.');
     const safe = sanitizeQuestionSpans(originalSpans, keyLines);
-    const spans = safe.spans;
+    let spans = safe.spans;
     if (safe.clipped && spans.length === 0) {
       flags.push(flag('KEY_TERRITORY_EXCLUDED', `Question candidate ${raw.label || raw.no || qId} spanned only official answer-key lines and was excluded from question parsing.`, 'warn', qId));
       return;
@@ -790,7 +967,11 @@ function assembleAndValidateQuestionsInner(
       errors.push('Question span touched official answer-key territory and was clipped locally.');
       flags.push(flag('QUESTION_SPAN_IN_KEY_TERRITORY', `Question ${raw.label || qId} had question spans in answer-key territory; key lines were excluded.`, 'warn', qId));
     }
-    for (const [start, end] of spans) if (start < minLineId || end > maxLineId || start > end) errors.push(`Invalid span [${start}, ${end}]: outside source range [${minLineId}, ${maxLineId}]`);
+    for (const sp of spans) {
+      const start = spanStartLine(sp);
+      const end = spanEndLine(sp);
+      if (start < minLineId || end > maxLineId || start > end) errors.push(`Invalid span [${start}, ${end}]: outside source range [${minLineId}, ${maxLineId}]`);
+    }
 
     const rawOptions: NonNullable<Question['options']> = (Array.isArray(raw.options) ? raw.options : []).map((option: any, optionIdx: number) => {
       const sanitized = sanitizeQuestionSpans(normalizedSpans(option?.spans), keyLines);
@@ -802,24 +983,29 @@ function assembleAndValidateQuestionsInner(
       };
     });
     let perQuestionWatermark = false;
-    // A2: watermark excision on option slices BEFORE splitting (excision then split)
-    const split = splitOptionTexts(rawOptions, sourceLines, learnedWatermarks);
+    // Detect inline watermarks on spanned source lines so WATERMARK_STRIPPED provenance remains exact.
+    for (const ln of spanLineNumbers([...spans, ...rawOptions.flatMap(o => o.spans)])) {
+      const rawLineText = lineById.get(ln)?.text || '';
+      if (rawLineText && exciseWatermarksWithLearned(rawLineText, learnedWatermarks).excised) {
+        perQuestionWatermark = true;
+      }
+    }
+    const split = carveOptionsByOffsets(rawOptions, sourceLines, learnedWatermarks);
     let assembledOptions = split.options || [];
     if (split.excisedCount) { watermarkExcisionCount += split.excisedCount; perQuestionWatermark = true; }
-    // Also excise any residual in already-separated options (without changing source lines).
     assembledOptions = assembledOptions.map(opt => {
       const exc = exciseWatermarksWithLearned(opt.text || '', learnedWatermarks);
       if (exc.excised) { watermarkExcisionCount += exc.count; perQuestionWatermark = true; }
       return { ...opt, text: exc.text };
     });
-    const duplicateResult = collapseAdjacentOptionDuplicates(assembledOptions);
-    assembledOptions = duplicateResult.options;
-    if (duplicateResult.nonAdjacentDuplicates.length) {
-      flags.push(flag('OPTION_DUPLICATE', `Question ${raw.label || qId}: repeated non-adjacent option text retained for verifier review.`, 'warn', qId));
+    const nonEmptyNormOpts = assembledOptions.map(o => normalizeForMatching(o.text || '').trim().toLowerCase()).filter(Boolean);
+    if (nonEmptyNormOpts.length >= 2 && new Set(nonEmptyNormOpts).size < nonEmptyNormOpts.length) {
+      flags.push(flag('OPTION_DUPLICATE', `Question ${raw.label || qId}: repeated option text retained for canonicalizer / I12 review.`, 'warn', qId));
     }
     const optionSplitFailed = split.failed;
     if (optionSplitFailed) {
-      flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(sliceOptionUnion(rawOptions, sourceLines)).length}) did not match ${rawOptions.length} option spans; unsplit option blob discarded.`, 'warn', qId));
+      const unionText = sliceSourceSpans(rawOptions.flatMap(o => o.spans), sourceLines);
+      flags.push(flag('OPTION_SPLIT_FAILED', `Question ${raw.label || qId}: option markers (${findOptionMarkers(unionText).length}) did not match ${rawOptions.length} option spans; unsplit option blob discarded.`, 'warn', qId));
     }
     const effectiveType = raw.type || 'unknown';
     const optionsMissingForMcq = effectiveType === 'mcq' && assembledOptions.length < 2;
@@ -839,27 +1025,29 @@ function assembleAndValidateQuestionsInner(
         else { acceptedRewrites.push(rewrite); flags.push(flag('REWRITE_APPLIED', `Question ${raw.label || qId}: garbled L${String(rewrite.line).padStart(4, '0')} rendered from the model's rewrite; original retained for one-click revert.`, 'info', qId, `flag_REWRITE_APPLIED_${qId}_${rewrite.line}`)); }
       }
     }
-    // Intra-line char offset slicing (from segmenter or multi-number child expansion)
-    let resolvedCharStart: number | undefined = typeof raw.charStart === 'number' ? raw.charStart : undefined;
-    let resolvedCharEnd: number | undefined = typeof raw.charEnd === 'number' ? raw.charEnd : undefined;
-    if (resolvedCharStart === undefined && spans.length === 1 && spans[0][0] === spans[0][1]) {
-      const singleLine = lineById.get(spans[0][0]);
-      if (singleLine) {
-        const matchItem = findIntraLineMultiNumbers(singleLine.text).find(it => it.no === originalNo);
-        if (matchItem) { resolvedCharStart = matchItem.charStart; resolvedCharEnd = matchItem.charEnd; }
+
+    const hasSubLineSpan = spans.some(spanHasOffsets);
+    // When inline options share the stem line and were carved cleanly, tighten stem spans to pre-marker OffsetSpans.
+    if (!hasSubLineSpan && split.preMarkerStemSpans && acceptedRewrites.length === 0) {
+      const optLineSet = new Set(spanLineNumbers(rawOptions.flatMap(o => o.spans)));
+      const nonOptionLines = spanLineNumbers(spans).filter(ln => !optLineSet.has(ln));
+      const combinedStemSpans: LineSpan[] = [
+        ...compressLineNumbers(nonOptionLines),
+        ...split.preMarkerStemSpans,
+      ];
+      if (sliceSourceSpans(combinedStemSpans, sourceLines).trim()) {
+        spans = combinedStemSpans;
       }
     }
-    const hasIntraSlice = resolvedCharStart !== undefined && resolvedCharEnd !== undefined && spans.length === 1 && spans[0][0] === spans[0][1];
-    const originalStemRaw = hasIntraSlice
-      ? (lineById.get(spans[0][0])?.text || '').slice(resolvedCharStart, resolvedCharEnd).trim()
-      : sliceSourceSpans(spans, sourceLines, acceptedRewrites);
+
+    const originalStemRaw = sliceSourceSpans(spans, sourceLines, acceptedRewrites);
     const originalExc = exciseWatermarksWithLearned(originalStemRaw, learnedWatermarks);
     const originalStem = originalExc.text;
     if (originalExc.excised) { watermarkExcisionCount += originalExc.count; perQuestionWatermark = true; }
     const printedBeforeCleanup = parsePrintedNumberFromStem(originalStem) ?? originalNo;
-    let stem = hasIntraSlice
+    let stem = spans.some(spanHasOffsets)
       ? originalStem
-      : decontaminateStem(spans, rawOptions.flatMap((o: { spans: Array<[number, number]> }) => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
+      : decontaminateStem(spans, rawOptions.flatMap(o => o.spans), sourceLines, printedBeforeCleanup, acceptedRewrites);
     const stemExc = exciseWatermarksWithLearned(stem, learnedWatermarks);
     if (stemExc.excised) { stem = stemExc.text; watermarkExcisionCount += stemExc.count; perQuestionWatermark = true; }
     let optionResidueTrimmed = false;
@@ -879,8 +1067,9 @@ function assembleAndValidateQuestionsInner(
     if (synthesizedByKey.has(gapKey)) flags.push(flag('OPTIONS_SYNTHESIZED', `Question ${raw.label || qId}: ${synthesizedByKey.get(gapKey)} option(s) split locally from printed markers the model did not return.`, 'info', qId));
 
     // D3 + Fix 2: validate assembled question number against printed number in first span line & stem.
-    const firstSpanLineObj = spans[0]?.[0] !== undefined ? lineById.get(spans[0][0]) : undefined;
-    const firstLinePrintedNo = !hasIntraSlice && firstSpanLineObj && !firstSpanLineObj.furniture
+    const firstLineNum = spans[0] ? spanStartLine(spans[0]) : undefined;
+    const firstSpanLineObj = firstLineNum !== undefined ? lineById.get(firstLineNum) : undefined;
+    const firstLinePrintedNo = !hasSubLineSpan && firstSpanLineObj && !firstSpanLineObj.furniture
       ? parsePrintedNumberFromStem(firstSpanLineObj.text.split(/\r?\n/)[0] || '')
       : undefined;
     const spanSourceLines = spanLineNumbers(spans).map(n => lineById.get(n)).filter((l): l is SourceLine => Boolean(l));
@@ -907,16 +1096,18 @@ function assembleAndValidateQuestionsInner(
 
     let answer: Question['answer'];
     if (raw.answer?.spans) {
-      const answerSpans = normalizedSpans(raw.answer.spans); // answer spans may point into key territory
-      let fullText = sliceSourceSpans(answerSpans, sourceLines);
-      const fullExc = exciseWatermarksWithLearned(fullText, learnedWatermarks);
-      if (fullExc.excised) { fullText = fullExc.text; watermarkExcisionCount += fullExc.count; perQuestionWatermark = true; }
-      const segmented = splitGroupedAnswer(fullText, no);
-      let segText = segmented.text;
+      const rawAnswerSpans = normalizedSpans(raw.answer.spans);
+      const carvedAnswerSpans = carveGroupedAnswerSpans(rawAnswerSpans, sourceLines, no);
+      const answerUnmatched = carvedAnswerSpans === rawAnswerSpans && (() => {
+        const probe = normalizeForMatching(sliceSourceSpans(rawAnswerSpans, sourceLines));
+        const multiMatches = [...probe.matchAll(/(?:^|\s)(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*)/g)].map(m => Number(m[1]));
+        return new Set(multiMatches).size >= 2 && !multiMatches.includes(no);
+      })();
+      let segText = sliceSourceSpans(carvedAnswerSpans, sourceLines);
       const segExc = exciseWatermarksWithLearned(segText, learnedWatermarks);
       if (segExc.excised) { segText = segExc.text; watermarkExcisionCount += segExc.count; perQuestionWatermark = true; }
-      answer = { spans: answerSpans, text: segText, source: 'paper' };
-      if (segmented.unmatched) flags.push(flag('ANSWER_SEGMENT_UNMATCHED', `Question ${label}: grouped answer line did not contain printed number ${no}; full line retained for review.`, 'info', qId));
+      answer = { spans: carvedAnswerSpans, text: segText, source: 'paper' };
+      if (answerUnmatched) flags.push(flag('ANSWER_SEGMENT_UNMATCHED', `Question ${label}: grouped answer line did not contain printed number ${no}; full line retained for review.`, 'info', qId));
     }
 
     if (perQuestionWatermark) flags.push(flag('WATERMARK_STRIPPED', `Question ${label} had watermark substrings excised from sliced text.`, 'info', qId));
@@ -953,7 +1144,8 @@ function assembleAndValidateQuestionsInner(
     const shouldPenalizeOverlap = overlaps && !(raw.parentId);
     if (shouldPenalizeOverlap) confidence -= 0.2;
     if (unknownImageRefs.length) confidence -= 0.2;
-    if ((raw.type || 'unknown') !== 'fillblank' && stem.trim().length < 8) confidence -= 0.3;
+    const isParenthesizedGroupChild = Boolean(raw.parentId) && /^\(\d{1,3}\)$/.test(normalizeForMatching(stem).trim());
+    if ((raw.type || 'unknown') !== 'fillblank' && !isParenthesizedGroupChild && stem.trim().length < 8) confidence -= 0.3;
     confidence = Math.max(0.05, Math.min(0.98, confidence));
     const questionFlags = [...(Array.isArray(raw.flags) ? raw.flags.map(String) : [])];
     if (optionSplitFailed && !questionFlags.includes('OPTION_SPLIT_FAILED')) questionFlags.push('OPTION_SPLIT_FAILED');
@@ -971,15 +1163,14 @@ function assembleAndValidateQuestionsInner(
     const segmentReceipt = (options.segmentReceipts || []).find(segment =>
       (segment.printedNo === no || segment.printedNo === originalNo) && segment.startLine <= Math.max(...spanLineNumbers(spans)) && segment.endLine >= Math.min(...spanLineNumbers(spans))
     ) || (options.segmentReceipts || []).find(segment => segment.parentSegmentId && segment.printedNo === no);
-    const receiptStart = Math.min(...spanLineNumbers(spans), ...rawOptions.flatMap(option => spanLineNumbers(option.spans)));
-    const receiptEnd = Math.max(...spanLineNumbers(spans), ...rawOptions.flatMap(option => spanLineNumbers(option.spans)));
+    const receiptBounds = spanBounds([...spans, ...rawOptions.flatMap(option => option.spans)]) || [1, 1];
     const ruleChain = [...(segmentReceipt?.ruleChain || (raw.parentId ? ['multi-number-split'] : ['question-start']))];
     if (absorbedByKey.has(gapKey)) ruleChain.push('gap-absorbed');
     if (split.inlineSplit) ruleChain.push('inline-options');
     if (perQuestionWatermark) ruleChain.push('watermark-excised');
     const receipt = {
-      lineStart: Number.isFinite(receiptStart) ? receiptStart : (spans[0]?.[0] || 1),
-      lineEnd: Number.isFinite(receiptEnd) ? receiptEnd : (spans[spans.length - 1]?.[1] || spans[0]?.[0] || 1),
+      lineStart: receiptBounds[0],
+      lineEnd: receiptBounds[1],
       ruleChain,
       ruleConfidence: Math.max(0, Math.min(100, Number(segmentReceipt?.ruleConfidence ?? 85))),
     };
@@ -1024,21 +1215,6 @@ function assembleAndValidateQuestionsInner(
       }
     }
   }
-  const sharedStemGroups = new Map<string, Question[]>();
-  for (const q of questions) {
-    if (q.spans.length !== 1 || q.spans[0][0] !== q.spans[0][1] || !q.stem) continue;
-    const key = `${q.spans[0][0]}:${q.stem}`;
-    sharedStemGroups.set(key, [...(sharedStemGroups.get(key) || []), q]);
-  }
-  for (const group of sharedStemGroups.values()) {
-    if (group.length < 3) continue;
-    const parent = group[0];
-    for (const child of group.slice(1)) {
-      child.parentId ||= parent.id;
-      child.flags = [...(child.flags || []), 'GROUP_CHILDREN_SUSPECT'];
-    }
-    flags.push(flag('GROUP_CHILDREN_SUSPECT', `${group.length} questions share one identical single-line span/stem; nested under ${parent.label} for review.`, 'warn', parent.id));
-  }
 
   const hierarchy = buildQuestionTree(questions);
   for (const question of questions) {
@@ -1052,6 +1228,51 @@ function assembleAndValidateQuestionsInner(
         : `Question ${question.label} had a missing or self-referential parent; it was retained as a root question.`,
       'warn', question.id
     ));
+  }
+
+  // Part C1 — Run deterministic form canonicalizer registry over assembled questions BEFORE semantic/I12 checks.
+  {
+    const canonicalized = canonicalizeForms({
+      questions,
+      sourceLines,
+      sections: options.sections,
+    });
+    questions.splice(0, questions.length, ...canonicalized.questions);
+    if (options.sections && canonicalized.sections.length === options.sections.length) {
+      canonicalized.sections.forEach((sec, sIdx) => {
+        if (sec.passage) options.sections![sIdx].passage = sec.passage;
+      });
+    }
+    for (const f of canonicalized.flags) {
+      if (!flags.some(existing => existing.code === f.code && existing.questionId === f.questionId)) {
+        flags.push(f);
+      }
+    }
+    // Remove stale doc-level option defect flags on questions repaired by Part C canonicalizers.
+    const repairedIds = new Set(canonicalized.deltas.map(d => d.questionId));
+    if (repairedIds.size > 0) {
+      for (let i = flags.length - 1; i >= 0; i--) {
+        const fl = flags[i];
+        if (!fl.questionId || !repairedIds.has(fl.questionId)) continue;
+        const qNow = questions.find(q => q.id === fl.questionId);
+        if (!qNow) {
+          flags.splice(i, 1);
+          continue;
+        }
+        if ((fl.code === 'OPTION_SPLIT_FAILED' || fl.code === 'OPTIONS_MISSING' || fl.code === 'OPTION_DUPLICATE') && !qNow.flags?.includes(fl.code)) {
+          flags.splice(i, 1);
+        }
+      }
+      for (let i = failingQuestions.length - 1; i >= 0; i--) {
+        const fq = failingQuestions[i];
+        const qNow = questions.find(q => q.id === fq.question.id);
+        if (!qNow || (fq.errors.length === 0 && qNow.confidence >= 0.4)) {
+          failingQuestions.splice(i, 1);
+        } else {
+          fq.question = qNow;
+        }
+      }
+    }
   }
   // E2/E3 — points derivation: ensure every question has a number, section sums reconcile
   {
@@ -1133,6 +1354,27 @@ function assembleAndValidateQuestionsInner(
     const sum = questions.filter(question => !question.parentId).reduce((acc, question) => acc + (question.points || 0), 0);
     if (Math.abs(sum - documentTotal) > 0.51) flags.push(flag('POINTS_MISMATCH', `Points sum (${sum}) does not match immutable document total (${documentTotal}); deficit ${Number((documentTotal - sum).toFixed(2))}.`, 'warn'));
   }
+
+  // Part B3 — Assembly Invariant I12 check (after Part C canonicalizers have run).
+  // Surviving I12 violations record error flags here and demote the doc to PARTIAL at save boundary (#27).
+  {
+    const i12 = checkInvariantI12(questions);
+    for (const f of i12.flags) {
+      if (!flags.some(existing => existing.code === f.code && existing.questionId === f.questionId)) {
+        flags.push(f);
+      }
+      if (f.questionId) {
+        const targetQ = questions.find(q => q.id === f.questionId);
+        if (targetQ) {
+          if (!targetQ.flags?.includes(f.code)) {
+            targetQ.flags = [...(targetQ.flags || []), f.code];
+          }
+          targetQ.confidence = Math.min(targetQ.confidence, 0.45);
+        }
+      }
+    }
+  }
+
   const sortedNos = questions.filter(q => !q.parentId).map(q => q.no).sort((a, b) => a - b);
   for (let i = 0; i < sortedNos.length - 1; i++) if (sortedNos[i + 1] - sortedNos[i] > 1) flags.push(flag('NUMBERING_GAP', `Question numbering gap between #${sortedNos[i]} and #${sortedNos[i + 1]}.`, 'info'));
   return { questions, flags, failingQuestions };
@@ -1154,14 +1396,26 @@ function parseSectionPoints(text: string): number | undefined {
 
 function isHeaderOrRowLine(text: string): boolean {
   const value = normalizeForMatching(text).trim();
-  return !value || /^(?:section|part|unit)\s+\d+\b/i.test(value) ||
-    /^\d{1,3}\s+(?:listening|vocabulary|grammar|reading|writing)\b/i.test(value) ||
+  return !value || /^[\s\d./|()]+$/.test(value) || /^(?:section|part|unit)\s+\d+\b/i.test(value) ||
+    /^\d{1,3}\s+(?:listening|vocabulary|ocabulary|grammar|reading|writing|speaking)\b/i.test(value) ||
     /(?:ردیف|نمره|points?|marks?)/i.test(value) && value.length < 100 ||
+    /(?:باسمه\s*تعالی|سوالات\s*امتحان\s*نهایی|تاریخ\s*امتحان|مدت\s*امتحان|تعداد\s*صفحه|دانش\s*اموزان\s*روزانه|نام\s*و\s*نام\s*خانوادگی|^good\s*luck\b)/i.test(value) ||
     /^\d{1,3}\s*[|│]/.test(value);
 }
 
 function isInstructionLine(text: string): boolean {
-  return /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|دستورالعمل|به سوالات|به پرسش|گزینه)/i.test(normalizeForMatching(text).trim());
+  if (isReadTheTextInstruction(text) || isInstructionText(text)) return true;
+  const norm = normalizeForMatching(text).trim();
+  if (/^(?:true\s*\/\s*false|درست\s*\/\s*نادرست|a|b)$/iu.test(norm)) return true;
+  if (/^(?:[الفبپتجد]\s*[).\-:]|\d{1,2}(?:\s*[./]\s*\d{1,2})?\s*\.?)\s*[\p{Script=Arabic}]/u.test(norm) &&
+      /(?:کامل\s+کنید|پاسخ\s+دهید|انتخاب\s+کنید|بنویسید|مشخص\s+کنید|پیدا\s+کنید|مرتب\s+کنید|وصل\s+کنید)/u.test(norm)) {
+    return true;
+  }
+  if (parsePrintedNumberFromStem(text) === undefined && /^[\p{Script=Arabic}\s()«»"':،.؛/0-9-]+$/u.test(norm) &&
+      /(?:کامل\s+کنید|پاسخ\s+دهید|انتخاب\s+کنید|گوش\s+دهید|بنویسید|بخوانید)/u.test(norm)) {
+    return true;
+  }
+  return /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|دستورالعمل|به سوالات|به پرسش|گزینه|متن زیر|با توجه به)/i.test(norm);
 }
 
 function trimInstructions(instructions: string, title: string, allSectionTitles: string[]): { text: string; long: boolean } {
@@ -1194,7 +1448,7 @@ export function assembleAndValidateSections(
     const spans = normalizedSpans(section?.spans);
     const id = String(section?.id || `sec_${index + 1}`);
     const indexValue = Number(section?.index) || index + 1;
-    const sectionLines = sourceLines.filter(line => !line.furniture && spans.some(([start, end]) => lineNoFromId(line.id) >= start && lineNoFromId(line.id) <= end));
+    const sectionLines = sourceLines.filter(line => !line.furniture && spansContainLine(spans, lineNoFromId(line.id)));
     const headerLines = sectionLines.slice(0, 12);
     const titleRaw = typeof section?.title === 'string' ? section.title : (typeof section?.kind === 'string' ? section.kind : '');
     let title = cleanSectionTitle(titleRaw);
@@ -1203,7 +1457,7 @@ export function assembleAndValidateSections(
     const isGeneric = genericTitles.has(normalizedTitle) || /^question group\s*\d*$/i.test(title) || /^section\s*\d*$/i.test(title) || /^part\s*\d*$/i.test(title);
     // A2: generic titles forbidden when header-derived title exists within ±3 lines of section start
     const allHeaders = detectSectionHeaders(sourceLines);
-    const sectionStartLine = spans.length ? Math.min(...spans.map(s=>s[0])) : 0;
+    const sectionStartLine = spans.length ? Math.min(...spans.map(spanStartLine)) : 0;
     const nearbyHeader = allHeaders.find(h => Math.abs(h.headerLine - sectionStartLine) <= 3);
     if (isGeneric && nearbyHeader) {
       title = nearbyHeader.title;
@@ -1262,7 +1516,7 @@ export function canonicalizeSections(
   questions: Question[] = [],
 ): { sections: ExamSection[]; questions: Question[]; changed: boolean; flags: Flag[] } {
   if (!sections.length) return { sections, questions, changed: false, flags: [] };
-  const firstSpanLine = (s: ExamSection) => s.spans?.length ? Math.min(...s.spans.map(sp => sp[0])) : Infinity;
+  const firstSpanLine = (s: ExamSection) => s.spans?.length ? Math.min(...s.spans.map(spanStartLine)) : Infinity;
   let idChanged = false;
   const allocatedIds = new Set<string>();
   const deduped = sections.map(sec => {
@@ -1291,9 +1545,9 @@ export function canonicalizeSections(
   let remappedAny = false;
   const remappedQuestions = questions.map(q => {
     if (!q.sectionId || validIds.has(q.sectionId)) return q;
-    const qLine = q.spans?.[0]?.[0];
+    const qLine = q.spans?.[0] ? spanStartLine(q.spans[0]) : undefined;
     const containing = qLine !== undefined
-      ? canonical.find(s => s.spans.some(([start, end]) => qLine >= start && qLine <= end))
+      ? canonical.find(s => spansContainLine(s.spans, qLine))
       : undefined;
     const nearest = containing ?? (qLine !== undefined
       ? [...canonical].sort((a, b) => Math.abs(firstSpanLine(a) - qLine) - Math.abs(firstSpanLine(b) - qLine))[0]
@@ -1365,7 +1619,7 @@ function pageForImageReference(
   anchorLine: number | undefined,
   pageByLine: Map<number, number>
 ): number | undefined {
-  const line = anchorLine ?? question.spans[0]?.[0];
+  const line = anchorLine ?? (question.spans[0] ? spanStartLine(question.spans[0]) : undefined);
   return line === undefined ? undefined : pageByLine.get(line);
 }
 
@@ -1391,7 +1645,7 @@ function chooseImageOccurrence(
   const pageCandidates = onReferencePage.length > 0 ? onReferencePage : occurrences;
   const labelCandidates = pageCandidates.filter(occurrence => imageLabelMatchesQuestion(occurrence.image, question));
   const candidates = labelCandidates.length > 0 ? labelCandidates : pageCandidates;
-  const targetLine = anchorLine ?? question.spans[0]?.[0];
+  const targetLine = anchorLine ?? (question.spans[0] ? spanStartLine(question.spans[0]) : undefined);
 
   return [...candidates].sort((left, right) => {
     if (targetLine !== undefined) {

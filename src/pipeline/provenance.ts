@@ -4,7 +4,7 @@ import type { ExamDoc, Question } from '../types';
 import type { CriticVerdict } from './critic';
 import { estimateTokens } from './memory/tokens';
 
-export interface TransformRecord { kind: 'option-split' | 'answer-split' | 'numbering' | 'image-merge' | 'consensus' | 'critic' | 'patch' | 'manual' | 'rewrite' | 'gap-completion'; detail: string; ts: string }
+export interface TransformRecord { kind: 'option-split' | 'answer-split' | 'numbering' | 'image-merge' | 'consensus' | 'critic' | 'patch' | 'manual' | 'rewrite' | 'gap-completion' | 'form-canonicalize'; detail: string; ts: string }
 export interface QuestionTrace {
   questionId: string; no: number;
   origin: { callLabel: string; model: string; wireFormat?: string; journalResumed: boolean };
@@ -51,6 +51,11 @@ export function localTransforms(doc: ExamDoc, q: Question): TransformRecord[] {
     out.push({ kind: 'rewrite', detail: `L${String(r.line).padStart(4, '0')} [GARBLED?] rendered from rewrite: “${(original || '').slice(0, 60)}” ⮕ “${r.text.slice(0, 60)}” (original retained; revert in Step 4)`, ts });
   }
   if ((q.flags || []).includes('GAP_ABSORBED')) out.push({ kind: 'gap-completion', detail: 'Unowned lines after the model\'s span were absorbed locally (B2); printed numbers, headers and key lines were never crossed.', ts });
+  const formRules = (q.receipt?.ruleChain || []).filter(r => r.startsWith('form:'));
+  if (formRules.length) {
+    const typeNote = (q.flags || []).includes('TYPE_CORRECTED_BY_FORM') ? ` (type corrected to ${q.type})` : '';
+    out.push({ kind: 'form-canonicalize', detail: `Applied deterministic form canonicalizer(s): ${formRules.join(', ')}${typeNote}.`, ts });
+  }
   return out;
 }
 

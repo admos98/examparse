@@ -13,6 +13,7 @@ import { runBatchedOcr } from './ocr';
 import { runStructurePass } from './structure';
 import { labelImagesBatched, fallbackImageKind } from './vision';
 import { assembleAndValidateQuestions, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
+import { spanLineNumbers, spansContainLine } from './spans';
 import { validateSemantic } from './semanticValidators';
 import { buildCriticQueue, runCritic, recordVerdicts } from './critic';
 import { consensusTriggerForSection, diffConsensus, resolveConsensusModel, CONSENSUS_CAPS } from './consensus';
@@ -659,10 +660,7 @@ export async function runFullPipeline(
     if (img.label?.questionRef && img.label.role !== 'decoration' && img.label.kind !== 'decoration') {
       const matchQ = finalQuestions.find(q => q.id === img.label?.questionRef || q.label === img.label?.questionRef || String(q.no) === img.label?.questionRef);
       const isGeometryOnly = (img.label as any).source === 'geometry';
-      const hasSamePageSpan = matchQ ? matchQ.spans.some(([s, e]) => {
-        for (let ln = s; ln <= e; ln++) if (workingLinePageByNo.get(ln) === img.page) return true;
-        return false;
-      }) : false;
+      const hasSamePageSpan = matchQ ? spanLineNumbers(matchQ.spans).some(ln => workingLinePageByNo.get(ln) === img.page) : false;
       if (matchQ && (!isGeometryOnly || hasSamePageSpan)) {
         if (!matchQ.images.some(ref => ref.imageId === img.id)) {
           matchQ.images.push({ imageId: img.id, role: img.label.role || 'stem', anchorLine: img.anchorLine });
@@ -918,7 +916,7 @@ export async function runFullPipeline(
         const missingInSection = expectedQuestionNos.filter(n => {
           if (parsedNosGlobal.has(n)) return false;
           const line = expectedEnumeration.lineByNumber.get(n);
-          return line !== undefined && (sec.spans || []).some(([a, b]) => line >= a && line <= b);
+          return line !== undefined && spansContainLine(sec.spans, line);
         });
         // In-section points mismatch: parsed points vs the section header total, when declared.
         const parsedPoints = qs.reduce((sum, q) => sum + (q.points || 0), 0);
@@ -1161,3 +1159,8 @@ export async function runFullPipeline(
 function examContentRevisionLocal(doc: ExamDoc): string {
   try { return JSON.stringify([doc.questions?.length, doc.sections?.length, doc.images?.length, doc.flags?.length, doc.meta]).slice(0, 400); } catch { return ''; }
 }
+
+export { sliceSourceSpans, carveOptionsAcrossLines, carveGroupChildSpans } from './spans';
+export { canonicalizeForms, computeShapeAudit, FORM_EXECUTION_ORDER, FORM_RULE_ID } from './forms';
+export { replayFieldExport } from './fieldReplay';
+

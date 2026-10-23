@@ -9,12 +9,26 @@ import path from 'node:path';
 import { assembleAndValidateQuestions } from '../src/pipeline/assemble';
 import { findIntraLineMultiNumbers, segmentDocument } from '../src/pipeline/segment';
 import { applyLocalGates } from '../src/pipeline/gates';
-import { detectKeyTerritory, detectSectionHeaders, enumerateExpectedQuestionNos, extractDocumentTotals, normalizeForMatching, parsePrintedNumberFromStem } from '../src/pipeline/quality';
+import { computeShapeAudit, type ShapeAuditCounts } from '../src/pipeline/forms';
+import {
+  detectKeyTerritory,
+  detectSectionHeaders,
+  enumerateExpectedQuestionNos,
+  extractDocumentTotals,
+  normalizeForMatching,
+  parsePrintedNumberFromStem,
+} from '../src/pipeline/quality';
 import type { ExamSection, Question, SourceLine } from '../src/types';
 
 interface SpotCheck {
   no: number;
   stemIncludes?: string;
+  stemEquals?: string;
+  stemExcludes?: string[];
+  maxStemLength?: number;
+  sectionPassageIncludes?: string;
+  noStemIncludesPassage?: string;
+  distinctChildStems?: number[];
   options?: string[];
   optionPoolContains?: string[];
   children?: number[];
@@ -23,13 +37,16 @@ interface SpotCheck {
 interface Truth {
   expectedNumbers: number[];
   types?: Record<string, Question['type']>;
+  headerLines?: number[];
   sectionTitles: string[];
   totalPoints: number;
+  keyPages?: number[];
+  mustHaveNoSelfParentNumber?: boolean;
   spotChecks?: SpotCheck[];
   groups?: Array<{ parent: number; children: number[] }>;
   mustHaveNoDuplicateImageIds?: boolean;
 }
-interface CorpusResult {
+export interface CorpusResult {
   exam: string;
   expected: number;
   found: number;
@@ -37,6 +54,8 @@ interface CorpusResult {
   sections: string;
   total: string;
   spotChecks: string;
+  shapeAudit: ShapeAuditCounts;
+  shapeAuditLabel: string;
   duplicateImageIds: number;
   preAssistantChildren: string;
   failures: string[];
@@ -48,20 +67,15 @@ const ACCEPTANCE_ID = 'english-final-13991009pq89w65173';
 function lineNo(line: SourceLine): number { return Number(String(line.id).replace(/\D/g, '')) || 0; }
 function normalized(value: string): string { return normalizeForMatching(value).replace(/\s+/g, ' ').trim(); }
 function optionTexts(q: Question | undefined): string[] { return (q?.options || []).map(option => normalized(option.text || '')); }
-function sectionRanges(lines: SourceLine[], titles: string[]): any[] {
+function sectionRanges(lines: SourceLine[], titles: string[], unguided = false): any[] {
   const headers = detectSectionHeaders(lines);
-  const selected = titles.length
-    ? titles.flatMap((title, index) => {
-      const match = headers.find((header, i) => header.title === title && !headers.slice(0, i).some(previous => previous.headerLine === header.headerLine));
-      return match ? [{ ...match, index }] : [];
-    })
-    : headers.map((header, index) => ({ ...header, index }));
-  // Preserve every detected occurrence, including repeated Reading/Vocabulary/Writing sections.
-  const ordered = titles.length ? titles.map((title, index) => {
-    const candidates = headers.filter(header => header.title === title);
-    const occurrence = titles.slice(0, index + 1).filter(item => item === title).length - 1;
-    return candidates[occurrence];
-  }).filter(Boolean) : selected;
+  const ordered = unguided || !titles.length
+    ? headers
+    : titles.map((title, index) => {
+      const candidates = headers.filter(header => header.title === title);
+      const occurrence = titles.slice(0, index + 1).filter(item => item === title).length - 1;
+      return candidates[occurrence];
+    }).filter(Boolean);
   const allLines = [...lines].sort((a, b) => lineNo(a) - lineNo(b));
   const max = Math.max(0, ...allLines.map(lineNo));
   return ordered.map((header: any, index: number) => ({
@@ -91,7 +105,7 @@ function buildLazyResponse(lines: SourceLine[], numbers: number[], sectionDefs: 
     const intra = anchorLine ? findIntraLineMultiNumbers(anchorLine.text) : [];
     if (intra.some(item => item.no === no) && intra[0]?.no !== no) continue;
     const sourceSpan: [number, number] = [anchor, anchor];
-    const spanText = anchorLine?.text || ''; 
+    const spanText = anchorLine?.text || '';
     const section = sectionDefs.find((candidate: any) => candidate.spans[0][0] <= anchor && candidate.spans[0][1] >= anchor);
     const mcq = localOptionRow(spanText);
     questions.push({
@@ -119,7 +133,8 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
     const expected = [...truth.expectedNumbers].sort((a, b) => a - b);
     const enumerated = enumerateExpectedQuestionNos(lines);
     const segments = segmentDocument({ lines, keyLines }).segments;
-    const defs = sectionRanges(lines, truth.sectionTitles || []);
+    const detectedHeaders = detectSectionHeaders(lines.filter(l => !keyLines.has(lineNo(l))));
+    const defs = sectionRanges(lines.filter(l => !keyLines.has(lineNo(l))), truth.sectionTitles || [], exam === ACCEPTANCE_ID);
     const raw = buildLazyResponse(lines, expected, defs, enumerated.lineByNumber, keyLines, segments, truth.types || {});
     const total = extractDocumentTotals(lines, keyLines).documentTotal ?? truth.totalPoints;
     const assembled = assembleAndValidateQuestions(raw, lines, total, {
@@ -129,7 +144,12 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
     });
     const gated = applyLocalGates({ questions: assembled.questions, rawSections: defs, lines, keyLines, metaTotalPoints: total });
     const questions = gated.questions;
-    if (process.env.CORPUS_DEBUG && exam === ACCEPTANCE_ID) for (const no of [25,28,29,35,63,64,65,66,67]) { const q = gated.questions.find(item => item.no === no); console.log('DEBUG', no, q?.id, q?.parentId, q?.spans, JSON.stringify(q?.stem), q?.options?.map(option => option.text), q?.points, q?.receipt); }
+    if (process.env.CORPUS_DEBUG && exam === ACCEPTANCE_ID) {
+      for (const no of [6, 15, 16, 17, 18, 25, 28, 29, 35, 38, 40, 63, 64, 65, 66, 67]) {
+        const q = gated.questions.find(item => item.no === no);
+        console.log('DEBUG', no, q?.id, q?.parentId, q?.spans, JSON.stringify(q?.stem), q?.options?.map(option => option.text), q?.points, q?.receipt);
+      }
+    }
     const numbers = [...new Set(questions.map(question => question.no))].sort((a, b) => a - b);
     const byNo = new Map<number, Question>();
     for (const question of questions) if (!byNo.has(question.no) || question.parentId) byNo.set(question.no, question);
@@ -139,20 +159,101 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
     const spotChecks = truth.spotChecks || [];
     let passedSpots = 0;
     const failures: string[] = [];
+
+    if (truth.headerLines) {
+      const actualHeaderLines = detectedHeaders.map(h => h.headerLine);
+      if (JSON.stringify(actualHeaderLines) !== JSON.stringify(truth.headerLines)) {
+        failures.push(`header lines mismatch: ${JSON.stringify(actualHeaderLines)} != ${JSON.stringify(truth.headerLines)}`);
+      }
+    }
+    if (truth.keyPages) {
+      const actualKeyPages = [...new Set(lines.filter(l => keyLines.has(lineNo(l))).map(l => l.page))].sort((a, b) => a - b);
+      if (JSON.stringify(actualKeyPages) !== JSON.stringify(truth.keyPages)) {
+        failures.push(`key pages mismatch: ${JSON.stringify(actualKeyPages)} != ${JSON.stringify(truth.keyPages)}`);
+      }
+    }
+    if (truth.mustHaveNoSelfParentNumber) {
+      const byId = new Map(questions.map(q => [q.id, q]));
+      for (const q of questions) {
+        if (!q.parentId) continue;
+        const parent = byId.get(q.parentId);
+        if (q.parentId === q.id || (parent && parent.no === q.no)) {
+          failures.push(`Q${q.no} (${q.id}) is numbered as its own parent (${q.parentId})`);
+        }
+      }
+    }
+
     for (const spot of spotChecks) {
       let pass = true;
       const q = byNo.get(spot.no);
       if (!q) { pass = false; failures.push(`spot Q${spot.no}: missing`); }
-      if (q && spot.stemIncludes && !normalized(q.stem || '').includes(normalized(spot.stemIncludes))) { pass = false; failures.push(`spot Q${spot.no}: stem text missing “${spot.stemIncludes}”`); }
-      if (q && spot.options && JSON.stringify(optionTexts(q)) !== JSON.stringify(spot.options.map(normalized))) { pass = false; failures.push(`spot Q${spot.no}: options differ (${JSON.stringify(optionTexts(q))})`); }
-      if (q && spot.points !== undefined && q.points !== spot.points) { pass = false; failures.push(`spot Q${spot.no}: expected ${spot.points} points, got ${q.points}`); }
-      if (spot.children && JSON.stringify(getChildren(questions, spot.no)) !== JSON.stringify([...spot.children].sort((a,b)=>a-b))) { pass = false; failures.push(`spot Q${spot.no}: children mismatch`); }
+      if (q && spot.stemIncludes && !normalized(q.stem || '').includes(normalized(spot.stemIncludes))) {
+        pass = false; failures.push(`spot Q${spot.no}: stem text missing “${spot.stemIncludes}”`);
+      }
+      if (q && spot.stemEquals && normalized(q.stem || '') !== normalized(spot.stemEquals)) {
+        pass = false; failures.push(`spot Q${spot.no}: stem expected “${spot.stemEquals}”, got “${q.stem}”`);
+      }
+      if (q && spot.stemExcludes) {
+        for (const forbidden of spot.stemExcludes) {
+          if (normalized(q.stem || '').includes(normalized(forbidden))) {
+            pass = false; failures.push(`spot Q${spot.no}: stem still includes forbidden “${forbidden}”`);
+          }
+        }
+      }
+      if (q && spot.maxStemLength !== undefined && (q.stem || '').length >= spot.maxStemLength) {
+        pass = false; failures.push(`spot Q${spot.no}: stem length ${(q.stem || '').length} >= ${spot.maxStemLength}`);
+      }
+      if (q && spot.sectionPassageIncludes) {
+        const sec = gated.sections.find(s => s.id === q.sectionId);
+        if (!sec || !normalized(sec.passage || '').includes(normalized(spot.sectionPassageIncludes))) {
+          pass = false; failures.push(`spot Q${spot.no}: section passage missing “${spot.sectionPassageIncludes}”`);
+        }
+      }
+      if (spot.noStemIncludesPassage) {
+        const target = normalized(spot.noStemIncludesPassage);
+        const offender = questions.find(cand => normalized(cand.stem || '').includes(target));
+        if (offender) {
+          pass = false; failures.push(`spot Q${spot.no}: passage leaked into Q${offender.no} stem`);
+        }
+      }
+      if (q && spot.distinctChildStems) {
+        const parent = questions.find(cand => cand.no === spot.no && !cand.parentId);
+        const childQuestions = spot.distinctChildStems.map(cNo =>
+          questions.find(cand => cand.no === cNo && parent && cand.parentId === parent.id),
+        );
+        if (childQuestions.some(c => !c || !(c.stem || '').trim())) {
+          pass = false; failures.push(`spot Q${spot.no}: missing child stems for ${JSON.stringify(spot.distinctChildStems)}`);
+        } else {
+          const childStems = childQuestions.map(c => normalized(c!.stem || ''));
+          if (new Set(childStems).size !== childStems.length) {
+            pass = false; failures.push(`spot Q${spot.no}: non-distinct child stems ${JSON.stringify(childStems)}`);
+          }
+        }
+      }
+      if (q && spot.options && JSON.stringify(optionTexts(q)) !== JSON.stringify(spot.options.map(normalized))) {
+        pass = false; failures.push(`spot Q${spot.no}: options differ (${JSON.stringify(optionTexts(q))})`);
+      }
+      if (q && spot.points !== undefined && q.points !== spot.points) {
+        pass = false; failures.push(`spot Q${spot.no}: expected ${spot.points} points, got ${q.points}`);
+      }
+      if (spot.children && JSON.stringify(getChildren(questions, spot.no)) !== JSON.stringify([...spot.children].sort((a, b) => a - b))) {
+        pass = false; failures.push(`spot Q${spot.no}: children mismatch (${JSON.stringify(getChildren(questions, spot.no))})`);
+      }
       if (spot.optionPoolContains) {
         const corpusText = normalized(lines.filter(line => !keyLines.has(lineNo(line))).map(line => line.text).join(' '));
-        if (!spot.optionPoolContains.every(value => corpusText.includes(normalized(value)))) { pass = false; failures.push(`spot Q${spot.no}: matching pool text missing`); }
+        if (!spot.optionPoolContains.every(value => corpusText.includes(normalized(value)))) {
+          pass = false; failures.push(`spot Q${spot.no}: matching pool text missing`);
+        }
       }
       if (pass) passedSpots++;
     }
+    const shapeAudit = computeShapeAudit(questions);
+    const shapeAuditLabel = `${shapeAudit.optionIncludesStem}/${shapeAudit.duplicateSiblingStems}/${shapeAudit.overlongStems}`;
+    const shapeAuditAllZero =
+      shapeAudit.optionIncludesStem === 0 &&
+      shapeAudit.duplicateSiblingStems === 0 &&
+      shapeAudit.overlongStems === 0;
+
     const imageIds = (lines as any).images || [];
     const duplicateImageIds = imageIds.length - new Set(imageIds.map((image: any) => image.id)).size;
     const groupResults = (truth.groups || []).map(group => `${group.parent}:${getChildren(questions, group.parent).join(',')}`);
@@ -160,9 +261,18 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
     const recall = `${numbers.filter(number => expected.includes(number)).length}/${expected.length}`;
     const sections = `${actualTitles.filter((title, index) => title === (truth.sectionTitles || [])[index]).length}/${(truth.sectionTitles || []).length}`;
     const result: CorpusResult = {
-      exam, expected: expected.length, found: numbers.length, recall, sections,
+      exam,
+      expected: expected.length,
+      found: numbers.length,
+      recall,
+      sections,
       total: `${gated.totalPoints ?? '—'}${totalMatches ? '' : ` (expected ${truth.totalPoints})`}`,
-      spotChecks: `${passedSpots}/${spotChecks.length}`, duplicateImageIds, preAssistantChildren, failures,
+      spotChecks: `${passedSpots}/${spotChecks.length}`,
+      shapeAudit,
+      shapeAuditLabel,
+      duplicateImageIds,
+      preAssistantChildren,
+      failures,
     };
     if (numbers.length !== expected.length || expected.some(number => !numbers.includes(number))) failures.push(`number recall ${recall}`);
     if (!sectionsMatch) failures.push(`section order mismatch: ${actualTitles.join(' / ')}`);
@@ -171,14 +281,31 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
       if (byNo.get(Number(number))?.type !== type) failures.push(`Q${number} type expected ${type}, got ${byNo.get(Number(number))?.type || 'missing'}`);
     }
     if (truth.mustHaveNoDuplicateImageIds && duplicateImageIds) failures.push(`duplicate image ids=${duplicateImageIds}`);
+    if (exam === ACCEPTANCE_ID && !shapeAuditAllZero) {
+      failures.push(`shape audit non-zero: ${shapeAuditLabel}`);
+    }
     results.push(result);
-    if (opts.print !== false) console.log(`${exam.padEnd(38)} ${recall.padEnd(8)} ${sections.padEnd(8)} ${result.total.padEnd(14)} ${result.spotChecks.padEnd(7)} dup-img=${duplicateImageIds} groups=${preAssistantChildren}`);
+    if (opts.print !== false) {
+      console.log(
+        `${exam.padEnd(38)} ${recall.padEnd(8)} ${sections.padEnd(8)} ${result.total.padEnd(14)} ${result.spotChecks.padEnd(8)} shape=${shapeAuditLabel.padEnd(7)} dup-img=${duplicateImageIds} groups=${preAssistantChildren}`,
+      );
+    }
   }
   const acceptance = results.find(result => result.exam === ACCEPTANCE_ID);
-  const acceptanceOK = !opts.strict || Boolean(acceptance && acceptance.recall === '67/67' && acceptance.sections === '9/9' && acceptance.total === '48' && acceptance.spotChecks === '8/8' && acceptance.duplicateImageIds === 0 && acceptance.preAssistantChildren.includes('15:16,17,18') && acceptance.preAssistantChildren.includes('63:64,65,66'));
-  if (!acceptanceOK && acceptance) acceptance.failures.push('A1 acceptance gate not met');
+  const acceptanceOK = !opts.strict || Boolean(
+    acceptance &&
+    acceptance.recall === '67/67' &&
+    acceptance.sections === '8/8' &&
+    acceptance.total === '48' &&
+    acceptance.spotChecks === '12/12' &&
+    acceptance.shapeAuditLabel === '0/0/0' &&
+    acceptance.duplicateImageIds === 0 &&
+    acceptance.preAssistantChildren === '15:16,17,18;63:64,65,66' &&
+    acceptance.failures.length === 0,
+  );
+  if (!acceptanceOK && acceptance) acceptance.failures.push('F1 acceptance gate not met');
   // This batch's hard corpus gate is the declared English-final acceptance exam; historical fixtures
-  // remain replayable/report-only because their old section/spot expectations were not all order-aware.
+  // remain replayable/report-only (including shape-audit reporting without gating).
   const legacyFailures = results.filter(result => result.exam !== ACCEPTANCE_ID).flatMap(result => result.failures);
   const ok = acceptanceOK && (!opts.strict ? legacyFailures.length === 0 : true);
   if (opts.print !== false) {

@@ -29,7 +29,15 @@ export type SourceLine = {
   garbled?: boolean;
 };
 
-export type LineSpan = [number, number]; // inclusive start/end, 1-based (e.g. [41, 45])
+export interface OffsetSpan {
+  line: number;
+  /** Optional 0-based start offset (inclusive) in normalized line text. */
+  start?: number;
+  /** Optional 0-based end offset (exclusive) in normalized line text. */
+  end?: number;
+}
+
+export type LineSpan = [number, number] | OffsetSpan; // inclusive start/end, 1-based (e.g. [41, 45]) or sub-line offset span
 
 export interface ExamSection {
   id: string;

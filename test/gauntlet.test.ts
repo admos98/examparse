@@ -60,8 +60,12 @@ const mcqUnder2 = (doc: ExamDoc) => doc.questions.filter((q) => q.type === 'mcq'
 /** Questions whose first stem line falls outside the spans of the section they are filed under. */
 const misfiled = (doc: ExamDoc) => doc.questions.filter((q) => {
   const sec = doc.sections.find((s) => s.id === q.sectionId);
-  const line = q.spans[0]?.[0];
-  return !sec || line === undefined || !sec.spans.some(([a, b]) => line >= a && line <= b);
+  const first = q.spans[0];
+  const line = Array.isArray(first) ? first[0] : first?.line;
+  return !sec || line === undefined || !sec.spans.some((sp) => {
+    const [a, b] = Array.isArray(sp) ? sp : [sp.line, sp.line];
+    return line >= a && line <= b;
+  });
 }).length;
 /** Content hash that ignores cleanup tags/flags/stats — what F3 says may NOT change when cleanup is off. */
 function contentHash(doc: ExamDoc): string {

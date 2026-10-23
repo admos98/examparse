@@ -24,6 +24,7 @@ import {
   computeImageQuestionHints,
   computeLearnedWatermarks,
   exciseWatermarksWithLearned,
+  checkInvariantI12,
 } from "./quality";
 import {
   canonicalizeSections,
@@ -32,6 +33,12 @@ import {
   stripLeadingOptionMarker,
   trimOptionInstructionResidue,
 } from "./assemble";
+import { spanBounds, spanLineNumbers, spansContainLine } from "./spans";
+import {
+  canonicalizeForms,
+  detectShapeProblemQuestions,
+  type FormApplicationDelta,
+} from "./forms";
 import { agentText, AgentOperationError } from "./agentI18n";
 import {
   applySectionCandidate,
@@ -89,15 +96,9 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
   const pagesCount = new Set((doc.source?.lines || []).map((l) => l.page)).size;
   const learnedWatermarks = computeLearnedWatermarks(doc.source?.lines || [], pagesCount);
 
-  const rootSpanLines = (root.spans || [])
-    .flatMap(([s, e]) => {
-      const acc: typeof doc.source.lines = [];
-      for (let ln = s; ln <= e; ln++) {
-        const line = lineByNo.get(ln);
-        if (line && !line.furniture) acc.push(line);
-      }
-      return acc;
-    });
+  const rootSpanLines = spanLineNumbers(root.spans || [])
+    .map((ln) => lineByNo.get(ln))
+    .filter((line): line is NonNullable<typeof line> => Boolean(line && !line.furniture));
 
   // Collect all enumerated numbers on the group (from root.stem and source span lines)
   const parenMatches = [
@@ -139,16 +140,12 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
 
   // Re-slice shared options through: watermark exciser -> inline option splitter -> parent instruction residue trimmer
   const optionSpans = (root.options || []).flatMap((o) => o.spans || []);
+  const optionBounds = spanBounds(optionSpans);
   const optionSourceText = optionSpans.length
-    ? optionSpans
-        .flatMap(([s, e]) => {
-          const lines: string[] = [];
-          for (let ln = s; ln <= e; ln++) {
-            const line = lineByNo.get(ln);
-            if (line && !line.furniture) lines.push(exciseWatermarksWithLearned(line.text, learnedWatermarks).text);
-          }
-          return lines;
-        })
+    ? spanLineNumbers(optionSpans)
+        .map((ln) => lineByNo.get(ln))
+        .filter((line): line is NonNullable<typeof line> => Boolean(line && !line.furniture))
+        .map((line) => exciseWatermarksWithLearned(line.text, learnedWatermarks).text)
         .join("\n")
     : (root.options || [])
         .map((o, idx) => {
@@ -163,7 +160,7 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
     if (inlineParts && inlineParts.length >= 2) {
       reSlicedOptions = inlineParts.map((p, idx) => ({
         key: p.key || String.fromCharCode(97 + idx),
-        spans: optionSpans.length ? [[optionSpans[0][0], optionSpans[optionSpans.length - 1][1]]] : root.spans,
+        spans: optionBounds ? [[optionBounds[0], optionBounds[1]]] : root.spans,
         text: p.text,
       }));
     } else if ((root.options || []).length >= 2) {
@@ -290,13 +287,217 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
     });
   }
 
+  const postForms = canonicalizeForms({
+    questions: updatedQuestions,
+    sourceLines: doc.source?.lines || [],
+    sections: doc.sections || [],
+  });
+  for (const cf of postForms.flags) {
+    if (!nextDocFlags.some((f) => f.code === cf.code && f.questionId === cf.questionId)) {
+      nextDocFlags.push(cf);
+    }
+  }
+
   return {
     ok: true,
     summary: `Split group: added ${toAdd.length} children (${toAdd.join(",")})`,
     added: toAdd,
-    doc: { ...doc, questions: updatedQuestions, flags: nextDocFlags },
+    doc: { ...doc, questions: postForms.questions, sections: postForms.sections, flags: nextDocFlags },
     residueTrimmed,
   };
+}
+
+export function canonicalizeQuestionInDoc(
+  doc: ExamDoc,
+  params: { questionId?: string; scope?: "exam" },
+): {
+  ok: boolean;
+  changed: boolean;
+  doc: ExamDoc;
+  deltas: FormApplicationDelta[];
+  formsApplied: string[];
+  textsChanged: Array<{
+    questionId: string;
+    no: number;
+    formsApplied: string[];
+    fieldsChanged: string[];
+    beforeStem: string;
+    afterStem: string;
+    beforeOptions?: string[];
+    afterOptions?: string[];
+  }>;
+  summary: string;
+} {
+  const isExamScope = params.scope === "exam" || !params.questionId;
+  if (!isExamScope && params.questionId) {
+    const targetExists = doc.questions.some((q) => q.id === params.questionId);
+    if (!targetExists) throw new AgentOperationError("questionMissing");
+  }
+  const beforeById = new Map(doc.questions.map((q) => [q.id, q]));
+  const shapeBeforeIds = new Set(
+    detectShapeProblemQuestions(doc).map((p) => p.questionId),
+  );
+  const res = canonicalizeForms({
+    questions: doc.questions,
+    sourceLines: doc.source?.lines || [],
+    sections: doc.sections || [],
+    scopeQuestionIds: isExamScope ? undefined : new Set([params.questionId!]),
+  });
+
+  const remainingShapeIds = new Set(
+    detectShapeProblemQuestions({ ...doc, questions: res.questions, sections: res.sections }).map((p) => p.questionId),
+  );
+  const deltaById = new Map(res.deltas.map((d) => [d.questionId, d]));
+
+  // Questions whose shape defect was cleanly resolved by Part C canonicalizers recover healthy confidence (>=0.85);
+  // questions that remain malformed or carry STEM_OVERLONG / INVARIANT_I12_* stay below floor for D2 needs-human.
+  const nextQuestions = res.questions.map((q) => {
+    const hadShapeProblem = shapeBeforeIds.has(q.id) || deltaById.has(q.id);
+    if (!hadShapeProblem) return q;
+    const cleanedFlags = (q.flags || []).filter(
+      (fc) =>
+        !(
+          !remainingShapeIds.has(q.id) &&
+          (fc === "OPTION_DUPLICATE" ||
+            fc === "OPTIONS_MISSING" ||
+            fc === "OPTION_SPLIT_FAILED" ||
+            fc.startsWith("INVARIANT_I12"))
+        ),
+    );
+    const hasResidualHardDefect =
+      remainingShapeIds.has(q.id) ||
+      cleanedFlags.some(
+        (fc) =>
+          fc === "STEM_OVERLONG" ||
+          fc === "OPTIONS_MISSING" ||
+          fc === "OPTION_SPLIT_FAILED" ||
+          fc.startsWith("INVARIANT_I12"),
+      );
+    const nextConfidence = !hasResidualHardDefect && deltaById.has(q.id)
+      ? Math.max(q.confidence, 0.85)
+      : q.confidence;
+    return {
+      ...q,
+      flags: cleanedFlags,
+      confidence: nextConfidence,
+    };
+  });
+
+  // Refresh doc-level I12 / shape flags
+  const touchedIds = isExamScope
+    ? new Set(nextQuestions.map((q) => q.id))
+    : new Set([params.questionId!]);
+  let nextDocFlags = (doc.flags || []).filter((f) => {
+    if (!f.questionId || !touchedIds.has(f.questionId)) return true;
+    const qNow = nextQuestions.find((q) => q.id === f.questionId);
+    if (!qNow) return false;
+    if (
+      (f.code === "OPTION_DUPLICATE" ||
+        f.code === "OPTIONS_MISSING" ||
+        f.code === "OPTION_SPLIT_FAILED" ||
+        f.code.startsWith("INVARIANT_I12")) &&
+      !qNow.flags?.includes(f.code)
+    ) {
+      return false;
+    }
+    return true;
+  });
+  for (const cf of res.flags) {
+    if (!nextDocFlags.some((f) => f.code === cf.code && f.questionId === cf.questionId)) {
+      nextDocFlags = [...nextDocFlags, cf];
+    }
+  }
+  const inv = checkInvariantI12(nextQuestions);
+  for (const inf of inv.flags) {
+    if (!nextDocFlags.some((f) => f.code === inf.code && f.questionId === inf.questionId)) {
+      nextDocFlags = [...nextDocFlags, inf];
+    }
+  }
+
+  const afterById = new Map(nextQuestions.map((q) => [q.id, q]));
+  const formsApplied = [...new Set(res.deltas.flatMap((d) => d.rules))];
+  const textsChanged = res.deltas
+    .filter((d) => d.stemChanged || d.optionsChanged || d.typeChanged)
+    .map((d) => {
+      const beforeQ = beforeById.get(d.questionId);
+      const afterQ = afterById.get(d.questionId);
+      const fieldsChanged: string[] = [];
+      if (d.stemChanged) fieldsChanged.push("stem");
+      if (d.optionsChanged) fieldsChanged.push("options");
+      if (d.typeChanged) fieldsChanged.push("type");
+      return {
+        questionId: d.questionId,
+        no: d.no,
+        formsApplied: d.rules,
+        fieldsChanged,
+        beforeStem: (beforeQ?.stem || "").slice(0, 120),
+        afterStem: (afterQ?.stem || "").slice(0, 120),
+        beforeOptions: beforeQ?.options?.map((o) => o.text || ""),
+        afterOptions: afterQ?.options?.map((o) => o.text || ""),
+      };
+    });
+  const sectionsChanged = JSON.stringify(res.sections) !== JSON.stringify(doc.sections);
+  const changed =
+    res.deltas.length > 0 ||
+    sectionsChanged ||
+    nextQuestions.length !== doc.questions.length ||
+    nextDocFlags.length !== (doc.flags || []).length ||
+    nextQuestions.some((q, i) => q.confidence !== doc.questions[i]?.confidence);
+  const nextDoc: ExamDoc = changed
+    ? { ...doc, questions: nextQuestions, sections: res.sections, flags: nextDocFlags }
+    : doc;
+  const scopeLabel = isExamScope ? "exam" : params.questionId!;
+  const summary = res.deltas.length > 0
+    ? `Canonicalized ${res.deltas.length} question(s) [${scopeLabel}]: forms ${formsApplied.join(", ") || "none"}, texts changed ${textsChanged.length}`
+    : `Canonicalize checked [${scopeLabel}]: 0 form changes needed`;
+  return {
+    ok: true,
+    changed,
+    doc: nextDoc,
+    deltas: res.deltas,
+    formsApplied,
+    textsChanged,
+    summary,
+  };
+}
+
+export function buildShapeActionQueue(
+  doc: ExamDoc,
+  ledger?: ActionLedger,
+): {
+  shapeProblems: ReturnType<typeof detectShapeProblemQuestions>;
+  queue: ActionQueueItem[];
+  filteredFingerprints: string[];
+} {
+  const shapeProblems = detectShapeProblemQuestions(doc);
+  const rawItems: ActionQueueItem[] = [];
+  if (shapeProblems.length > 6) {
+    rawItems.push({
+      tool: "canonicalize_question",
+      args: { scope: "exam" },
+      rationale: `${shapeProblems.length} questions have deterministic shape problems (${[...new Set(shapeProblems.flatMap((p) => p.kinds))].join(", ")})`,
+      riskClass: "mutate",
+    });
+  } else {
+    for (const prob of shapeProblems) {
+      rawItems.push({
+        tool: "canonicalize_question",
+        args: { questionId: prob.questionId },
+        rationale: `Q${prob.no} has shape problem (${prob.kinds.join(", ")}) — run deterministic canonicalizer`,
+        riskClass: "mutate",
+      });
+    }
+  }
+  const filteredFingerprints: string[] = [];
+  const queue = rawItems.filter((item) => {
+    const fp = computeActionFingerprint(item.tool, item.args, doc);
+    if (ledger?.executedFingerprints.has(fp) || ledger?.refusedFingerprints.has(fp)) {
+      filteredFingerprints.push(fp);
+      return false;
+    }
+    return true;
+  });
+  return { shapeProblems, queue, filteredFingerprints };
 }
 
 function diagnoseMissingWithLedger(
@@ -314,7 +515,9 @@ function diagnoseMissingWithLedger(
     if (idx > 0) neighbours.push(sortedQs[idx - 1]);
     if (idx >= 0 && idx < sortedQs.length) neighbours.push(sortedQs[idx]);
     if (idx >= 0 && idx + 1 < sortedQs.length) neighbours.push(sortedQs[idx + 1]);
-    const sec = doc.sections.find((s) => s.spans.some(([a, b]) => expectedLine && expectedLine >= a && expectedLine <= b));
+    const sec = expectedLine !== undefined
+      ? doc.sections.find((s) => spansContainLine(s.spans, expectedLine))
+      : undefined;
     let cause = "unknown";
     if (!expectedLine) cause = "gap between sections or key-territory leak";
     else {
@@ -350,7 +553,8 @@ function diagnoseMissingWithLedger(
       const matched =
         doc.questions.find(
           (q) =>
-            q.spans.some(([a, b]) => r.expectedLine !== undefined && r.expectedLine >= a && r.expectedLine <= b) &&
+            r.expectedLine !== undefined &&
+            spansContainLine(q.spans, r.expectedLine) &&
             new RegExp(`\\(${r.number}\\)`).test(q.stem || ""),
         ) || doc.questions.find((q) => new RegExp(`\\(${r.number}\\)`).test(q.stem || ""));
       const rootParent = matched ? resolveGroupRootParent(doc, matched) : undefined;
@@ -390,21 +594,36 @@ function diagnoseMissingWithLedger(
     });
   }
 
+  // Part D1 — Classify shape problems (duplicate options, sibling-identical stems, overlong stems, malformed TF)
+  // as canonicalize_question actions in actionQueue so diagnose -> canonicalize -> health re-check runs in one pass.
+  const shapeQueue = buildShapeActionQueue(doc, ledger);
+
   // Filter actionQueue against executed/refused (action + target + docHash) fingerprints so already-tried items never re-queue
-  const filteredOut: string[] = [];
-  const queue = rawQueue.filter((item) => {
-    const fp = computeActionFingerprint(item.tool, item.args, doc);
-    if (ledger?.executedFingerprints.has(fp) || ledger?.refusedFingerprints.has(fp)) {
-      filteredOut.push(fp);
-      return false;
-    }
-    return true;
-  });
+  const filteredOut: string[] = [...shapeQueue.filteredFingerprints];
+  const queue = [
+    ...shapeQueue.queue,
+    ...rawQueue.filter((item) => {
+      const fp = computeActionFingerprint(item.tool, item.args, doc);
+      if (ledger?.executedFingerprints.has(fp) || ledger?.refusedFingerprints.has(fp)) {
+        filteredOut.push(fp);
+        return false;
+      }
+      return true;
+    }),
+  ];
+
+  const missingSummary = `Diagnosed ${numbers.length} missing numbers: ${result.map((r: { number: number; cause: string }) => `${r.number}=${r.cause.split("?")[0].split(" (")[0]}`).join("; ").slice(0, 200)}`;
+  const summary = shapeQueue.shapeProblems.length > 0 && numbers.length === 0
+    ? `Diagnosed ${shapeQueue.shapeProblems.length} shape problem(s): ${shapeQueue.shapeProblems.map((p) => `Q${p.no}=${p.kinds[0]}`).join("; ").slice(0, 180)}`
+    : shapeQueue.shapeProblems.length > 0
+      ? `${missingSummary}; shapeProblems=${shapeQueue.shapeProblems.length}`
+      : missingSummary;
 
   return {
     ok: true,
-    summary: `Diagnosed ${numbers.length} missing numbers: ${result.map((r: { number: number; cause: string }) => `${r.number}=${r.cause.split("?")[0].split(" (")[0]}`).join("; ").slice(0, 200)}`,
+    summary,
     data: result,
+    shapeProblems: shapeQueue.shapeProblems,
     actionQueue: queue,
     filteredFingerprints: filteredOut,
   };
@@ -425,22 +644,33 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       doc.source.lines,
       doc.source.keyTerritoryLineNos,
     );
-    await ctx.updateDoc({
+    const nextDocBase: ExamDoc = {
       ...doc,
       questions: doc.questions.map((old) => (old.id === qid ? updated : old)),
-    });
-    return { updated: qid, health: healthSummary(ctx.getDoc()) };
+    };
+    const canon = canonicalizeQuestionInDoc(nextDocBase, { scope: "exam" });
+    await ctx.updateDoc(canon.doc);
+    return { updated: qid, health: healthSummary(ctx.getDoc()), formsApplied: canon.formsApplied };
   };
   return {
     get_exam_health: {
-      description: "{} or {fresh:true} → local counts/points/images/health (cached unless fresh or mutation)",
+      description: "{} or {fresh:true} → local counts/points/images/shape-problems/health (queues canonicalize_question when shape problems exist)",
       schema: z.object({ fresh: z.boolean().optional() }).strict(),
       access: "read",
-      execute: (args: any) => {
-        const h = healthSummary(ctx.getDoc());
+      execute: (_args: any) => {
+        const doc = ctx.getDoc();
+        const h = healthSummary(doc);
         const dossier = ctx.getDossier?.();
-        // If dossier exists, include digest? But we return health
-        return { ...h, cached: false, ageMs: 0, dossier: dossier?.healthSnapshot ? { digest: dossier.healthSnapshot } : undefined };
+        const ledger = ctx.actionLedger ?? getActiveTurnLedger();
+        const shape = buildShapeActionQueue(doc, ledger);
+        return {
+          ...h,
+          cached: false,
+          ageMs: 0,
+          shapeProblems: shape.shapeProblems.length,
+          ...(shape.queue.length ? { actionQueue: shape.queue } : {}),
+          dossier: dossier?.healthSnapshot ? { digest: dossier.healthSnapshot } : undefined,
+        };
       },
     },
     list_missing: {
@@ -625,13 +855,13 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       },
     },
     diagnose_missing: {
-      description: "{numbers: number[]} → for given numbers: expected line, neighbouring parsed questions, section, likely cause (group-parent? sub-part? gap? key-territory?) with source slice",
-      schema: z.object({ numbers: z.array(z.number().int().min(1).max(300)).min(1).max(20) }).strict(),
+      description: "{numbers?: number[]} → for given numbers (and any shape problems): expected line, neighbouring parsed questions, section, likely cause + canonicalize/split actionQueue",
+      schema: z.object({ numbers: z.array(z.number().int().min(1).max(300)).max(20).default([]) }).strict(),
       access: "read",
       execute: ({ numbers }) => {
         const doc = ctx.getDoc();
         const ledger = ctx.actionLedger ?? getActiveTurnLedger();
-        return diagnoseMissingWithLedger(doc, numbers, ledger);
+        return diagnoseMissingWithLedger(doc, numbers || [], ledger);
       },
     },
     get_open_issues: {
@@ -748,7 +978,7 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
         const sectionsTried = [...new Set(attempted.map(n=>{
           const ln = enumRes.lineByNumber.get(n);
           if (!ln) return 'unknown';
-          const sec = beforeDoc.sections.find(s=> s.spans.some(([a,b])=> ln>=a && ln<=b));
+          const sec = beforeDoc.sections.find(s=> spansContainLine(s.spans, ln));
           return sec?.title || sec?.id || 'unknown';
         }))];
         const result = {
@@ -781,10 +1011,14 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
         const health0 = healthSummary(current);
         steps.push({ step: "health", healthBefore: health0, delta: { addedCount: 0 } });
 
-        // L0 locals: deterministic section canonicalization + strict same-page geometry hints
+        // L0 locals: deterministic section canonicalization + form canonicalization + strict same-page geometry hints
         const canon = canonicalizeSections(current.sections || [], current.questions || []);
-        const hints = computeImageQuestionHints(current.images || [], canon.questions, current.source?.lines || []);
-        let l0Mutated = canon.changed;
+        const formCanon = canonicalizeQuestionInDoc(
+          { ...current, sections: canon.sections, questions: canon.questions },
+          { scope: "exam" },
+        );
+        const hints = computeImageQuestionHints(current.images || [], formCanon.doc.questions, current.source?.lines || []);
+        let l0Mutated = canon.changed || formCanon.changed;
         const nextImages = (current.images || []).map((img) => {
           const h = hints[img.id];
           if (!h || h.page !== img.page || img.label?.questionRef) return img;
@@ -795,9 +1029,9 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           };
         });
         if (l0Mutated) {
-          const nextFlags = canon.changed && !(current.flags || []).some((f) => f.code === "SECTION_ORDER_CANONICALIZED")
+          const nextFlags = canon.changed && !(formCanon.doc.flags || []).some((f) => f.code === "SECTION_ORDER_CANONICALIZED")
             ? [
-                ...(current.flags || []),
+                ...(formCanon.doc.flags || []),
                 {
                   id: "flag_section_order_canonicalized",
                   code: "SECTION_ORDER_CANONICALIZED",
@@ -805,15 +1039,16 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
                   message: "Section order and indices canonicalized by first span line.",
                 },
               ]
-            : current.flags;
-          current = { ...current, sections: canon.sections, questions: canon.questions, images: nextImages, flags: nextFlags };
+            : formCanon.doc.flags;
+          current = { ...formCanon.doc, images: nextImages, flags: nextFlags };
           await ctx.updateDoc(current);
         }
         steps.push({
           step: "L0 locals",
-          summary: "L0 checked deterministic splits/numbering/image assignment",
+          summary: "L0 checked deterministic splits/forms/numbering/image assignment",
           canonicalizedSections: canon.changed,
-          delta: { addedCount: 0 },
+          formsApplied: formCanon.formsApplied,
+          delta: { addedCount: 0, formsApplied: formCanon.formsApplied },
         });
 
         // L1 retry (satisfies reparse_section retry precondition even when addedCount === 0)
@@ -862,12 +1097,10 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
           const enumRes = enumerateExpectedQuestionNos(current.source.lines);
           const sectionsForMissing = current.sections
             .filter((s) =>
-              s.spans.some(([a, b]) =>
-                healthMid.missing.some((m) => {
-                  const ln = enumRes.lineByNumber.get(m);
-                  return ln && ln >= a && ln <= b;
-                }),
-              ),
+              healthMid.missing.some((m) => {
+                const ln = enumRes.lineByNumber.get(m);
+                return ln !== undefined && spansContainLine(s.spans, ln);
+              }),
             )
             .slice(0, 2);
           for (const sec of sectionsForMissing) {
@@ -947,6 +1180,46 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
         await ctx.updateDoc(newDoc);
         const health = healthSummary(newDoc);
         return { ok:true, summary:`Accepted group ${parent.no} covering ${childNumbers.join(',')}, missing now ${health.missing.length}`, delta:{addedCount:0}, data:{ health } };
+      },
+    },
+    canonicalize_question: {
+      description:
+        "{questionId?:string, scope?:'exam'} run deterministic Part C form canonicalizer registry on one question or whole exam (0 model calls, undoable via mutation journal, returns delta of forms applied & texts changed)",
+      schema: z
+        .object({
+          questionId: id.optional(),
+          scope: z.literal("exam").optional(),
+        })
+        .strict()
+        .refine(
+          (v) => Boolean(v.questionId) || v.scope === "exam",
+          "Provide questionId or scope:'exam'",
+        ),
+      access: "mutate",
+      execute: async (args: { questionId?: string; scope?: "exam" }) => {
+        const doc = ctx.getDoc();
+        const res = canonicalizeQuestionInDoc(doc, args);
+        if (res.changed) {
+          await ctx.updateDoc(res.doc);
+        }
+        const health = healthSummary(ctx.getDoc());
+        return {
+          ok: true,
+          changed: res.changed,
+          summary: res.summary,
+          delta: {
+            addedCount: 0,
+            changedCount: res.deltas.length,
+            formsApplied: res.formsApplied,
+            textsChanged: res.textsChanged,
+          },
+          data: {
+            deltas: res.deltas,
+            formsApplied: res.formsApplied,
+            textsChanged: res.textsChanged,
+            health,
+          },
+        };
       },
     },
     split_group_children: {

@@ -22,6 +22,7 @@ import { LLMAdapter } from "../providers/adapter";
 import { retryMissingCoverage } from "../pipeline/retryCoverage";
 import { calculateActualCost } from "../utils/budget";
 import { prepareSectionReparse } from "../pipeline/reparseSection";
+import { buildDossier } from "../pipeline/dossier";
 import { assistantError, AgentOperationError } from "../pipeline/agentI18n";
 import { beginJob, endJob, guidanceSummary, type JobHandle } from "../pipeline/memory/harness";
 import { MemoryPanel } from "../components/MemoryPanel";
@@ -371,7 +372,7 @@ export function AssistantView({
               const raw = localStorage.getItem(`examparse_dossier_${docRef.current.id}`);
               if (raw) return JSON.parse(raw);
             } catch {}
-            try { const { buildDossier } = require('../pipeline/dossier'); return buildDossier(docRef.current as any); } catch { return undefined; }
+            try { return buildDossier(docRef.current); } catch { return undefined; }
           },
           registry,
           persist,
@@ -705,6 +706,25 @@ export function AssistantView({
             >
               {t("Cancel", "لغو")}
             </button>
+          </div>
+        )}
+        {session.needsHuman && !busy && (
+          <div
+            className="border border-[var(--warn)] bg-[var(--warn-soft)] p-3 rounded-[10px] text-xs text-[var(--warn-ink)]"
+            data-testid="assistant-needs-human"
+          >
+            <p className="font-semibold">
+              {t(
+                "Needs human review — local canonicalization completed with unresolved shape items",
+                "نیازمند بررسی انسانی — بازآرایی محلی انجام شد اما برخی موارد ساختاری باقی مانده‌اند",
+              )}
+            </p>
+            {session.needsHuman.openQuestions.length > 0 && (
+              <p className="mt-1 font-mono">
+                {t("Open questions:", "سوال‌های باز:")}{" "}
+                {session.needsHuman.openQuestions.map((item) => `Q${item.no}`).join(", ")}
+              </p>
+            )}
           </div>
         )}
         {session.running && !busy && (

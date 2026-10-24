@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { createHash } from 'node:crypto';
 import { GoogleGenAI } from '@google/genai';
-import { LLMRequest, LLMResponse, getDisplayName } from './src/types';
+import { LLMRequest, LLMResponse, getDisplayName, LLM_ROLES } from './src/types';
 import { AppSettingsSchema, SAFE_STORAGE_KEY, isSensitiveCredentialName, validateExtraBodyJson, validateHeaders, validateJsonSize, validateProviderBaseUrl } from './src/utils/validation';
 import { getExamHealth, examContentRevision } from './src/pipeline/quality';
 import { BOOTSTRAP_PLAYBOOK } from './src/pipeline/memory/bootstrap';
@@ -131,9 +131,9 @@ function validateStoredExam(body: any, routeId: string): string | null {
   return null;
 }
 
-function validateLlmRequest(value: any): string | null {
+export function validateLlmRequest(value: any): string | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return 'LLM request object required.';
-  if (!['fast', 'standard', 'escalation', 'vision', 'ocr', 'patch', 'agent'].includes(value.role)) return 'Unsupported LLM role.';
+  if (!(LLM_ROLES as readonly string[]).includes(value.role)) return 'Unsupported LLM role.';
   if (typeof value.system !== 'string' || value.system.length > 200_000 || typeof value.text !== 'string' || value.text.length > 25_000_000) return 'LLM prompt is invalid or exceeds the size limit.';
   if (value.label !== undefined && (typeof value.label !== 'string' || value.label.length > 500)) return 'LLM request label is invalid.';
   if (value.maxOutputTokens !== undefined && (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 1 || value.maxOutputTokens > 65_536)) return 'LLM output token limit is invalid.';
@@ -1575,4 +1575,8 @@ async function startServer() {
   });
 }
 
-startServer();
+// Tests import validateLlmRequest from this module; only bind a port when this file is the CLI entry.
+const entryBase = path.basename(process.argv[1] || '');
+if (/^server\.(ts|js|mts|mjs|cjs)$/.test(entryBase)) {
+  startServer();
+}

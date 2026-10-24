@@ -144,9 +144,28 @@ export interface Flag {
   questionId?: string;
 }
 
+/**
+ * Canonical LLM request/usage roles. Server validation MUST use this list so
+ * pipeline roles cannot drift out of the whitelist again.
+ */
+export const LLM_ROLES = [
+  'fast',
+  'standard',
+  'escalation',
+  'vision',
+  'ocr',
+  'patch',
+  'agent',
+  'critic',
+  'consensus',
+  'cleanup',
+  'text-repair',
+] as const;
+export type LLMRole = (typeof LLM_ROLES)[number];
+
 export interface UsageRecord {
   ts: string;
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup' | 'text-repair';
+  role: LLMRole;
   provider: string;
   model: string;
   inputTokens: number;
@@ -363,7 +382,7 @@ export interface AppSettings {
  * LLM Request & Response Abstraction (§7)
  */
 export interface LLMRequest {
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup' | 'text-repair';
+  role: LLMRole;
   system: string;
   text: string;
   images?: {

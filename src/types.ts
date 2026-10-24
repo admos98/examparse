@@ -202,6 +202,8 @@ export interface ExamDoc {
     cleanupOverrides?: Record<string, LineTag>;
     /** Stage 2.5 summary for the stage card / bench (lines judged, junk, tokens saved). */
     cleanupStats?: { judged: number; junk: number; suspect: number; fenceSaved: number; aiSkipped: boolean; linesBefore: number; linesAfter: number; tokensBefore: number; tokensAfter: number; source: 'off' | 'local' | 'ai' | 'cached' };
+    /** Marvel Batch 6 Fix 1c: final-pass shape audit counts, persisted for `getExamHealth`/banner. */
+    finalShapeAudit?: { optionIncludesStem: number; duplicateSiblingStems: number; overlongStems: number };
   };
   flags: Flag[];
   /**

@@ -20,6 +20,7 @@ import {
 import { runStructurePass, StructurePassResult } from "./structure";
 import { PARSER_VERSION } from "./prompts";
 import { AgentOperationError } from "./agentI18n";
+import { canonicalizeForms } from "./forms";
 
 const UsageSchema = z
   .object({
@@ -126,9 +127,27 @@ export function applySectionCandidate(doc: ExamDoc, input: unknown): ExamDoc {
     assembled.questions.length !== candidate.rawQuestions.length
   )
     throw new AgentOperationError("invalidCandidate");
+  // Fix 2 (Marvel Batch 6) — ADOPTION-TIME CANONICALIZATION (defense in depth).
+  // A section reparse replaces questions wholesale, so replacements pass the same deterministic
+  // registry the assembler uses (with their group parent context) BEFORE they are inserted.
+  const reparsedCanonical = canonicalizeForms({
+    questions: [
+      ...doc.questions.filter((question) => question.sectionId === section.id),
+      ...assembled.questions,
+    ],
+    sourceLines: doc.source.lines,
+    sections: doc.sections,
+    scopeQuestionIds: new Set(assembled.questions.map((question) => question.id)),
+  });
+  const canonicalById = new Map(reparsedCanonical.questions.map((question) => [question.id, question]));
+  const adoptedReplacements = assembled.questions
+    .map((question) => canonicalById.get(question.id))
+    .filter((question): question is Question => Boolean(question))
+    .filter((question) => !(question.parentId && question.parentId === question.id));
+
   const used = new Set(outside.map((q) => q.id));
   const remap = new Map<string, string>();
-  const replacements = assembled.questions
+  const replacements = adoptedReplacements
     .map((q, i) => {
       const previous =
         old.find(

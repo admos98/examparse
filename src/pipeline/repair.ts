@@ -2,11 +2,12 @@
  * Two-Tier Escalation Repair Pipeline (§5.5)
  * Batches only failing items (max 8 items) to the escalation model with their errors.
  */
-import { LLMRequest, Question, SourceLine } from '../types';
+import { Flag, LLMRequest, Question, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { T3_REPAIR_SYSTEM } from './prompts';
 import { applyMergePatch } from './patch';
 import { RawQuestionSchema, assembleTables, lineNoFromId, rewriteRejection, sanitizeSpansAgainstSource, sliceSourceSpans, spanLineNumbers } from './assemble';
+import { canonicalizeForms } from './forms';
 import { spanBounds, spanStartLine } from './spans';
 
 export interface RepairResult {
@@ -19,6 +20,8 @@ export interface RepairResult {
   /** D — rewrite requests the fence refused (garbled-only, number-free, inside spans, ≤140 chars, never key). */
   rewritesRejected?: number;
   rewritesApplied?: number;
+  /** Fix 2 — doc-level flags raised by the adoption-time canonicalization pass. */
+  formFlags?: Flag[];
 }
 
 export async function runEscalationRepair(params: {
@@ -229,10 +232,27 @@ export async function runEscalationRepair(params: {
     if (!validation.success) repairedQ.flags = [...(repairedQ.flags || []), 'REPAIR_VALIDATION_WARNING'];
     return repairedQ;
   });
-  const repairedQuestions = repairedCandidates.filter((question): question is Question => question !== null);
+  let repairedQuestions = repairedCandidates.filter((question): question is Question => question !== null);
+
+  // Fix 2 (Marvel Batch 6) — ADOPTION-TIME CANONICALIZATION (defense in depth).
+  // Repaired items are replacements: they must pass the same deterministic registry the
+  // assembler uses BEFORE they enter the document, or a repaired stem/option set can ship
+  // uncanonicalized (whole-line True/False options, stems keeping their `a) True b) False` tail).
+  // Scope = patched questions (+ their group children); untouched questions stay verbatim.
+  let formFlags: Flag[] = [];
+  if (patchMap.size > 0) {
+    const canonical = canonicalizeForms({
+      questions: repairedQuestions,
+      sourceLines,
+      scopeQuestionIds: new Set([...patchMap.keys()]),
+    });
+    repairedQuestions = canonical.questions;
+    formFlags = canonical.flags;
+  }
 
   return {
     repairedQuestions,
+    formFlags,
     usage: response.usage,
     shapeMismatch,
     appliedCount,

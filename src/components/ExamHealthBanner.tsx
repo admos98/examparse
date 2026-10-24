@@ -59,6 +59,7 @@ export const ExamHealthBanner: React.FC<{ doc: ExamDoc; className?: string; onEx
       {health.lowConfidenceCount > 0 && <span>{health.lowConfidenceCount} low-confidence question(s)</span>}
       {(health.parentLinkIssueCount || 0) > 0 && <span className="font-semibold">{health.parentLinkIssueCount} invalid nested-question link(s)</span>}
       {(health.hollowQuestions?.length || 0) > 0 && <span className="font-semibold" title={health.hollowQuestions.map(h => `${h.label}: ${h.code}`).join(', ')}>{health.hollowQuestions.length} hollow/unverified question(s)</span>}
+      {(health.stemOverlong?.length || 0) > 0 && <span className="font-semibold" title={health.stemOverlong.map(q => `Q${q.no}: ${q.length} chars (text kept verbatim)`).join(', ')}>{health.stemOverlong.length} stem(s) over 500 chars after re-detachment</span>}
       {liveOrphans.length > 0 && (() => {
         const first = liveOrphans[0];
         const rate = (quality?.details?.orphanRate ?? 0) * 100; // same denominator as the quality score (exam territory, non-skip lines)

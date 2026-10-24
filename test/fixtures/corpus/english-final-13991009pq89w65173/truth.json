@@ -30,5 +30,6 @@
     {"no": 15, "children": [16, 17, 18], "distinctChildStems": [16, 17, 18]}
   ],
   "groups": [{"parent": 15, "children": [16, 17, 18]}, {"parent": 63, "children": [64, 65, 66]}],
-  "mustHaveNoDuplicateImageIds": true
+  "mustHaveNoDuplicateImageIds": true,
+  "profiles": [{ "name": "malformed-first-pass" }]
 }

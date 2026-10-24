@@ -5,6 +5,7 @@
  */
 import { AppSettings, ExamDoc, LineTag, Question, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
 import { CLEANUP_VERSION, runCleanupStage, cleanupKeySignature } from './cleanup';
+import { applyTextRepairOverlay, runTextRepairStage, TextRepairCache, TextRepairCacheEntry, TextRepairStats } from './textRepair';
 import { computeOwnership, orphanFlag } from './ownership';
 import { applyLocalGates } from './gates';
 import { extractDocument, ExtractedDocument } from './extract';
@@ -22,6 +23,7 @@ import { LLMAdapter } from '../providers/adapter';
 import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, markPartialForInvariantViolations, parsePrintedNumberFromStem, validateExamInvariants } from './quality';
 import { runEscalationRepair } from './repair';
 import { canonicalizeForms, runFinalCanonicalization } from './forms';
+import { distributeGroupImages } from './groupImages';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
 import { appendUsageRecord, getPipelineCache, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
@@ -98,6 +100,10 @@ export async function runFullPipeline(
   }
 
   let workingLines = extracted.lines;
+  let storedSourceLines: SourceLine[] = workingLines;
+  let textRepairLineRepairs: Record<string, string> = {};
+  let textRepairStats: TextRepairStats | undefined;
+  const textRepairFlags: any[] = [];
   let ocrUsed = extracted.ocrUsed;
   const usageRecords: UsageRecord[] = [];
 
@@ -315,6 +321,66 @@ export async function runFullPipeline(
     });
   }
 
+  // 2.75 STAGE: OPTIONAL BATCHED TEXT REPAIR — overlays only; stored extracted lines stay immutable.
+  {
+    storedSourceLines = workingLines;
+    const enabled = settings.textRepairEnabled === true;
+    const repairStageName = 'Text Repair Overlay (Stage 2.75)';
+    onStageUpdate({ id: 'text-repair', name: repairStageName, status: enabled ? 'running' : 'skipped', message: enabled ? 'Checking suspicious non-key lines; at most one batched call…' : 'Disabled in Settings — parsing original source text (0 calls).' });
+    const repairSel = settings.roleMapping.cleanup || settings.roleMapping.fast;
+    const repairProvider = settings.providers.find(p => p.id === repairSel.providerId) || settings.providers[0];
+    const repairProviderConfig = enabled && repairProvider ? { ...repairProvider, model: repairSel.model } : undefined;
+    const lineCache: TextRepairCache = {
+      get: async key => {
+        try { return await getPipelineCache<TextRepairCacheEntry>(key); } catch { return undefined; }
+      },
+      set: async (key, value) => {
+        if (cacheEnabled) await setPipelineCache<TextRepairCacheEntry>(key, value);
+      },
+    };
+    const t0 = Date.now();
+    const repairResult = await runTextRepairStage({
+      lines: storedSourceLines,
+      keyLines: new Set(keyTerritoryLineNos),
+      enabled,
+      provider: repairProviderConfig?.id,
+      model: repairProviderConfig?.model,
+      force: stageForced('text-repair'),
+      cache: lineCache,
+      caller: repairProviderConfig ? async req => {
+        const response = await LLMAdapter.execute(
+          { role: 'text-repair', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: repairProviderConfig },
+          { onDelta: (channel, full) => onLiveText?.('text-repair', req.label, channel, full), onInfo: note => onLiveText?.('text-repair', req.label, 'info', note) },
+        );
+        return { rawText: response.rawText, json: response.json, usage: response.usage };
+      } : undefined,
+    });
+    textRepairLineRepairs = repairResult.lineRepairs;
+    textRepairStats = repairResult.stats;
+    textRepairFlags.push(...repairResult.flags);
+    workingLines = applyTextRepairOverlay(storedSourceLines, textRepairLineRepairs);
+    if (repairResult.stats.calls && repairProviderConfig) {
+      const repairCost = calculateActualCost(repairResult.stats.inputTokens, repairResult.stats.outputTokens, repairProviderConfig.model, settings.costTable);
+      const rec: UsageRecord = {
+        ts: new Date().toISOString(), role: 'text-repair', provider: repairProviderConfig.name, model: repairProviderConfig.model,
+        inputTokens: repairResult.stats.inputTokens, outputTokens: repairResult.stats.outputTokens, costUsd: repairCost,
+        label: `Text repair (${repairResult.stats.candidates} candidates; one batch)`,
+      };
+      usageRecords.push(rec); appendUsageRecord(rec); onUsageUpdate?.(rec);
+    }
+    const stageStatus = repairResult.stats.status === 'disabled' || repairResult.stats.status === 'no-candidates' || repairResult.stats.status === 'unavailable'
+      ? 'skipped'
+      : repairResult.stats.status === 'cached' ? 'cached'
+        : repairResult.stats.status === 'completed-with-problems' ? 'completed-with-problems' : 'completed';
+    const repairCost = repairResult.stats.calls && repairProviderConfig
+      ? calculateActualCost(repairResult.stats.inputTokens, repairResult.stats.outputTokens, repairProviderConfig.model, settings.costTable) : 0;
+    onStageUpdate({
+      id: 'text-repair', name: repairStageName, status: stageStatus,
+      durationMs: Date.now() - t0, inputTokens: repairResult.stats.inputTokens, outputTokens: repairResult.stats.outputTokens, costUsd: repairCost,
+      message: `${repairResult.stats.calls ? '1 batched call' : repairResult.stats.cachedLines ? 'per-line cache hit (0 calls)' : '0 calls'} · ${repairResult.stats.candidates} candidates · ${repairResult.stats.repaired} overlay(s) · ${repairResult.stats.rejected} rejected · ${repairResult.stats.unchanged} unchanged · ${repairResult.stats.cachedLines} cached line(s) · original source preserved${repairResult.stats.skippedReason ? ` · ${repairResult.stats.skippedReason}` : ''}.`,
+    });
+  }
+
   // F2/B: SEGMENTATION SUMMARY BEFORE STRUCTURE (shown before any structure token spent)
   // B1 deterministic 100% coverage + B4 fallback (>20% mismatch → legacy) + lens preview
   let segmentation: any = null;
@@ -354,9 +420,11 @@ export async function runFullPipeline(
         range: [s.startLine, s.endLine],
         ...(s.printedNo !== undefined ? { n: s.printedNo } : {}),
         ...(s.childNos ? { childNos: s.childNos } : {}),
+        ...(s.groupForm ? { groupForm: s.groupForm } : {}),
+        ...(s.parentStemLines?.length ? { parentStemLines: s.parentStemLines } : {}),
         hint: s.sectionHint,
-        // 120-char stem preview for lens (not sent to model as ground truth, only as manifest)
-        preview: (workingLines.find((l: any) => Number(l.id.replace(/\D/g,''))===s.startLine)?.text || '').slice(0,120),
+        // 120-char preview favors the governing instruction for an enumerative shared parent.
+        preview: (workingLines.find((l: any) => Number(l.id.replace(/\D/g,''))===(s.parentStemLines?.[0] || s.startLine))?.text || '').slice(0,120),
       }));
     }
   } catch (e: any) {
@@ -650,6 +718,7 @@ export async function runFullPipeline(
   let finalQuestions = assembled.questions;
   let allFlags: any[] = [
     ...cleanupFlags,
+    ...textRepairFlags,
     ...(structureData.flags || []),
     ...assembled.flags,
     ...(visionStageFlags || []),
@@ -678,7 +747,6 @@ export async function runFullPipeline(
       allFlags.push({ id: `flag_${imageFlag}_${img.id}`, severity: 'warn', code: imageFlag, message });
     }
   }
-
   // 6. STAGE: ESCALATION REPAIR (≤ 1 call, escalation model)
   if (assembled.failingQuestions.length > 0) {
     onStageUpdate({
@@ -1100,6 +1168,11 @@ export async function runFullPipeline(
   for (const formFlag of finalPass.flags) {
     if (!allFlags.some(existing => existing.code === formFlag.code && existing.questionId === formFlag.questionId)) allFlags.push(formFlag);
   }
+  const imageDistribution = distributeGroupImages(finalQuestions, updatedImages);
+  finalQuestions = imageDistribution.questions;
+  allFlags.push(...imageDistribution.flags);
+  if (imageDistribution.unassigned) allFlags.push({ id: 'flag_GROUP_IMAGE_UNASSIGNED', severity: 'warn', code: 'GROUP_IMAGE_UNASSIGNED', message: `${imageDistribution.unassigned} shared group image reference(s) could not be assigned to a child; retained for review.` });
+
 
   // Typed against `ShapeProblemDiagnosis['kinds']` so a new final-pass shape class cannot be
   // silently dropped from the demotion mapping (tsc enforces completeness now).
@@ -1180,7 +1253,9 @@ export async function runFullPipeline(
     images: updatedImages,
     source: {
       diagnostics,
-      lines: workingLines,
+      lines: storedSourceLines,
+      ...(Object.keys(textRepairLineRepairs).length ? { lineRepairs: textRepairLineRepairs } : {}),
+      ...(textRepairStats ? { textRepairStats } : {}),
       pages: extracted.pages,
       ocrUsed,
       fileName: file.name,

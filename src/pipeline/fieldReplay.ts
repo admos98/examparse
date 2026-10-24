@@ -92,7 +92,9 @@ function buildScriptedRawFromLines(
       seg.parentSegmentId && seg.printedNo !== undefined
         ? [Number(seg.printedNo)]
         : seg.kind === 'group-parent'
-          ? (seg.childNos || []).filter((no: number) => Number(no) !== Number(seg.printedNo))
+          ? (seg.groupForm === 'dialogue' || seg.groupForm === 'enumeration'
+              ? (seg.childNos || []).map(Number)
+              : (seg.childNos || []).filter((no: number) => Number(no) !== Number(seg.printedNo)))
           : [],
     ),
   );

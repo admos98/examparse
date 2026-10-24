@@ -483,7 +483,7 @@ export function evaluateCoverage(
   const parsedNumbers = [...counts.keys()].sort((a, b) => a - b);
   const missing = expected.filter(n => !counts.has(n));
   const duplicates = [...counts].filter(([, count]) => count > 1).map(([n]) => n).sort((a, b) => a - b);
-  const pointsParsed = questions.reduce((sum, q) => sum + (Number((q as any).points) || 0), 0);
+  const pointsParsed = Number(questions.reduce((sum, q) => sum + (Number((q as any).points) || 0), 0).toFixed(2));
   const pointDeficit = totalPoints === undefined ? 0 : Number((totalPoints - pointsParsed).toFixed(2));
   const pointsMatch = totalPoints === undefined || Math.abs(pointDeficit) <= 0.51;
   const coveragePercent = expected.length === 0 ? 100 : Math.max(0, ((expected.length - missing.length) / expected.length) * 100);
@@ -517,9 +517,11 @@ function parseTotalValue(text: string): number | undefined {
 }
 function parseHeaderPoints(text: string): number | undefined {
   const v = normalizeForMatching(text);
-  const m = v.match(/\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:نمره|points?|marks?)\s*[:：]?\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)/i);
+  // Explicit score evidence only. A bare trailing digit or "نمره 1" can be a question/page/column number.
+  if (/(?:row|question|questions|ردیف|سوالات?)\s*[:：]?\s*(?:number|no\.?|شماره)?[\s\S]{0,35}(?:marks?|points?|نمره)/i.test(v)) return undefined;
+  const m = v.match(/\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:points?|marks?|نمره)\s*[:=：]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:points?|marks?)\b/i);
   const n = Number(m?.[1] || m?.[2] || m?.[3]);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
+  return Number.isFinite(n) && n > 0 ? Number(n.toFixed(2)) : undefined;
 }
 
 export function extractDocumentTotals(lines: SourceLine[], keyLines: Set<number> | number[] = []): DocumentTotals {

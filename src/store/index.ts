@@ -110,6 +110,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   // A5: Stage 2.5 cleanup on by default; off ⇒ byte-identical pre-cleanup behaviour (tags aside).
   cleanupEnabled: true,
+  textRepairEnabled: false,
   document: {
     defaultLanguage: 'auto',
     paperSize: 'A4',
@@ -267,6 +268,7 @@ export function loadSettings(): AppSettings {
       document: { ...DEFAULT_SETTINGS.document, ...(parsed.document || {}) },
       agentLimits: { ...DEFAULT_SETTINGS.agentLimits, ...(parsed.agentLimits || {}) },
       cleanupEnabled: typeof parsed.cleanupEnabled === 'boolean' ? parsed.cleanupEnabled : true,
+      textRepairEnabled: typeof parsed.textRepairEnabled === 'boolean' ? parsed.textRepairEnabled : false,
     };
     return validateAppSettings(merged);
   } catch {

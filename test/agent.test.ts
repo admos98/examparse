@@ -29,7 +29,7 @@ function exam(parsed = 38): ExamDoc {
   }));
   const source = [
     { id: 'L0001', page: 1, text: 'ردیف | سؤالات | نمره' },
-    { id: 'L0002', page: 1, text: 'آزمون نهایی زبان انگلیسی — نمره ۴۸' },
+    { id: 'L0002', page: 1, text: 'آزمون نهایی زبان انگلیسی — جمع نمره: 48' },
     { id: 'L0003', page: 1, text: 'شنیداری Listening' },
     ...lines.map((l, i) => ({
       ...l,
@@ -172,7 +172,7 @@ test('agent verify Iranian 38/67 → retry → forced re-observation → green; 
     (e) => e.tool?.name === 'retry_missing_questions',
   );
   assert.ok(firstStatement >= 0 && firstStatement < retry);
-  assert.match(session.events[firstStatement].text, /points 25\/48/);
+  assert.match(session.events[firstStatement].text, /points 26\.98\/48/);
   assert.equal(session.events[retry + 1].tool?.name, 'get_exam_health');
   assert.match(session.events.at(-1)!.text, /38 → 67/);
   assert.match(session.events.at(-1)!.text, /Verified green/);

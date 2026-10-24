@@ -24,7 +24,7 @@ import {
 } from "../src/pipeline/reparseSection";
 
 function fixture(): ExamDoc {
-  const lines = [
+  const lines: ExamDoc['source']['lines'] = [
     { id: "L0001", page: 1, text: "Writing" },
     { id: "L0002", page: 1, text: "۱. مي‌شود؟ Original exact stem" },
     { id: "L0003", page: 1, text: "۲. يكي ديگر از پرسش‌های اين بخش؟" },
@@ -32,6 +32,7 @@ function fixture(): ExamDoc {
     { id: "L0005", page: 1, text: "۳. Outside section — untouched" },
     { id: "L0006", page: 2, text: "راهنمای تصحیح" },
     { id: "L0007", page: 2, text: "1. answer, not a question" },
+    { id: "L0008", page: 2, text: "Question 1 is worth 0.5 marks. Question 2 is worth 1.5 marks. Question 3 is worth 1 mark.", tag: "key" },
   ];
   return {
     id: "reparse_fixture",
@@ -45,7 +46,7 @@ function fixture(): ExamDoc {
       fileName: "fixture.txt",
       ocrUsed: false,
       expectedQuestionNos: [1, 2, 3],
-      keyTerritoryLineNos: [6, 7],
+      keyTerritoryLineNos: [6, 7, 8],
     },
     questions: assembleAndValidateQuestions(
       [
@@ -78,6 +79,8 @@ function fixture(): ExamDoc {
         },
       ],
       lines,
+      undefined,
+      { keyTerritoryLineNos: [6, 7, 8] },
     ).questions,
     sections: [
       { id: "s1", index: 1, title: "Writing", spans: [[1, 3]] },
@@ -273,7 +276,7 @@ test("human edit invalidates pending exact diff; no snapshot, overwrite, or repe
   session.confirmed = true;
   await runAgentTurn(h.runtime, session);
   assert.equal(h.doc.displayName, "Human edit wins");
-  assert.equal(h.doc.questions[0].points, 1);
+  assert.equal(h.doc.questions[0].points, 0.5);
   assert.equal(h.preparations, 1);
   assert.equal(h.snapshots.length, 0);
   assert.equal(session.pending, undefined);
@@ -317,7 +320,7 @@ test("cancelled, interrupted, or forged confirmations never apply a section cand
   s.pending = undefined;
   s.prepared = undefined;
   s.confirmed = false;
-  assert.equal(h.doc.questions[0].points, 1);
+  assert.equal(h.doc.questions[0].points, 0.5);
   assert.equal(h.snapshots.length, 0);
   s.preparing = true;
   await runAgentTurn(h.runtime, s);
@@ -463,7 +466,7 @@ test("a human edit during preparation rejects the candidate before it becomes pe
   assert.equal(s.pending, undefined);
   assert.equal(s.prepared, undefined);
   assert.equal(h.snapshots.length, 0);
-  assert.equal(h.doc.questions[0].points, 1);
+  assert.equal(h.doc.questions[0].points, 0.5);
   assert.match(s.events.at(-1)!.text, /Exam changed after preparation/);
 });
 
@@ -493,7 +496,7 @@ test("confirmed local candidate can commit at the six-call bound without another
   pending.confirmed = true;
   await runAgentTurn(capped.runtime, pending);
   assert.equal(capped.snapshots.length, 0);
-  assert.equal(capped.doc.questions[0].points, 1);
+  assert.equal(capped.doc.questions[0].points, 0.5);
 });
 
 test("source-only human edits invalidate consent, so new source text cannot replace the reviewed candidate under identical question spans", async () => {
@@ -517,7 +520,7 @@ test("source-only human edits invalidate consent, so new source text cannot repl
   s.confirmed = true;
   await runAgentTurn(h.runtime, s);
   assert.equal(h.snapshots.length, 0);
-  assert.equal(h.doc.questions[0].points, 1);
+  assert.equal(h.doc.questions[0].points, 0.5);
   assert.equal(s.pending, undefined);
   assert.match(s.events.map((e) => e.text).join("\n"), /Human edits detected/);
 });

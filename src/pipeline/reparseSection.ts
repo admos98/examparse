@@ -165,6 +165,10 @@ export function applySectionCandidate(doc: ExamDoc, input: unknown): ExamDoc {
         ...q,
         id,
         sectionId: section.id,
+        // A section-only span reparse does not re-price unchanged existing items. New point values
+        // still come only from source key/header evidence in assembly; the prior accepted value is
+        // retained when re-identifying the same printed question.
+        points: previous?.points ?? q.points,
         answer: q.answer || previous?.answer,
         images: q.images.length ? q.images : previous?.images || [],
       };

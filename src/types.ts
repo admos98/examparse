@@ -146,7 +146,7 @@ export interface Flag {
 
 export interface UsageRecord {
   ts: string;
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup' | 'text-repair';
   provider: string;
   model: string;
   inputTokens: number;
@@ -202,6 +202,9 @@ export interface ExamDoc {
     cleanupOverrides?: Record<string, LineTag>;
     /** Stage 2.5 summary for the stage card / bench (lines judged, junk, tokens saved). */
     cleanupStats?: { judged: number; junk: number; suspect: number; fenceSaved: number; aiSkipped: boolean; linesBefore: number; linesAfter: number; tokensBefore: number; tokensAfter: number; source: 'off' | 'local' | 'ai' | 'cached' };
+    /** Stage 2.75 overlays keyed by 1-based source line number; source.lines always retain originals. */
+    lineRepairs?: Record<string, string>;
+    textRepairStats?: import('./pipeline/textRepair').TextRepairStats;
     /** Marvel Batch 6 Fix 1c: final-pass shape audit counts, persisted for `getExamHealth`/banner. */
     finalShapeAudit?: { optionIncludesStem: number; duplicateSiblingStems: number; overlongStems: number };
   };
@@ -352,13 +355,15 @@ export interface AppSettings {
   agentLimits?: { maxModelCalls?: number; maxToolExecutions?: number };
   /** A4/F3: Stage 2.5 cleanup on/off (default on). Off ⇒ no tags, byte-identical pre-cleanup behaviour. */
   cleanupEnabled?: boolean;
+  /** Optional Stage 2.75 OCR/PDF text readability repair (default off; overlays only). */
+  textRepairEnabled?: boolean;
 }
 
 /**
  * LLM Request & Response Abstraction (§7)
  */
 export interface LLMRequest {
-  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup';
+  role: 'fast' | 'standard' | 'escalation' | 'vision' | 'ocr' | 'patch' | 'agent' | 'critic' | 'consensus' | 'cleanup' | 'text-repair';
   system: string;
   text: string;
   images?: {
@@ -404,7 +409,7 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'ocr' | 'cleanup' | 'structure' | 'vision' | 'assemble' | 'repair';
+export type PipelineStageId = 'extract' | 'ocr' | 'cleanup' | 'text-repair' | 'structure' | 'vision' | 'assemble' | 'repair';
 
 export interface StageStatus {
   id: PipelineStageId;

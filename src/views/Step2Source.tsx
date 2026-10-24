@@ -7,6 +7,7 @@ import {
   Search,
   ArrowRight,
   ImageIcon,
+  RotateCcw,
 } from 'lucide-react';
 import { ImageAsset, LineTag, SourceLine } from '../types';
 import { getImageBlob, getPipelineCache, setPipelineCache } from '../store';
@@ -30,6 +31,9 @@ interface Props {
   focusLine?: number;
   /** B3 — lines the last parse left unowned (ORPHAN_LINES); enables the Orphan lens. */
   orphanLineNos?: number[];
+  /** Stage 2.75 text overlays; source line objects remain original. */
+  lineRepairs?: Record<string, string>;
+  onRevertLineRepair?: (lineNo: number) => void;
 }
 
 type CleanupLens = 'all' | 'kept' | 'junk' | 'suspect' | 'orphan';
@@ -56,6 +60,8 @@ export const Step2Source: React.FC<Props> = ({
   taggedLines,
   focusLine,
   orphanLineNos,
+  lineRepairs = {},
+  onRevertLineRepair,
 }) => {
   const [showLineIds, setShowLineIds] = useState(true);
   const [activePage, setActivePage] = useState<number>(() => (focusLine ? (lines.find(l => Number(l.id.replace(/\D/g, '')) === focusLine)?.page || 1) : 1));
@@ -152,8 +158,9 @@ export const Step2Source: React.FC<Props> = ({
   }
 
   // Filter lines if search query is active, then by the Cleanup lens
+  const repairedText = (line: SourceLine) => lineRepairs[String(Number(line.id.replace(/\D/g, '')))] ?? line.text;
   const filteredLines = (searchQuery.trim()
-    ? tagged.filter(l => l.text.toLowerCase().includes(searchQuery.toLowerCase()))
+    ? tagged.filter(l => repairedText(l).toLowerCase().includes(searchQuery.toLowerCase()))
     : (linesByPage[activePage] || tagged)).filter(l => lensMatches(l, lens, orphanSet));
 
   return (
@@ -331,9 +338,20 @@ export const Step2Source: React.FC<Props> = ({
                       {line.tag ? TAG_LABEL[line.tag] || line.tag : ''}{line.garbled ? (line.tag ? ' ?' : 'GARBLED?') : ''}
                     </span>
                   )}
-                  <span className={`whitespace-pre-wrap break-words leading-relaxed flex-1 ${omitted ? 'line-through text-[var(--ink-2)]' : 'text-[var(--ink)]'}`}>
-                    {line.text}
-                  </span>
+                  <div className="min-w-0 flex-1">
+                    <span className={`whitespace-pre-wrap break-words leading-relaxed ${omitted ? 'line-through text-[var(--ink-2)]' : 'text-[var(--ink)]'}`}>
+                      {repairedText(line)}
+                    </span>
+                    {lineRepairs[String(lineNo)] !== undefined && (
+                      <div className="mt-0.5 flex items-start gap-2 text-[length:var(--type-12)]">
+                        <span className="shrink-0 rounded-[4px] border border-[var(--accent)] px-1 text-[var(--accent-ink)]">REPAIRED OVERLAY</span>
+                        <span className="min-w-0 break-words text-[var(--ink-2)]" title="Immutable extracted source text">Original: {line.text}</span>
+                        <button type="button" onClick={() => onRevertLineRepair?.(lineNo)} className="inline-flex shrink-0 items-center gap-1 text-[var(--danger)] hover:underline" title="Remove the repair overlay and use the original source line">
+                          <RotateCcw className="w-3 h-3" /> Revert
+                        </button>
+                      </div>
+                    )}
+                  </div>
                   {fileHash && (
                     <select
                       aria-label={`Cleanup override for ${line.id}`}

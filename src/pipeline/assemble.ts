@@ -30,6 +30,7 @@ import {
   maskWatermarksSameLength,
 } from './spans';
 import { canonicalizeForms } from './forms';
+import { answerTextForSpans, carveAnswerAnchor, extendIncompleteAnswer, findAnswerKeySpan, isNumberOnlyAnswer, printedAnswerAnchors } from './answerKey';
 
 export const OffsetSpanReferenceSchema = z.object({
   line: z.number().int().positive(),
@@ -52,7 +53,7 @@ export const RawQuestionSchema = z.object({
   spans: z.array(SpanReferenceSchema),
   charStart: z.number().int().min(0).optional(),
   charEnd: z.number().int().min(0).optional(),
-  points: z.number().optional(),
+  points: z.number().min(0).max(300).optional(),
   type: z.enum(['mcq', 'truefalse', 'short', 'long', 'fillblank', 'matching', 'multi', 'numeric', 'diagram', 'essay', 'unknown']).optional(),
   options: z.array(z.object({ key: z.string().optional(), spans: z.array(SpanReferenceSchema) })).optional(),
   answer: z.object({ spans: z.array(SpanReferenceSchema).optional() }).optional(),
@@ -222,6 +223,10 @@ export function trimOptionInstructionResidue(
       /اضافه|بارم|نمره|\bextra\b|\bpoint/i.test(normTail) ||
       normTail.split(/\s+/).length >= 5;
     if (!isInstructionShaped) continue;
+    const strippedParenthetical = rawTail.replace(/^[\s(（]+|[\s)）]+$/gu, '').trim();
+    if (/^یک\s+(?:تعریف|کلمه|جمله|مورد)\s+اضاف(?:ه|ی)\s+(?:است|می‌باشد|میباشد)$/u.test(normalizeForMatching(strippedParenthetical)) && /[.!؟?]$/.test(rawHead)) {
+      return { text: normalizeOptionText(rawHead), trimmed: true };
+    }
 
     // Direct normalized substring match OR bidi-reordered score + parenthetical match
     let matchesRef = normRef.includes(normTail);
@@ -534,7 +539,7 @@ export interface AssembleOptions {
   /** D: 'fenced' (default) only accepts rewrites on locally garbled, number-free lines; 'open' for user patches. */
   rewritePolicy?: 'fenced' | 'open';
   /** Deterministic segmenter receipts; optional for legacy/recovery callers. */
-  segmentReceipts?: Array<{ id?: string; kind?: string; startLine: number; endLine: number; printedNo?: number; childNos?: number[]; parentSegmentId?: string; charStart?: number; charEnd?: number; offsetSpan?: OffsetSpan; ruleChain?: string[]; ruleConfidence?: number }>;
+  segmentReceipts?: Array<{ id?: string; kind?: string; startLine: number; endLine: number; printedNo?: number; childNos?: number[]; parentSegmentId?: string; sectionId?: string; charStart?: number; charEnd?: number; offsetSpan?: OffsetSpan; ruleChain?: string[]; ruleConfidence?: number; groupForm?: 'dialogue' | 'enumeration' | 'matching'; parentStemLines?: number[] }>;
 }
 
 export const REWRITE_MAX_CHARS = 140;
@@ -586,6 +591,34 @@ export function sanitizeSpansAgainstSource(
   };
 }
 
+function isInstructionSpanText(text: string): boolean {
+  // A numbered prompt is a question stem even when its wording uses a command verb.
+  if (parsePrintedNumberFromStem(text) !== undefined) return false;
+  const body = text.replace(/^\s*(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*[.)\-:])\s*/u, '').trim();
+  return isInstructionLine(text) || isInstructionText(body) || isReadTheTextInstruction(body);
+}
+
+/** Remove instruction-only line spans from question stems while retaining exact non-instruction source spans. */
+function demoteInstructionSpans(spans: LineSpan[], sourceLines: SourceLine[]): LineSpan[] {
+  const byNo = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
+  const retainedLines: number[] = [];
+  const retainedOffsets: LineSpan[] = [];
+  for (const span of spans) {
+    if (isOffsetSpan(span)) {
+      const line = byNo.get(span.line);
+      if (!line) continue;
+      const fragment = sliceNormalizedLineByOffsets(line.text, span.start, span.end).text;
+      if (!isInstructionSpanText(fragment)) retainedOffsets.push(span);
+      continue;
+    }
+    for (let n = span[0]; n <= span[1]; n++) {
+      const line = byNo.get(n);
+      if (line && !isInstructionSpanText(line.text)) retainedLines.push(n);
+    }
+  }
+  return [...compressSpanLines([...new Set(retainedLines)].sort((a, b) => a - b)), ...retainedOffsets];
+}
+
 function spanCoverage(q: Question): number {
   return spanLineNumbers(q.spans).length + (q.options || []).reduce((sum, option) => sum + spanLineNumbers(option.spans).length, 0);
 }
@@ -605,124 +638,226 @@ function normalizeRtlDecimalMarks(text: string): string {
     .replace(/\(\s*5\s*\/\s*2\s*\)|\)\s*5\s*\/\s*2\s*\(/g, '(2.5)');
 }
 
-function marksFromAnswerKey(lines: SourceLine[], keyLines: Set<number>): Map<number, number> {
-  const out = new Map<number, number>();
-  for (const line of lines) {
-    if (!keyLines.has(lineNoFromId(line.id))) continue;
+interface AnswerKeyMarks {
+  perItem: Map<number, number>;
+  groupTotals: Map<number, number>;
+}
+
+function marksFromAnswerKey(lines: SourceLine[], keyLines: Set<number>): AnswerKeyMarks {
+  const perItem = new Map<number, number>();
+  const groupTotals = new Map<number, number>();
+  const sorted = [...lines].sort((a, b) => lineNoFromId(a.id) - lineNoFromId(b.id));
+  let activeMark: number | undefined;
+  const addRange = (start: number, end: number, mark: number) => {
+    if (!Number.isFinite(mark) || mark <= 0 || mark > 100 || start < 1 || end < start || end - start > 150) return;
+    for (let no = start; no <= end; no++) if (!perItem.has(no)) perItem.set(no, mark);
+  };
+
+  for (const line of sorted) {
+    if (!keyLines.has(lineNoFromId(line.id)) || line.furniture) continue;
     const text = normalizeRtlDecimalMarks(normalizeForMatching(line.text));
-    const rangeRe = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*(\d{1,3})\s*(?:to|تا|[-–])\s*(\d{1,3})[\s\S]{0,100}?(?:each|هر\s*کدام)[\s\S]{0,24}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)?/gi;
-    for (const m of text.matchAll(rangeRe)) {
-      const start = Number(m[1]), end = Number(m[2]), mark = Number(m[3]);
-      if (!Number.isFinite(mark) || start < 1 || end < start || end - start > 150) continue;
-      for (let no = start; no <= end; no++) out.set(no, mark);
+
+    const range = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*(\d{1,3})\s*(?:to|through|تا|[-–—])\s*(\d{1,3})[\s\S]{0,100}?(?:each|per\s+(?:item|question|blank)|هر\s*(?:کدام|پاسخ|سوال|مورد))[\s\S]{0,30}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/gi;
+    for (const match of text.matchAll(range)) addRange(Number(match[1]), Number(match[2]), Number(match[3]));
+
+    const grouped = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*((?:\d{1,3}\s*(?:,|and|&|و|،)\s*)+\d{1,3})[\s\S]{0,80}?(?:each|per\s+(?:item|question|blank)|هر\s*(?:کدام|پاسخ|سوال|مورد))[\s\S]{0,30}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/gi;
+    for (const match of text.matchAll(grouped)) {
+      const mark = Number(match[2]);
+      for (const token of match[1].matchAll(/\d{1,3}/g)) perItem.set(Number(token[0]), mark);
     }
-    const grouped = /(?:questions?|سوال(?:ات)?|سوالات\s*شماره)\s*(\d{1,3})\s*(?:and|و|،|,)\s*(\d{1,3})[\s\S]{0,60}?(?:each|هر\s*کدام)[\s\S]{0,20}?\(?\s*(\d+(?:\.\d+)?)\s*\)?/gi;
-    for (const m of text.matchAll(grouped)) {
-      const mark = Number(m[3]);
-      if (Number.isFinite(mark)) { out.set(Number(m[1]), mark); out.set(Number(m[2]), mark); }
+
+    const chosenGroup = /(?:questions?|سوال(?:ات)?|سوالات)\s*(\d{1,3})\s*(?:to|through|تا|[-–—])\s*(\d{1,3})[\s\S]{0,120}?(?:choose|answer|select|انتخاب|پاسخ)\s*(?:any\s*)?(\d{1,2})[\s\S]{0,45}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)\s*(?:each|هر\s*(?:کدام|مورد))?/gi;
+    for (const match of text.matchAll(chosenGroup)) {
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const choose = Number(match[3]);
+      const mark = Number(match[4]);
+      if (start >= 1 && end >= start && choose >= 1 && mark > 0) groupTotals.set(start, Number((choose * mark).toFixed(2)));
     }
-    const single = /(?:question|سوال)\s*(\d{1,3})\s*\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/gi;
-    for (const m of text.matchAll(single)) {
-      const mark = Number(m[2]);
-      if (Number.isFinite(mark)) out.set(Number(m[1]), mark);
+
+    const single = /(?:question|q\.?|سوال)\s*(\d{1,3})[\s\S]{0,35}?(?:\(\s*(\d+(?:\.\d+)?)\s*\)\s*(?:marks?|points?|نمره)|(?<![\d.])(\d+(?:\.\d+)?)\s*(?:marks?|points?|نمره))/gi;
+    for (const match of text.matchAll(single)) {
+      const mark = Number(match[2] || match[3]);
+      if (Number.isFinite(mark) && mark > 0 && mark <= 100) perItem.set(Number(match[1]), mark);
     }
-    const trailingParen = /(?:question|سوال)\s*(\d{1,3})[\s\S]{0,100}?(\d+(?:\.\d+)?)\s*\(\s*(?:marks?|points?|نمره)/gi;
-    for (const m of text.matchAll(trailingParen)) {
-      const mark = Number(m[2]);
-      if (Number.isFinite(mark) && mark > 0 && mark <= 20) out.set(Number(m[1]), mark);
+
+    const genericMark = text.match(/(?:each\s+(?:correct\s+)?(?:answer|question|item|blank)|per\s+(?:item|question|blank)|هر\s*(?:پاسخ|سوال|مورد|جای\s*خالی))[\s\S]{0,60}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/i);
+    const hasSpecificItemRef = /(?:questions?|question|سوال(?:ات)?)\s*\d{1,3}/i.test(text);
+    if (genericMark && !hasSpecificItemRef) {
+      const parsedMark = Number(genericMark[1]);
+      if (Number.isFinite(parsedMark) && parsedMark > 0 && parsedMark <= 100) activeMark = parsedMark;
     }
-    const contextual = /(?:question|سوال)\s*(\d{1,3})[\s\S]{0,100}?(?:\(\s*(\d+(?:\.\d+)?)\s*\)\s*(?:marks?|points?|نمره)|(?<![\d.])(\d+(?:\.\d+)?)\s*(?:marks?|points?|نمره))/gi;
-    for (const m of text.matchAll(contextual)) {
-      const mark = Number(m[2] || m[3]);
-      if (Number.isFinite(mark) && mark > 0 && mark <= 20) out.set(Number(m[1]), mark);
+
+    // A bare "N. answer" line inherits the nearest explicit per-item mark instruction.
+    // Instruction/mark lines are not themselves answer anchors.
+    const isMarkInstruction = /(?:each|per\s+(?:item|question|blank)|هر\s*(?:پاسخ|سوال|مورد))[\s\S]{0,80}?(?:marks?|points?|نمره)/i.test(text);
+    if (!isMarkInstruction && activeMark !== undefined) {
+      for (const anchor of printedAnswerAnchors(line.text)) if (!perItem.has(anchor.no)) perItem.set(anchor.no, activeMark);
     }
   }
-  return out;
+  return { perItem, groupTotals };
 }
 
 function deriveAndReconcilePoints(params: {
   questions: Question[]; lines: SourceLine[]; keyLines: Set<number>; total?: number; sections?: ExamSection[];
 }): { flags: Flag[]; rescaled: boolean; before?: number; after?: number } {
-  const roots = params.questions.filter(question => !question.parentId);
+  const roots = params.questions.filter(question => !question.parentId).sort((a, b) => a.no - b.no || a.id.localeCompare(b.id));
   const keyMarks = marksFromAnswerKey(params.lines, params.keyLines);
   const sourceHeaders = detectSectionHeaders(params.lines).map(header => ({
     line: header.headerLine, title: header.title, points: parsePrintedPoints(header.rawTitle),
   }));
-  const fixed = new Set<string>();
-  const derived = new Set<string>();
+  const priced = new Set<string>();
+  const rules = new Map<string, string>();
   const flags: Flag[] = [];
-  // Preserve explicitly invalid negatives for the validation/reparse boundary; never mask them with defaults.
-  const unsafeExplicitPoints = new Set(roots.filter(q => !keyMarks.has(q.no) && typeof q.points === 'number' && q.points < 0).map(q => q.id));
-
-  // Source key values outrank section totals; model-supplied values are only provisional defaults.
-  for (const q of roots) {
-    const keyMark = keyMarks.get(q.no);
-    if (keyMark !== undefined) { q.points = keyMark; fixed.add(q.id); derived.add(q.id); }
+  const childrenByParent = new Map<string, Question[]>();
+  for (const child of params.questions.filter(question => question.parentId)) {
+    childrenByParent.set(child.parentId!, [...(childrenByParent.get(child.parentId!) || []), child]);
   }
-  const sections = params.sections || [];
-  for (const section of sections) {
-    const members = roots.filter(q => q.sectionId === section.id);
-    if (!members.length) continue;
-    let printedTotal = typeof section.points === 'number' && section.points > 0 ? section.points : undefined;
-    if (printedTotal === undefined) {
-      const first = section.spans?.length ? Math.min(...section.spans.map(spanStartLine)) : undefined;
-      const header = sourceHeaders.find(candidate => candidate.points !== undefined && first !== undefined && Math.abs(candidate.line - first) <= 4);
-      printedTotal = header?.points;
+
+  // Per-item key evidence is exact; grouped roots aggregate distinct printed item numbers once.
+  for (const root of roots) {
+    const children = childrenByParent.get(root.id) || [];
+    let keyValue: number | undefined;
+    if (children.length) {
+      keyValue = keyMarks.groupTotals.get(root.no);
+      if (keyValue === undefined) {
+        const itemNos = new Set([root.no, ...children.map(child => child.no)]);
+        const marks = [...itemNos].map(no => keyMarks.perItem.get(no)).filter((mark): mark is number => mark !== undefined);
+        if (marks.length) keyValue = Number(marks.reduce((sum, mark) => sum + mark, 0).toFixed(2));
+      }
+    } else {
+      keyValue = keyMarks.groupTotals.get(root.no) ?? keyMarks.perItem.get(root.no);
     }
-    if (printedTotal === undefined) continue;
-    const unmarked = members.filter(q => !fixed.has(q.id) && !unsafeExplicitPoints.has(q.id));
-    if (!unmarked.length) continue;
-    const reserved = members.filter(q => fixed.has(q.id) && !unsafeExplicitPoints.has(q.id)).reduce((sum, q) => sum + (q.points || 0), 0);
-    const remainder = Math.max(0, printedTotal - reserved);
-    const base = Math.floor((remainder / unmarked.length) * 100) / 100;
-    unmarked.forEach((q, index) => { q.points = index === unmarked.length - 1 ? Number((remainder - base * (unmarked.length - 1)).toFixed(2)) : base; fixed.add(q.id); derived.add(q.id); });
+    if (keyValue !== undefined && Number.isFinite(keyValue) && keyValue >= 0) {
+      root.points = Number(keyValue.toFixed(2));
+      priced.add(root.id);
+      rules.set(root.id, 'points-derived:key');
+    }
   }
 
-  for (const q of roots) {
-    if (!fixed.has(q.id)) {
-      if (typeof q.points === 'number' && q.points < 0) continue;
-      if (!(typeof q.points === 'number' && Number.isFinite(q.points) && q.points > 0)) q.points = 0.5;
-      derived.add(q.id); // default/model candidate is the only rescalable class
-      flags.push(flag('POINTS_DERIVED', `Question ${q.label}: points defaulted from document evidence (0.5 before any document-total reconciliation).`, 'info', q.id));
+  const sectionMarks = new Map<string, number>();
+  for (const section of params.sections || []) {
+    const first = section.spans?.length ? Math.min(...section.spans.map(spanStartLine)) : undefined;
+    if (first === undefined) continue;
+    const header = sourceHeaders
+      .filter(candidate => candidate.points !== undefined && Math.abs(candidate.line - first) <= 4)
+      .sort((a, b) => Math.abs(a.line - first) - Math.abs(b.line - first))[0];
+    if (header?.points !== undefined) sectionMarks.set(section.id, Number(header.points.toFixed(2)));
+  }
+
+  const allocateEvenly = (members: Question[], amount: number, rule: string) => {
+    if (!members.length || amount <= 0) return;
+    const totalCents = Math.round(amount * 100);
+    const baseCents = Math.floor(totalCents / members.length);
+    let used = 0;
+    members.forEach((question, index) => {
+      const cents = index === members.length - 1 ? totalCents - used : baseCents;
+      question.points = Number((cents / 100).toFixed(2));
+      used += cents;
+      priced.add(question.id);
+      rules.set(question.id, rule);
+    });
+  };
+
+  // Explicit section-header totals fill only roots still unpriced by the answer key.
+  for (const section of params.sections || []) {
+    const printedTotal = sectionMarks.get(section.id);
+    if (printedTotal === undefined) continue;
+    const members = roots.filter(question => question.sectionId === section.id);
+    if (!members.length) continue;
+    const reserved = Number(members.filter(question => priced.has(question.id)).reduce((sum, question) => sum + (question.points || 0), 0).toFixed(2));
+    const unpriced = members.filter(question => !priced.has(question.id));
+    if (reserved > printedTotal + 0.01) {
+      flags.push(flag('POINTS_OVERFLOW', `Section ${section.index} answer-key marks (${reserved}) exceed explicit header total (${printedTotal}); key evidence will be proportionally reconciled to the immutable total.`, 'error'));
+      continue;
+    }
+    const residual = Number((printedTotal - reserved).toFixed(2));
+    if (unpriced.length && residual > 0) allocateEvenly(unpriced, residual, 'points-derived:header');
+    else if (!unpriced.length && residual > 0.01) {
+      flags.push(flag('POINTS_HEADER_RESIDUAL', `Section ${section.index} has ${residual.toFixed(2)} header points with no unpriced root to receive them.`, 'warn'));
+    }
+  }
+
+  const before = Number(roots.reduce((sum, question) => sum + (question.points || 0), 0).toFixed(2));
+  const target = typeof params.total === 'number' && Number.isFinite(params.total) && params.total > 0 ? Number(params.total.toFixed(2)) : undefined;
+  let rescaled = false;
+  if (target !== undefined) {
+    const pricedSum = Number(roots.filter(question => priced.has(question.id)).reduce((sum, question) => sum + (question.points || 0), 0).toFixed(2));
+    const unpriced = roots.filter(question => !priced.has(question.id));
+    const residual = Number((target - pricedSum).toFixed(2));
+    if (residual >= -0.01 && unpriced.length) {
+      allocateEvenly(unpriced, Math.max(0, residual), 'points-derived:residual');
+    } else if (residual < -0.01) {
+      // Source marks can conflict with the immutable printed document total. Scale only in this
+      // contradiction case, use largest remainder in printed order, and make the conflict loud.
+      const weightSum = pricedSum;
+      if (roots.length && weightSum > 0) {
+        const targetCents = Math.round(target * 100);
+        const allocations = roots.map((question, index) => {
+          const weight = priced.has(question.id) ? Math.max(0, question.points || 0) : 0;
+          const exactCents = targetCents * weight / weightSum;
+          const cents = Math.floor(exactCents);
+          return { question, index, cents, remainder: exactCents - cents };
+        });
+        let remainderCents = targetCents - allocations.reduce((sum, allocation) => sum + allocation.cents, 0);
+        for (const allocation of [...allocations].sort((a, b) => b.remainder - a.remainder || a.index - b.index).slice(0, remainderCents)) {
+          allocation.cents++;
+        }
+        for (const allocation of allocations) {
+          allocation.question.points = Number((allocation.cents / 100).toFixed(2));
+          rules.set(allocation.question.id, 'points-overflow-scaled');
+        }
+      }
+      rescaled = true;
+      flags.push(flag('POINTS_OVERFLOW', `Answer-key/section marks total ${pricedSum}, exceeding immutable document total ${target}; root marks were deterministically scaled to preserve the exact document total.`, 'error'));
+    } else if (residual > 0.01 && !unpriced.length && roots.length) {
+      // There is no unpriced root. Add the residual to existing source-derived marks rather than
+      // replacing them; cents are placed in printed order and the immutable total stays exact.
+      const totalCents = Math.round(residual * 100);
+      const baseCents = Math.floor(totalCents / roots.length);
+      let usedCents = 0;
+      roots.forEach((question, index) => {
+        const addCents = index === roots.length - 1 ? totalCents - usedCents : baseCents;
+        question.points = Number(((Math.round((question.points || 0) * 100) + addCents) / 100).toFixed(2));
+        usedCents += addCents;
+        rules.set(question.id, 'points-derived:residual');
+      });
+      flags.push(flag('POINTS_RESIDUAL_NO_UNPRICED_ROOT', `Document total had ${residual.toFixed(2)} residual but all roots were already priced; added residual across existing root marks in printed order.`, 'warn'));
+    } else if (unpriced.length) {
+      allocateEvenly(unpriced, 0, 'points-derived:residual');
+    }
+  }
+
+  for (const question of roots) {
+    if (!priced.has(question.id)) {
+      question.points = 0;
+      rules.set(question.id, 'points-unpriced');
+      flags.push(flag('POINTS_UNPRICED', `Question ${question.label} has no per-item key mark, explicit section-header allocation, or remaining document total; stored as 0.00 instead of a flat default.`, 'warn', question.id));
     }
   }
   for (const child of params.questions.filter(question => question.parentId)) child.points = 0;
-  const before = Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2));
-  let rescaled = false;
-  const target = params.total;
-  const adjustable = roots.filter(q => derived.has(q.id) && !fixed.has(q.id));
-  if (target !== undefined && target > 0 && Math.abs(before - target) > 0.51 && adjustable.length) {
-    const fixedSum = roots.filter(q => !adjustable.some(item => item.id === q.id)).reduce((sum, q) => sum + (q.points || 0), 0);
-    const adjustableSum = adjustable.reduce((sum, q) => sum + (q.points || 0), 0);
-    const residual = Math.max(0, target - fixedSum);
-    if (adjustableSum > 0) {
-      const scale = residual / adjustableSum;
-      adjustable.forEach(q => { q.points = Number(((q.points || 0) * scale).toFixed(2)); });
-      const afterRounded = adjustable.reduce((sum, q) => sum + (q.points || 0), 0);
-      const delta = Number((residual - afterRounded).toFixed(2));
-      if (adjustable.length) adjustable[adjustable.length - 1].points = Number(((adjustable[adjustable.length - 1].points || 0) + delta).toFixed(2));
-      rescaled = true;
-      flags.push(flag('POINTS_RESCALED', `Derived question points rescaled from ${before} to ${Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2))} to match the immutable document total ${target}; key/header-derived marks were held fixed.`, 'warn'));
-    }
+
+  const after = Number(roots.reduce((sum, question) => sum + (question.points || 0), 0).toFixed(2));
+  if (target !== undefined && Math.abs(after - target) > 0.01) {
+    flags.push(flag('POINTS_TOTAL_ASSERTION_FAILED', `Root points sum ${after.toFixed(2)} does not equal immutable document total ${target.toFixed(2)} within 0.01.`, 'error'));
   }
-  for (const q of params.questions) {
-    const keyDerived = keyMarks.has(q.no);
-    const headerDerived = fixed.has(q.id) && !keyDerived;
-    const rule = keyDerived ? 'points-derived:key' : unsafeExplicitPoints.has(q.id) ? 'points-invalid-preserved' : headerDerived ? 'points-derived:header' : 'points-derived:default';
-    const bounds = spanBounds(q.spans) || [1, 1];
-    const existingChain = q.receipt?.ruleChain || [];
+  for (const question of params.questions) {
+    const rule = rules.get(question.id) || (question.parentId ? 'points-derived:key-child' : 'points-unpriced');
+    const bounds = spanBounds(question.spans) || [1, 1];
+    const existingChain = question.receipt?.ruleChain || [];
     const nextChain = existingChain.includes(rule) ? [...existingChain] : [...existingChain, rule];
-    if (rescaled && !fixed.has(q.id) && !nextChain.includes('points-rescaled')) nextChain.push('points-rescaled');
-    q.receipt = { ...(q.receipt || { lineStart: bounds[0], lineEnd: bounds[1], ruleChain: [], ruleConfidence: 85 }), ruleChain: nextChain };
+    question.receipt = { ...(question.receipt || { lineStart: bounds[0], lineEnd: bounds[1], ruleChain: [], ruleConfidence: 85 }), ruleChain: nextChain };
   }
-  return { flags, rescaled, before, after: Number(roots.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2)) };
+  return { flags, rescaled, before, after };
 }
 
-function parsePrintedPoints(text: string): number | undefined {
+export function parsePrintedPoints(text: string): number | undefined {
   const normalized = normalizeForMatching(text);
-  const match = normalized.match(/(?:\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:نمره|points?|marks?)\s*[:：]?\s*(\d+(?:\.\d+)?))/i);
-  const value = Number(match?.[1] || match?.[2]);
-  return Number.isFinite(value) && value > 0 ? value : undefined;
+  // Do not promote ambiguous trailing digits (e.g. "3 Listening 1" or a score-column heading) to marks.
+  if (/(?:row|question|questions|ردیف|سوالات?)\s*[:：]?\s*(?:number|no\.?|شماره)?[\s\S]{0,35}(?:marks?|points?|نمره)/i.test(normalized)) return undefined;
+  const match = normalized.match(/\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:points?|marks?|نمره)\s*[:=：]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:points?|marks?)\b/i);
+  const value = Number(match?.[1] || match?.[2] || match?.[3]);
+  return Number.isFinite(value) && value > 0 ? Number(value.toFixed(2)) : undefined;
 }
 
 export function assembleAndValidateQuestions(
@@ -766,15 +901,35 @@ function assembleAndValidateQuestionsInner(
   for (const segment of options.segmentReceipts || []) {
     if (segment.kind !== 'group-parent' || !segment.childNos?.length) continue;
     const parentNo = Number(segment.printedNo);
+    const groupForm = segment.groupForm || 'matching';
+    const defaultGroupType = groupForm === 'matching' ? 'matching' : 'unknown';
     let parent = rawList.find(q => Number(q?.no) === parentNo && !q?.parentId);
     if (!parent && Number.isInteger(parentNo) && parentNo > 0) {
-      parent = { id: `q${parentNo}`, no: parentNo, label: String(parentNo), type: 'matching', spans: [[segment.startLine, segment.endLine]], confidence: 0.85 };
+      parent = { id: `q${parentNo}`, no: parentNo, label: String(parentNo), type: defaultGroupType, spans: [[segment.startLine, segment.endLine]], confidence: 0.85 };
       rawList.push(parent);
     }
     if (!parent) continue;
     const parentId = String(parent.id || `q${parentNo}`);
     parent.id = parentId;
-    if (segment.offsetSpan) {
+    parent.sectionId ||= segment.sectionId;
+    if (groupForm === 'dialogue') parent.type = 'fillblank';
+    else if (groupForm === 'matching') parent.type = 'matching';
+    else if (!parent.type) parent.type = defaultGroupType;
+    if (groupForm === 'enumeration') {
+      // The first enumerated item is the numbered root; combine it with the governing instruction.
+      // This keeps the root substantive without creating a phantom same-number child.
+      const firstItem = findIntraLineMultiNumbers(sourceByNo.get(segment.startLine)?.text || '').find(item => item.no === parentNo);
+      const parentSpans: LineSpan[] = [];
+      if (segment.offsetSpan) parentSpans.push(segment.offsetSpan);
+      if (firstItem) parentSpans.push({ line: segment.startLine, start: firstItem.charStart, end: firstItem.charEnd });
+      if (parentSpans.length) parent.spans = normalizedSpans(parentSpans);
+      else if (typeof segment.charStart === 'number' && typeof segment.charEnd === 'number') {
+        parent.spans = [{ line: segment.startLine, start: segment.charStart, end: segment.charEnd }];
+      } else {
+        // No safe governing instruction: keep only the first numbered item, never siblings.
+        parent.spans = firstItem ? [{ line: segment.startLine, start: firstItem.charStart, end: firstItem.charEnd }] : [{ line: segment.startLine, start: 0, end: 0 }];
+      }
+    } else if (segment.offsetSpan) {
       parent.spans = [segment.offsetSpan];
     } else if (typeof segment.charStart === 'number' && typeof segment.charEnd === 'number') {
       parent.spans = [{ line: segment.startLine, start: segment.charStart, end: segment.charEnd }];
@@ -790,9 +945,10 @@ function assembleAndValidateQuestionsInner(
       parent.options = undefined;
     }
     const explicitChildren = (options.segmentReceipts || []).filter(item => item.parentSegmentId === segment.id && item.printedNo !== undefined);
+    const allowsSameNumberChild = groupForm === 'dialogue' || groupForm === 'enumeration';
     const childNos = explicitChildren.length
-      ? explicitChildren.map(item => Number(item.printedNo)).filter(no => no !== parentNo)
-      : (segment.childNos || []).filter(no => Number(no) !== parentNo);
+      ? explicitChildren.map(item => Number(item.printedNo)).filter(no => allowsSameNumberChild || no !== parentNo)
+      : (segment.childNos || []).filter(no => allowsSameNumberChild || Number(no) !== parentNo);
 
     const groupLines: Array<{ lineNo: number; text: string }> = [];
     for (let ln = segment.startLine; ln <= segment.endLine; ln++) {
@@ -802,7 +958,7 @@ function assembleAndValidateQuestionsInner(
     const carvedGroupChildren = carveGroupChildSpans(groupLines, parentNo, childNos);
 
     for (const no of childNos) {
-      if (!Number.isInteger(no) || Number(no) <= 0 || Number(no) === parentNo) continue;
+      if (!Number.isInteger(no) || Number(no) <= 0 || (Number(no) === parentNo && !allowsSameNumberChild)) continue;
       const explicitChildSeg = explicitChildren.find(item => Number(item.printedNo) === no);
       let childSpans: LineSpan[] = [[segment.startLine, segment.endLine]];
       if (explicitChildSeg?.offsetSpan) {
@@ -824,6 +980,8 @@ function assembleAndValidateQuestionsInner(
 
       const existingChild = rawList.find(q => Number(q?.no) === no && q?.parentId === parentId);
       if (existingChild) {
+        existingChild.sectionId ||= parent.sectionId || segment.sectionId;
+        if (groupForm === 'dialogue') existingChild.type = 'fillblank';
         if (!normalizedSpans(existingChild.spans).some(spanHasOffsets) && childSpans.some(spanHasOffsets)) {
           existingChild.spans = childSpans;
         }
@@ -836,7 +994,7 @@ function assembleAndValidateQuestionsInner(
         if (!belongsToGroup) continue;
         existingRoot.parentId = parentId;
         existingRoot.sectionId ||= parent.sectionId;
-        existingRoot.type ||= parent.type || 'matching';
+        existingRoot.type = groupForm === 'dialogue' ? 'fillblank' : existingRoot.type || parent.type || 'matching';
         existingRoot.points = 0;
         existingRoot.spans = childSpans;
         delete existingRoot.charStart;
@@ -849,7 +1007,7 @@ function assembleAndValidateQuestionsInner(
         label: String(no),
         parentId,
         sectionId: parent.sectionId,
-        type: parent.type || 'matching',
+        type: groupForm === 'dialogue' ? 'fillblank' : parent.type || 'matching',
         spans: childSpans,
         points: 0,
         confidence: parent.confidence || 0.85,
@@ -919,6 +1077,11 @@ function assembleAndValidateQuestionsInner(
   rawList.forEach((rawInput, idx) => {
     const raw = rawInput && typeof rawInput === 'object' ? { ...rawInput } : {};
     const errors: string[] = [];
+    if (typeof raw.points === 'number' && (!Number.isFinite(raw.points) || raw.points < 0 || raw.points > 300)) {
+      const label = String(raw.label || raw.no || idx + 1);
+      delete raw.points;
+      flags.push(flag('MODEL_POINTS_IGNORED', `Question ${label}: out-of-range model point proposal was ignored; only source marks and deterministic residuals set points.`, 'info', typeof raw.id === 'string' ? raw.id : undefined));
+    }
     const parsed = RawQuestionSchema.safeParse(raw);
     if (!parsed.success) {
       const issues: any[] = (parsed.error as any).issues || [];
@@ -959,6 +1122,15 @@ function assembleAndValidateQuestionsInner(
     else if (Array.isArray(raw.spans) && originalSpans.length < raw.spans.length) errors.push('One or more source spans were malformed or exceeded the safe range limit.');
     const safe = sanitizeQuestionSpans(originalSpans, keyLines);
     let spans = safe.spans;
+    const rootSegment = (options.segmentReceipts || []).find(segment => !segment.parentSegmentId && (segment.printedNo === originalNo || segment.printedNo === Number(raw.no)));
+    const enumerationParent = !raw.parentId && rootSegment?.groupForm === 'enumeration';
+    if (!enumerationParent && spans.length) {
+      const demoted = demoteInstructionSpans(spans, sourceLines);
+      if (JSON.stringify(demoted) !== JSON.stringify(spans)) {
+        spans = demoted;
+        flags.push(flag('INSTRUCTION_SPANS_DEMOTED', `Question ${raw.label || qId}: instruction-only source span(s) were demoted from the question stem.`, 'info', qId));
+      }
+    }
     if (safe.clipped && spans.length === 0) {
       flags.push(flag('KEY_TERRITORY_EXCLUDED', `Question candidate ${raw.label || raw.no || qId} spanned only official answer-key lines and was excluded from question parsing.`, 'warn', qId));
       return;
@@ -1095,20 +1267,58 @@ function assembleAndValidateQuestionsInner(
     }
 
     let answer: Question['answer'];
+    let answerWasNumberOnly = false;
+    let answerRecoveredFromKey = false;
+    let answerExtended = false;
     if (raw.answer?.spans) {
       const rawAnswerSpans = normalizedSpans(raw.answer.spans);
-      const carvedAnswerSpans = carveGroupedAnswerSpans(rawAnswerSpans, sourceLines, no);
-      const answerUnmatched = carvedAnswerSpans === rawAnswerSpans && (() => {
-        const probe = normalizeForMatching(sliceSourceSpans(rawAnswerSpans, sourceLines));
+      const anchored = carveAnswerAnchor(rawAnswerSpans, sourceLines, no);
+      const grouped = anchored.matched ? anchored.spans : carveGroupedAnswerSpans(rawAnswerSpans, sourceLines, no);
+      let answerSpans = grouped;
+      let answerText = answerTextForSpans(answerSpans, sourceLines);
+      if (!anchored.matched && answerSpans === rawAnswerSpans) {
+        const probe = normalizeForMatching(answerText);
         const multiMatches = [...probe.matchAll(/(?:^|\s)(\d{1,3})\s*(?:[.)]\s+|[-–—:：]\s*)/g)].map(m => Number(m[1]));
-        return new Set(multiMatches).size >= 2 && !multiMatches.includes(no);
-      })();
-      let segText = sliceSourceSpans(carvedAnswerSpans, sourceLines);
-      const segExc = exciseWatermarksWithLearned(segText, learnedWatermarks);
-      if (segExc.excised) { segText = segExc.text; watermarkExcisionCount += segExc.count; perQuestionWatermark = true; }
-      answer = { spans: carvedAnswerSpans, text: segText, source: 'paper' };
-      if (answerUnmatched) flags.push(flag('ANSWER_SEGMENT_UNMATCHED', `Question ${label}: grouped answer line did not contain printed number ${no}; full line retained for review.`, 'info', qId));
+        if (new Set(multiMatches).size >= 2 && !multiMatches.includes(no)) {
+          flags.push(flag('ANSWER_SEGMENT_UNMATCHED', `Question ${label}: grouped answer line did not contain printed number ${no}; exact per-item key lookup attempted.`, 'info', qId));
+        }
+      }
+      answerWasNumberOnly = isNumberOnlyAnswer(answerText);
+      if (!answerText.trim() || answerWasNumberOnly) {
+        const recovered = findAnswerKeySpan(sourceLines, keyLines, no);
+        if (recovered) {
+          answerSpans = recovered;
+          answerText = answerTextForSpans(answerSpans, sourceLines);
+          answerRecoveredFromKey = true;
+          answerWasNumberOnly = false;
+        }
+      }
+      if (answerText.trim() && !isNumberOnlyAnswer(answerText)) {
+        const extended = extendIncompleteAnswer(answerSpans, sourceLines, keyLines);
+        answerSpans = extended.spans;
+        answerExtended = extended.extended;
+        answerText = answerTextForSpans(answerSpans, sourceLines);
+        const segExc = exciseWatermarksWithLearned(answerText, learnedWatermarks);
+        if (segExc.excised) { answerText = segExc.text; watermarkExcisionCount += segExc.count; perQuestionWatermark = true; }
+        answer = { spans: answerSpans, text: answerText, source: 'paper' };
+      }
+    } else {
+      const recovered = findAnswerKeySpan(sourceLines, keyLines, no);
+      if (recovered) {
+        let answerSpans = recovered;
+        const extended = extendIncompleteAnswer(answerSpans, sourceLines, keyLines);
+        answerSpans = extended.spans;
+        answerExtended = extended.extended;
+        answerRecoveredFromKey = true;
+        let answerText = answerTextForSpans(answerSpans, sourceLines);
+        const segExc = exciseWatermarksWithLearned(answerText, learnedWatermarks);
+        if (segExc.excised) { answerText = segExc.text; watermarkExcisionCount += segExc.count; perQuestionWatermark = true; }
+        if (answerText.trim() && !isNumberOnlyAnswer(answerText)) answer = { spans: answerSpans, text: answerText, source: 'paper' };
+      }
     }
+    if (answerRecoveredFromKey) flags.push(flag('ANSWER_KEY_ANCHOR_RECOVERED', `Question ${label}: answer re-sliced from its exact printed answer-key anchor.`, 'info', qId));
+    if (answerExtended) flags.push(flag('ANSWER_SPAN_EXTENDED', `Question ${label}: incomplete answer slice was extended to the same item's sentence boundary.`, 'info', qId));
+    if (answerWasNumberOnly && !answer) flags.push(flag('ANSWER_NUMBER_ONLY_MISSING', `Question ${label}: answer slice contained only a printed number; treated as missing.`, 'warn', qId));
 
     if (perQuestionWatermark) flags.push(flag('WATERMARK_STRIPPED', `Question ${label} had watermark substrings excised from sliced text.`, 'info', qId));
     const assembledTables = assembleTables(raw.tables, sourceLines, keyLines);
@@ -1160,9 +1370,16 @@ function assembleAndValidateQuestionsInner(
     if (confidence < 0.6) flags.push(flag('LOW_CONFIDENCE', `Question ${label} confidence calibrated to ${(confidence * 100).toFixed(0)}%.`, 'info', qId));
     if (unknownImageRefs.length) flags.push(flag('IMAGE_REFERENCE_UNRESOLVED', `Question ${label} references unresolved image(s): ${unknownImageRefs.map((i: any) => i.imageId).join(', ')}.`, 'warn', qId));
 
-    const segmentReceipt = (options.segmentReceipts || []).find(segment =>
-      (segment.printedNo === no || segment.printedNo === originalNo) && segment.startLine <= Math.max(...spanLineNumbers(spans)) && segment.endLine >= Math.min(...spanLineNumbers(spans))
-    ) || (options.segmentReceipts || []).find(segment => segment.parentSegmentId && segment.printedNo === no);
+    const segmentCandidates = (options.segmentReceipts || []).filter(segment =>
+      (segment.printedNo === no || segment.printedNo === originalNo) &&
+      segment.startLine <= Math.max(...(spanLineNumbers(spans).length ? spanLineNumbers(spans) : [segment.startLine])) &&
+      segment.endLine >= Math.min(...(spanLineNumbers(spans).length ? spanLineNumbers(spans) : [segment.startLine]))
+    );
+    const segmentReceipt = raw.parentId
+      ? segmentCandidates.find(segment => Boolean(segment.parentSegmentId)) || (options.segmentReceipts || []).find(segment => segment.parentSegmentId && segment.printedNo === no)
+      : rootSegment?.groupForm
+        ? rootSegment
+        : segmentCandidates.find(segment => !segment.parentSegmentId) || segmentCandidates[0];
     const receiptBounds = spanBounds([...spans, ...rawOptions.flatMap(option => option.spans)]) || [1, 1];
     const ruleChain = [...(segmentReceipt?.ruleChain || (raw.parentId ? ['multi-number-split'] : ['question-start']))];
     if (absorbedByKey.has(gapKey)) ruleChain.push('gap-absorbed');
@@ -1274,58 +1491,6 @@ function assembleAndValidateQuestionsInner(
       }
     }
   }
-  // E2/E3 — points derivation: ensure every question has a number, section sums reconcile
-  {
-    // Build section map for derivation
-    const sectionById = new Map<string, { points?: number; count: number }>();
-    for (const q of questions) {
-      const sid = q.sectionId || 'sec_1';
-      const cur = sectionById.get(sid) || { points: undefined, count: 0 };
-      cur.count++;
-      sectionById.set(sid, cur);
-    }
-    // Populate section points from options.sections if available (E1)
-    if (options.sections) {
-      for (const s of options.sections as any[]) {
-        const id = String(s.id || s.index || 'sec_1');
-        const pts = typeof s.points === 'number' ? s.points : undefined;
-        if (pts !== undefined) {
-          const cur = sectionById.get(id) || { count: 0 };
-          cur.points = pts;
-          sectionById.set(id, cur);
-        }
-      }
-    }
-    for (const q of questions) {
-      if (typeof q.points !== 'number') {
-        // Try section-derived
-        const sid = q.sectionId || 'sec_1';
-        const sec = sectionById.get(sid);
-        let derived: number | undefined;
-        if (sec?.points !== undefined && sec.count > 0) {
-          const per = Math.round((sec.points / sec.count) * 4) / 4;
-          // Remainder handling: last item gets remainder
-          const isLastInSection = questions.filter(x=> (x.sectionId||'sec_1')===sid).indexOf(q) === sec.count -1;
-          if (isLastInSection) {
-            const sumPrev = questions.filter(x=> (x.sectionId||'sec_1')===sid && x!==q).reduce((s,qq)=>s+(qq.points||per),0);
-            derived = Number((sec.points - sumPrev).toFixed(2));
-            if (derived <=0) derived = per;
-          } else {
-            derived = per;
-          }
-        } else {
-          derived = 0.5;
-        }
-        q.points = derived;
-        flags.push(flag('POINTS_DERIVED', `Q${q.no} points derived as ${derived} (E2 fallback).`, 'info', q.id));
-        q.flags = [...(q.flags||[]), 'POINTS_DERIVED'];
-      }
-    }
-    // Handle matching/group children: parent holds group total, children 0 unless per-item
-    // For now ensure roots sum logic; children already handled via parentId with 0 default? Keep as is.
-    // If parent has points and children have 0, no double count - invariant E3 checks roots only.
-  }
-
   questions.sort((a, b) => a.no - b.no || Number(Boolean(a.parentId)) - Number(Boolean(b.parentId)) || a.id.localeCompare(b.id));
 
   // 2A semantic validators (pure, 0 calls) — inside the single assembly funnel so
@@ -1388,10 +1553,7 @@ function cleanSectionTitle(value: string | undefined): string {
 }
 
 function parseSectionPoints(text: string): number | undefined {
-  const normalized = normalizeForMatching(text);
-  const match = normalized.match(/(?:\(\s*(\d+(?:\.\d+)?)\s*(?:points?|marks?|نمره)\s*\)|(?:نمره|points?|marks?)\s*[:：]?\s*(\d+(?:\.\d+)?))/i);
-  const n = Number(match?.[1] || match?.[2]);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
+  return parsePrintedPoints(text);
 }
 
 function isHeaderOrRowLine(text: string): boolean {
@@ -1499,8 +1661,7 @@ export function assembleAndValidateSections(
     const passage = passageExc.text;
     const storedPassage = passage.split(/\r?\n/).length >= 2 || passage.length >= 120 ? passage : undefined;
 
-    const pointHeader = headerLines.find(line => parseSectionPoints(line.text) !== undefined);
-    const points = typeof section?.points === 'number' ? section.points : pointHeader ? parseSectionPoints(pointHeader.text) : undefined;
+    const points = nearbyHeader ? parseSectionPoints(nearbyHeader.rawTitle) : undefined;
     const sectionQuestions = questions.filter(q => q.sectionId === id);
     const sectionSum = sectionQuestions.reduce((sum, q) => sum + (q.points || 0), 0);
     if (points !== undefined && Math.abs(points - sectionSum) > 0.51) flags.push(flag('SECTION_POINTS_MISMATCH', `Section ${indexValue} question points sum (${sectionSum}) differs from header points (${points}).`, 'info'));

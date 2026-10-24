@@ -28,6 +28,7 @@ import { Button, Kbd, Modal } from './design/primitives';
 import { StyleGuideView } from './design/StyleGuideView';
 import { UiLanguage, uiText } from './design/i18n';
 import { getExamHealth } from './pipeline/quality';
+import { revertTextRepairOverlays } from './pipeline/textRepair';
 
 export default function App() {
   const [currentStep, setCurrentStep] = useState<StepNumber>(1);
@@ -199,6 +200,12 @@ export default function App() {
     setUsageRecords(loadUsageLog());
     void refreshSummaries();
   };
+  const handleRevertTextRepair = (lineNo: number) => {
+    if (!examDoc?.source.lineRepairs?.[String(lineNo)]) return;
+    const reverted = revertTextRepairOverlays(examDoc, [lineNo]);
+    handleDocUpdated(reverted);
+    void saveExamDoc(reverted);
+  };
 
   const navigateToStep = useCallback((step: StepNumber) => {
     setAssistantMode('closed');
@@ -343,7 +350,7 @@ export default function App() {
         {currentStep === 2 && examDoc && <div className="ep-main-content"><ExamHealthBanner doc={examDoc} /></div>}
         <main id="main-content" tabIndex={-1} className="ep-main-content flex-1 pb-16">
           {currentStep === 1 && <Step1Import onDocumentLoaded={handleDocumentLoaded} onDemoLoaded={handleDemoLoaded} isLoading={false} cacheEnabled={settings.thrift.cacheEnabled} onOpenSavedExam={handleOpenExamFromLibrary} />}
-          {currentStep === 2 && extractedDoc && <Step2Source diagnostics={extractedDoc.diagnostics} lines={extractedDoc.lines} pages={extractedDoc.pages} ocrUsed={extractedDoc.ocrUsed} pageImages={extractedDoc.pageImages} pageThumbKeys={extractedDoc.pageThumbKeys} images={extractedDoc.images} fileHash={importedFileHash || undefined} taggedLines={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lines : undefined} focusLine={sourceFocusLine} orphanLineNos={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.orphanLineNos : undefined} onProceedToAnalyze={() => { setSourceFocusLine(undefined); setCurrentStep(3); setMaxReachedStep(prev => Math.max(prev, 3) as StepNumber); }} />}
+          {currentStep === 2 && extractedDoc && <Step2Source diagnostics={extractedDoc.diagnostics} lines={extractedDoc.lines} pages={extractedDoc.pages} ocrUsed={extractedDoc.ocrUsed} pageImages={extractedDoc.pageImages} pageThumbKeys={extractedDoc.pageThumbKeys} images={extractedDoc.images} fileHash={importedFileHash || undefined} taggedLines={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lines : undefined} lineRepairs={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lineRepairs : undefined} onRevertLineRepair={handleRevertTextRepair} focusLine={sourceFocusLine} orphanLineNos={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.orphanLineNos : undefined} onProceedToAnalyze={() => { setSourceFocusLine(undefined); setCurrentStep(3); setMaxReachedStep(prev => Math.max(prev, 3) as StepNumber); }} />}
           {currentStep === 3 && extractedDoc && <Step3Analyze extractedDoc={extractedDoc} rawFile={rawFile} answerKeyFile={answerKeyFile} settings={settings} stages={stages} onStagesUpdate={setStages} onAnalysisComplete={handleAnalysisComplete} isAnalyzing={isAnalyzing} setIsAnalyzing={setIsAnalyzing} fileHash={importedFileHash || undefined} onOpenSavedExam={handleOpenExamFromLibrary} />}
           {currentStep === 4 && examDoc && <Step4Review key={examDoc.id} examDoc={examDoc} settings={settings} onUpdateDoc={handleDocUpdated} onProceedToExamView={() => { setCurrentStep(5); setMaxReachedStep(5); }} retryRequest={retryRequest} onRetryRequestHandled={() => setRetryRequest(0)} onJumpToSource={extractedDoc && importedFileHash && examDoc.fileHash === importedFileHash ? (lineNo) => { setSourceFocusLine(lineNo); navigateToStep(2); } : undefined} />}
           {currentStep === 5 && examDoc && <Step5Exam defaultExamMode={settings.defaultExamMode} doc={examDoc} onUpdateDoc={handleDocUpdated} exportRequest={exportRequest} />}

@@ -1,5 +1,6 @@
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
+import { revertTextRepairOverlays } from '../pipeline/textRepair';
 import { formatSpans } from '../pipeline/spans';
 import React, { useEffect, useRef, useState } from 'react';
 import {
@@ -368,6 +369,13 @@ export const Step4Review: React.FC<Props> = ({
     saveExamDoc(newDoc);
   };
 
+  const handleRevertAllTextRepairs = () => {
+    if (!Object.keys(examDoc.source.lineRepairs || {}).length) return;
+    const updated = revertTextRepairOverlays(examDoc);
+    onUpdateDoc(updated);
+    saveExamDoc(updated);
+  };
+
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-6">
       {/* Control Bar */}
@@ -452,6 +460,15 @@ export const Step4Review: React.FC<Props> = ({
       </div>
 
       <ExamHealthBanner doc={examDoc} onJumpToSource={onJumpToSource} onExplainScore={(f)=> { if(f) setFilterType(f); setScoreExplain('Quality score: coverage 30 + points 15 + options 15 + images 15 + numbering 10 + confidence 6 + orphan lines 4 + passage 5'); }} />
+      {Object.keys(examDoc.source.lineRepairs || {}).length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-[10px] border border-[var(--accent)] bg-[var(--paper-raised)] text-xs">
+          <div><strong>{Object.keys(examDoc.source.lineRepairs || {}).length} Stage 2.75 text overlay(s)</strong> — proposed repairs are reversible; the original source lines remain stored and exported.</div>
+          <div className="flex items-center gap-2">
+            {onJumpToSource && <button type="button" onClick={() => onJumpToSource(Number(Object.keys(examDoc.source.lineRepairs || {})[0]))} className="px-2.5 py-1 rounded-[6px] border border-[var(--rule)]">Inspect first line</button>}
+            <button type="button" onClick={handleRevertAllTextRepairs} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] border border-[var(--danger)] text-[var(--danger)]"><RotateCcw className="w-3 h-3" /> Revert all</button>
+          </div>
+        </div>
+      )}
       {/* Proactive suggestions (F1): silent-by-default, dismissible, ≤3 chips */}
       {(() => {
         const chips = computeSuggestions(examDoc).filter(c=> !dismissedChips.has(c.id));

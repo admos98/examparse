@@ -37,6 +37,10 @@ export interface Segment {
   /** Deterministic rule provenance for the segment, independent of the model. */
   ruleChain?: string[];
   ruleConfidence?: number;
+  /** Explicit shared-context group subtype used by local canonicalization. */
+  groupForm?: 'dialogue' | 'enumeration' | 'matching';
+  /** Governing instruction line(s) used only as the enumerative parent's shared stem. */
+  parentStemLines?: number[];
 }
 
 const INTRA_LINE_PERSIAN = 'الف|ب|پ|ت|ث|ج|چ|د|ه|و';
@@ -104,6 +108,29 @@ function isGroupParentLine(text: string): { isGroup: boolean; parentNo?: number;
     return { isGroup: true, parentNo: nums[0], childNos: nums };
   }
   return { isGroup: false, childNos: [] };
+}
+
+interface NumberedBlankItem extends IntraLineItem {
+  lineNo: number;
+}
+
+function findNumberedBlankItems(lines: SourceLine[]): NumberedBlankItem[] {
+  const out: NumberedBlankItem[] = [];
+  for (const line of lines) {
+    const view = matchingView(line.text);
+    const re = /(?:^|\s)(\d{1,3})\s*(?:(?:[.)-])\s*)?(?:…{2,}|\.{2,}|_{2,}|\(\s*\))/gu;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(view.text))) {
+      const no = Number(match[1]);
+      if (!Number.isInteger(no) || no < 1 || no > 300) continue;
+      const startNorm = match.index + match[0].indexOf(match[1]);
+      const endNorm = match.index + match[0].length;
+      const start = view.originalOffset(startNorm);
+      const end = view.originalOffset(endNorm);
+      out.push({ no, marker: 'blank', charStart: start, charEnd: Math.max(start, end), lineNo: lineNumber(line) });
+    }
+  }
+  return out;
 }
 
 function isQuestionStart(line: SourceLine): number | undefined {
@@ -250,11 +277,58 @@ export function segmentDocument(params: {
         let runEnd = p;
         while (runEnd < toIdx && isPassageCandidate(bodyLines[runEnd])) runEnd++;
         const runLen = runEnd - p;
-        if (passageAllowed && runLen >= 3) {
+        if (passageAllowed && runLen >= 2) {
           const runLines = bodyLines.slice(p, runEnd);
           const avg = avgLength(runLines);
-          const dialogueCheck = runLines.every(l => /^\s*[A-Z]:/.test(l.text.trim()) || /^\s*(A|B)\s*:/i.test(l.text.trim()));
-          if (avg >= 35 || dialogueCheck || sawReadPrompt) {
+          const speakerTags = runLines.map(l => /^\s*([A-Z])\s*:/i.exec(l.text.trim())?.[1]?.toUpperCase()).filter(Boolean);
+          const hasSpeakerDialogue = new Set(speakerTags).size >= 2;
+          const blankItems = findNumberedBlankItems(runLines);
+          if (hasSpeakerDialogue && blankItems.length >= 2) {
+            const parentId = mkId();
+            const nums = runLines.map(lineNumber);
+            out.push({
+              id: parentId,
+              kind: 'group-parent',
+              startLine: nums[0],
+              endLine: nums[nums.length - 1],
+              printedNo: blankItems[0].no,
+              // The first printed blank is the numbered root itself; children are the remaining blanks.
+              childNos: blankItems.slice(1).map(item => item.no),
+              groupForm: 'dialogue',
+              sectionHint: range.title,
+              lines: nums,
+              sectionId: sectionIdForRange,
+              ruleChain: ['dialogue-group'],
+            });
+            const byLine = new Map<number, NumberedBlankItem[]>();
+            for (const item of blankItems) byLine.set(item.lineNo, [...(byLine.get(item.lineNo) || []), item]);
+            for (const item of blankItems.slice(1)) {
+              const source = byNo.get(item.lineNo)!;
+              const siblingsOnLine = byLine.get(item.lineNo) || [];
+              const siblingIndex = siblingsOnLine.indexOf(item);
+              const charStart = siblingsOnLine.length === 1 ? 0 : siblingIndex === 0 ? 0 : siblingsOnLine[siblingIndex - 1].charEnd;
+              const charEnd = siblingsOnLine.length === 1 ? source.text.length : siblingIndex + 1 < siblingsOnLine.length ? siblingsOnLine[siblingIndex + 1].charStart : source.text.length;
+              out.push({
+                id: `${parentId}_c${item.no}_${item.lineNo}`,
+                kind: 'question',
+                parentSegmentId: parentId,
+                startLine: item.lineNo,
+                endLine: item.lineNo,
+                printedNo: item.no,
+                charStart,
+                charEnd,
+                offsetSpan: { line: item.lineNo, start: charStart, end: charEnd },
+                groupForm: 'dialogue',
+                sectionHint: range.title,
+                lines: [item.lineNo],
+                sectionId: sectionIdForRange,
+                ruleChain: ['dialogue-group-child'],
+              });
+            }
+            p = runEnd;
+            continue;
+          }
+          if (runLen >= 3 && (avg >= 35 || sawReadPrompt)) {
             const nums = runLines.map(lineNumber);
             out.push({
               id: mkId(),
@@ -345,19 +419,26 @@ export function segmentDocument(params: {
       if (intraMulti.length >= 2) {
         const parentId = mkId();
         const lineNo = lineNumber(line);
-        const parentOffsetSpan: OffsetSpan | undefined = linesSlice.length === 1
-          ? { line: lineNo, start: intraMulti[0].charStart, end: intraMulti[0].charEnd }
-          : undefined;
+        let governingLineNo: number | undefined;
+        for (let prior = idx - 1; prior >= Math.max(0, idx - 5); prior--) {
+          if (questionIdxSet.has(prior)) break;
+          const priorLine = bodyLines[prior];
+          if (priorLine.tag === 'instruction' || isInstructionText(priorLine.text) || isRowSubInstruction(priorLine.text)) {
+            governingLineNo = lineNumber(priorLine);
+            break;
+          }
+        }
+        const parentContextText = governingLineNo ? byNo.get(governingLineNo)?.text || '' : '';
         initialQuestionSegments.push({
           id: parentId,
           kind: 'group-parent',
           startLine: linesSlice[0],
-          endLine: linesSlice[linesSlice.length-1],
+          endLine: linesSlice[linesSlice.length - 1],
           printedNo: intraMulti[0].no,
-          childNos: intraMulti.slice(1).map(it => it.no),
-          charStart: intraMulti[0].charStart,
-          charEnd: intraMulti[0].charEnd,
-          offsetSpan: parentOffsetSpan,
+          childNos: intraMulti.slice(1).map(item => item.no),
+          offsetSpan: governingLineNo ? { line: governingLineNo, start: 0, end: parentContextText.length } : undefined,
+          parentStemLines: governingLineNo ? [governingLineNo] : [],
+          groupForm: 'enumeration',
           sectionHint: range.title,
           lines: linesSlice,
           sectionId: sectionIdForRange,
@@ -376,6 +457,7 @@ export function segmentDocument(params: {
             sectionHint: range.title,
             lines: [lineNo],
             sectionId: sectionIdForRange,
+            groupForm: 'enumeration',
           });
         }
       } else if (groupInfo.isGroup) {
@@ -386,6 +468,7 @@ export function segmentDocument(params: {
           endLine: linesSlice[linesSlice.length-1],
           printedNo: qn ?? groupInfo.parentNo,
           childNos: groupInfo.childNos,
+          groupForm: 'matching',
           sectionHint: range.title,
           lines: linesSlice,
           sectionId: sectionIdForRange,
@@ -490,7 +573,10 @@ export function segmentDocument(params: {
   for (const segment of segments) {
     const isChild = Boolean(segment.parentSegmentId);
     segment.ruleChain = isChild
-      ? ['multi-number-split']
+      ? segment.groupForm === 'dialogue' ? ['dialogue-group-child'] : segment.groupForm === 'enumeration' ? ['enumerative-group-child'] : ['multi-number-split']
+      : segment.groupForm === 'dialogue' ? ['dialogue-group']
+      : segment.groupForm === 'enumeration' ? ['enumerative-group']
+      : segment.groupForm === 'matching' ? ['matching-group']
       : segment.kind === 'group-parent' ? ['group-parent']
       : segment.kind === 'question' ? ['question-start']
       : [`segment-${segment.kind}`];

@@ -8,7 +8,7 @@ import { ImageAsset, SourceLine } from '../types';
 import { computeImageDHash, hammingDistance, isNearUniformColor, sha256 } from '../utils/hash';
 import { saveImageBlob } from '../store';
 import { normalizeForMatching, normalizeStoredText, parsePrintedNumberFromStem, computeLineQuality } from './quality';
-import { columnSegments, tagFurniture, extractionDiagnostics, ExtractionDiagnostics } from './extractionQuality';
+import { columnSegments, tagFurniture, extractionDiagnostics, ExtractionDiagnostics, TextItemPosition, assemblePositionedTextItems } from './extractionQuality';
 import { isSuspectStrip, mergeAdjacentImageGeometry, materializeMergedCrop } from './imageGeometry';
 
 // #21: pdfjs-dist is loaded lazily inside extractPdf() only, so importing the
@@ -101,15 +101,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
     const textContent = await page.getTextContent();
     let pageCharCount = 0;
 
-    interface TextItemPos {
-      str: string;
-      x: number;
-      y: number;
-      w: number;
-      h: number;
-      dir: 'ltr' | 'rtl';
-    }
-
+    type TextItemPos = TextItemPosition;
     const items: TextItemPos[] = [];
     for (const item of textContent.items as any[]) {
       if (!item.str) continue;
@@ -159,29 +151,10 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
 
       const { segments: columnSegmentsForLine, ambiguous } = columnSegments(cluster, items, viewport.width / viewport.scale);
 
-      // For each segment: join fragments by x-gap (space only when gap > ~0.3x font height)
+      // Join by relative font-sized gaps; restore LTR English islands inside RTL lines.
       for (const segment of columnSegmentsForLine) {
-        let lineText = '';
-        for (let i = 0; i < segment.length; i++) {
-          const item = segment[i];
-          if (i === 0) {
-            lineText += item.str;
-          } else {
-            const prev = segment[i - 1];
-            const avgFontHeight = (prev.h + item.h) / 2 || 12;
-            const gap = isRtl
-              ? (prev.x - (item.x + item.w))
-              : (item.x - (prev.x + prev.w));
-
-            // Space only when gap > ~0.3x font height
-            if (gap > avgFontHeight * 0.3) {
-              lineText += ' ';
-            }
-            lineText += item.str;
-          }
-        }
-
-        const trimmed = lineText.trim();
+        const assembled = assemblePositionedTextItems(segment, isRtl);
+        const trimmed = assembled.text;
         if (!trimmed) continue;
 
         const normalizedStored = normalizeStoredText(trimmed);
@@ -190,7 +163,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
           id: lineId,
           page: pageNum,
           text: normalizedStored,
-          layoutWarning: ambiguous ? 'COLUMN_AMBIGUOUS_LEGACY_ORDER' : undefined,
+          layoutWarning: ambiguous ? 'COLUMN_AMBIGUOUS_LEGACY_ORDER' : assembled.reorderedEnglishIsland ? 'RTL_BIDI_LITE_ENGLISH_ISLAND' : undefined,
           y: segment[0].y,
           pageHeight: page.view[3] - page.view[1],
         });

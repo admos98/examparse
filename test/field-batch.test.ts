@@ -50,7 +50,7 @@ test('field R1: speaker labels stay in dialogue stems and model-reported grouped
   assert.equal(child?.stem, '(2)');
 });
 
-test('field R2: immutable document total beats a 52.5 question sum; defaults rescale to 48 rather than raising the total', () => {
+test('field R2: immutable document total beats model points; residual is allocated only to unpriced roots', () => {
   const lines: SourceLine[] = Array.from({ length: 106 }, (_, index) => source(index < 105 ? `${index + 1}. Question ${index + 1}` : 'جمع نمره: 48', `L${String(index + 1).padStart(4, '0')}`));
   const raw = Array.from({ length: 105 }, (_, index) => ({ id: `q${index + 1}`, no: index + 1, points: 0.5, type: 'short', spans: [[index + 1, index + 1]] }));
   assert.equal(raw.length * 0.5, 52.5);
@@ -59,25 +59,24 @@ test('field R2: immutable document total beats a 52.5 question sum; defaults res
   const total = reconcileMetaTotal(52.5, lines, [], assembled.questions);
   assert.equal(Number(sum.toFixed(2)), 48);
   assert.equal(total.totalPoints, 48);
-  assert.ok(assembled.flags.some(flag => flag.code === 'POINTS_RESCALED'));
+  assert.ok(assembled.flags.every(flag => flag.code !== 'POINTS_OVERFLOW'));
+  assert.ok(assembled.questions.every(question => question.receipt?.ruleChain.includes('points-derived:residual')));
   assert.ok(!assembled.flags.some(flag => flag.message.includes('raised to the question sum')));
 });
 
-test('field R2: section header points divide exactly with the final-item remainder', () => {
-  const lines = [source('1. one'), source('2. two', 'L0002'), source('3. three', 'L0003'), source('جمع نمره: 2', 'L0004')];
-  const assembled = assembleAndValidateQuestions([1,2,3].map(no => ({ id: `q${no}`, no, sectionId: 'sec_1', spans: [[no,no]], type: 'short' })), lines, 2, {
+test('field R2: source section-header points divide exactly with the final-item remainder; model points are ignored', () => {
+  const lines = [
+    source('1 | Vocabulary (2 points)'),
+    source('1. one', 'L0002'), source('2. two', 'L0003'), source('3. three', 'L0004'), source('جمع نمره: 2', 'L0005'),
+  ];
+  const assembled = assembleAndValidateQuestions([1,2,3].map(no => ({ id: `q${no}`, no, sectionId: 'sec_1', points: no === 1 ? -1 : 77, spans: [[no + 1,no + 1]], type: 'short' })), lines, 99, {
     gapCompletion: false,
-    sections: [{ id: 'sec_1', index: 1, title: 'Section', points: 2, spans: [[1,3]] }],
+    sections: [{ id: 'sec_1', index: 1, title: 'Vocabulary', points: 99, spans: [[1,5]] }],
   });
   assert.deepEqual(assembled.questions.map(question => question.points), [0.66,0.66,0.68]);
   assert.ok(assembled.questions.every(question => question.receipt?.ruleChain.includes('points-derived:header')));
-
-  const invalid = assembleAndValidateQuestions([
-    { id: 'q1', no: 1, sectionId: 'sec_1', points: -1, spans: [[1,1]], type: 'short' },
-    { id: 'q2', no: 2, sectionId: 'sec_1', spans: [[2,2]], type: 'short' },
-  ], lines, 2, { gapCompletion: false, sections: [{ id: 'sec_1', index: 1, title: 'Section', points: 2, spans: [[1,3]] }] });
-  assert.equal(invalid.questions.find(question => question.no === 1)?.points, -1);
-  assert.equal(invalid.questions.find(question => question.no === 2)?.points, 2);
+  assert.ok(assembled.flags.some(flag => flag.code === 'MODEL_POINTS_IGNORED'), 'out-of-range model points are demoted, not allowed to block the question');
+  assert.equal(assembled.questions.reduce((sum, question) => sum + (question.points || 0), 0), 2);
 });
 
 test('field R3: descending intra-line numbering is emitted as an ascending parent plus children', () => {

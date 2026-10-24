@@ -8,8 +8,11 @@ import { PARSER_VERSION } from './prompts';
 import { getPipelineCache, setPipelineCache, savePageThumbBlobs, getImageBlob } from '../store';
 import { sha256 } from '../utils/hash';
 
+/** Bumped whenever PDF text-run assembly changes, independently of structure prompt versioning. */
+export const EXTRACTION_VERSION = 'extract-v4-relative-gap-bidi-lite';
+
 export function extractionCacheKey(fileHash: string): string {
-  return `extract:${fileHash}:${PARSER_VERSION}`;
+  return `extract:${fileHash}:${EXTRACTION_VERSION}:${PARSER_VERSION}`;
 }
 
 interface CachedExtraction {

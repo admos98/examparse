@@ -482,7 +482,13 @@ export function evaluateCoverage(
   }
   const parsedNumbers = [...counts.keys()].sort((a, b) => a - b);
   const missing = expected.filter(n => !counts.has(n));
-  const duplicates = [...counts].filter(([, count]) => count > 1).map(([n]) => n).sort((a, b) => a - b);
+  const duplicates = [...counts].filter(([n, count]) => {
+    if (count <= 1) return false;
+    const matches = questions.filter(q => (parsePrintedNumberFromStem(q.stem) ?? Number(q.no)) === n);
+    const roots = matches.filter(q => !q.parentId);
+    // A parent plus its own children is one structural item, not duplicate content.
+    return !(roots.length === 1 && (roots[0] as any).id && matches.every(q => q === roots[0] || q.parentId === (roots[0] as any).id));
+  }).map(([n]) => n).sort((a, b) => a - b);
   const pointsParsed = Number(questions.reduce((sum, q) => sum + (Number((q as any).points) || 0), 0).toFixed(2));
   const pointDeficit = totalPoints === undefined ? 0 : Number((totalPoints - pointsParsed).toFixed(2));
   const pointsMatch = totalPoints === undefined || Math.abs(pointDeficit) <= 0.51;

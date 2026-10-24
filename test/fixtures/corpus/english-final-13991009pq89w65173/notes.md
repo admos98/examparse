@@ -14,3 +14,11 @@
     8. `L0221`: `Writing` (`8 Writing 18`)
 - **Extraction provenance & ordering choice (Part A2)**: `source-lines.json` has been regenerated to match the actual `323`-line (`L0001..L0323`) y-band field extraction shipped in real exports (`English — 11_structured (2).json`), replacing the earlier unmerged `360`-line plain-text dump. Where the raw text dump split same-row table cells (`نمره` mark column, center prompt/header, `ردیف` row ordinal, masthead URL/page number, and duplicate diagonal watermarks) onto separate lines, field LTR row ordering (`<points> <title/instruction> <row>`) and 8-page assignment (`p1..p6` exam, `p7..p8` answer key) are preferred and preserved deterministically with zero lost text.
 - **Evidence-only point gate (Part D)**: Q67's older `4`-point spot-check was not backed by an explicit per-item key mark or an unambiguous section-header mark in these stored source lines. With model-provided point defaults ignored, its deterministic residual allocation is `1.86` while the 48-point document total remains exact. This is fallback (`English — 11_structured (2).json`) evidence, not the missing requested 12 export.
+
+## Answer-side discipline acceptance
+
+Q25's exact **0.5** mark is sourced from key L0258 (`هر پاسخ صحیح … ) 5 (./ نمره`),
+with items 25–30 on L0259. The spot check now pins that source-backed mark rather than
+Q67's old **1.86** residual allocation (which was not a printed per-item mark).
+Residual allocation can change as more explicit key marks are recognized; the immutable
+48-point sum remains gated, as do Q63's long type and answer-text furniture hygiene.

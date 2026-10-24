@@ -332,6 +332,8 @@ export async function saveExamDoc(
   doc: ExamDoc,
   expectedContentHash?: string,
 ): Promise<void> {
+  const { reconcileFinalFlags, repairImageReferences } = await import('../pipeline/reviewIntegrity');
+  Object.assign(doc, reconcileFinalFlags(repairImageReferences(doc)));
   // C1/C2 — invariant gate at the single save funnel. Persistence is NOT endorsement:
   // error-severity violations DEMOTE the doc to visibly PARTIAL (persisted marker + banner
   // naming violating codes/question numbers) and the save proceeds normally. The gate
@@ -479,6 +481,15 @@ export async function saveImageBlob(key: string, blob: Blob): Promise<void> {
       `Failed to save image to folder storage (HTTP ${res.status})`,
     );
   return;
+}
+
+/** Review must distinguish absent bytes from a temporary storage failure. */
+export async function getReviewImageBlob(key: string): Promise<Blob | undefined> {
+  if (!SAFE_STORAGE_KEY.test(key)) return undefined;
+  const response = await fetch(`/api/images/${encodeURIComponent(key)}`);
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw new Error(`Image storage HTTP ${response.status}`);
+  return response.blob();
 }
 
 export async function getImageBlob(key: string): Promise<Blob | undefined> {

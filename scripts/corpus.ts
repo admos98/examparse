@@ -420,8 +420,14 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
         sections: defs as ExamSection[],
       });
       const gated = applyLocalGates({ questions: assembled.questions, rawSections: defs, lines, keyLines, metaTotalPoints: total });
+      if (exam === ACCEPTANCE_ID && gated.questions.some(q => /نمره/.test(normalizeForMatching(q.answer?.text || '')))) throw new Error('Answer contains key furniture');
       return gated;
     };
+
+    if (exam === ACCEPTANCE_ID) {
+      const keyStatement = lines.find(line => line.id === 'L0258');
+      if (!keyStatement || !normalizeForMatching(keyStatement.text).includes('هر پاسخ صحیح')) throw new Error('Q25 mark evidence missing at L0258');
+    }
 
     // Base profile — the lazy scripted model every corpus/bench fixture already uses.
     const base = runScripted(false);

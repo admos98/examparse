@@ -61,6 +61,7 @@ test('pipeline saves page-aware image-id repairs for duplicate extraction assets
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = init?.method || (typeof input === 'object' && 'method' in input ? input.method : 'GET');
+    if (url.startsWith('/api/images/')) return new Response(new Blob(['fixture image'], { type: 'image/png' }));
     if (url.startsWith('/api/exams/')) {
       if (method === 'GET') return new Response(JSON.stringify({ error: 'not found' }), { status: 404 });
       if (method === 'PUT') {

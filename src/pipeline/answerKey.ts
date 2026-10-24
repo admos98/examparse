@@ -1,6 +1,7 @@
 /** Deterministic per-item answer-key anchors and bounded answer-span completion. */
 import type { LineSpan, OffsetSpan, SourceLine } from '../types';
-import { matchingView, normalizeForMatching } from './quality';
+import { exciseWatermarks, matchingView, normalizeForMatching } from './quality';
+import { isInstructionText } from './cleanup';
 import { isOffsetSpan } from './spans';
 
 export interface PrintedAnswerAnchor {
@@ -16,7 +17,7 @@ function sourceNo(line: SourceLine): number {
 export function printedAnswerAnchors(text: string): PrintedAnswerAnchor[] {
   const view = matchingView(text || '');
   const out: PrintedAnswerAnchor[] = [];
-  const re = /(?:^|\s)(?:\((\d{1,3})\)|(\d{1,3}))\s*(?:[.)]|[-–—:：])\s*/gu;
+  const re = /(?:^|\s)(?:\((\d{1,3})\)|(\d{1,3}))\s*(?:[.)]|[-–—:：])(?!\d)\s*/gu;
   let match: RegExpExecArray | null;
   while ((match = re.exec(view.text))) {
     const token = match[1] || match[2];
@@ -81,6 +82,7 @@ export function carveAnswerAnchor(spans: LineSpan[], lines: SourceLine[], no: nu
 
 /** Find the exact printed answer anchor for an item, never borrowing a sibling answer. */
 export function findAnswerKeySpan(lines: SourceLine[], keyLines: Set<number>, no: number): LineSpan[] | undefined {
+  if (!keyLines.size) return undefined;
   const sorted = [...lines].sort((a, b) => sourceNo(a) - sourceNo(b));
   for (const line of sorted) {
     if (!keyLines.has(sourceNo(line)) || line.tag === 'junk' || line.furniture) continue;
@@ -111,8 +113,26 @@ function isIncompleteTail(text: string): boolean {
   return /(?:\b(?:and|or|but|because|which|that|who|whom|whose|to|of|in|on|at|with|for|from|by|as|is|are|was|were|be|been|being|has|have|had|the|a|an|this|these|those|than|into|over|under|after|before|when|while|if|although|such|very|too|not)|[,;:])\s*$/iu.test(value);
 }
 
+/** All offsets remain in the original source's coordinate space. */
 function nextAnchorStart(text: string, from: number): number | undefined {
-  return printedAnswerAnchors(text).find(anchor => anchor.start >= from)?.start;
+  const view = matchingView(text);
+  const barriers = [...printedAnswerAnchors(text).map(anchor => anchor.start)];
+  const re = /(?:\(?[\d./]+\)?\s*نمره|[()]\s*(?:[./][\d./]+|\d+[./][\d./]+)\s*[()]|[()]\s*\d+\s*[()]\s*نمره|هر\s*پاسخ\s*صحیح|(?:listening|vocabulary|grammar|reading|writing)\b|راهنمای\s*تصحیح)/giu;
+  for (const match of view.text.matchAll(re)) barriers.push(view.originalOffset(match.index!));
+  return barriers.filter(offset => offset >= from).sort((a, b) => a - b)[0];
+}
+
+export function isKeyInstruction(text: string): boolean {
+  const value = normalizeForMatching(text).replace(/^\s*\d+\s*[.)-]?\s*/, '');
+  return (/\s/.test(value.trim()) && isInstructionText(value)) || /^(?:هر\s*(?:پاسخ|کدام)|همکار|در\s*این\s*بخش)/u.test(value);
+}
+
+/** Slice-time furniture removal shared by every answer path, not an export scrub. */
+export function cleanAnswerText(text: string): string {
+  const clean = exciseWatermarks(text).text;
+  const view = matchingView(clean);
+  const furniture = /(?:\d+\s*نمره|نمره|هر\s*پاسخ\s*صحیح|[()]\s*(?:[./][\d./]+|\d+[./][\d./]+)\s*[()]|[()]\s*\d+\s*[()]\s*نمره)/u.exec(view.text);
+  return (furniture ? clean.slice(0, view.originalOffset(furniture.index)) : clean).trim();
 }
 
 /** Extend a truncated answer only through the same key item, stopping at the next printed anchor. */
@@ -129,10 +149,12 @@ export function extendIncompleteAnswer(spans: LineSpan[], lines: SourceLine[], k
   let end = isOffsetSpan(last) ? (last.end ?? lastLine.text.length) : lastLine.text.length;
   const start = isOffsetSpan(last) ? (last.start ?? 0) : 0;
   let gathered = textForSpans(out, lines);
-  if (!gathered || hasSentenceEnd(gathered)) return { spans: out, extended };
+  if (!gathered || isKeyInstruction(gathered) || hasSentenceEnd(gathered)) return { spans: out, extended };
 
   const bound = nextAnchorStart(lastLine.text, end);
   const sameLineEnd = bound ?? lastLine.text.length;
+  const existingBarrier = nextAnchorStart(lastLine.text, start);
+  if (existingBarrier !== undefined && existingBarrier < end) return { spans: out, extended };
   if (sameLineEnd > end && (isIncompleteTail(gathered) || end < lastLine.text.length)) {
     if (isOffsetSpan(last)) out[lastIndex] = { ...last, end: sameLineEnd };
     else out[lastIndex] = { line: lastNo, start, end: sameLineEnd } as OffsetSpan;
@@ -147,7 +169,7 @@ export function extendIncompleteAnswer(spans: LineSpan[], lines: SourceLine[], k
     const nextLine = byNo.get(nextNo);
     if (!nextLine || !keyLines.has(nextNo) || nextLine.furniture) break;
     const anchors = printedAnswerAnchors(nextLine.text);
-    if (anchors.length) break;
+    if (anchors.length || nextAnchorStart(nextLine.text, 0) !== undefined || isKeyInstruction(nextLine.text)) break;
     const nextText = nextLine.text.trim();
     if (!nextText) continue;
     // A continuation line starts lower-case or with punctuation; a fresh heading/answer is a hard stop.
@@ -161,5 +183,5 @@ export function extendIncompleteAnswer(spans: LineSpan[], lines: SourceLine[], k
 }
 
 export function answerTextForSpans(spans: LineSpan[], lines: SourceLine[]): string {
-  return textForSpans(spans, lines);
+  return cleanAnswerText(textForSpans(spans, lines));
 }

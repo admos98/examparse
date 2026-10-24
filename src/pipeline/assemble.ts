@@ -30,7 +30,7 @@ import {
   maskWatermarksSameLength,
 } from './spans';
 import { canonicalizeForms } from './forms';
-import { answerTextForSpans, carveAnswerAnchor, extendIncompleteAnswer, findAnswerKeySpan, isNumberOnlyAnswer, printedAnswerAnchors } from './answerKey';
+import { isKeyInstruction, answerTextForSpans, carveAnswerAnchor, extendIncompleteAnswer, findAnswerKeySpan, isNumberOnlyAnswer, printedAnswerAnchors } from './answerKey';
 
 export const OffsetSpanReferenceSchema = z.object({
   line: z.number().int().positive(),
@@ -631,6 +631,8 @@ function isSubset(a: Question, b: Question): boolean {
 function normalizeRtlDecimalMarks(text: string): string {
   return text
     .replace(/\)\s*5\s*\(\s*[./]+/g, '(0.5) ')
+    .replace(/\)\s*(\d+(?:\s*\/\s*\d+)?)\s*\(/g, '($1)')
+    .replace(/[./]\s*\/\s*(\d{1,2})|\.\s*\/\s*(\d{1,2})/g, (_, a, b) => `0.${a || b}`)
     .replace(/\(\s*5\s*\/\s*0\s*\)|\)\s*5\s*\/\s*0\s*\(/g, '(0.5)')
     .replace(/\(\s*25\s*\/\s*0\s*\)|\)\s*25\s*\/\s*0\s*\(/g, '(0.25)')
     .replace(/\(\s*75\s*\/\s*0\s*\)|\)\s*75\s*\/\s*0\s*\(/g, '(0.75)')
@@ -681,12 +683,26 @@ function marksFromAnswerKey(lines: SourceLine[], keyLines: Set<number>): AnswerK
       if (Number.isFinite(mark) && mark > 0 && mark <= 100) perItem.set(Number(match[1]), mark);
     }
 
-    const genericMark = text.match(/(?:each\s+(?:correct\s+)?(?:answer|question|item|blank)|per\s+(?:item|question|blank)|هر\s*(?:پاسخ|سوال|مورد|جای\s*خالی))[\s\S]{0,60}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/i);
+    const genericMark = text.match(/(?:each\s+(?:correct\s+)?(?:answer|question|item|blank)|per\s+(?:item|question|blank)|پاسخ\s*صحیح|هر\s*(?:پاسخ|سوال|مورد|جای\s*خالی))[\s\S]{0,60}?\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*(?:marks?|points?|نمره)/i);
     const hasSpecificItemRef = /(?:questions?|question|سوال(?:ات)?)\s*\d{1,3}/i.test(text);
+    const standaloneMark = text.match(/^\s*\(?\s*(\d+(?:\.\d+)?)\s*\)?\s*نمره\s*$/);
+    if (standaloneMark) activeMark = Number(standaloneMark[1]);
+    const parentheticalMark = text.match(/(?:هر\s*(?:پاسخ|کدام)|پاسخ\s*صحیح)[\s\S]{0,40}?\(\s*(\d+(?:\.\d+)?)\s*\)\s*نمره/i);
+    if (/^(?:listening|vocabulary|grammar|reading|writing)\b/i.test(text)) activeMark = undefined;
+    if (parentheticalMark && !hasSpecificItemRef) activeMark = Number(parentheticalMark[1]);
     if (genericMark && !hasSpecificItemRef) {
       const parsedMark = Number(genericMark[1]);
       if (Number.isFinite(parsedMark) && parsedMark > 0 && parsedMark <= 100) activeMark = parsedMark;
     }
+
+    // An explicit mark on an item's own segment outranks the section default.
+    const itemAnchors = printedAnswerAnchors(text);
+    itemAnchors.forEach((anchor, index) => {
+      const body = text.slice(anchor.bodyStart, itemAnchors[index + 1]?.start ?? text.length);
+      const itemMark = body.match(/\(\s*(\d+\.\d+)\s*\)\s*(?:نمره|marks?|points?)?|\(\s*(\d+)\s*\)\s*(?:نمره|marks?|points?)|(?<![\d.])(\d+(?:\.\d+)?)\s*(?:نمره|marks?|points?)/i);
+      const value = Number(itemMark?.[1] || itemMark?.[2] || itemMark?.[3]);
+      if (value > 0 && value <= 100) perItem.set(anchor.no, value);
+    });
 
     // A bare "N. answer" line inherits the nearest explicit per-item mark instruction.
     // Instruction/mark lines are not themselves answer anchors.
@@ -1270,11 +1286,13 @@ function assembleAndValidateQuestionsInner(
     let answerWasNumberOnly = false;
     let answerRecoveredFromKey = false;
     let answerExtended = false;
+    let answerInstructionSuspect = false;
     if (raw.answer?.spans) {
       const rawAnswerSpans = normalizedSpans(raw.answer.spans);
       const anchored = carveAnswerAnchor(rawAnswerSpans, sourceLines, no);
       const grouped = anchored.matched ? anchored.spans : carveGroupedAnswerSpans(rawAnswerSpans, sourceLines, no);
       let answerSpans = grouped;
+      answerInstructionSuspect = isKeyInstruction(sliceSourceSpans(answerSpans, sourceLines));
       let answerText = answerTextForSpans(answerSpans, sourceLines);
       if (!anchored.matched && answerSpans === rawAnswerSpans) {
         const probe = normalizeForMatching(answerText);
@@ -1288,6 +1306,7 @@ function assembleAndValidateQuestionsInner(
         const recovered = findAnswerKeySpan(sourceLines, keyLines, no);
         if (recovered) {
           answerSpans = recovered;
+          answerInstructionSuspect = isKeyInstruction(sliceSourceSpans(answerSpans, sourceLines));
           answerText = answerTextForSpans(answerSpans, sourceLines);
           answerRecoveredFromKey = true;
           answerWasNumberOnly = false;
@@ -1306,6 +1325,7 @@ function assembleAndValidateQuestionsInner(
       const recovered = findAnswerKeySpan(sourceLines, keyLines, no);
       if (recovered) {
         let answerSpans = recovered;
+        answerInstructionSuspect = isKeyInstruction(sliceSourceSpans(answerSpans, sourceLines));
         const extended = extendIncompleteAnswer(answerSpans, sourceLines, keyLines);
         answerSpans = extended.spans;
         answerExtended = extended.extended;
@@ -1315,6 +1335,11 @@ function assembleAndValidateQuestionsInner(
         if (segExc.excised) { answerText = segExc.text; watermarkExcisionCount += segExc.count; perQuestionWatermark = true; }
         if (answerText.trim() && !isNumberOnlyAnswer(answerText)) answer = { spans: answerSpans, text: answerText, source: 'paper' };
       }
+    }
+    if (answerInstructionSuspect || (answer && isKeyInstruction(answer.text || ''))) {
+      answer = undefined;
+      answerExtended = false;
+      flags.push(flag('ANSWER_ANCHOR_SUSPECT', `Question ${label}: key instructions are not an answer; please check the key.`, 'warn', qId));
     }
     if (answerRecoveredFromKey) flags.push(flag('ANSWER_KEY_ANCHOR_RECOVERED', `Question ${label}: answer re-sliced from its exact printed answer-key anchor.`, 'info', qId));
     if (answerExtended) flags.push(flag('ANSWER_SPAN_EXTENDED', `Question ${label}: incomplete answer slice was extended to the same item's sentence boundary.`, 'info', qId));
@@ -1655,11 +1680,12 @@ export function assembleAndValidateSections(
     if (trimmed.long) flags.push(flag('SECTION_INSTRUCTIONS_LONG', `Section ${indexValue} instructions exceed 400 characters after trimming.`, 'info'));
 
     const questionLineSet = new Set(questions.filter(q => q.sectionId === id).flatMap(q => spanLineNumbers([...q.spans, ...(q.options || []).flatMap(o => o.spans), ...(q.tables || []).flatMap(table => table.spans)])));
-    const areaLines = sectionLines.filter(line => !questionLineSet.has(lineNoFromId(line.id)) && !keyLines.has(lineNoFromId(line.id)) && !isHeaderOrRowLine(line.text) && !isInstructionLine(line.text) && cleanSectionTitle(line.text) !== title);
+    const questionRanges = questions.filter(q => q.sectionId === id).map(q => spanBounds(q.spans)).filter((b): b is [number, number] => !!b);
+    const areaLines = sectionLines.filter(line => !questionRanges.some(([lo, hi]) => lineNoFromId(line.id) >= lo && lineNoFromId(line.id) <= hi) && !questionLineSet.has(lineNoFromId(line.id)) && !keyLines.has(lineNoFromId(line.id)) && !isHeaderOrRowLine(line.text) && !isInstructionLine(line.text) && cleanSectionTitle(line.text) !== title);
     const passageRaw = areaLines.map(line => line.text.trim()).filter(Boolean).join('\n').trim();
     const passageExc = passageRaw ? exciseWatermarks(passageRaw) : { text: passageRaw, excised: false };
     const passage = passageExc.text;
-    const storedPassage = passage.split(/\r?\n/).length >= 2 || passage.length >= 120 ? passage : undefined;
+    const storedPassage = !isKeyInstruction(passage) && (passage.split(/\r?\n/).length >= 2 || passage.length >= 120) ? passage : undefined;
 
     const points = nearbyHeader ? parseSectionPoints(nearbyHeader.rawTitle) : undefined;
     const sectionQuestions = questions.filter(q => q.sectionId === id);

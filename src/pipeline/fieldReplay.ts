@@ -262,6 +262,7 @@ export function replayFieldExport(
     'WORD-BANK': 0,
     UNSCRAMBLE: 0,
     DIALOGUE: 0,
+    'WRITING-TOPICS': 0,
   };
   for (const rq of replayedQuestions) {
     const chain = rq.receipt?.ruleChain || [];

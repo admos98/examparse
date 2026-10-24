@@ -289,6 +289,7 @@ export async function runTextRepairStage(params: {
     return result;
   }
 
+  delete result.stats.skippedReason;
   const candidateByNo = new Map(candidates.map(candidate => [candidate.lineNo, candidate]));
   const entries = new Map<number, TextRepairCacheEntry>();
   const cacheKeys = new Map<number, string>();

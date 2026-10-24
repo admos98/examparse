@@ -42,7 +42,8 @@ export type FormName =
   | 'MATCHING-POOL'
   | 'WORD-BANK'
   | 'UNSCRAMBLE'
-  | 'DIALOGUE';
+  | 'DIALOGUE'
+  | 'WRITING-TOPICS';
 
 export const FORM_EXECUTION_ORDER: readonly FormName[] = [
   'TRUEFALSE',
@@ -51,6 +52,7 @@ export const FORM_EXECUTION_ORDER: readonly FormName[] = [
   'WORD-BANK',
   'UNSCRAMBLE',
   'DIALOGUE',
+  'WRITING-TOPICS',
 ] as const;
 
 export const FORM_RULE_ID: Record<FormName, string> = {
@@ -60,6 +62,7 @@ export const FORM_RULE_ID: Record<FormName, string> = {
   'WORD-BANK': 'form:word-bank',
   'UNSCRAMBLE': 'form:unscramble',
   'DIALOGUE': 'form:dialogue',
+  'WRITING-TOPICS': 'form:writing-topics',
 };
 
 export interface FormApplicationDelta {
@@ -1172,6 +1175,18 @@ export function canonicalizeForms(params: {
   applyWordBankForm(workingQuestions, sourceLines, lineMap, flags, appliedRulesByQ);
   applyUnscrambleForm(workingQuestions, sourceLines, lineMap, flags, appliedRulesByQ);
   applyDialogueForm(workingQuestions, sourceLines, lineMap, flags, appliedRulesByQ);
+
+  for (const parent of workingQuestions.filter(q => !q.parentId)) {
+    const section = workingSections.find(s => s.id === parent.sectionId);
+    if (!/writing/i.test(section?.title || '')) continue;
+    const children = workingQuestions.filter(q => q.parentId === parent.id);
+    if (!children.length) continue;
+    const body = [parent, ...children].map(q => q.stem || '').join('\n');
+    if (!/(?:^|\s)[a-d][).]\s*\S/imu.test(body)) continue;
+    applyTypeFromForm(parent, 'long', 'WRITING-TOPICS', flags);
+    ensureRule(parent, FORM_RULE_ID['WRITING-TOPICS']);
+    appliedRulesByQ.set(parent.id, [...(appliedRulesByQ.get(parent.id) || []), FORM_RULE_ID['WRITING-TOPICS']]);
+  }
 
   // If scoped to specific question IDs, keep untouched questions verbatim while allowing scoped questions + their group children to update.
   if (params.scopeQuestionIds && params.scopeQuestionIds.size > 0) {

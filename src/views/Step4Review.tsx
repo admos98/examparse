@@ -1,3 +1,7 @@
+import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences } from '../pipeline/reviewIntegrity';
+import { IntegrityFlags } from '../components/IntegrityFlags';
+import { triageFlags } from '../utils/flagPresentation';
+import { getReviewImageBlob } from '../store';
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
 import { revertTextRepairOverlays } from '../pipeline/textRepair';
@@ -46,7 +50,40 @@ interface Props {
   onJumpToSource?: (lineNo: number) => void;
 }
 
-export const Step4Review: React.FC<Props> = ({
+export const Step4Review: React.FC<Props> = (props) => {
+  const [ready, setReady] = useState<{ input: ExamDoc; doc: ExamDoc } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const imageIdentity = (doc: ExamDoc) => JSON.stringify(doc.images.map(image => [image.id, image.blobKey]));
+  const assetsReady = ready?.input.id === props.examDoc.id && imageIdentity(ready.input) === imageIdentity(props.examDoc);
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    if (assetsReady) return;
+    prepareReviewDocument(props.examDoc, getReviewImageBlob).then(doc => {
+      if (cancelled) return;
+      setReady({ input: props.examDoc, doc });
+      const facts = (value: ExamDoc) => JSON.stringify([value.images.map(({ dataUrl, ...image }) => image), value.questions.map(q => q.images), value.flags]);
+      if (facts(doc) !== facts(props.examDoc)) {
+        props.onUpdateDoc(doc);
+        void saveExamDoc(doc).catch(() => setError('The reviewed exam could not be saved; please try again.'));
+      }
+    })
+      .catch(() => { if (!cancelled) setError('Image storage could not be checked. Please reopen this exam when storage is available.'); });
+    return () => { cancelled = true; };
+  }, [props.examDoc]);
+  if (!ready || !assetsReady) return <p role="status" className="p-6">{error || 'Preparing your questions and images…'}</p>;
+  // Keep editing state mounted on question/label edits; only new asset identities need I/O.
+  const images = props.examDoc.images.flatMap(image => {
+    const resolved = ready.doc.images.find(asset => asset.id === image.id && asset.blobKey === image.blobKey);
+    return resolved ? [{ ...image, dataUrl: resolved.dataUrl }] : [];
+  });
+  const absenceFlags = ready.doc.flags.filter(flag => flag.code === 'IMAGE_ASSET_ABSENT' && !props.examDoc.flags.some(existing => existing.id === flag.id));
+  const reviewed = reconcileFinalFlags(repairImageReferences({ ...props.examDoc, images, flags: [...props.examDoc.flags, ...absenceFlags] }, props.examDoc.images));
+  return <>{error && <p role="alert" className="p-4 text-[var(--danger)]">{error}</p>}<Step4ReviewContent {...props} examDoc={reviewed} /></>;
+
+};
+
+const Step4ReviewContent: React.FC<Props> = ({
   examDoc,
   settings,
   onUpdateDoc,
@@ -97,6 +134,8 @@ export const Step4Review: React.FC<Props> = ({
   for (const questions of Object.values(questionsBySection)) questions.sort((a, b) => (a.confidence ?? 1) - (b.confidence ?? 1) || a.no - b.no);
 
   const health = getExamHealth(examDoc);
+  const attention = triageFlags(examDoc.flags).attention;
+  const checkCount = new Set(attention.filter(f => f.questionId).map(f => f.questionId)).size;
 
   const handleRetryMissingCoverage = async () => {
     if (retryingCoverage || health.missing.length === 0) return;
@@ -378,6 +417,15 @@ export const Step4Review: React.FC<Props> = ({
 
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-6">
+      <section className="p-4 rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] space-y-3">
+        <h1 className="font-bold text-sm">{health.parsedCount} of {health.expectedCount} questions · {health.pointsParsed} of {health.pointsExpected ?? health.pointsParsed} points · {health.unplacedImages.length} images to place · {checkCount} questions to check</h1>
+        <button className="px-4 py-2 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] text-xs font-semibold" onClick={() => {
+          if (health.unplacedImages.length) document.getElementById('unplaced-images')?.scrollIntoView({ behavior: 'smooth' });
+          else if (attention.length || health.missing.length) { setShowFlagsPanel(true); document.getElementById('review-issues')?.scrollIntoView({ behavior: 'smooth' }); }
+          else onProceedToExamView();
+        }}>{health.unplacedImages.length ? 'Place images' : attention.length || health.missing.length ? 'Review questions' : 'Preview & Print'}</button>
+      </section>
+      <details><summary className="cursor-pointer text-xs text-[var(--ink-2)]">Editing tools & exam details</summary>
       {/* Control Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 ">
         <div>
@@ -385,7 +433,7 @@ export const Step4Review: React.FC<Props> = ({
             Question Bank Review & Editor
           </h1>
           <p className="text-xs text-[var(--ink-2)]">
-            {examDoc.questions.length} questions • {examDoc.sections.length} sections • {examDoc.flags.length} flags
+            {examDoc.questions.length} questions · {examDoc.sections.length} sections
           </p>
         </div>
 
@@ -446,7 +494,7 @@ export const Step4Review: React.FC<Props> = ({
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5 text-[var(--warn-ink)]" />
-            <span>Flags ({examDoc.flags.length})</span>
+            <span>{attention.length} things need attention</span>
           </button>
 
           <button
@@ -469,6 +517,7 @@ export const Step4Review: React.FC<Props> = ({
           </div>
         </div>
       )}
+      </details>
       {/* Proactive suggestions (F1): silent-by-default, dismissible, ≤3 chips */}
       {(() => {
         const chips = computeSuggestions(examDoc).filter(c=> !dismissedChips.has(c.id));
@@ -500,6 +549,7 @@ export const Step4Review: React.FC<Props> = ({
       {pendingBulkDelete && <ConfirmCard title={settings.uiLanguage === 'fa' ? 'حذف پرسش‌های انتخاب‌شده؟' : 'Delete selected questions?'} description={settings.uiLanguage === 'fa' ? `تعداد ${selectedIds.size} پرسش حذف می‌شود. این تغییر قابل بازگردانی است.` : `${selectedIds.size} selected question(s) will be removed. This change can be undone.`} confirmLabel={settings.uiLanguage === 'fa' ? 'حذف پرسش‌ها' : 'Delete questions'} cancelLabel={settings.uiLanguage === 'fa' ? 'لغو' : 'Cancel'} danger onConfirm={() => { const { doc: next, undo } = applyBulk(examDoc, [...selectedIds], { type: 'delete' }); setUndoSnapshot(undo); onUpdateDoc(next); saveExamDoc(next); setSelectedIds(new Set()); setPendingBulkDelete(false); }} onCancel={() => setPendingBulkDelete(false)} />}
       {undoSnapshot && selectedIds.size===0 && <div className="text-xs flex items-center gap-2"><span>Bulk change applied.</span><button onClick={()=> { const prev=JSON.parse(undoSnapshot); onUpdateDoc(prev); saveExamDoc(prev); setUndoSnapshot(null); }} className="px-2 py-1 rounded-[6px] border text-xs font-semibold">Undo</button></div>}
       {health.missing.length > 0 && (
+        <details><summary className="cursor-pointer text-xs">Coverage details</summary>
         <div className="rounded-[10px] border border-[var(--danger)] bg-[var(--danger-soft)] p-4 text-xs text-[var(--danger)]   ">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div><strong>PARTIAL COVERAGE — {health.missing.length} expected question(s) are missing.</strong><div className="mt-1">Missing printed numbers: {health.missing.join(', ')}. This document remains incomplete and exports require confirmation.</div></div>
@@ -510,13 +560,14 @@ export const Step4Review: React.FC<Props> = ({
           {retryProgress && <div role="status" className="mt-2 font-mono">{retryProgress}</div>}
           {coverageError && <div role="alert" className="mt-2 font-semibold">{coverageError}</div>}
         </div>
+        </details>
       )}
       {health.unplacedImages.length > 0 && (
         <section className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-4 text-xs  ">
-          <h2 className="font-bold text-[var(--warn-ink)] ">Unplaced image assets ({health.unplacedImages.length}) — none are hidden</h2>
+          <h2 id="unplaced-images" className="font-bold text-[var(--warn-ink)] ">Unplaced image assets ({health.unplacedImages.length}) — none are hidden</h2>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{health.unplacedImages.map(image => (
             <div key={image.id} className="flex gap-3 rounded-[10px] border border-[var(--warn)] bg-[var(--paper-raised)] p-2  ">
-              {image.dataUrl ? <img src={image.dataUrl} alt={image.id} className="h-16 w-20 object-contain rounded-[6px] bg-[var(--paper)]" /> : <div className="flex h-16 w-20 items-center justify-center rounded-[6px] border border-dashed border-[var(--warn)] text-[length:var(--type-12)]">Missing asset</div>}
+              <img src={image.dataUrl} alt={image.label?.caption || image.id} className="h-16 w-20 object-contain rounded-[6px] bg-[var(--paper)]" />
               <div className="min-w-0 flex-1"><div className="font-mono font-bold">{image.id} · page {image.page}</div><div className="truncate text-[var(--ink-2)]">{image.label?.caption || 'Unassigned extracted image'}</div><label className="mt-1 block text-[length:var(--type-12)]">Assign to question<select value="" onChange={event => event.target.value && handleAssignImage(image.id, event.target.value)} className="mt-1 w-full rounded-[6px] border border-[var(--warn)] bg-[var(--paper-raised)] p-1 "><option value="">Choose question…</option>{examDoc.questions.filter(question => !question.parentId).map(question => <option key={question.id} value={question.id}>Q{question.label} — {(question.stem || '').slice(0, 60)}</option>)}</select></label></div>
             </div>
           ))}</div>
@@ -537,46 +588,12 @@ export const Step4Review: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Flags Panel (§4 & §6.3) */}
-      {showFlagsPanel && examDoc.flags.length > 0 && (
-        <div className="bg-[var(--warn-soft)]  border border-[var(--warn)]  rounded-[10px] p-4 space-y-2 text-xs">
-          <div className="font-bold text-[var(--warn-ink)]  flex items-center justify-between">
-            <span className="flex items-center gap-1.5">
-              <ShieldAlert className="w-4 h-4 text-[var(--warn-ink)]" />
-              <span>Integrity Flags ({examDoc.flags.length})</span>
-            </span>
-            <button onClick={() => setShowFlagsPanel(false)} className="text-[var(--warn-ink)] hover:text-[var(--warn-ink)]">
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {examDoc.flags.map(f => (
-              <div
-                key={f.id}
-                className="p-2.5 rounded-[10px] bg-[var(--paper-raised)]  border border-[var(--warn)]  flex items-start gap-2"
-              >
-                <span
-                  className={`text-[length:var(--type-12)] font-mono px-1.5 py-0.5 rounded-[6px] uppercase font-semibold shrink-0 ${
-                    f.severity === 'error'
-                      ? 'bg-[var(--danger-soft)] text-[var(--danger)]'
-                      : f.severity === 'warn'
-                      ? 'bg-[var(--warn-soft)] text-[var(--warn-ink)]'
-                      : 'bg-[var(--paper)] text-[var(--accent-ink)]'
-                  }`}
-                >
-                  {f.code}
-                </span>
-                <span className="text-[var(--ink)]  leading-snug">{f.message}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <div id="review-issues">{showFlagsPanel && <IntegrityFlags doc={examDoc} />}</div>
 
       {/* 2F Provenance — per-question Trace disclosure + 2B critic verdict badges */}
       {(((examDoc as any).traces?.length || Object.keys((examDoc as any).verdicts || {}).length) ? (
-        <div className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 space-y-2 text-xs">
-          <div className="font-bold text-[var(--ink)] ">Provenance — Trace & Critic verdicts</div>
+        <details className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 space-y-2 text-xs">
+          <summary className="cursor-pointer font-bold text-[var(--ink)] ">Provenance — Trace & Critic verdicts</summary>
           <div className="space-y-1.5">
             {examDoc.questions.map(q => {
               const trace = ((examDoc as any).traces || []).find((t: any) => t.questionId === q.id);
@@ -602,7 +619,7 @@ export const Step4Review: React.FC<Props> = ({
               );
             })}
           </div>
-        </div>
+        </details>
       ) : null)}
 
       {/* Local Image Manager Modal / Panel */}

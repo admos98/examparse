@@ -1,3 +1,5 @@
+import { getReviewImageBlob } from '../store';
+import { prepareReviewDocument } from './reviewIntegrity';
 /**
  * Main Pipeline Orchestrator (§6)
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
@@ -1279,6 +1281,7 @@ export async function runFullPipeline(
   // C5: resolve extraction collisions only after assembly, when source-page context
   // can safely rewrite question references as well as image metadata and flags.
   examDoc = validateAndFixDuplicateImageIds(examDoc).doc;
+  examDoc = await prepareReviewDocument(examDoc, getReviewImageBlob);
 
   // C2 — a finished parse always persists. Any error-severity violation that survived the
   // deterministic fixes demotes this doc to visibly PARTIAL (persisted `partial` marker +

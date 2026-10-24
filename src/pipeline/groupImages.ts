@@ -34,6 +34,18 @@ export function distributeGroupImages(questions: Question[], images: ImageAsset[
       continue;
     }
     const moveRefs = parent.images.filter(ref => ref.role !== 'decoration');
+    const mismatch = moveRefs.filter(ref => assetById.has(ref.imageId)).length !== children.length;
+    if (moveRefs.length && moveRefs.length < children.length) {
+      const pages = new Set(moveRefs.map(ref => assetById.get(ref.imageId)?.page).filter(page => page !== undefined));
+      const claimed = new Set(next.flatMap(q => q.images.map(ref => ref.imageId)));
+      const candidates = images.filter(image => pages.has(image.page) && !claimed.has(image.id) && !image.label?.questionRef && image.label?.role !== 'decoration' && image.label?.kind !== 'decoration')
+        .sort((a, b) => a.page - b.page || a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x || a.id.localeCompare(b.id));
+      for (const image of candidates.slice(0, children.length - moveRefs.length)) moveRefs.push({ imageId: image.id, role: 'stem', anchorLine: image.anchorLine });
+    }
+    if (mismatch) moveRefs.sort((a, b) => {
+      const x = assetById.get(a.imageId), y = assetById.get(b.imageId);
+      return (x?.page || 0) - (y?.page || 0) || (x?.bbox.y || 0) - (y?.bbox.y || 0) || (x?.bbox.x || 0) - (y?.bbox.x || 0);
+    });
     if (!moveRefs.length) continue;
 
     const retainedRefs = parent.images.filter(ref => ref.role === 'decoration');
@@ -70,12 +82,12 @@ export function distributeGroupImages(questions: Question[], images: ImageAsset[
       let target = labelPointsToParent ? undefined : children.find(child => child.id === asset.label?.questionRef || child.label === asset.label?.questionRef || labelNos.includes(child.no));
       let usedFallback = false;
       const anchor = ref.anchorLine ?? asset.anchorLine;
-      if (!target && anchor !== undefined) {
+      if (!target && anchor !== undefined && !mismatch) {
         target = [...children].sort((a, b) => childLineDistance(a, anchor) - childLineDistance(b, anchor) || a.no - b.no || a.id.localeCompare(b.id))[0];
         usedFallback = true;
       }
       if (!target) {
-        target = children[distributed % children.length];
+        target = children.find(child => !child.images.some(image => image.role !== 'decoration')) || children[seen.size % children.length];
         usedFallback = true;
       }
       if (!target) {
@@ -98,6 +110,10 @@ export function distributeGroupImages(questions: Question[], images: ImageAsset[
       });
     }
     parent.images = retainedRefs;
+    for (const child of children.filter(child => !child.images.some(ref => ref.role !== 'decoration'))) {
+      flags.push({ id: `flag_GROUP_IMAGE_DISTRIBUTION_UNASSIGNED_${parent.id}_${child.id}`, code: 'GROUP_IMAGE_DISTRIBUTION_UNASSIGNED', severity: 'warn', questionId: child.id,
+        message: `Q${child.no}: no remaining same-page image candidate; check the shared parent or source.` });
+    }
   }
   return { questions: next, flags, distributed, fallback, unassigned };
 }

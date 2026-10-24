@@ -5,7 +5,7 @@
  */
 import { ExtractedDocument, extractDocument } from './extract';
 import { PARSER_VERSION } from './prompts';
-import { getPipelineCache, setPipelineCache, savePageThumbBlobs, getImageBlob } from '../store';
+import { getPipelineCache, setPipelineCache, savePageThumbBlobs, getImageBlob, getReviewImageBlob, saveSourceFile } from '../store';
 import { sha256 } from '../utils/hash';
 
 /** Bumped whenever PDF text-run assembly changes, independently of structure prompt versioning. */
@@ -45,26 +45,45 @@ export async function getOrExtractDocument(
 ): Promise<{ extracted: ExtractedDocument; fileHash: string; fromCache: boolean }> {
   const fileHash = opts?.fileHash || (await sha256(await file.arrayBuffer()));
   const useCache = opts?.useCache !== false;
+  void saveSourceFile(fileHash, file, file.name);
 
   if (useCache) {
     const cached = await getPipelineCache<CachedExtraction>(extractionCacheKey(fileHash));
     if (cached && Array.isArray(cached.lines)) {
-      const pageThumbKeys = cached.pageThumbKeys || [];
-      return {
-        extracted: {
-          diagnostics: cached.diagnostics,
-          lines: cached.lines,
-          images: cached.images || [],
-          scannedPageIndices: cached.scannedPageIndices || [],
-          pages: cached.pages,
-          ocrUsed: cached.ocrUsed,
-          fileName: cached.fileName || file.name,
-          pageImages: pageThumbKeys.length > 0 ? await resolveThumbUrls(pageThumbKeys) : [],
-          pageThumbKeys,
-        },
-        fileHash,
-        fromCache: true,
-      };
+      const cachedImages = cached.images || [];
+      let allBlobsPresent = true;
+      for (const img of cachedImages) {
+        if (!img.blobKey) {
+          allBlobsPresent = false;
+          break;
+        }
+        const blob = await getReviewImageBlob(img.blobKey).catch(() => undefined);
+        if (!blob) {
+          allBlobsPresent = false;
+          break;
+        }
+      }
+      if (allBlobsPresent) {
+        const pageThumbKeys = cached.pageThumbKeys || [];
+        return {
+          extracted: {
+            diagnostics: cached.diagnostics,
+            lines: cached.lines,
+            images: cachedImages.map(img => ({
+              ...img,
+              dataUrl: `/api/images/${encodeURIComponent(img.blobKey)}`,
+            })),
+            scannedPageIndices: cached.scannedPageIndices || [],
+            pages: cached.pages,
+            ocrUsed: cached.ocrUsed,
+            fileName: cached.fileName || file.name,
+            pageImages: pageThumbKeys.length > 0 ? await resolveThumbUrls(pageThumbKeys) : [],
+            pageThumbKeys,
+          },
+          fileHash,
+          fromCache: true,
+        };
+      }
     }
   }
 

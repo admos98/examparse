@@ -20,7 +20,7 @@ import { Step4Review } from './views/Step4Review';
 import { Step5Exam } from './views/Step5Exam';
 import { LibraryView } from './views/LibraryView';
 import { AppSettings, ExamDoc, StageStatus, UsageRecord } from './types';
-import { hydrateServerStorage, loadExamDoc, loadSettings, saveSettings, loadUsageLog, saveExamDoc, getStorageBackend, listExamSummaries, ExamSummary } from './store';
+import { hydrateServerStorage, loadExamDoc, loadSettings, saveSettings, loadUsageLog, saveExamDoc, getStorageBackend, getSourceFile, listExamSummaries, ExamSummary } from './store';
 import { ExtractedDocument } from './pipeline/extract';
 import { createDemoExamDoc } from './pipeline/demoData';
 import { CommandPalette } from './design/CommandPalette';
@@ -76,7 +76,15 @@ export default function App() {
       setStorageDir(info.dir || '');
       setStorageError(info.error ? (language === 'fa' ? 'پوشه داده محلی در دسترس نیست.' : 'The local data folder is unavailable.') : '');
     }).catch(() => setStorageError(language === 'fa' ? 'بررسی فضای ذخیره‌سازی محلی ممکن نشد.' : 'Could not check local storage.'));
-    const listener = () => setStorageError(language === 'fa' ? 'عملیات ذخیره‌سازی محلی ناموفق بود. پوشه داده را بررسی و دوباره تلاش کنید.' : 'A local storage operation failed. Check the configured data folder and try again.');
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent)?.detail;
+      const detailText = typeof detail === 'string' ? detail : typeof detail?.message === 'string' ? detail.message : '';
+      if (detailText.includes('PARTIAL-STORAGE')) {
+        setStorageError(detailText);
+        return;
+      }
+      setStorageError(language === 'fa' ? 'عملیات ذخیره‌سازی محلی ناموفق بود. پوشه داده را بررسی و دوباره تلاش کنید.' : 'A local storage operation failed. Check the configured data folder and try again.');
+    };
     window.addEventListener('storage-error', listener);
     return () => window.removeEventListener('storage-error', listener);
   }, [language]);
@@ -167,6 +175,11 @@ export default function App() {
     });
     const dummyBlob = new Blob([demo.source.lines.map(line => line.text).join('\n')], { type: 'text/plain' });
     setRawFile(new File([dummyBlob], demo.source.fileName, { type: 'text/plain' }));
+    if (demo.fileHash) {
+      void getSourceFile(demo.fileHash, demo.source.fileName).then(stored => {
+        if (stored) setRawFile(stored);
+      });
+    }
     setUsageRecords(demo.usage);
     setCurrentStep(4);
     setMaxReachedStep(5);
@@ -352,7 +365,7 @@ export default function App() {
           {currentStep === 1 && <Step1Import onDocumentLoaded={handleDocumentLoaded} onDemoLoaded={handleDemoLoaded} isLoading={false} cacheEnabled={settings.thrift.cacheEnabled} onOpenSavedExam={handleOpenExamFromLibrary} />}
           {currentStep === 2 && extractedDoc && <Step2Source diagnostics={extractedDoc.diagnostics} lines={extractedDoc.lines} pages={extractedDoc.pages} ocrUsed={extractedDoc.ocrUsed} pageImages={extractedDoc.pageImages} pageThumbKeys={extractedDoc.pageThumbKeys} images={extractedDoc.images} fileHash={importedFileHash || undefined} taggedLines={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lines : undefined} lineRepairs={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lineRepairs : undefined} onRevertLineRepair={handleRevertTextRepair} focusLine={sourceFocusLine} orphanLineNos={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.orphanLineNos : undefined} onProceedToAnalyze={() => { setSourceFocusLine(undefined); setCurrentStep(3); setMaxReachedStep(prev => Math.max(prev, 3) as StepNumber); }} />}
           {currentStep === 3 && extractedDoc && <Step3Analyze extractedDoc={extractedDoc} rawFile={rawFile} answerKeyFile={answerKeyFile} settings={settings} stages={stages} onStagesUpdate={setStages} onAnalysisComplete={handleAnalysisComplete} isAnalyzing={isAnalyzing} setIsAnalyzing={setIsAnalyzing} fileHash={importedFileHash || undefined} onOpenSavedExam={handleOpenExamFromLibrary} />}
-          {currentStep === 4 && examDoc && <Step4Review key={examDoc.id} examDoc={examDoc} settings={settings} onUpdateDoc={handleDocUpdated} onProceedToExamView={() => { setCurrentStep(5); setMaxReachedStep(5); }} retryRequest={retryRequest} onRetryRequestHandled={() => setRetryRequest(0)} onJumpToSource={extractedDoc && importedFileHash && examDoc.fileHash === importedFileHash ? (lineNo) => { setSourceFocusLine(lineNo); navigateToStep(2); } : undefined} />}
+          {currentStep === 4 && examDoc && <Step4Review key={examDoc.id} examDoc={examDoc} rawFile={rawFile} settings={settings} onUpdateDoc={handleDocUpdated} onProceedToExamView={() => { setCurrentStep(5); setMaxReachedStep(5); }} retryRequest={retryRequest} onRetryRequestHandled={() => setRetryRequest(0)} onJumpToSource={extractedDoc && importedFileHash && examDoc.fileHash === importedFileHash ? (lineNo) => { setSourceFocusLine(lineNo); navigateToStep(2); } : undefined} />}
           {currentStep === 5 && examDoc && <Step5Exam defaultExamMode={settings.defaultExamMode} doc={examDoc} onUpdateDoc={handleDocUpdated} exportRequest={exportRequest} />}
         </main>
       </React.Fragment>}

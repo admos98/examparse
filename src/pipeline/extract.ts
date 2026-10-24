@@ -37,11 +37,21 @@ function multiplyTransform(m1: number[], m2: number[]): number[] {
   ];
 }
 
-export async function extractDocument(file: File): Promise<ExtractedDocument> {
+export interface ExtractDocumentOptions {
+  /** Re-extract only the specified 1-based page numbers (used by per-image Restore from source). */
+  onlyPages?: number[];
+  /** Skip immediate folder-storage writes when caller handles persistence explicitly. */
+  skipPersistence?: boolean;
+}
+
+export async function extractDocument(
+  file: File,
+  options?: ExtractDocumentOptions,
+): Promise<ExtractedDocument> {
   const extension = file.name.split('.').pop()?.toLowerCase();
 
-  const result = extension === 'pdf' ? await extractPdf(file)
-    : extension === 'docx' ? await extractDocx(file)
+  const result = extension === 'pdf' ? await extractPdf(file, options)
+    : extension === 'docx' ? await extractDocx(file, options)
     : ['jpg', 'jpeg', 'png', 'webp'].includes(extension || '') ? await extractSingleImageScan(file)
     : await extractPlainText(file);
   result.lines = tagFurniture(result.lines, result.pages);
@@ -60,7 +70,7 @@ export async function extractDocument(file: File): Promise<ExtractedDocument> {
 /**
  * PDF Extraction with layout-aware line sorting, direction, columns & embedded image extraction
  */
-async function extractPdf(file: File): Promise<ExtractedDocument> {
+async function extractPdf(file: File, options?: ExtractDocumentOptions): Promise<ExtractedDocument> {
   const pdfjsLib = await import('pdfjs-dist');
   try {
     pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -82,8 +92,10 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
   let globalLineNumber = 1;
   let rawAssetCounter = 0;
   let imagesFound = 0; let imagesMerged = 0; let candidatesKept = 0;
+  const pageFilter = options?.onlyPages?.length ? new Set(options.onlyPages) : null;
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    if (pageFilter && !pageFilter.has(pageNum)) continue;
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: 1.5 });
 
@@ -391,8 +403,23 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         if (!questionAnchored) finalAsset.imageFlags.push('IMAGE_UNANCHORED');
         console.warn(`IMAGE_SUSPECT_STRIP retained for review: ${finalAsset.id} on page ${pageNum} (${(finalAsset.bbox.w / viewport.scale).toFixed(1)}×${(finalAsset.bbox.h / viewport.scale).toFixed(1)}pt); ${questionAnchored ? 'question-anchored' : 'unanchored asset remains visible'}.`);
       }
-      if (finalAsset._blob) await saveImageBlob(finalAsset.blobKey, finalAsset._blob);
+      const rawBlob = finalAsset._blob;
       const { _blob: _discard, ...serializable } = finalAsset;
+      if (rawBlob) {
+        Object.defineProperty(serializable, '_blob', {
+          value: rawBlob,
+          enumerable: false,
+          configurable: true,
+        });
+        if (!options?.skipPersistence) {
+          try {
+            await saveImageBlob(finalAsset.blobKey, rawBlob);
+          } catch (err) {
+            console.warn(`Image blob write deferred to save boundary for ${finalAsset.blobKey}:`, err);
+            serializable.storageMissing = true;
+          }
+        }
+      }
       images.push(serializable);
     }
   }
@@ -481,7 +508,7 @@ export function mergeExtractedPageImages(
 /**
  * DOCX Extraction using mammoth + JSZip with real dimensions & document order anchors
  */
-async function extractDocx(file: File): Promise<ExtractedDocument> {
+async function extractDocx(file: File, options?: ExtractDocumentOptions): Promise<ExtractedDocument> {
   const arrayBuffer = await file.arrayBuffer();
 
   // Extract HTML text
@@ -573,11 +600,19 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
       img.src = dataUrl;
     });
 
-    await saveImageBlob(imgSha, blobData);
+    const typedBlob = blobData.type ? blobData : new Blob([buffer], { type: mime });
+    let storageMissing = false;
+    if (!options?.skipPersistence) {
+      try {
+        await saveImageBlob(imgSha, typedBlob);
+      } catch (err) {
+        console.warn(`Image blob write deferred to save boundary for ${imgSha}:`, err);
+        storageMissing = true;
+      }
+    }
 
     const anchorLine = imgAnchorLines[i] || 1;
-
-    images.push({
+    const asset: ImageAsset = {
       id: assetId,
       page: 1,
       bbox: { x: 0, y: 0, w: dimensions.w, h: dimensions.h },
@@ -588,7 +623,14 @@ async function extractDocx(file: File): Promise<ExtractedDocument> {
       anchorLine,
       blobKey: imgSha,
       dataUrl,
+      ...(storageMissing ? { storageMissing: true } : {}),
+    };
+    Object.defineProperty(asset, '_blob', {
+      value: typedBlob,
+      enumerable: false,
+      configurable: true,
     });
+    images.push(asset);
   }
 
   return {

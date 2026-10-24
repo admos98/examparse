@@ -1,7 +1,7 @@
-import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences } from '../pipeline/reviewIntegrity';
+import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences, restoreMissingImageFromSource } from '../pipeline/reviewIntegrity';
 import { IntegrityFlags } from '../components/IntegrityFlags';
-import { triageFlags } from '../utils/flagPresentation';
-import { getReviewImageBlob } from '../store';
+import { groupAttentionFlags, triageFlags } from '../utils/flagPresentation';
+import { getReviewImageBlob, getSourceFile } from '../store';
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
 import { revertTextRepairOverlays } from '../pipeline/textRepair';
@@ -41,6 +41,7 @@ import { ConfirmCard, Modal } from '../design/primitives';
 
 interface Props {
   examDoc: ExamDoc;
+  rawFile?: File | null;
   settings: AppSettings;
   onUpdateDoc: (updated: ExamDoc) => void;
   onProceedToExamView: () => void;
@@ -48,13 +49,18 @@ interface Props {
   onRetryRequestHandled?: () => void;
   /** B3 — orphan jump to Step 2 (only when the import is still open in this session). */
   onJumpToSource?: (lineNo: number) => void;
+  initialExpandedSectionIds?: string[];
 }
 
 export const Step4Review: React.FC<Props> = (props) => {
-  const [ready, setReady] = useState<{ input: ExamDoc; doc: ExamDoc } | null>(null);
+  const [ready, setReady] = useState<{ input: ExamDoc; doc: ExamDoc } | null>(() =>
+    props.examDoc.images.length === 0 ? { input: props.examDoc, doc: props.examDoc } : null,
+  );
   const [error, setError] = useState<string | null>(null);
-  const imageIdentity = (doc: ExamDoc) => JSON.stringify(doc.images.map(image => [image.id, image.blobKey]));
-  const assetsReady = ready?.input.id === props.examDoc.id && imageIdentity(ready.input) === imageIdentity(props.examDoc);
+  const imageIdentity = (doc: ExamDoc) => JSON.stringify(doc.images.map(image => [image.id, image.blobKey, Boolean(image.storageMissing), Boolean(image.dataUrl)]));
+  const assetsReady =
+    props.examDoc.images.length === 0 ||
+    (ready?.input.id === props.examDoc.id && imageIdentity(ready.input) === imageIdentity(props.examDoc));
   useEffect(() => {
     let cancelled = false;
     setError(null);
@@ -70,27 +76,36 @@ export const Step4Review: React.FC<Props> = (props) => {
     })
       .catch(() => { if (!cancelled) setError('Image storage could not be checked. Please reopen this exam when storage is available.'); });
     return () => { cancelled = true; };
-  }, [props.examDoc]);
-  if (!ready || !assetsReady) return <p role="status" className="p-6">{error || 'Preparing your questions and images…'}</p>;
-  // Keep editing state mounted on question/label edits; only new asset identities need I/O.
-  const images = props.examDoc.images.flatMap(image => {
-    const resolved = ready.doc.images.find(asset => asset.id === image.id && asset.blobKey === image.blobKey);
-    return resolved ? [{ ...image, dataUrl: resolved.dataUrl }] : [];
+  }, [props.examDoc, assetsReady]);
+  if (!assetsReady) return <p role="status" className="p-6">{error || 'Preparing your questions and images…'}</p>;
+  // Keep editing state mounted on question/label edits; preserve dataUrl-free references for missing blobs.
+  const readyDoc = ready?.doc || props.examDoc;
+  const images = props.examDoc.images.map(image => {
+    const resolved = readyDoc.images.find(asset => asset.id === image.id && asset.blobKey === image.blobKey);
+    if (!resolved) return { ...image, dataUrl: undefined, storageMissing: true };
+    const { storageMissing: _old, ...rest } = image;
+    return {
+      ...rest,
+      dataUrl: resolved.dataUrl,
+      ...(resolved.storageMissing ? { storageMissing: true } : {}),
+    };
   });
-  const absenceFlags = ready.doc.flags.filter(flag => flag.code === 'IMAGE_ASSET_ABSENT' && !props.examDoc.flags.some(existing => existing.id === flag.id));
+  const absenceFlags = readyDoc.flags.filter(flag => flag.code === 'IMAGE_ASSET_ABSENT' && !props.examDoc.flags.some(existing => existing.id === flag.id));
   const reviewed = reconcileFinalFlags(repairImageReferences({ ...props.examDoc, images, flags: [...props.examDoc.flags, ...absenceFlags] }, props.examDoc.images));
   return <>{error && <p role="alert" className="p-4 text-[var(--danger)]">{error}</p>}<Step4ReviewContent {...props} examDoc={reviewed} /></>;
 
 };
 
-const Step4ReviewContent: React.FC<Props> = ({
+export const Step4ReviewContent: React.FC<Props> = ({
   examDoc,
+  rawFile,
   settings,
   onUpdateDoc,
   onProceedToExamView,
   retryRequest = 0,
   onRetryRequestHandled,
   onJumpToSource,
+  initialExpandedSectionIds,
 }) => {
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
   const [patchModalQuestion, setPatchModalQuestion] = useState<Question | null>(null);
@@ -135,7 +150,66 @@ const Step4ReviewContent: React.FC<Props> = ({
 
   const health = getExamHealth(examDoc);
   const attention = triageFlags(examDoc.flags).attention;
-  const checkCount = new Set(attention.filter(f => f.questionId).map(f => f.questionId)).size;
+  const attentionGroups = groupAttentionFlags(examDoc.flags, examDoc);
+  const attentionQuestionIdSet = new Set<string>([
+    ...attention.map(f => f.questionId).filter((id): id is string => Boolean(id)),
+    ...examDoc.questions
+      .filter(q => (q.flags || []).some(code => code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS'))
+      .map(q => q.id),
+  ]);
+  const checkCount = attentionQuestionIdSet.size;
+
+  // Part C — Calm by default: all sections start collapsed; ONLY questions with attention items auto-expand.
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(() => new Set(initialExpandedSectionIds));
+  const [expandedQuestions, setExpandedQuestions] = useState<Set<string>>(() => new Set(attentionQuestionIdSet));
+  const [restoringImageId, setRestoringImageId] = useState<string | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const restoreFileInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingRestoreIdRef = useRef<string | null>(null);
+
+  const toggleSection = (secId: string) => {
+    setExpandedSections(prev => {
+      const next = new Set(prev);
+      if (next.has(secId)) next.delete(secId);
+      else next.add(secId);
+      return next;
+    });
+  };
+  const toggleQuestionExpanded = (qId: string) => {
+    setExpandedQuestions(prev => {
+      const next = new Set(prev);
+      if (next.has(qId)) next.delete(qId);
+      else next.add(qId);
+      return next;
+    });
+    setActiveQuestionId(prev => (prev === qId ? null : qId));
+  };
+
+  const missingBlobImages = examDoc.images.filter(img => img.storageMissing || !img.dataUrl);
+
+  const runRestoreForImage = async (imageId: string, overrideFile?: File) => {
+    setRestoringImageId(imageId);
+    setRestoreError(null);
+    try {
+      let source: File | undefined = overrideFile || (rawFile && rawFile.type !== 'text/plain' ? rawFile : undefined);
+      if (!source && examDoc.fileHash) {
+        source = await getSourceFile(examDoc.fileHash, examDoc.source.fileName);
+      }
+      if (!source) {
+        pendingRestoreIdRef.current = imageId;
+        restoreFileInputRef.current?.click();
+        setRestoringImageId(null);
+        return;
+      }
+      const restored = await restoreMissingImageFromSource(examDoc, imageId, source);
+      onUpdateDoc(restored);
+      await saveExamDoc(restored);
+    } catch (err: any) {
+      setRestoreError(err?.message || `Could not restore image ${imageId} from source.`);
+    } finally {
+      setRestoringImageId(null);
+    }
+  };
 
   const handleRetryMissingCoverage = async () => {
     if (retryingCoverage || health.missing.length === 0) return;
@@ -488,13 +562,13 @@ const Step4ReviewContent: React.FC<Props> = ({
           <button
             onClick={() => setShowFlagsPanel(!showFlagsPanel)}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border transition cursor-pointer ${
-              showFlagsPanel && examDoc.flags.length > 0
+              showFlagsPanel && attentionGroups.length > 0
                 ? 'bg-[var(--warn-soft)]  border-[var(--warn)]  text-[var(--warn-ink)] '
                 : 'border-[var(--rule)]  hover:bg-[var(--paper)] '
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5 text-[var(--warn-ink)]" />
-            <span>{attention.length} things need attention</span>
+            <span>{attentionGroups.length} {attentionGroups.length === 1 ? 'thing needs' : 'things need'} attention</span>
           </button>
 
           <button
@@ -561,6 +635,47 @@ const Step4ReviewContent: React.FC<Props> = ({
           {coverageError && <div role="alert" className="mt-2 font-semibold">{coverageError}</div>}
         </div>
         </details>
+      )}
+      <input
+        ref={restoreFileInputRef}
+        type="file"
+        accept=".pdf,.docx,.png,.jpg,.jpeg,.webp"
+        className="hidden"
+        onChange={event => {
+          const picked = event.target.files?.[0];
+          const targetId = pendingRestoreIdRef.current;
+          pendingRestoreIdRef.current = null;
+          event.currentTarget.value = '';
+          if (picked && targetId) void runRestoreForImage(targetId, picked);
+        }}
+      />
+      {missingBlobImages.length > 0 && (
+        <section data-missing-images-tray="true" className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-4 text-xs space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="font-bold text-[var(--warn-ink)]">
+              Missing image blobs ({missingBlobImages.length}) — restore individually from source
+            </h2>
+          </div>
+          {restoreError && <div role="alert" className="text-[var(--danger)] font-medium">{restoreError}</div>}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {missingBlobImages.map(image => (
+              <div key={image.id} className="flex items-center justify-between gap-3 rounded-[10px] border border-[var(--warn)] bg-[var(--paper-raised)] p-3">
+                <div className="min-w-0">
+                  <div className="font-mono font-bold text-[var(--ink)]">{image.id} · page {image.page}</div>
+                  <div className="truncate text-[var(--ink-2)]">{image.label?.questionRef ? `Q${image.label.questionRef}` : 'Unassigned'} · {image.width}×{image.height}</div>
+                </div>
+                <button
+                  type="button"
+                  disabled={restoringImageId === image.id}
+                  onClick={() => void runRestoreForImage(image.id)}
+                  className="shrink-0 rounded-[6px] border border-[var(--accent)] bg-[var(--paper)] px-2.5 py-1.5 font-semibold text-[var(--accent-ink)] hover:bg-[var(--paper-raised)] disabled:opacity-50 cursor-pointer"
+                >
+                  {restoringImageId === image.id ? 'Restoring…' : 'Restore from source'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
       {health.unplacedImages.length > 0 && (
         <section className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-4 text-xs  ">
@@ -652,8 +767,16 @@ const Step4ReviewContent: React.FC<Props> = ({
                     className="w-full h-28 object-contain rounded-[10px] bg-[var(--paper-raised)] border border-[var(--rule)] "
                   />
                 ) : (
-                  <div className="w-full h-28 rounded-[10px] bg-[var(--paper)]  flex items-center justify-center text-[var(--ink-2)]">
-                    Image {img.id}
+                  <div className="w-full h-28 rounded-[10px] bg-[var(--paper)] flex flex-col items-center justify-center gap-2 text-[var(--ink-2)] p-2">
+                    <span>Image {img.id} (missing blob)</span>
+                    <button
+                      type="button"
+                      disabled={restoringImageId === img.id}
+                      onClick={() => void runRestoreForImage(img.id)}
+                      className="rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] px-2 py-1 text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] cursor-pointer"
+                    >
+                      {restoringImageId === img.id ? 'Restoring…' : 'Restore from source'}
+                    </button>
                   </div>
                 )}
 
@@ -690,8 +813,21 @@ const Step4ReviewContent: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Question Cards by Section */}
-      <div className="space-y-6">
+      {/* Question Cards by Section (Part C: Sections collapsed by default; calm review cards) */}
+      <div className="flex items-center justify-between text-xs text-[var(--ink-2)]">
+        <span>{sections.length} section(s) · click a section to expand its questions</span>
+        <button
+          type="button"
+          onClick={() => {
+            const allOpen = sections.every(s => expandedSections.has(s.id));
+            setExpandedSections(allOpen ? new Set() : new Set(sections.map(s => s.id)));
+          }}
+          className="px-2.5 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] text-[var(--ink)] font-medium cursor-pointer"
+        >
+          {sections.every(s => expandedSections.has(s.id)) ? 'Collapse all sections' : 'Expand all sections'}
+        </button>
+      </div>
+      <div className="space-y-3">
         {sections.map(sec => {
           const secQuestions = questionsBySection[sec.id] || [];
           const hierarchy = buildQuestionTree(secQuestions);
@@ -700,291 +836,362 @@ const Step4ReviewContent: React.FC<Props> = ({
             const children = hierarchy.children.get(parentId) || [];
             if (!children.length) return null;
             return <div className={`${depth === 1 ? 'ms-4 border-s-2 border-[var(--accent)] ps-3 ' : 'ms-4 border-s border-[var(--accent)] ps-3 '} space-y-2`}>
-              {children.map((child, childIndex) => <div key={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
-                <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span><span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {formatSpans(child.spans)}</span></div><button onClick={() => setActiveQuestionId(activeQuestionId === child.id ? null : child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{activeQuestionId === child.id ? 'Close edit' : 'Edit child'}</button></div>
-                {activeQuestionId === child.id ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
-                {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
-                {child.answer?.text && <div className="mt-2 border-t border-[var(--accent)] pt-2"><b>Answer:</b> {child.answer.text}</div>}
-                {renderNestedChildren(child.id, depth + 1)}
-              </div>)}
+              {children.map((child, childIndex) => {
+                const childExpanded = expandedQuestions.has(child.id) || activeQuestionId === child.id;
+                return <div key={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
+                  <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span>{child.points !== undefined && <span className="font-mono text-[var(--ok)]">{child.points} pts</span>}{childExpanded && <span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {formatSpans(child.spans)}</span>}</div><button onClick={() => toggleQuestionExpanded(child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{childExpanded ? 'Close edit' : 'Inspect / Edit'}</button></div>
+                  {childExpanded ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
+                  {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
+                  {child.answer?.text && <div className="mt-2 border-t border-[var(--accent)] pt-2"><b>Answer:</b> {child.answer.text}</div>}
+                  {renderNestedChildren(child.id, depth + 1)}
+                </div>;
+              })}
             </div>;
           };
           if (secQuestions.length === 0 && !sec.passage) return null;
 
+          const secPoints = sec.points !== undefined
+            ? sec.points
+            : Number(secQuestions.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2));
+          const secAttentionCount = secQuestions.filter(q => attentionQuestionIdSet.has(q.id)).length;
+          const isSectionExpanded = expandedSections.has(sec.id) || filterType !== 'all';
+
           return (
-            <div key={sec.id} className="space-y-3">
-              {(hierarchy.cycleBreaks.size > 0 || hierarchy.orphanedParents.size > 0) && <div role="status" className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]   ">Invalid nested-question links were flattened so all {hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size} affected question(s) remain visible.</div>}
-              {/* Section Header */}
-              <div className="flex items-center justify-between pb-1 border-b border-[var(--rule)] ">
-                <div className="space-y-0.5">
-                  <h2 className="text-xs font-bold text-[var(--ink)]  uppercase tracking-wider">
+            <div key={sec.id} data-review-section={sec.id} className="rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)]">
+              {(hierarchy.cycleBreaks.size > 0 || hierarchy.orphanedParents.size > 0) && <div role="status" className="m-3 rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]   ">Invalid nested-question links were flattened so all {hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size} affected question(s) remain visible.</div>}
+              {/* Section Header (collapsed by default) */}
+              <button
+                type="button"
+                aria-expanded={isSectionExpanded}
+                onClick={() => toggleSection(sec.id)}
+                className="w-full flex items-center justify-between gap-3 px-4 py-3 text-start cursor-pointer hover:bg-[var(--paper)] rounded-[10px] transition"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  {secAttentionCount > 0 && (
+                    <span
+                      data-attention-dot="true"
+                      aria-label="Section has items needing attention"
+                      className="w-2.5 h-2.5 rounded-full bg-[var(--warn)] shrink-0"
+                    />
+                  )}
+                  <h2 className="text-xs font-bold text-[var(--ink)] uppercase tracking-wider truncate">
                     {sec.title || `Section ${sec.index}`}
                   </h2>
-                  {sec.instructions && <p dir="auto" className="text-[length:var(--type-12)] text-[var(--ink-2)] italic">{sec.instructions}</p>}
-                  {sec.passage && <div dir="auto" className="mt-2 max-w-4xl whitespace-pre-wrap rounded-[10px] border border-[var(--rule)] bg-[var(--paper)] p-3 text-xs leading-relaxed text-[var(--ink)]   ">{sec.passage}</div>}
                 </div>
-                <span className="text-[length:var(--type-12)] font-mono text-[var(--ink-2)]">
-                  {sec.points !== undefined ? `${sec.points} pts · ` : ''}{secQuestions.length} question(s)
-                </span>
-              </div>
+                <div className="flex items-center gap-3 shrink-0 text-[length:var(--type-12)] font-mono text-[var(--ink-2)]">
+                  <span>{secQuestions.length} question(s)</span>
+                  <span>·</span>
+                  <span>{secPoints} pts</span>
+                  <span>·</span>
+                  <span className={secAttentionCount > 0 ? 'font-semibold text-[var(--warn-ink)]' : ''}>
+                    {secAttentionCount} attention
+                  </span>
+                  {isSectionExpanded ? <ChevronUp className="w-4 h-4 text-[var(--ink-2)]" /> : <ChevronDown className="w-4 h-4 text-[var(--ink-2)]" />}
+                </div>
+              </button>
 
-              {/* Question Cards List */}
-              <div className="space-y-3">
-                {rootQuestions.map(q => {
-                  const isExpanded = activeQuestionId === q.id;
-                  const groupChildren = hierarchy.children.get(q.id) || [];
-                  const showChildren = Boolean(expandedGroups[q.id]);
+              {isSectionExpanded && (
+                <div className="px-4 pb-4 pt-1 space-y-3 border-t border-[var(--rule)]">
+                  {sec.instructions && <p dir="auto" className="text-[length:var(--type-12)] text-[var(--ink-2)] italic">{sec.instructions}</p>}
+                  {sec.passage && <div dir="auto" className="max-w-4xl max-h-60 overflow-y-auto whitespace-pre-wrap rounded-[10px] border border-[var(--rule)] bg-[var(--paper)] p-3 text-xs leading-relaxed text-[var(--ink)]">{sec.passage}</div>}
 
-                  return (
-                    <div
-                      key={q.id}
-                      data-review-question={q.id}
-                      tabIndex={-1}
-                      className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4  space-y-3 transition hover:border-[var(--rule-strong)] "
-                    >
-                      {/* Question Header Row */}
-                      <div className="flex items-center justify-between gap-3 text-xs">
-                        <div className="flex items-center gap-2">
-                          <input type="checkbox" checked={selectedIds.has(q.id)} onChange={e=> setSelectedIds(s=> { const n=new Set(s); if(e.target.checked) n.add(q.id); else n.delete(q.id); return n; })} className="w-3.5 h-3.5" />
-                          <span className="w-7 h-7 rounded-[10px] bg-[var(--paper)] text-[var(--accent-ink)]  font-bold flex items-center justify-center font-mono">
-                            {q.label}
-                          </span>
+                  {/* Question Cards List */}
+                  <div className="space-y-3">
+                    {rootQuestions.map(q => {
+                      const hasAttention = attentionQuestionIdSet.has(q.id);
+                      const isExpanded = expandedQuestions.has(q.id) || activeQuestionId === q.id;
+                      const groupChildren = hierarchy.children.get(q.id) || [];
+                      const showChildren = Boolean(expandedGroups[q.id]);
 
-                          <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono uppercase bg-[var(--paper)]  text-[var(--ink-2)] ">
-                            {q.type}
-                          </span>
+                      return (
+                        <div
+                          key={q.id}
+                          data-review-question={q.id}
+                          data-question-expanded={isExpanded ? 'true' : 'false'}
+                          tabIndex={-1}
+                          className="bg-[var(--paper)] border border-[var(--rule)] rounded-[10px] p-4 space-y-2.5 transition hover:border-[var(--rule-strong)]"
+                        >
+                          {/* Question Header Row (Calm Review Form: number, type chip, points, actions) */}
+                          <div className="flex items-center justify-between gap-3 text-xs">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <input type="checkbox" checked={selectedIds.has(q.id)} onChange={e=> setSelectedIds(s=> { const n=new Set(s); if(e.target.checked) n.add(q.id); else n.delete(q.id); return n; })} className="w-3.5 h-3.5" />
+                              <span className="w-7 h-7 rounded-[10px] bg-[var(--paper-raised)] text-[var(--accent-ink)] font-bold flex items-center justify-center font-mono">
+                                {q.label}
+                              </span>
 
-                          {q.points !== undefined && (
-                            <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono bg-[var(--ok-soft)] text-[var(--ok)]  font-semibold">
-                              {q.points} pts
-                            </span>
+                              <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono uppercase bg-[var(--paper-raised)] text-[var(--ink-2)]">
+                                {q.type}
+                              </span>
+
+                              {q.points !== undefined && (
+                                <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono bg-[var(--ok-soft)] text-[var(--ok)] font-semibold">
+                                  {q.points} pts
+                                </span>
+                              )}
+
+                              {hasAttention && (
+                                <span
+                                  data-question-attention-dot="true"
+                                  title="Needs attention"
+                                  className="w-2 h-2 rounded-full bg-[var(--warn)] inline-block"
+                                />
+                              )}
+
+                              {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded-[6px] bg-[var(--paper-raised)] px-2 py-1 text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)]">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
+                            </div>
+
+                            {/* Question Action Buttons */}
+                            <div className="flex items-center gap-1.5">
+                              {/* Solve single with AI */}
+                              <button
+                                disabled={solvingQuestionId === q.id}
+                                onClick={() => handleSolveSingle(q)}
+                                className="flex items-center gap-1 px-2.5 py-1 rounded-[6px] bg-[var(--paper-raised)] border border-[var(--accent)] text-[var(--accent-ink)] text-[length:var(--type-12)] font-medium hover:bg-[var(--paper)] transition cursor-pointer"
+                                title="Solve or regenerate answer for this question with AI"
+                              >
+                                <Sparkles className="w-3 h-3 text-[var(--accent-ink)]" />
+                                <span>{solvingQuestionId === q.id ? 'Solving...' : q.answer?.text ? 'Re-solve' : 'AI Solve'}</span>
+                              </button>
+
+                              {/* Minimal-Patch Regeneration Button (§5.4) */}
+                              <button
+                                onClick={() => {
+                                  setPatchModalQuestion(q);
+                                  setPatchDiffResult(null);
+                                  setPatchInstruction('');
+                                }}
+                                className="flex items-center gap-1 px-2.5 py-1 rounded-[6px] bg-[var(--warn-soft)] border border-[var(--warn)] text-[var(--warn-ink)] text-[length:var(--type-12)] font-medium hover:bg-[var(--warn-soft)] transition cursor-pointer"
+                                title={settings.uiLanguage === 'fa' ? 'بازسازی همین پرسش با وصلهٔ کمینهٔ RFC 7386' : 'Regenerate this single question using minimal RFC 7386 JSON Merge Patch'}
+                              >
+                                <Sparkles className="w-3 h-3 text-[var(--warn-ink)]" />
+                                <span>{settings.uiLanguage === 'fa' ? 'وصله' : 'Patch'}</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                aria-expanded={isExpanded}
+                                aria-label={isExpanded ? `Collapse inspector for question ${q.label}` : `Expand inspector for question ${q.label}`}
+                                onClick={() => toggleQuestionExpanded(q.id)}
+                                className="p-1.5 text-[var(--ink-2)] hover:text-[var(--ink)] rounded-[6px] hover:bg-[var(--paper-raised)] transition cursor-pointer"
+                              >
+                                {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                              </button>
+
+                              <button
+                                onClick={() => handleDeleteQuestion(q.id)}
+                                className="p-1.5 text-[var(--ink-2)] hover:text-[var(--danger)] rounded-[6px] hover:bg-[var(--danger-soft)] transition cursor-pointer"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Inspector Internals (spans, confidence %, Built-by receipt, per-question flags) — shown ONLY when expanded */}
+                          {isExpanded && (
+                            <div data-question-internals={q.id} className="flex flex-wrap items-center gap-2 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] px-2.5 py-1.5 text-[length:var(--type-12)] font-mono text-[var(--ink-2)]">
+                              <span>spans: {formatSpans(q.spans)}</span>
+                              <span
+                                className={`px-1.5 py-0.5 rounded-[6px] ${
+                                  q.confidence >= 0.8
+                                    ? 'bg-[var(--ok-soft)] text-[var(--ok)]'
+                                    : 'bg-[var(--warn-soft)] text-[var(--warn-ink)]'
+                                }`}
+                              >
+                                {((q.confidence ?? 1) * 100).toFixed(0)}% conf
+                              </span>
+                              {q.receipt && (
+                                <span aria-label="Deterministic parse provenance">
+                                  Built by: {q.receipt.ruleChain.map(rule => rule === 'question-start' ? 'seg-number' : rule === 'watermark-excised' ? 'excision' : rule).join(' → ')} · conf {Math.round(q.receipt.ruleConfidence)}
+                                </span>
+                              )}
+                              {(q.flags || []).map(code => {
+                                const isError = code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS';
+                                const label = code === 'GAP_ABSORBED' ? 'gap absorbed' : code === 'REWRITE_APPLIED' ? 'rewrite' : code === 'OPTIONS_SYNTHESIZED' ? 'options synthesized' : code === 'SECTION_REASSIGNED' ? 'section reassigned' : code.toLowerCase().replace(/_/g, ' ');
+                                return <span key={code} title={code} className={`px-1.5 py-0.5 rounded-[6px] border ${isError ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger-soft)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{label}</span>;
+                              })}
+                            </div>
                           )}
 
-                          <span className="text-[length:var(--type-12)] text-[var(--ink-2)] font-mono">
-                            spans: {formatSpans(q.spans)}
-                          </span>
-
-                          <span
-                            className={`px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono ${
-                              q.confidence >= 0.8
-                                ? 'bg-[var(--ok-soft)] text-[var(--ok)]'
-                                : 'bg-[var(--warn-soft)] text-[var(--warn-ink)]'
-                            }`}
-                          >
-                            {((q.confidence ?? 1) * 100).toFixed(0)}% conf
-                          </span>
-                          {/* Per-question validator/funnel flags (C1/B2/D): error codes red, the rest muted. */}
-                          {(q.flags || []).length > 0 && (q.flags || []).slice(0, 4).map(code => {
-                            const isError = code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS';
-                            const label = code === 'GAP_ABSORBED' ? 'gap absorbed' : code === 'REWRITE_APPLIED' ? 'rewrite' : code === 'OPTIONS_SYNTHESIZED' ? 'options synthesized' : code === 'SECTION_REASSIGNED' ? 'section reassigned' : code.toLowerCase().replace(/_/g, ' ');
-                            return <span key={code} title={code} className={`px-1.5 py-0.5 rounded-[6px] text-[length:var(--type-12)] border ${isError ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger-soft)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{label}</span>;
-                          })}
-                          {(q.flags || []).length > 4 && <span className="text-[length:var(--type-12)] text-[var(--ink-2)]" title={(q.flags || []).slice(4).join(', ')}>+{(q.flags || []).length - 4}</span>}
-                          {groupChildren.length > 0 && <button onClick={() => setExpandedGroups(current => ({ ...current, [q.id]: !current[q.id] }))} className="rounded-[6px] bg-[var(--paper)] px-2 py-1 text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)]  ">{groupChildren.length} subquestion(s) {showChildren ? '▲' : '▼'}</button>}
-                        </div>
-
-                        {/* Question Action Buttons */}
-                        <div className="flex items-center gap-1.5">
-                          {/* Solve single with AI */}
-                          <button
-                            disabled={solvingQuestionId === q.id}
-                            onClick={() => handleSolveSingle(q)}
-                            className="flex items-center gap-1 px-2.5 py-1 rounded-[6px] bg-[var(--paper)]  border border-[var(--accent)]  text-[var(--accent-ink)]  text-[length:var(--type-12)] font-medium hover:bg-[var(--paper)]  transition cursor-pointer"
-                            title="Solve or regenerate answer for this question with AI"
-                          >
-                            <Sparkles className="w-3 h-3 text-[var(--accent-ink)]" />
-                            <span>{solvingQuestionId === q.id ? 'Solving...' : q.answer?.text ? 'Re-solve' : 'AI Solve'}</span>
-                          </button>
-
-                          {/* Minimal-Patch Regeneration Button (§5.4) */}
-                          <button
-                            onClick={() => {
-                              setPatchModalQuestion(q);
-                              setPatchDiffResult(null);
-                              setPatchInstruction('');
-                            }}
-                            className="flex items-center gap-1 px-2.5 py-1 rounded-[6px] bg-[var(--warn-soft)]  border border-[var(--warn)]  text-[var(--warn-ink)]  text-[length:var(--type-12)] font-medium hover:bg-[var(--warn-soft)]  transition cursor-pointer"
-                            title={settings.uiLanguage === 'fa' ? 'بازسازی همین پرسش با وصلهٔ کمینهٔ RFC 7386' : 'Regenerate this single question using minimal RFC 7386 JSON Merge Patch'}
-                          >
-                            <Sparkles className="w-3 h-3 text-[var(--warn-ink)]" />
-                            <span>{settings.uiLanguage === 'fa' ? 'وصله' : 'Patch'}</span>
-                          </button>
-
-                          <button
-                            onClick={() => setActiveQuestionId(isExpanded ? null : q.id)}
-                            className="p-1.5 text-[var(--ink-2)] hover:text-[var(--ink-2)]  rounded-[6px] hover:bg-[var(--paper)]  transition cursor-pointer"
-                          >
-                            {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                          </button>
-
-                          <button
-                            onClick={() => handleDeleteQuestion(q.id)}
-                            className="p-1.5 text-[var(--ink-2)] hover:text-[var(--danger)] rounded-[6px] hover:bg-[var(--danger-soft)]  transition cursor-pointer"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Stem Text (Editable) */}
-                      <div>
-                        {q.receipt && <div className="mb-1 text-[length:var(--type-12)] font-mono text-[var(--ink-2)]" aria-label="Deterministic parse provenance">Built by: {q.receipt.ruleChain.map(rule => rule === 'question-start' ? 'seg-number' : rule === 'watermark-excised' ? 'excision' : rule).join(' → ')} · conf {Math.round(q.receipt.ruleConfidence)}</div>}
-                        {isExpanded ? (
-                          <textarea
-                            rows={3}
-                            value={q.stem || ''}
-                            onChange={e => handleUpdateQuestion(q.id, { stem: e.target.value })}
-                            className="w-full p-2.5 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper)]  text-xs font-sans text-[var(--ink)] "
-                          />
-                        ) : (
-                          <div className="text-xs text-[var(--ink)]  whitespace-pre-wrap leading-relaxed">
-                            {q.stem}
-                          </div>
-                        )}
-                        {/* D — rewrites are rendering-only: show original ⮕ rewrite with one-click revert. */}
-                        {(q.rewrites || []).length > 0 && (
-                          <div className="mt-1.5 space-y-1 rounded-[6px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">
-                            <div className="font-semibold">REWRITE_APPLIED — {(q.rewrites || []).length} garbled line(s) rendered from the model's rewrite (original retained)</div>
-                            {(q.rewrites || []).map(r => {
-                              const original = examDoc.source.lines.find(l => Number(l.id.replace(/\D/g, '')) === r.line)?.text || '';
-                              return (
-                                <div key={r.line} className="flex items-start gap-2">
-                                  <span className="font-mono shrink-0">L{String(r.line).padStart(4, '0')}</span>
-                                  <span className="min-w-0 flex-1 break-words"><span className="line-through opacity-70">{original}</span> ⮕ <span className="font-medium">{r.text}</span></span>
-                                  <button onClick={() => handleRevertRewrite(q.id, r.line)} className="shrink-0 rounded-[4px] border border-[var(--warn)] px-1.5 py-0.5 hover:bg-[var(--paper)]">Revert</button>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Attached Diagram / Image */}
-                      {q.images && q.images.length > 0 && (
-                        <div className="flex flex-wrap gap-2 pt-1">
-                          {q.images.map(imgRef => {
-                            const asset = examDoc.images.find(i => i.id === imgRef.imageId);
-                            if (!asset || !asset.dataUrl) return (
-                              <div key={imgRef.imageId} className="rounded-[10px] border-2 border-dashed border-[var(--warn)] bg-[var(--warn-soft)] p-3 text-[length:var(--type-12)] text-[var(--warn-ink)]  ">
-                                Missing image {imgRef.imageId} — open original page {asset?.page ?? 'unknown'}
-                              </div>
-                            );
-                            return (
-                              <div
-                                key={imgRef.imageId}
-                                className="relative rounded-[10px] border border-[var(--rule)]  p-1 bg-[var(--paper)]  inline-block"
-                              >
-                                <img
-                                  src={asset.dataUrl}
-                                  alt={asset.id}
-                                  onError={event => { event.currentTarget.style.display = 'none'; const fallback = event.currentTarget.parentElement?.querySelector('[data-image-error]') as HTMLElement | null; if (fallback) fallback.hidden = false; }}
-                                  className="max-h-24 rounded-[10px] object-contain bg-[var(--paper-raised)]"
-                                />
-                                <div hidden data-image-error className="p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">Image unavailable — open original page {asset.page}.</div>
-                                <span className="absolute bottom-1 end-1 text-[length:var(--type-12)] font-mono px-1 rounded-[6px] ep-scrim text-[var(--scrim-fg)]">
-                                  {imgRef.role}
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-
-                      {/* Options Grid (MCQ) */}
-                      {q.options && q.options.length > 0 && (
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 text-xs">
-                          {q.options.map(opt => (
-                            <div
-                              key={opt.key}
-                              className="flex items-center gap-2 p-2 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] "
-                            >
-                              <span className="w-5 h-5 rounded-[10px] bg-[var(--paper)]  text-[var(--ink)]  font-bold flex items-center justify-center text-[length:var(--type-12)] shrink-0 font-mono">
-                                {opt.key}
-                              </span>
-                              <span className="text-[var(--ink)]  truncate">
-                                {opt.text}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Answer Key preview with Origin Badge & Inline Edit */}
-                      <div className="pt-1">
-                        {q.answer && q.answer.text ? (
-                          <div className="text-[length:var(--type-12)] bg-[var(--paper)]  p-2.5 rounded-[10px] border border-[var(--rule)]  space-y-1.5">
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <span className="font-bold text-[var(--ink)] ">Answer:</span>
-                                <span
-                                  className={`text-[length:var(--type-12)] font-mono px-1.5 py-0.5 rounded-[6px] font-semibold uppercase ${
-                                    q.answer.source === 'paper'
-                                      ? 'bg-[var(--ok-soft)] text-[var(--ok)]  border border-[var(--ok)]'
-                                      : q.answer.source === 'keyfile'
-                                      ? 'bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)]'
-                                      : q.answer.source === 'ai'
-                                      ? 'bg-[var(--paper)] text-[var(--accent-ink)]  border border-[var(--accent)]'
-                                      : 'bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)]'
-                                  }`}
-                                >
-                                  {q.answer.source === 'paper'
-                                    ? 'In-Doc Key'
-                                    : q.answer.source === 'keyfile'
-                                    ? 'Key File'
-                                    : q.answer.source === 'ai'
-                                    ? 'AI Solved'
-                                    : 'Manual'}
-                                </span>
-                              </div>
-                            </div>
+                          {/* Stem Text */}
+                          <div>
                             {isExpanded ? (
                               <textarea
-                                rows={2}
-                                value={q.answer.text}
-                                onChange={e =>
-                                  handleUpdateQuestion(q.id, {
-                                    answer: { ...q.answer, text: e.target.value, source: 'manual' },
-                                  })
-                                }
-                                className="w-full p-2 rounded-[6px] border border-[var(--rule)]  bg-[var(--paper-raised)]  text-xs font-mono"
+                                rows={3}
+                                value={q.stem || ''}
+                                onChange={e => handleUpdateQuestion(q.id, { stem: e.target.value })}
+                                className="w-full p-2.5 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] text-xs font-sans text-[var(--ink)]"
                               />
                             ) : (
-                              <div className="text-[var(--ink)]  font-medium whitespace-pre-wrap">
-                                {q.answer.text}
+                              <div dir="auto" className="max-h-56 overflow-y-auto text-xs text-[var(--ink)] whitespace-pre-wrap leading-relaxed">
+                                {q.stem}
+                              </div>
+                            )}
+                            {/* D — rewrites are rendering-only: show original ⮕ rewrite with one-click revert when expanded */}
+                            {isExpanded && (q.rewrites || []).length > 0 && (
+                              <div className="mt-1.5 space-y-1 rounded-[6px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">
+                                <div className="font-semibold">REWRITE_APPLIED — {(q.rewrites || []).length} garbled line(s) rendered from the model's rewrite (original retained)</div>
+                                {(q.rewrites || []).map(r => {
+                                  const original = examDoc.source.lines.find(l => Number(l.id.replace(/\D/g, '')) === r.line)?.text || '';
+                                  return (
+                                    <div key={r.line} className="flex items-start gap-2">
+                                      <span className="font-mono shrink-0">L{String(r.line).padStart(4, '0')}</span>
+                                      <span className="min-w-0 flex-1 break-words"><span className="line-through opacity-70">{original}</span> ⮕ <span className="font-medium">{r.text}</span></span>
+                                      <button onClick={() => handleRevertRewrite(q.id, r.line)} className="shrink-0 rounded-[4px] border border-[var(--warn)] px-1.5 py-0.5 hover:bg-[var(--paper)]">Revert</button>
+                                    </div>
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
-                        ) : (
-                          <div className="flex items-center justify-between p-2 rounded-[10px] border border-dashed border-[var(--rule-strong)]  text-[length:var(--type-12)] text-[var(--ink-2)]">
-                            <span>No answer linked yet</span>
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => handleSolveSingle(q)}
-                                className="text-[var(--accent-ink)]  hover:underline cursor-pointer flex items-center gap-1 font-medium"
-                              >
-                                <Sparkles className="w-3 h-3" />
-                                <span>Solve with AI</span>
-                              </button>
-                              <span>•</span>
-                              <button
-                                onClick={() =>
-                                  handleUpdateQuestion(q.id, {
-                                    answer: { text: '', source: 'manual' },
-                                  })
-                                }
-                                className="text-[var(--accent-ink)] hover:underline cursor-pointer"
-                              >
-                                + Add manual
-                              </button>
+
+                          {/* Word Bank (when present on fill-in-the-blank items) */}
+                          {q.wordBank && q.wordBank.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1.5 text-[length:var(--type-12)] text-[var(--ink-2)]">
+                              <span className="font-semibold">Word bank:</span>
+                              {q.wordBank.map(word => (
+                                <span key={word} className="px-2 py-0.5 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] font-mono text-[var(--ink)]">{word}</span>
+                              ))}
                             </div>
+                          )}
+
+                          {/* Attached Diagram / Image */}
+                          {q.images && q.images.length > 0 && (
+                            <div className="flex flex-wrap gap-2 pt-1">
+                              {q.images.map(imgRef => {
+                                const asset = examDoc.images.find(i => i.id === imgRef.imageId);
+                                if (!asset || !asset.dataUrl || asset.storageMissing) return (
+                                  <div key={imgRef.imageId} className="flex items-center gap-2 rounded-[10px] border-2 border-dashed border-[var(--warn)] bg-[var(--warn-soft)] p-3 text-[length:var(--type-12)] text-[var(--warn-ink)]">
+                                    <span>Missing image {imgRef.imageId} (page {asset?.page ?? 'unknown'})</span>
+                                    {asset && (
+                                      <button
+                                        type="button"
+                                        disabled={restoringImageId === asset.id}
+                                        onClick={() => void runRestoreForImage(asset.id)}
+                                        className="rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] px-2 py-0.5 font-semibold text-[var(--accent-ink)] cursor-pointer"
+                                      >
+                                        {restoringImageId === asset.id ? 'Restoring…' : 'Restore from source'}
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                                return (
+                                  <div
+                                    key={imgRef.imageId}
+                                    className="relative rounded-[10px] border border-[var(--rule)] p-1 bg-[var(--paper-raised)] inline-block"
+                                  >
+                                    <img
+                                      src={asset.dataUrl}
+                                      alt={asset.id}
+                                      onError={event => { event.currentTarget.style.display = 'none'; const fallback = event.currentTarget.parentElement?.querySelector('[data-image-error]') as HTMLElement | null; if (fallback) fallback.hidden = false; }}
+                                      className="max-h-24 rounded-[10px] object-contain bg-[var(--paper-raised)]"
+                                    />
+                                    <div hidden data-image-error className="p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">Image unavailable — open original page {asset.page}.</div>
+                                    <span className="absolute bottom-1 end-1 text-[length:var(--type-12)] font-mono px-1 rounded-[6px] ep-scrim text-[var(--scrim-fg)]">
+                                      {imgRef.role}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {/* Options Grid (MCQ) */}
+                          {q.options && q.options.length > 0 && (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 text-xs">
+                              {q.options.map(opt => (
+                                <div
+                                  key={opt.key}
+                                  className="flex items-center gap-2 p-2 rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)]"
+                                >
+                                  <span className="w-5 h-5 rounded-[10px] bg-[var(--paper)] text-[var(--ink)] font-bold flex items-center justify-center text-[length:var(--type-12)] shrink-0 font-mono">
+                                    {opt.key}
+                                  </span>
+                                  <span className="text-[var(--ink)] truncate">
+                                    {opt.text}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Answer Key preview with Origin Badge & Inline Edit */}
+                          <div className="pt-1">
+                            {q.answer && q.answer.text ? (
+                              <div className="text-[length:var(--type-12)] bg-[var(--paper-raised)] p-2.5 rounded-[10px] border border-[var(--rule)] space-y-1.5">
+                                <div className="flex items-center justify-between">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-bold text-[var(--ink)]">Answer:</span>
+                                    <span
+                                      className={`text-[length:var(--type-12)] font-mono px-1.5 py-0.5 rounded-[6px] font-semibold uppercase ${
+                                        q.answer.source === 'paper'
+                                          ? 'bg-[var(--ok-soft)] text-[var(--ok)] border border-[var(--ok)]'
+                                          : q.answer.source === 'keyfile'
+                                          ? 'bg-[var(--paper)] text-[var(--accent-ink)] border border-[var(--accent)]'
+                                          : q.answer.source === 'ai'
+                                          ? 'bg-[var(--paper)] text-[var(--accent-ink)] border border-[var(--accent)]'
+                                          : 'bg-[var(--warn-soft)] text-[var(--warn-ink)] border border-[var(--warn)]'
+                                      }`}
+                                    >
+                                      {q.answer.source === 'paper'
+                                        ? 'In-Doc Key'
+                                        : q.answer.source === 'keyfile'
+                                        ? 'Key File'
+                                        : q.answer.source === 'ai'
+                                        ? 'AI Solved'
+                                        : 'Manual'}
+                                    </span>
+                                  </div>
+                                </div>
+                                {isExpanded ? (
+                                  <textarea
+                                    rows={2}
+                                    value={q.answer.text}
+                                    onChange={e =>
+                                      handleUpdateQuestion(q.id, {
+                                        answer: { ...q.answer, text: e.target.value, source: 'manual' },
+                                      })
+                                    }
+                                    className="w-full p-2 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] text-xs font-mono"
+                                  />
+                                ) : (
+                                  <div className="text-[var(--ink)] font-medium whitespace-pre-wrap">
+                                    {q.answer.text}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="flex items-center justify-between p-2 rounded-[10px] border border-dashed border-[var(--rule-strong)] text-[length:var(--type-12)] text-[var(--ink-2)]">
+                                <span>No answer linked yet</span>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    onClick={() => handleSolveSingle(q)}
+                                    className="text-[var(--accent-ink)] hover:underline cursor-pointer flex items-center gap-1 font-medium"
+                                  >
+                                    <Sparkles className="w-3 h-3" />
+                                    <span>Solve with AI</span>
+                                  </button>
+                                  <span>•</span>
+                                  <button
+                                    onClick={() =>
+                                      handleUpdateQuestion(q.id, {
+                                        answer: { text: '', source: 'manual' },
+                                      })
+                                    }
+                                    className="text-[var(--accent-ink)] hover:underline cursor-pointer"
+                                  >
+                                    + Add manual
+                                  </button>
+                                </div>
+                              </div>
+                            )}
                           </div>
-                        )}
-                      </div>
-                      {showChildren && groupChildren.length > 0 && renderNestedChildren(q.id)}
-                    </div>
-                  );
-                })}
-              </div>
+                          {showChildren && groupChildren.length > 0 && renderNestedChildren(q.id)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           );
         })}

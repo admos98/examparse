@@ -19,6 +19,7 @@ import {
   compressLineNumbers as compressSpanLines,
   filterSpansByLines,
   isOffsetSpan,
+  isOptionBoundaryStopLine,
   sliceNormalizedLineByOffsets,
   spanBounds,
   spanEndLine,
@@ -29,7 +30,8 @@ import {
   trimOffsetsOnLine,
   maskWatermarksSameLength,
 } from './spans';
-import { canonicalizeForms } from './forms';
+import { isStandaloneFurnitureLine } from './furniture';
+import { canonicalizeForms, isWordBankListLine } from './forms';
 import { isKeyInstruction, answerTextForSpans, carveAnswerAnchor, extendIncompleteAnswer, findAnswerKeySpan, isNumberOnlyAnswer, printedAnswerAnchors } from './answerKey';
 
 export const OffsetSpanReferenceSchema = z.object({
@@ -434,6 +436,18 @@ function carveOptionsByOffsets(
   let excisedCount = 0;
   const cleaned = options.map(opt => {
     let spans = opt.spans;
+    const optLineNos = spanLineNumbers(spans);
+    if (optLineNos.length > 1 && !spans.some(spanHasOffsets)) {
+      const keptLines: number[] = [optLineNos[0]];
+      for (let i = 1; i < optLineNos.length; i++) {
+        const src = lineMap.get(optLineNos[i]);
+        if (src && (isOptionBoundaryStopLine(src.text) || isInstructionLine(src.text))) break;
+        keptLines.push(optLineNos[i]);
+      }
+      if (keptLines.length < optLineNos.length) {
+        spans = compressSpanLines(keptLines);
+      }
+    }
     if (spans.length === 1 && !isOffsetSpan(spans[0]) && spans[0][0] === spans[0][1]) {
       const ln = spans[0][0];
       const src = lineMap.get(ln);
@@ -1631,19 +1645,62 @@ export function assembleAndValidateSections(
   const fallbackSpan: LineSpan[] = sourceLines.length ? [[lineNoFromId(sourceLines[0].id), lineNoFromId(sourceLines[sourceLines.length - 1].id)]] : [];
   const candidates = raw.length ? raw : [{ id: 'sec_1', index: 1, spans: fallbackSpan }];
   const firstQuestionLine = (sectionId: string) => Math.min(Infinity, ...questions.filter(q => q.sectionId === sectionId).flatMap(q => spanLineNumbers(q.spans)));
+
+  // Part D4: Precompute once across the exam — exclude lines inside ANY question's spans
+  // AND lines that are the immediate unnumbered prose continuation of a fill/blank stem.
+  const allQuestionLineSet = new Set(
+    questions.flatMap(q =>
+      spanLineNumbers([
+        ...q.spans,
+        ...(q.options || []).flatMap(o => o.spans),
+        ...(q.tables || []).flatMap(table => table.spans),
+      ]),
+    ),
+  );
+  const allQuestionRanges = questions
+    .map(q => spanBounds(q.spans))
+    .filter((b): b is [number, number] => !!b);
+  const lineByNo = new Map(sourceLines.map(l => [lineNoFromId(l.id), l]));
+  const fillContinuationLineSet = new Set<number>();
+  const FILL_STEM_BLANK_RE = /(?:[._…]{3,}|…{2,}|_{2,}|(?:\s-\s){2,}|[–—]{3,})/u;
+  for (const q of questions) {
+    const qBounds = spanBounds([
+      ...q.spans,
+      ...(q.options || []).flatMap(o => o.spans),
+    ]);
+    if (!qBounds) continue;
+    const lastLineText = lineByNo.get(qBounds[1])?.text || '';
+    const stemCandidate = q.stem || sliceSourceSpans(q.spans, sourceLines) || lastLineText;
+    const hasFillBlank =
+      q.type === 'fillblank' ||
+      FILL_STEM_BLANK_RE.test(stemCandidate) ||
+      FILL_STEM_BLANK_RE.test(lastLineText);
+    if (!hasFillBlank) continue;
+    for (let ln = qBounds[1] + 1; ; ln++) {
+      const nextLine = lineByNo.get(ln);
+      if (!nextLine || nextLine.furniture || isStandaloneFurnitureLine(nextLine.text)) break;
+      if (keyLines.has(ln) || allQuestionLineSet.has(ln)) break;
+      const txt = nextLine.text.trim();
+      if (!txt) break;
+      if (parsePrintedNumberFromStem(txt) !== undefined) break;
+      if (isHeaderOrRowLine(txt) || isInstructionLine(txt)) break;
+      fillContinuationLineSet.add(ln);
+    }
+  }
+  const allHeaders = detectSectionHeaders(sourceLines);
+
   const provisional = candidates.map((section, index) => {
     const spans = normalizedSpans(section?.spans);
     const id = String(section?.id || `sec_${index + 1}`);
     const indexValue = Number(section?.index) || index + 1;
     const sectionLines = sourceLines.filter(line => !line.furniture && spansContainLine(spans, lineNoFromId(line.id)));
     const headerLines = sectionLines.slice(0, 12);
-    const titleRaw = typeof section?.title === 'string' ? section.title : (typeof section?.kind === 'string' ? section.kind : '');
+    const titleRaw = typeof section?.title === 'string' ? section?.title : (typeof section?.kind === 'string' ? section?.kind : '');
     let title = cleanSectionTitle(titleRaw);
     const genericTitles = new Set(['question group', 'section', 'part', 'page', 'question']);
     const normalizedTitle = normalizeForMatching(title);
     const isGeneric = genericTitles.has(normalizedTitle) || /^question group\s*\d*$/i.test(title) || /^section\s*\d*$/i.test(title) || /^part\s*\d*$/i.test(title);
     // A2: generic titles forbidden when header-derived title exists within ±3 lines of section start
-    const allHeaders = detectSectionHeaders(sourceLines);
     const sectionStartLine = spans.length ? Math.min(...spans.map(spanStartLine)) : 0;
     const nearbyHeader = allHeaders.find(h => Math.abs(h.headerLine - sectionStartLine) <= 3);
     if (isGeneric && nearbyHeader) {
@@ -1672,16 +1729,28 @@ export function assembleAndValidateSections(
         flags.push(flag('SECTION_TITLE_DERIVED', `Section ${indexValue} title was derived locally as “${title}”.`, 'info'));
       }
     }
-    const firstQ = firstQuestionLine(id);
+    const firstQ = Math.min(
+      firstQuestionLine(id),
+      ...questions
+        .flatMap(q => spanLineNumbers(q.spans))
+        .filter(ln => spansContainLine(spans, ln)),
+    );
     const preQuestion = sectionLines.filter(line => lineNoFromId(line.id) < firstQ);
     const inferredInstruction = preQuestion.map(line => line.text).filter(text => isInstructionLine(text)).join('\n');
     const instructionCandidate = typeof section?.instructions === 'string' ? section.instructions : inferredInstruction;
     const trimmed = trimInstructions(instructionCandidate, title, raw.map(s => cleanSectionTitle(s?.title || s?.kind)));
     if (trimmed.long) flags.push(flag('SECTION_INSTRUCTIONS_LONG', `Section ${indexValue} instructions exceed 400 characters after trimming.`, 'info'));
 
-    const questionLineSet = new Set(questions.filter(q => q.sectionId === id).flatMap(q => spanLineNumbers([...q.spans, ...(q.options || []).flatMap(o => o.spans), ...(q.tables || []).flatMap(table => table.spans)])));
-    const questionRanges = questions.filter(q => q.sectionId === id).map(q => spanBounds(q.spans)).filter((b): b is [number, number] => !!b);
-    const areaLines = sectionLines.filter(line => !questionRanges.some(([lo, hi]) => lineNoFromId(line.id) >= lo && lineNoFromId(line.id) <= hi) && !questionLineSet.has(lineNoFromId(line.id)) && !keyLines.has(lineNoFromId(line.id)) && !isHeaderOrRowLine(line.text) && !isInstructionLine(line.text) && cleanSectionTitle(line.text) !== title);
+    const areaLines = sectionLines.filter(line => {
+      const ln = lineNoFromId(line.id);
+      if (allQuestionRanges.some(([lo, hi]) => ln >= lo && ln <= hi)) return false;
+      if (allQuestionLineSet.has(ln) || fillContinuationLineSet.has(ln) || keyLines.has(ln)) return false;
+      if (FILL_STEM_BLANK_RE.test(line.text) && parsePrintedNumberFromStem(line.text) !== undefined) return false;
+      if (isStandaloneFurnitureLine(line.text) || isWordBankListLine(line.text)) return false;
+      if (isHeaderOrRowLine(line.text) || isInstructionLine(line.text) || cleanSectionTitle(line.text) === title) return false;
+      if (/^\s*است\s*[()[\].]*\s*$/u.test(normalizeForMatching(line.text))) return false;
+      return true;
+    });
     const passageRaw = areaLines.map(line => line.text.trim()).filter(Boolean).join('\n').trim();
     const passageExc = passageRaw ? exciseWatermarks(passageRaw) : { text: passageRaw, excised: false };
     const passage = passageExc.text;
@@ -1876,6 +1945,9 @@ export function validateAndFixDuplicateImageIds(doc: ExamDoc): { doc: ExamDoc; f
     if ((duplicates.includes(image.id) && occurrence > 1) || /_dup\d+$/.test(image.id)) id = freshSequentialId();
     allocatedIds.add(id);
     const renamed = { ...image, id };
+    if ((image as any)._blob instanceof Blob) {
+      Object.defineProperty(renamed, '_blob', { value: (image as any)._blob, enumerable: false, configurable: true, writable: true });
+    }
     const occurrences = occurrencesByOriginalId.get(image.id) || [];
     occurrences.push({ image: renamed, index });
     occurrencesByOriginalId.set(image.id, occurrences);

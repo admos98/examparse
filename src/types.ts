@@ -86,6 +86,8 @@ export interface Question {
     spans: LineSpan[];
     text?: string;
   }[];
+  /** Optional shared or inline word-bank items associated with fill-in-the-blank questions. */
+  wordBank?: string[];
   subQuestions?: Question[];
   answer?: {
     spans?: LineSpan[];
@@ -134,6 +136,10 @@ export interface ImageAsset {
   };
   blobKey: string; // Folder image key; binary is NEVER base64'd into JSON exports
   dataUrl?: string; // cached in-memory preview
+  /** True when the image blob was missing or failed to write to local folder storage (recoverable from source). */
+  storageMissing?: boolean;
+  exportPath?: string; // relative path reference in JSON exports
+  localUrl?: string; // local folder-storage endpoint reference (/api/images/<blobKey>)
 }
 
 export interface Flag {
@@ -142,6 +148,7 @@ export interface Flag {
   code: string;
   message: string;
   questionId?: string;
+  rootCauseId?: string;
 }
 
 /**
@@ -234,6 +241,15 @@ export interface ExamDoc {
    * export affordances read this + the PARTIAL_EXAM flag.
    */
   partial?: boolean;
+  /** Part A: set to 'PARTIAL-STORAGE' when metadata persisted but >=1 image blob write failed. */
+  storageState?: 'PARTIAL-STORAGE';
+  failedImageIds?: string[];
+  exportMeta?: {
+    binariesStripped: boolean;
+    imageMode: string;
+    imageCount: number;
+    note: string;
+  };
   usage: UsageRecord[];
   modelInfo?: { fast?: string; escalation?: string; vision?: string };
   /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */

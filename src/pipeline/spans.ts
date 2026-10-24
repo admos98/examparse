@@ -1,14 +1,63 @@
 import { LineSpan, OffsetSpan, SourceLine } from '../types';
 import { exciseWatermarks, lineNumber, matchingView, normalizeStoredText } from './quality';
+import {
+  foldFurnitureForms,
+  isStandaloneFurnitureLine,
+  SHARED_INLINE_FURNITURE_MASK_PATTERNS,
+} from './furniture';
 
 /** Patterns matching inline institutional watermarks / running furniture at identical char length. */
 const INLINE_WATERMARK_MASK_PATTERNS: RegExp[] = [
-  /مرکز\s+سنجش\s+و\s+پایش\s+کیفیت\s+[آا]موزش[یى]/gu,
-  /[«»"()]?\s*ادامه(?:\s*ی)?\s+(?:س[وؤ]الات\s+)?در\s+صفحه(?:\s*ی)?\s+\S+(?:\s+\S+)?\s*[«»"()]?/gu,
-  /\bwww[\.-][a-z0-9-]+[\.-]ir\b/giu,
-  /https?:\/\/\S*medu\.ir\S*/giu,
+  ...SHARED_INLINE_FURNITURE_MASK_PATTERNS,
   /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/giu,
 ];
+
+/**
+ * Part D1 — True when a trailing line after the last option marker is a section/row
+ * instruction, standalone score, word-bank list, numbered item, or page furniture,
+ * and therefore MUST NOT be swept into the previous item's option.
+ */
+export function isOptionBoundaryStopLine(rawText: string): boolean {
+  const folded = foldFurnitureForms(rawText || '').trim();
+  if (!folded) return false;
+  if (isStandaloneFurnitureLine(folded)) return true;
+  // Standalone printed score / row number (e.g. `2`, `1/5`, `5 / 1`, `0.5`)
+  if (/^\s*\d{1,3}(?:\s*[/٫.]\s*\d{1,2})?\s*$/u.test(folded)) return true;
+  // Next numbered question header
+  if (/^\s*\d{1,3}\s*[.)\-–—]\s+\S/u.test(folded)) return true;
+  // Persian/Arabic rubric or subsection instructions
+  if (
+    /(?:جملات?\s+زیر\s+را|کلمات?\s+داده\s+شده|یک\s+(?:کلمه|جمله|تعریف|عبارت)\s+اضاف[یه]|پاسخ\s+(?:صحیح|کامل|دهید)|مشخص\s+(?:کنید|نمایید)|انتخاب\s+(?:کنید|نمایید)|کامل\s+(?:کنید|نمایید)|بنویسید|بخوانید|وصل\s+کنید|در\s+ستون\s+[ABab])/iu.test(
+      folded,
+    )
+  ) {
+    return true;
+  }
+  // English subsection instructions
+  if (
+    /^\s*(?:\d+(?:\s*[/٫.]\s*\d+)?\s+)?(?:read|choose|select|match|fill\s+in|complete|write|circle|underline|use\s+the\s+words)\s+(?:the\s+|each\s+|one\s+)/iu.test(
+      folded,
+    )
+  ) {
+    return true;
+  }
+  // Word-bank list line (3..8 comma/slash/dash-separated short lexical items, e.g. `repeatedly, forever, demand, arrange`)
+  if (folded.length <= 140) {
+    const parts = folded
+      .replace(/^[([{]+|[)\]}]+$/g, '')
+      .split(/\s*(?:,|،|\/|–|—|\s-\s)\s*/u)
+      .map(p => p.trim())
+      .filter(Boolean);
+    if (
+      parts.length >= 3 &&
+      parts.length <= 8 &&
+      parts.every(p => p.length >= 1 && p.length <= 28 && !/[.?!؟]$/u.test(p) && !/^\s*[a-hA-Hالف-ی]\s*[.)]/u.test(p))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export interface InlineOptionMarker {
   rawKey: string;
@@ -630,6 +679,8 @@ export function carveOptionsAcrossLines(
       }
       const endLineIdx = next ? next.lineIdx : lines.length;
       for (let li = cur.lineIdx + 1; li < endLineIdx; li++) {
+        if (!next && isOptionBoundaryStopLine(lines[li].text)) break;
+        if (!lines[li].text.trim()) continue;
         const ln = lines[li].lineNo;
         spans.push([ln, ln]);
       }

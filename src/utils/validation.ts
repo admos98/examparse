@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AppSettings, ExamDoc } from '../types';
+import { LLM_ROLES, type AppSettings, type ExamDoc } from '../types';
 
 export const MAX_SOURCE_FILE_BYTES = 50 * 1024 * 1024;
 export const MAX_EXAM_JSON_BYTES = 25 * 1024 * 1024;
@@ -36,7 +36,7 @@ const imageSchema = z.object({
   label: z.object({ role: z.enum(['stem', 'option', 'table', 'decoration']), questionRef: text(100).optional(), caption: text(500).optional(), reason: text(1000).optional(), kind: z.enum(['photo', 'diagram', 'chart', 'table', 'formula', 'handwriting', 'decoration']).optional(), needsText: z.boolean().optional() }).passthrough().optional(),
   blobKey: text(256), dataUrl: text(8 * 1024 * 1024).optional(), exportPath: text(512).optional(),
 }).passthrough();
-const usageSchema = z.object({ ts: text(100), role: z.enum(['fast', 'standard', 'escalation', 'vision', 'ocr', 'patch', 'agent', 'critic', 'consensus', 'cleanup', 'text-repair']), provider: text(200), model: text(300), inputTokens: z.number().finite().nonnegative(), outputTokens: z.number().finite().nonnegative(), cachedTokens: z.number().finite().nonnegative().optional(), costUsd: z.number().finite().nonnegative().optional(), label: text(1000), isCachedHit: z.boolean().optional(), dedupeKey: text(300).optional() }).passthrough();
+const usageSchema = z.object({ ts: text(100), role: z.enum(LLM_ROLES), provider: text(200), model: text(300), inputTokens: z.number().finite().nonnegative(), outputTokens: z.number().finite().nonnegative(), cachedTokens: z.number().finite().nonnegative().optional(), costUsd: z.number().finite().nonnegative().optional(), label: text(1000), isCachedHit: z.boolean().optional(), dedupeKey: text(300).optional() }).passthrough();
 
 export const ExamDocImportSchema = z.object({
   id: z.string().regex(SAFE_ID), fileHash: text(256), createdAt: text(100), displayName: text(300).optional(), nameSource: z.enum(['ai', 'manual']).optional(),

@@ -17,6 +17,7 @@ import {
 import { ColorSchema, ThemeTokenSchema } from "./agentTheme";
 import {
   lineNumber,
+  normalizeForMatching,
   examContentRevision,
   enumerateExpectedQuestionNos,
   getExamHealth,
@@ -33,7 +34,7 @@ import {
   stripLeadingOptionMarker,
   trimOptionInstructionResidue,
 } from "./assemble";
-import { spanBounds, spanLineNumbers, spansContainLine } from "./spans";
+import { carveGroupChildSpans, sliceSourceSpans, spanBounds, spanLineNumbers, spansContainLine } from "./spans";
 import {
   canonicalizeForms,
   detectShapeProblemQuestions,
@@ -111,7 +112,10 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
     if (Number.isInteger(n) && n > 0 && !enumeratedAll.includes(n)) enumeratedAll.push(n);
   }
   const existingNos = new Set(doc.questions.map((q) => q.no));
-  const toAdd = enumeratedAll.filter((n) => n !== root.no && !existingNos.has(n));
+  // Numbering check at creation: a group child may never carry its own parent's printed number
+  // (the phantom self-child `q15_c15` under parent 15). Filter on the RESOLVED root number, not
+  // on a possibly stale segment parent id.
+  const toAdd = enumeratedAll.filter((n) => Number(n) !== Number(root.no) && !existingNos.has(n));
   if (!enumeratedAll.filter((n) => n !== root.no).length) {
     return { ok: false, summary: "No enumerated child numbers in parent stem", added: [], doc, residueTrimmed: false };
   }
@@ -207,6 +211,31 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
 
   const usedIds = new Set(doc.questions.map((q) => q.id));
   const slotList = enumeratedAll.includes(root.no) ? enumeratedAll : toAdd;
+  // Fix 2 — distinct, offset-sliced stems AT CREATION. Shared-line/enumerated group children
+  // receive the exact `{ line, start, end }` slice of their own marker/body instead of a copy of
+  // the parent instruction, so sibling stems are never identical (I12 / shape audit).
+  const carvedChildSpans = carveGroupChildSpans(
+    rootSpanLines.map((line) => ({ lineNo: lineNumber(line), text: line.text })),
+    root.no,
+    toAdd,
+  );
+  // Only adopt the carved slices when they carry genuinely DISTINCT item bodies. When every
+  // carved tail is the same shared instruction/boilerplate (the common "a word is extra" row),
+  // fall back to the instruction-prefixed stem — distinct by printed number, never a duplicate.
+  const carvedBodies = toAdd.map((childNo) => {
+    const span = carvedChildSpans.get(childNo);
+    if (!span) return '';
+    return normalizeForMatching(sliceSourceSpans([span], doc.source?.lines || []))
+      .replace(new RegExp(`^\\s*\\(?${childNo}\\)?\\s*(?:[.)-:]\\s*)?`), '')
+      .replace(/\(\d{1,3}\)/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  });
+  const useCarvedChildStems =
+    // Marker-only enumerations: each slice is exactly its own `(n)` — distinct by construction.
+    carvedBodies.every((body) => body.length === 0) ||
+    // Real per-item bodies (intra-line cloze / captioned rows): adopt only when each is distinct.
+    (carvedBodies.every((body) => body.length > 0) && new Set(carvedBodies).size === carvedBodies.length);
 
   const newQuestions = toAdd.map((n, addIdx) => {
     let childId = `${root.id}_c${n}`;
@@ -230,9 +259,11 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
       candidateAtSlot.label.questionRef !== String(root.no);
     const slotImg = directImg || (belongsToOtherChild ? undefined : candidateAtSlot);
     const caption = String(slotImg?.label?.caption || "").trim();
+    const carvedSpan = useCarvedChildStems ? carvedChildSpans.get(n) : undefined;
+    const carvedStem = carvedSpan ? sliceSourceSpans([carvedSpan], doc.source?.lines || []).trim() : "";
     const childStem = caption
       ? `${n}. ${caption}`
-      : `${n}. ${cleanSharedInstruction || `Item ${n}`}`;
+      : carvedStem || `${n}. ${cleanSharedInstruction || `Item ${n}`}`;
 
     // I9: shared pool lives cleanly on root parent (`root.options`); children inherit pool via `parentId = root.id` with no duplicate per-child pool options
     const childType = root.type === "mcq" ? "matching" : root.type;
@@ -247,7 +278,7 @@ export function splitGroupChildrenInDoc(doc: ExamDoc, parentQuestionId: string):
       no: n,
       parentId: root.id,
       sectionId: root.sectionId,
-      spans: root.spans,
+      spans: carvedSpan ? [carvedSpan] : root.spans,
       stem: childStem,
       points: 0,
       type: childType,

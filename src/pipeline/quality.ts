@@ -583,6 +583,16 @@ export interface ExamHealth {
   hollowQuestions: Array<{ id: string; label: string; code: string }>;
   /** B3 orphan lines (persisted by the pipeline; recomputed lazily by callers that need exactness). */
   orphanLines: number;
+  /**
+   * Marvel Batch 6 Fix 1c: shape-audit counts from the LAST canonicalization pass, as persisted on
+   * the doc. `undefined` for docs parsed before the final pass existed.
+   */
+  shapeAudit?: { optionIncludesStem: number; duplicateSiblingStems: number; overlongStems: number };
+  /**
+   * Marvel Batch 6 Fix 4: stems still over the 500-char brake after final re-detachment — text is
+   * kept verbatim (never truncated/invented) and the question is named here for review.
+   */
+  stemOverlong: Array<{ id: string; no: number; label: string; length: number }>;
 }
 
 export function getExamHealth(doc: ExamDoc): ExamHealth {
@@ -645,6 +655,11 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
   const parentLinkIssueCount = hierarchy.cycleBreaks.size + hierarchy.orphanedParents.size;
   const hollowQuestions = (doc.questions || []).flatMap(q => (q.flags || []).filter(code => code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS').map(code => ({ id: q.id, label: q.label, code })));
   const orphanLines = (doc.source?.orphanLineNos || []).length;
+  // Fix 4: stems over the brake are named whether or not the parse-time snapshot survived an edit.
+  const stemOverlong = (doc.questions || [])
+    .filter(q => (q.stem || '').length > 500)
+    .map(q => ({ id: q.id, no: q.no, label: q.label || String(q.no), length: (q.stem || '').length }));
+  const shapeAudit = doc.source?.finalShapeAudit;
   const complete = hasQuestions && coverage.complete && unplacedImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0 && hollowQuestions.length === 0;
   const state = coverage.expected.length > 0 && coverage.coveragePercent < 80
     ? 'red'
@@ -666,6 +681,8 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     complete,
     hollowQuestions,
     orphanLines,
+    shapeAudit,
+    stemOverlong,
   };
 }
 

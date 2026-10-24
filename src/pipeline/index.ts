@@ -3,7 +3,7 @@
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
  * with content-hash caching, token thrift enforcement, and live stage status.
  */
-import { AppSettings, ExamDoc, LineTag, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
+import { AppSettings, ExamDoc, LineTag, Question, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
 import { CLEANUP_VERSION, runCleanupStage, cleanupKeySignature } from './cleanup';
 import { computeOwnership, orphanFlag } from './ownership';
 import { applyLocalGates } from './gates';
@@ -21,6 +21,7 @@ import { tracesForDoc } from './provenance';
 import { LLMAdapter } from '../providers/adapter';
 import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, markPartialForInvariantViolations, parsePrintedNumberFromStem, validateExamInvariants } from './quality';
 import { runEscalationRepair } from './repair';
+import { canonicalizeForms, runFinalCanonicalization } from './forms';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
 import { appendUsageRecord, getPipelineCache, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
@@ -709,7 +710,17 @@ export async function runFullPipeline(
       : null;
 
     if (cachedRepair) {
-      finalQuestions = cachedRepair.repairedQuestions;
+      // Fix 2 — a cache hit is still an ADOPTION: the stored replacement set enters the doc
+      // through the same exported canonicalizer registry as the live path (zero extra calls).
+      const cachedCanonical = canonicalizeForms({
+        questions: cachedRepair.repairedQuestions,
+        sourceLines: workingLines,
+        sections: structureData.sections || [],
+      });
+      finalQuestions = cachedCanonical.questions;
+      for (const formFlag of cachedCanonical.flags) {
+        if (!allFlags.some(existing => existing.code === formFlag.code && existing.questionId === formFlag.questionId)) allFlags.push(formFlag);
+      }
       const cachedUsageRec: UsageRecord = {
         ts: new Date().toISOString(),
         role: 'escalation',
@@ -744,6 +755,9 @@ export async function runFullPipeline(
       });
 
       finalQuestions = repairRes.repairedQuestions;
+      for (const formFlag of repairRes.formFlags || []) {
+        if (!allFlags.some(existing => existing.code === formFlag.code && existing.questionId === formFlag.questionId)) allFlags.push(formFlag);
+      }
       if (repairRes.rejectedCount) allFlags.push({ id: `flag_repair_rejected_${allFlags.length + 1}`, severity: 'error', code: 'REPAIR_SPAN_REJECTED', message: `${repairRes.rejectedCount} repaired question(s) were excluded because no safe question spans remained outside answer-key territory.` });
       if (repairRes.restrictedCount) allFlags.push({ id: `flag_repair_restricted_${allFlags.length + 1}`, severity: 'warn', code: 'REPAIR_SPAN_RESTRICTED', message: `${repairRes.restrictedCount} repaired item(s) had unsafe or answer-key spans clipped locally; review the remaining source anchors.` });
       // D — rewrite fence on the repair channel (same rules as the structure pass).
@@ -868,6 +882,24 @@ export async function runFullPipeline(
 
   const sectionAssembly = { sections: gates.sections };
 
+  // Fix 2 (Marvel Batch 6) — ADOPTION-TIME CANONICALIZATION (defense in depth).
+  // Every replacement question (consensus winner, critic reparse candidate, recovery insert)
+  // passes the SAME exported registry — together with its group parent/siblings so
+  // shared-line child stems can be carved — BEFORE it enters the final doc. Returns null when
+  // the registry rejects the candidate (e.g. a phantom child numbered as its own parent).
+  const adoptCanonicalized = (incoming: Question): Question | null => {
+    const peers = finalQuestions.filter(peer => peer.id === incoming.parentId || (incoming.parentId !== undefined && peer.parentId === incoming.parentId));
+    const canonical = canonicalizeForms({
+      questions: [...peers, incoming],
+      sourceLines: workingLines,
+      sections: sectionAssembly.sections,
+    });
+    for (const formFlag of canonical.flags) {
+      if (!allFlags.some(existing => existing.code === formFlag.code && existing.questionId === formFlag.questionId)) allFlags.push(formFlag);
+    }
+    return canonical.questions.find(question => question.id === incoming.id) || null;
+  };
+
   // 2A (d)/(e): section-aware semantic validators, now that sections exist.
   for (const issue of validateSemantic(finalQuestions, sectionAssembly.sections)) {
     if (issue.code !== 'PASSAGE_DETACHED' && issue.code !== 'PASSAGE_CONTAINS_STEM' && issue.code !== 'SECTION_SPAN_OUTSIDE') continue;
@@ -948,9 +980,12 @@ export async function runFullPipeline(
           const bAssembled = assembleAndValidateQuestions(second.rawQuestions || [], workingLines, totalDeclaredPoints, { keyTerritoryLineNos, imageIds: updatedImages.map(i => i.id), unresolvedImageIds, sections: sectionAssembly.sections });
           const dec = diffConsensus(aQs, bAssembled.questions.filter(q => aQs.some(a => a.no === q.no) || q.sectionId === sec.id), semanticAll);
           for (const accepted of dec.accepted) {
-            const idx = finalQuestions.findIndex(q => q.no === accepted.no && q.sectionId === sec.id);
-            if (idx >= 0) finalQuestions[idx] = { ...accepted, sectionId: sec.id };
-            else finalQuestions.push({ ...accepted, sectionId: sec.id });
+            const adoptedConsensus = adoptCanonicalized({ ...accepted, sectionId: sec.id });
+            if (adoptedConsensus) {
+              const idx = finalQuestions.findIndex(q => q.no === adoptedConsensus.no && q.sectionId === sec.id);
+              if (idx >= 0) finalQuestions[idx] = adoptedConsensus;
+              else finalQuestions.push(adoptedConsensus);
+            }
           }
           for (const rev of dec.review) {
             disagreementIds.push(finalQuestions.find(q => q.no === rev.no && q.sectionId === sec.id)?.id || '');
@@ -1018,8 +1053,16 @@ export async function runFullPipeline(
               const candidateWarns = validateSemantic([candidate], sectionAssembly.sections).filter(i => i.severity === 'warn').length;
               const beforeWarns = validateSemantic([before], sectionAssembly.sections).filter(i => i.severity === 'warn').length;
               if (candidateWarns < beforeWarns || JSON.stringify(candidate.spans) !== JSON.stringify(before.spans)) {
-                finalQuestions[idx] = { ...candidate, id: before.id, sectionId: before.sectionId, flags: [...(candidate.flags || []), 'CRITIC_REPARSED'] };
-                adopted++;
+                const adoptedCandidate = adoptCanonicalized({
+                  ...candidate,
+                  id: before.id,
+                  sectionId: before.sectionId,
+                  flags: [...(candidate.flags || []), 'CRITIC_REPARSED'],
+                });
+                if (adoptedCandidate) {
+                  finalQuestions[idx] = adoptedCandidate;
+                  adopted++;
+                }
               }
             }
           } catch { /* recovery failure leaves the original questions + review flags intact */ }
@@ -1030,6 +1073,67 @@ export async function runFullPipeline(
   } catch (err: any) {
     allFlags.push({ id: 'flag_PROVING_GROUND_SKIPPED', severity: 'info', code: 'PROVING_GROUND_SKIPPED', message: `Consensus/critic stage skipped after a local error (pipeline result unaffected): ${String(err?.message || err).slice(0, 160)}` });
   }
+
+  // 6.9 — FINAL CANONICALIZATION PASS (Marvel Batch 6, Fix 1).
+  // Assembly-time canonicalization only shapes the FIRST pass; escalation repair, consensus,
+  // critic reparse and recovery all replace questions wholesale afterwards. This runs the same
+  // exported registry last — after every question-producing/replacing stage and before the
+  // invariant gate/save — so form fixes (TF pairs, inline MCQ, matching pools), the >500-char
+  // passage re-detachment brake, phantom-child rejection and the shape audit are a guarantee,
+  // not a suggestion. It never blocks saving; remaining shape classes demote to PARTIAL below.
+  const finalPass = runFinalCanonicalization({
+    questions: finalQuestions,
+    sourceLines: workingLines,
+    sections: sectionAssembly.sections,
+  });
+  finalQuestions = finalPass.questions;
+  {
+    // Sections come back cloned; land passage/instruction updates on the live section objects.
+    const updatedById = new Map(finalPass.sections.map(section => [section.id, section]));
+    for (const section of sectionAssembly.sections) {
+      const updated = updatedById.get(section.id);
+      if (!updated) continue;
+      if (updated.passage !== undefined) section.passage = updated.passage;
+      if (updated.instructions !== undefined) section.instructions = updated.instructions;
+    }
+  }
+  for (const formFlag of finalPass.flags) {
+    if (!allFlags.some(existing => existing.code === formFlag.code && existing.questionId === formFlag.questionId)) allFlags.push(formFlag);
+  }
+
+  // Typed against `ShapeProblemDiagnosis['kinds']` so a new final-pass shape class cannot be
+  // silently dropped from the demotion mapping (tsc enforces completeness now).
+  const SHAPE_CLASS_CODE: Record<import('./forms').ShapeProblemDiagnosis['kinds'][number], { code: string; label: string }> = {
+    'duplicate-options': { code: 'SHAPE_DUPLICATE_OPTIONS', label: 'duplicate options' },
+    'option-contains-stem': { code: 'SHAPE_OPTION_INCLUDES_STEM', label: 'option repeats its whole stem' },
+    'sibling-identical-stem': { code: 'SHAPE_DUPLICATE_SIBLING_STEMS', label: 'identical sibling stems' },
+    'overlong-stem': { code: 'SHAPE_OVERLONG_STEM', label: 'stem >500 chars after re-detachment' },
+    'malformed-truefalse': { code: 'SHAPE_MALFORMED_TRUEFALSE', label: 'malformed True/False pair' },
+  };
+  const finalShapeViolations: import('./quality').InvariantViolation[] = [];
+  for (const problem of finalPass.shapeProblems) {
+    for (const kind of problem.kinds) {
+      const meta = SHAPE_CLASS_CODE[kind];
+      if (!meta) continue;
+      finalShapeViolations.push({
+        code: meta.code,
+        severity: 'error',
+        questionId: problem.questionId,
+        message: `Q${problem.no}: ${meta.label} survived the final canonicalization pass.`,
+      });
+    }
+  }
+  const shapeAuditLabel = `${finalPass.shapeAudit.optionIncludesStem}/${finalPass.shapeAudit.duplicateSiblingStems}/${finalPass.shapeAudit.overlongStems}`;
+  const shapeAuditClean = finalPass.shapeAudit.optionIncludesStem === 0 && finalPass.shapeAudit.duplicateSiblingStems === 0 && finalPass.shapeAudit.overlongStems === 0;
+  const overlongSummary = finalPass.stemOverlong.length
+    ? ` · overlong: ${finalPass.stemOverlong.map(item => `Q${item.no} (${item.length} chars)`).join(', ')}`
+    : '';
+  onStageUpdate({
+    id: 'assemble',
+    name: 'Assemble & Validate',
+    status: shapeAuditClean ? 'completed' : 'completed-with-problems',
+    message: `Final canonicalization (last): ${finalPass.questions.length} question(s) · shape audit ${shapeAuditLabel} (option⊃stem / duplicate sibling stems / overlong stems)${overlongSummary}.`,
+  });
 
   // 7. BUILD FINAL EXAM DOC & PERSIST
   const examId = `exam_${fileHash.slice(0, 12)}`;
@@ -1085,6 +1189,8 @@ export async function runFullPipeline(
       expectedQuestionNos,
       keyTerritoryLineNos,
       orphanLineNos: ownership.orphanLineNos,
+      // Fix 1c/4 — final canonicalization receipts for the health report (persisted, not just logged).
+      finalShapeAudit: { ...finalPass.shapeAudit },
       ...(cleanupStats ? { cleanupStats } : {}),
       ...(Object.keys(cleanupOverrides).length ? { cleanupOverrides } : {}),
     },
@@ -1103,7 +1209,12 @@ export async function runFullPipeline(
   // deterministic fixes demotes this doc to visibly PARTIAL (persisted `partial` marker +
   // PARTIAL_EXAM flag naming the questions). saveExamDoc itself never rejects for quality.
   const saveGate = validateExamInvariants(examDoc);
-  if (!saveGate.ok) examDoc = markPartialForInvariantViolations(examDoc, saveGate.violations);
+  // Final-pass shape classes are demoted through the SAME save-boundary mechanics (never block):
+  // the PARTIAL_EXAM banner names the offending printed numbers.
+  const gateViolations = finalShapeViolations.length
+    ? [...saveGate.violations, ...finalShapeViolations]
+    : saveGate.violations;
+  if (!saveGate.ok || finalShapeViolations.length) examDoc = markPartialForInvariantViolations(examDoc, gateViolations);
 
   await saveExamDoc(examDoc);
 
@@ -1131,6 +1242,9 @@ export async function runFullPipeline(
           expected: finalHealth.expectedCount, parsed: finalHealth.parsedCount, missing: finalHealth.missing,
           duplicates: finalHealth.duplicates, coveragePercent: finalHealth.coveragePercent, state: finalHealth.state,
           complete: finalHealth.complete, pointsParsed: finalHealth.pointsParsed, pointsExpected: finalHealth.pointsExpected,
+          // Final-pass (Fix 1c/4): shape audit counts + stems still over the brake after re-detachment.
+          shapeAudit: finalPass.shapeAudit,
+          overlongStems: finalPass.stemOverlong,
         },
         verifierDefects: allFlags.filter(f => ['ANSWER_ANCHOR_SUSPECT','OPTION_DUPLICATE','PASSAGE_DETACHED','SECTION_SPAN_OUTSIDE','CRITIC_DEFECT'].includes(String(f?.code))).length,
         calls: liveCalls.length,
@@ -1161,6 +1275,6 @@ function examContentRevisionLocal(doc: ExamDoc): string {
 }
 
 export { sliceSourceSpans, carveOptionsAcrossLines, carveGroupChildSpans } from './spans';
-export { canonicalizeForms, computeShapeAudit, FORM_EXECUTION_ORDER, FORM_RULE_ID } from './forms';
+export { canonicalizeForms, computeShapeAudit, runFinalCanonicalization, FORM_EXECUTION_ORDER, FORM_RULE_ID } from './forms';
 export { replayFieldExport } from './fieldReplay';
 

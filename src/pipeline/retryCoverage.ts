@@ -8,6 +8,7 @@ import { sha256 } from '../utils/hash';
 import { getPipelineCache, appendUsageRecord, saveExamDoc } from '../store';
 import { PARSER_VERSION } from './prompts';
 import { getExamHealth } from './quality';
+import { canonicalizeForms } from './forms';
 import { beginJob, endJob, type JobHandle } from './memory/harness';
 
 /** Journal-aware, local-only merge recovery for Step 4's Retry missing questions action. */
@@ -77,6 +78,22 @@ export async function retryMissingCoverage(
     imageIds: doc.images.map(image => image.id), unresolvedImageIds,
   });
   let additions = assembled.questions;
+  // Fix 2 (Marvel Batch 6) — ADOPTION-TIME CANONICALIZATION (defense in depth): recovered
+  // questions are inserted into an existing document, so they pass the same registry (with the
+  // document's sections as passage owners) before the merge.
+  {
+    const canonical = canonicalizeForms({
+      questions: [...doc.questions, ...additions],
+      sourceLines: lines,
+      sections: doc.sections,
+      scopeQuestionIds: new Set(additions.map(question => question.id)),
+    });
+    const byId = new Map(canonical.questions.map(question => [question.id, question]));
+    additions = additions
+      .map(question => byId.get(question.id))
+      .filter((question): question is typeof question & {} => Boolean(question))
+      .filter(question => !(question.parentId && question.parentId === question.id));
+  }
   const hints = computeImageQuestionHints(doc.images, additions, lines);
   const updatedImages = doc.images.map(image => {
     const hint = hints[image.id];

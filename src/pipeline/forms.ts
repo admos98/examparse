@@ -639,6 +639,15 @@ function applyMatchingPoolForm(
 ): Question[] {
   // 0. Never allow a question to be its own parent or duplicate its parent's printed number inside the same group.
   const byId = new Map(questions.map(q => [q.id, q]));
+  // Root numbers are also checked: a phantom child can reference a parent whose id was rewritten
+  // (repair/adoption/critic reparse) so `byId` misses it, while a root with the same printed number
+  // still proves the child duplicates its own parent. Same-section only, to keep cross-section
+  // numbering reuse legitimate.
+  const rootByNo = new Map<number, Question>();
+  for (const q of questions) {
+    if (q.parentId) continue;
+    if (!rootByNo.has(q.no)) rootByNo.set(q.no, q);
+  }
   const filtered: Question[] = [];
   for (const q of questions) {
     if (q.parentId === q.id) {
@@ -648,10 +657,24 @@ function applyMatchingPoolForm(
     }
     if (q.parentId) {
       const parent = byId.get(q.parentId);
-      if (parent && q.no === parent.no) {
+      const sameNoRoot = rootByNo.get(q.no);
+      const sameNoRootIsParent = Boolean(
+        sameNoRoot && sameNoRoot.id !== q.id && (
+          !sameNoRoot.sectionId || !q.sectionId || sameNoRoot.sectionId === q.sectionId
+        ),
+      );
+      if ((parent && q.no === parent.no) || sameNoRootIsParent) {
         // Drop phantom child numbered identically to its parent (e.g. child 15 under parent 15).
-        ensureRule(parent, FORM_RULE_ID['MATCHING-POOL']);
-        appliedRulesByQ.set(parent.id, [...(appliedRulesByQ.get(parent.id) || []), FORM_RULE_ID['MATCHING-POOL']]);
+        const anchor = parent && q.no === parent.no ? parent : sameNoRoot!;
+        ensureRule(anchor, FORM_RULE_ID['MATCHING-POOL']);
+        appliedRulesByQ.set(anchor.id, [...(appliedRulesByQ.get(anchor.id) || []), FORM_RULE_ID['MATCHING-POOL']]);
+        pushUniqueFlag(flags, {
+          id: `flag_PHANTOM_SELF_CHILD_${q.id}`,
+          severity: 'warn',
+          code: 'PHANTOM_SELF_CHILD_REMOVED',
+          message: `Phantom group child ${q.label || q.no} was numbered as its own parent ${anchor.label || anchor.no}; removed by the matching-pool canonicalizer.`,
+          questionId: anchor.id,
+        });
         continue;
       }
     }
@@ -1309,4 +1332,74 @@ export function computeShapeAudit(questions: Question[]): ShapeAuditCounts {
   }
 
   return { optionIncludesStem, duplicateSiblingStems, overlongStems };
+}
+
+/**
+ * Fix 1 (Marvel Batch 6) — the SAME canonicalizer registry, run LAST.
+ *
+ * Assembly-time canonicalization only shapes the first pass. Escalation repair, consensus,
+ * critic reparse and Assistant mutations replace questions wholesale after that, and those
+ * replacements never pass through the registry. Running the identical exported
+ * `canonicalizeForms` over the final question set — after every question-producing or
+ * question-replacing stage — turns "canonicalization is a suggestion" into a guarantee.
+ *
+ * Order (no forked logic):
+ *   (a) `canonicalizeForms` — the Batch-6 registry; its first entry is the C3 >500-char
+ *       passage-tail brake, so (b) passage re-detachment for any stem >500 chars reuses the
+ *       existing machinery unchanged.
+ *   (c) shape audit over the canonicalized result (counts are surfaced by the caller on the
+ *       stage card / health; remaining classes are demoted, never blocked).
+ *   (d) any stem still >500 chars after re-detachment keeps its exact text (the canonicalizers
+ *       never invent or truncate) and is reported as STEM_OVERLONG for the health report.
+ *
+ * Pure & idempotent: never mutates the caller's questions/sections.
+ */
+export interface FinalCanonicalizationResult {
+  questions: Question[];
+  sections: ExamSection[];
+  flags: Flag[];
+  shapeAudit: ShapeAuditCounts;
+  shapeProblems: ShapeProblemDiagnosis[];
+  /** Stems that remain over the 500-char brake after re-detachment (text kept verbatim). */
+  stemOverlong: Array<{ questionId: string; no: number; label: string; length: number }>;
+}
+
+export function runFinalCanonicalization(params: {
+  questions: Question[];
+  sourceLines: SourceLine[];
+  sections?: ExamSection[];
+}): FinalCanonicalizationResult {
+  const canonical = canonicalizeForms({
+    questions: params.questions || [],
+    sourceLines: params.sourceLines || [],
+    sections: params.sections || [],
+  });
+
+  const questions = canonical.questions;
+  const sections = canonical.sections;
+  const flags: Flag[] = [...canonical.flags];
+
+  // (c) shape audit on the final set.
+  const shapeAudit = computeShapeAudit(questions);
+  const shapeProblems = detectShapeProblemQuestions({ questions, sections } as ExamDoc);
+
+  // (d) overlong stems that survived the C3 brake: keep text, keep/raise STEM_OVERLONG, report.
+  const stemOverlong: FinalCanonicalizationResult['stemOverlong'] = [];
+  for (const q of questions) {
+    const length = (q.stem || '').length;
+    // Only a stem that is STILL over the brake is a live finding; a persisted STEM_OVERLONG flag
+    // that a later edit made obsolete stays as provenance but is not re-reported.
+    if (length <= 500) continue;
+    addQuestionFlag(q, 'STEM_OVERLONG');
+    pushUniqueFlag(flags, {
+      id: `flag_STEM_OVERLONG_${q.id}`,
+      severity: 'warn',
+      code: 'STEM_OVERLONG',
+      message: `Q${q.no}: stem is ${length} chars (>500) after the final re-detachment pass; text kept verbatim and flagged for review.`,
+      questionId: q.id,
+    });
+    stemOverlong.push({ questionId: q.id, no: q.no, label: q.label || String(q.no), length });
+  }
+
+  return { questions, sections, flags, shapeAudit, shapeProblems, stemOverlong };
 }

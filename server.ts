@@ -163,7 +163,28 @@ function readJsonFile<T>(file: string, fallback: T): T {
 function atomicWriteFile(file: string, data: string | Buffer): void {
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, file);
+  try {
+    let lastErr: any;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.renameSync(tmp, file);
+        return;
+      } catch (err: any) {
+        lastErr = err;
+        const code = err?.code;
+        if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw err;
+        // Brief spin backoff on transient Windows / AV / reader file locks
+        const waitUntil = Date.now() + 8 * (attempt + 1);
+        while (Date.now() < waitUntil) { /* spin */ }
+      }
+    }
+    // Windows overwrite fallback when destination handle prevents renameSync
+    fs.copyFileSync(tmp, file);
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  } catch (err) {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw err;
+  }
 }
 function atomicWriteJson(file: string, value: unknown): void {
   atomicWriteFile(file, JSON.stringify(value, null, 2));
@@ -801,13 +822,23 @@ app.delete('/api/exams/:id', (req: Request, res: Response) => {
   if (!file) return;
   if (fs.existsSync(file)) fs.unlinkSync(file);
   const versionsFile = path.join(VERSIONS_DIR, `${req.params.id}.json`); if (fs.existsSync(versionsFile)) fs.unlinkSync(versionsFile);
-  // Orphan-sweep images by scanning remaining exam files (image blobKeys + page thumb keys).
+  // Orphan-sweep images by scanning remaining exam files, version history, AND extraction cache entries.
   const referenced = new Set<string>();
+  const referencedHashes = new Set<string>();
   for (const f of listExamFiles()) {
     const doc = readJsonFile<any>(f, null);
+    if (doc?.fileHash) referencedHashes.add(String(doc.fileHash));
     for (const img of doc?.images || []) { if (img.blobKey) referenced.add(img.blobKey); if (img.sha) referenced.add(img.sha); }
     for (const k of doc?.source?.pageThumbKeys || []) referenced.add(k);
     for (const version of readJsonFile<any[]>(path.join(VERSIONS_DIR, `${doc?.id}.json`), [])) for (const image of version.images || []) if (image.blobKey) referenced.add(image.blobKey);
+  }
+  if (fs.existsSync(CACHE_DIR)) {
+    for (const name of fs.readdirSync(CACHE_DIR)) {
+      if (!name.startsWith('extract_') || !name.endsWith('.json')) continue;
+      const cached = readJsonFile<any>(path.join(CACHE_DIR, name), null);
+      for (const img of cached?.images || []) { if (img.blobKey) referenced.add(img.blobKey); if (img.sha) referenced.add(img.sha); }
+      for (const k of cached?.pageThumbKeys || []) referenced.add(k);
+    }
   }
   if (fs.existsSync(IMAGES_DIR)) {
     for (const name of fs.readdirSync(IMAGES_DIR)) {
@@ -817,7 +848,49 @@ app.delete('/api/exams/:id', (req: Request, res: Response) => {
       }
     }
   }
+  const sourcesDir = path.join(DATA_DIR, 'sources');
+  if (fs.existsSync(sourcesDir)) {
+    for (const name of fs.readdirSync(sourcesDir)) {
+      const hashPrefix = name.replace(/\.(?:bin|meta\.json)$/, '');
+      if (!referencedHashes.has(hashPrefix)) {
+        try { fs.unlinkSync(path.join(sourcesDir, name)); } catch { /* ignore */ }
+      }
+    }
+  }
   return res.json({ ok: true, id: req.params.id });
+});
+
+app.get('/api/sources/:hash', (req: Request, res: Response) => {
+  if (!safeSegment(res, req.params.hash)) return;
+  const sourcesDir = path.join(DATA_DIR, 'sources');
+  if (!fs.existsSync(sourcesDir)) return res.status(404).json({ error: 'Source file not found' });
+  const binFile = assertInsideDir(res, sourcesDir, path.join(sourcesDir, `${req.params.hash}.bin`));
+  if (!binFile || !fs.existsSync(binFile)) return res.status(404).json({ error: 'Source file not found' });
+  const meta = readJsonFile<{ mime?: string; fileName?: string }>(path.join(sourcesDir, `${req.params.hash}.meta.json`), {});
+  res.type(meta.mime || 'application/octet-stream');
+  if (meta.fileName) res.setHeader('X-Source-Filename', encodeURIComponent(meta.fileName));
+  return res.sendFile(binFile);
+});
+
+app.put('/api/sources/:hash', express.raw({ type: () => true, limit: 50 * 1024 * 1024 }), (req: Request, res: Response) => {
+  if (!safeSegment(res, req.params.hash)) return;
+  const body: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
+  if (!body.length) return res.status(400).json({ error: 'Source payload is empty.' });
+  try {
+    const sourcesDir = path.join(DATA_DIR, 'sources');
+    fs.mkdirSync(sourcesDir, { recursive: true });
+    const binFile = assertInsideDir(res, sourcesDir, path.join(sourcesDir, `${req.params.hash}.bin`));
+    const metaFile = assertInsideDir(res, sourcesDir, path.join(sourcesDir, `${req.params.hash}.meta.json`));
+    if (!binFile || !metaFile) return;
+    atomicWriteFile(binFile, body);
+    atomicWriteJson(metaFile, {
+      mime: String(req.query.mime || 'application/octet-stream').slice(0, 120),
+      fileName: String(req.query.name || 'source.bin').slice(0, 512),
+    });
+    return res.json({ ok: true, hash: req.params.hash, bytes: body.length });
+  } catch (err) {
+    return res.status(500).json({ error: `Failed to store source file: ${String(err)}` });
+  }
 });
 
 app.get('/api/images/:sha', (req: Request, res: Response) => {
@@ -835,21 +908,26 @@ app.put('/api/images/:sha', express.raw({ type: () => true, limit: MAX_IMAGE_BYT
   if (!safeSegment(res, req.params.sha)) return;
   const mime = String(req.query.mime || 'application/octet-stream');
   if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'].includes(mime)) return res.status(415).json({ error: 'Unsupported image MIME type.' });
+  const body: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
+  if (!body.length) return res.status(400).json({ error: 'Image blob is empty.' });
   let ext = mime.includes('/') ? mime.split('/')[1] : 'bin';
   ext = ext.replace(/[^A-Za-z0-9]/g, '').toLowerCase() || 'bin';
   if (ext === 'jpg') ext = 'jpeg';
   const file = assertInsideDir(res, IMAGES_DIR, path.join(IMAGES_DIR, `${req.params.sha}.${ext}`));
   if (!file) return;
-  if (fs.existsSync(IMAGES_DIR)) {
-    for (const name of fs.readdirSync(IMAGES_DIR)) {
-      if ((name === req.params.sha || name.startsWith(`${req.params.sha}.`)) && path.join(IMAGES_DIR, name) !== file) {
-        try { fs.unlinkSync(path.join(IMAGES_DIR, name)); } catch { /* ignore */ }
+  try {
+    if (fs.existsSync(IMAGES_DIR)) {
+      for (const name of fs.readdirSync(IMAGES_DIR)) {
+        if ((name === req.params.sha || name.startsWith(`${req.params.sha}.`)) && path.join(IMAGES_DIR, name) !== file) {
+          try { fs.unlinkSync(path.join(IMAGES_DIR, name)); } catch { /* ignore */ }
+        }
       }
     }
+    atomicWriteFile(file, body);
+    return res.json({ ok: true, sha: req.params.sha, bytes: body.length });
+  } catch (err) {
+    return res.status(500).json({ error: `Failed to store image blob: ${String(err)}` });
   }
-  const body: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
-  atomicWriteFile(file, body);
-  return res.json({ ok: true, sha: req.params.sha, bytes: body.length });
 });
 
 app.delete('/api/images/:sha', (req: Request, res: Response) => {

@@ -26,19 +26,28 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
   });
 }
 
-/** Build the clean export payload: no image dataUrls, no heavy page-image data URLs. */
+/** Build the clean export payload: strips heavy inline binary dataUrls while keeping resolvable image references and explicit export metadata. */
 export function buildExportDoc(doc: ExamDoc): any {
   const cleanImages = (doc.images || []).map(img => {
-    const { dataUrl, ...rest } = img as any;
+    const { dataUrl, _blob, ...rest } = img as any;
+    const ext = ((img.mime || 'image/jpeg').split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+    const key = img.blobKey || img.sha || '';
     return {
       ...rest,
-      exportPath: `images/${img.id}.${(img.mime || 'image/jpeg').split('/')[1] || 'jpg'}`,
+      exportPath: `images/${img.id}.${ext}`,
+      ...(key ? { localUrl: `/api/images/${encodeURIComponent(key)}` } : {}),
     };
   });
 
   const { pageImages, ...sourceWithoutPageImages } = (doc.source || {}) as any;
   return stripCredentialFields({
     ...doc,
+    exportMeta: {
+      binariesStripped: true,
+      imageMode: 'folder-blob-reference',
+      imageCount: cleanImages.length,
+      note: 'Binary image dataUrls and pageImages are intentionally stripped from JSON exports; each entry in images[] retains its resolvable blobKey, localUrl (/api/images/{blobKey}), and exportPath.',
+    },
     parseReport: parseReportForDoc(doc),
     displayName: getDisplayName(doc),
     images: cleanImages,

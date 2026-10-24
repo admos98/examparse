@@ -1,6 +1,12 @@
 /** Deterministic completeness, key-territory, and exam-health helpers. */
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, OffsetSpan, Question, SourceLine } from '../types';
 import { buildQuestionTree } from '../utils/questionTree';
+import { groupAttentionFlags } from '../utils/flagPresentation';
+import {
+  MATCHING_VIEW_GUILLEMET_ORDINAL_RE,
+  SHARED_FURNITURE_FAST_RE,
+  SHARED_FURNITURE_LEXICON,
+} from './furniture';
 
 function spanMinLine(span: LineSpan): number {
   return Array.isArray(span) ? span[0] : (span as OffsetSpan).line;
@@ -581,7 +587,9 @@ export interface ExamHealth {
   pointsExpected?: number;
   pointDeficit: number;
   unplacedImages: ImageAsset[];
+  missingBlobImages?: ImageAsset[];
   unresolvedImageRefs: string[];
+  attentionCount?: number;
   lowConfidenceCount: number;
   parentLinkIssueCount?: number;
   coveragePercent: number;
@@ -655,7 +663,9 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     const ref = img.label?.questionRef;
     if (ref && (doc.questions || []).some(q => q.id === ref || q.label === ref || String(q.no) === ref)) referenced.add(img.id);
   }
-  const unplacedImages = (doc.images || []).filter(img => !referenced.has(img.id) && img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
+  const missingBlobImages = (doc.images || []).filter(img => Boolean(img.storageMissing) && img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
+  const unplacedImages = (doc.images || []).filter(img => !img.storageMissing && !referenced.has(img.id) && img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
+  const attentionCount = groupAttentionFlags(doc.flags || [], doc).length;
   const lowConfidenceCount = (doc.questions || []).filter(q => q.confidence < 0.6).length;
   const hasCoverageProblem = coverage.missing.length > 0 || !coverage.pointsMatch;
   const hasQuestions = (doc.questions || []).length > 0;
@@ -668,7 +678,7 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     .filter(q => (q.stem || '').length > 500)
     .map(q => ({ id: q.id, no: q.no, label: q.label || String(q.no), length: (q.stem || '').length }));
   const shapeAudit = doc.source?.finalShapeAudit;
-  const complete = hasQuestions && coverage.complete && unplacedImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0 && hollowQuestions.length === 0;
+  const complete = hasQuestions && coverage.complete && unplacedImages.length === 0 && missingBlobImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0 && hollowQuestions.length === 0;
   const state = coverage.expected.length > 0 && coverage.coveragePercent < 80
     ? 'red'
     : complete ? 'green' : 'amber';
@@ -681,7 +691,9 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     pointsExpected: coverage.pointsExpected,
     pointDeficit: coverage.pointDeficit,
     unplacedImages,
+    missingBlobImages,
     unresolvedImageRefs: [...unresolved],
+    attentionCount,
     lowConfidenceCount,
     parentLinkIssueCount,
     coveragePercent: coverage.coveragePercent,
@@ -808,22 +820,15 @@ export function sectionRangesFromSections(sections: ExamSection[]): Array<{ id: 
  * A2 — WATERMARK EXCISION (applied to SLICED text, never stored lines)
  * ───────────────────────────────────────────────────────────────── */
 
-export const WATERMARK_LEXICON = [
-  /مرکز\s*سنجش\s*و\s*پایش\s*کیفیت\s*[آا]موزش[یى]/gi,
-  /www[.\-]kanoon[.\-]ir/gi,
-  /kanoon\.ir/gi,
-  /aee\.medu\.ir/gi,
-  /https?:\/\/\S+/gi,
-  /[»"]?\s*ادامه\s*(?:ی\s*)?س[وؤ]الات\s*در\s*صفحه(?:\s*(?:ی\s*)?(?:اول|د\s*وم|دوم|سوم|چهار\s*م|چهارم|پنجم|شش\s*م|ششم|هفتم|هشتم|\d+))?\s*[«"]?/gi,
-];
+export const WATERMARK_LEXICON = SHARED_FURNITURE_LEXICON;
 
-const WATERMARK_FAST_RE = /مرکز|kanoon|medu|https?:|ادامه|[\uFB50-\uFDFF\uFE70-\uFEFF]/i;
+const WATERMARK_FAST_RE = SHARED_FURNITURE_FAST_RE;
 const PRESENTATION_FORM_RE = /[\uFB50-\uFDFF\uFE70-\uFEFF]/;
 
 function excisePresentationFormWatermarks(input: string): { text: string; count: number } {
   if (!PRESENTATION_FORM_RE.test(input)) return { text: input, count: 0 };
   const view = matchingView(input);
-  if (!/مرکز|kanoon|medu|https?:|ادامه/i.test(view.text)) return { text: input, count: 0 };
+  if (!/مرکز|kanoon|medu|https?:|ادامه|صفحه|"/iu.test(view.text)) return { text: input, count: 0 };
   const spans: Array<[number, number]> = [];
   for (const re of WATERMARK_LEXICON) {
     const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
@@ -833,6 +838,22 @@ function excisePresentationFormWatermarks(input: string): { text: string; count:
       const rawStart = view.originalOffset(m.index);
       const rawEnd = view.originalOffset(m.index + m[0].length);
       if (rawEnd > rawStart) spans.push([rawStart, rawEnd]);
+    }
+  }
+  const guillemetCopy = new RegExp(
+    MATCHING_VIEW_GUILLEMET_ORDINAL_RE.source,
+    MATCHING_VIEW_GUILLEMET_ORDINAL_RE.flags,
+  );
+  for (const m of view.text.matchAll(guillemetCopy)) {
+    if (m.index === undefined) continue;
+    const rawStart = view.originalOffset(m.index);
+    const rawEnd = view.originalOffset(m.index + m[0].length);
+    if (
+      rawEnd > rawStart &&
+      (input[rawStart] === '«' || input[rawStart] === '»') &&
+      (input[rawEnd - 1] === '«' || input[rawEnd - 1] === '»')
+    ) {
+      spans.push([rawStart, rawEnd]);
     }
   }
   if (!spans.length) return { text: input, count: 0 };

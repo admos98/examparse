@@ -1,5 +1,5 @@
 import { getReviewImageBlob } from '../store';
-import { prepareReviewDocument } from './reviewIntegrity';
+import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences } from './reviewIntegrity';
 /**
  * Main Pipeline Orchestrator (§6)
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
@@ -1281,7 +1281,7 @@ export async function runFullPipeline(
   // C5: resolve extraction collisions only after assembly, when source-page context
   // can safely rewrite question references as well as image metadata and flags.
   examDoc = validateAndFixDuplicateImageIds(examDoc).doc;
-  examDoc = await prepareReviewDocument(examDoc, getReviewImageBlob);
+  examDoc = reconcileFinalFlags(repairImageReferences(examDoc, examDoc.images));
 
   // C2 — a finished parse always persists. Any error-severity violation that survived the
   // deterministic fixes demotes this doc to visibly PARTIAL (persisted `partial` marker +
@@ -1294,7 +1294,36 @@ export async function runFullPipeline(
     : saveGate.violations;
   if (!saveGate.ok || finalShapeViolations.length) examDoc = markPartialForInvariantViolations(examDoc, gateViolations);
 
-  await saveExamDoc(examDoc);
+  // Persist durably BEFORE prepareReviewDocument so deferred import-time _blob payloads are written
+  // to folder storage first, and any PARTIAL-STORAGE status is reflected on the returned examDoc.
+  const saveResult = await saveExamDoc(examDoc);
+  if (saveResult.status === 'PARTIAL-STORAGE') {
+    const failedSet = new Set(saveResult.failedImageIds);
+    examDoc = {
+      ...examDoc,
+      storageState: 'PARTIAL-STORAGE',
+      failedImageIds: saveResult.failedImageIds,
+      images: examDoc.images.map(img =>
+        failedSet.has(img.id)
+          ? (() => {
+              const { dataUrl: _omit, ...rest } = img;
+              return { ...rest, storageMissing: true };
+            })()
+          : img,
+      ),
+      flags: [
+        ...examDoc.flags.filter(f => f.code !== 'PARTIAL_STORAGE'),
+        {
+          id: 'flag_PARTIAL_STORAGE',
+          severity: 'warn',
+          code: 'PARTIAL_STORAGE',
+          rootCauseId: 'storage_failure',
+          message: saveResult.banner || `PARTIAL-STORAGE: failed to persist image blobs (${saveResult.failedImageIds.join(', ')})`,
+        },
+      ],
+    };
+  }
+  examDoc = await prepareReviewDocument(examDoc, getReviewImageBlob);
 
   // D3 — pipeline finish (including partial) is a job completion point: journal the run,
   // credit/blame matched lessons from the OUTCOME, and maybe reflect. Fire-and-forget.

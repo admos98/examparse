@@ -328,10 +328,36 @@ export function clearUsageLog(): void {
 /**
  * Folder persistence for Exam Documents & Image Blobs
  */
+export interface SaveExamResult {
+  status: 'ok' | 'PARTIAL-STORAGE';
+  failedImageIds: string[];
+  banner?: string;
+}
+
+async function putImageBlobQuietly(key: string, blob: Blob): Promise<void> {
+  if (!SAFE_STORAGE_KEY.test(key))
+    throw new Error('Invalid image storage key.');
+  if (
+    !(blob instanceof Blob) ||
+    blob.size <= 0 ||
+    blob.size > MAX_STORED_IMAGE_BYTES
+  )
+    throw new Error('Image blob is empty or exceeds the 32 MiB storage limit.');
+  const mime = blob.type || 'image/jpeg';
+  if (!ALLOWED_IMAGE_MIMES.has(mime))
+    throw new Error('Unsupported image MIME type.');
+  const res = await fetch(
+    `/api/images/${encodeURIComponent(key)}?mime=${encodeURIComponent(mime)}`,
+    { method: 'PUT', body: blob },
+  );
+  if (!res.ok)
+    throw new Error(`Failed to save image ${key} to folder storage (HTTP ${res.status})`);
+}
+
 export async function saveExamDoc(
   doc: ExamDoc,
   expectedContentHash?: string,
-): Promise<void> {
+): Promise<SaveExamResult> {
   const { reconcileFinalFlags, repairImageReferences } = await import('../pipeline/reviewIntegrity');
   Object.assign(doc, reconcileFinalFlags(repairImageReferences(doc)));
   // C1/C2 — invariant gate at the single save funnel. Persistence is NOT endorsement:
@@ -362,9 +388,81 @@ export async function saveExamDoc(
     // If validate not available or other error, don't block save (fail open for unrelated errors)
     console.warn('Invariant gate check failed to run:', e?.message);
   }
-  // Save doc without dataUrls to keep it compact
+
+  // Part A — An exam save is NOT reported successful unless its image blobs are durably written.
+  // Await all pending image blob writes and verify non-draft blob durability; partial failure
+  // marks the save PARTIAL-STORAGE with the failed IDs named in the storage banner while keeping
+  // dataUrl-free references intact in the saved ExamDoc.
+  const failedImageIds: string[] = [];
+  for (const img of doc.images || []) {
+    const key = img.blobKey || img.sha || img.id;
+    const attachedBlob = (img as any)._blob instanceof Blob ? ((img as any)._blob as Blob) : undefined;
+    const inlineDataUrl = img.dataUrl?.startsWith('data:') ? img.dataUrl : undefined;
+    const inlineObjectUrl = img.dataUrl?.startsWith('blob:') ? img.dataUrl : undefined;
+
+    if (attachedBlob || inlineDataUrl || inlineObjectUrl) {
+      try {
+        const blob = attachedBlob
+          ? attachedBlob
+          : inlineDataUrl
+            ? dataUrlToBlob(inlineDataUrl)
+            : await (await fetch(inlineObjectUrl!)).blob();
+        await putImageBlobQuietly(key, blob);
+        img.blobKey = key;
+        delete img.storageMissing;
+      } catch (err) {
+        console.warn(`PARTIAL-STORAGE: image blob write failed for ${img.id} (${key}):`, err);
+        failedImageIds.push(img.id);
+        img.blobKey = key;
+        img.storageMissing = true;
+        img.dataUrl = undefined;
+      }
+    } else if (!isSourceOnlyDraft) {
+      const existingBlob = key ? await getReviewImageBlob(key).catch(() => undefined) : undefined;
+      if (!existingBlob) {
+        failedImageIds.push(img.id);
+        img.storageMissing = true;
+        img.dataUrl = undefined;
+      } else {
+        delete img.storageMissing;
+      }
+    }
+  }
+
+  const uniqueFailedIds = [...new Set(failedImageIds)];
+  let banner: string | undefined;
+  if (uniqueFailedIds.length > 0) {
+    doc.storageState = 'PARTIAL-STORAGE';
+    doc.failedImageIds = uniqueFailedIds;
+    banner = `PARTIAL-STORAGE: failed to store image blob(s) [${uniqueFailedIds.join(', ')}] in the local data folder. Exam metadata was saved; restore missing images from source in Step 4.`;
+    doc.flags = [
+      ...(doc.flags || []).filter(
+        f =>
+          f.code !== 'PARTIAL_STORAGE' &&
+          !(
+            f.code === 'IMAGE_ASSET_ABSENT' &&
+            uniqueFailedIds.some(id => f.id === `flag_IMAGE_ASSET_ABSENT_${id}` || f.message.includes(id))
+          ),
+      ),
+      {
+        id: `flag_PARTIAL_STORAGE_${doc.id}`,
+        code: 'PARTIAL_STORAGE',
+        severity: 'warn',
+        rootCauseId: 'storage_failure',
+        message: banner,
+      },
+    ];
+    Object.assign(doc, reconcileFinalFlags(doc));
+  } else if (doc.storageState === 'PARTIAL-STORAGE' || doc.failedImageIds?.length || (doc.flags || []).some(f => f.code === 'PARTIAL_STORAGE')) {
+    delete doc.storageState;
+    delete doc.failedImageIds;
+    doc.flags = (doc.flags || []).filter(f => f.code !== 'PARTIAL_STORAGE' && f.code !== 'IMAGE_ASSET_ABSENT');
+    Object.assign(doc, reconcileFinalFlags(doc));
+  }
+
+  // Save doc without dataUrls to keep it compact while preserving dataUrl-free ImageAsset references
   const cleanImages: ImageAsset[] = (doc.images || []).map((img) => {
-    const { dataUrl, ...rest } = img;
+    const { dataUrl, _blob, ...rest } = img as any;
     return rest as ImageAsset;
   });
 
@@ -419,9 +517,16 @@ export async function saveExamDoc(
     throw new Error(
       `Failed to save exam to folder storage (HTTP ${res.status})`,
     );
+  if (banner && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('storage-error', { detail: banner }));
+  }
   // B2: dossier maintenance is deterministic, rebuilt incrementally on save
   try { await rebuildDossier(doc); } catch {}
-  return;
+  return {
+    status: uniqueFailedIds.length > 0 ? 'PARTIAL-STORAGE' : 'ok',
+    failedImageIds: uniqueFailedIds,
+    ...(banner ? { banner } : {}),
+  };
 }
 
 export async function loadExamDoc(id: string): Promise<ExamDoc | undefined> {
@@ -435,14 +540,22 @@ export async function loadExamDoc(id: string): Promise<ExamDoc | undefined> {
     );
   const doc = (await res.json()) as ExamDoc;
   if (!doc) return undefined;
-  // In folder mode image dataUrl is the server URL string (no blob fetch).
-  const images: ImageAsset[] = (doc.images || []).map((img) => ({
-    ...img,
-    dataUrl:
-      img.blobKey || (img as any).sha
-        ? `/api/images/${img.blobKey || (img as any).sha}`
-        : undefined,
-  }));
+  // Verify each image blob exists in folder storage; missing blobs retain dataUrl-free references.
+  const images: ImageAsset[] = await Promise.all(
+    (doc.images || []).map(async (img) => {
+      const key = img.blobKey || (img as any).sha;
+      if (!key) return { ...img, storageMissing: true, dataUrl: undefined };
+      const blob = await getReviewImageBlob(key).catch(() => undefined);
+      if (!blob) {
+        return { ...img, storageMissing: true, dataUrl: undefined };
+      }
+      const { storageMissing: _cleared, ...rest } = img;
+      return {
+        ...rest,
+        dataUrl: `/api/images/${encodeURIComponent(key)}`,
+      };
+    }),
+  );
   const pageImages = (doc.source?.pageThumbKeys || []).map(
     (k) => `/api/images/${k}`,
   );
@@ -454,6 +567,34 @@ export async function loadExamDoc(id: string): Promise<ExamDoc | undefined> {
       pageImages: pageImages.length > 0 ? pageImages : doc.source?.pageImages,
     },
   };
+}
+
+export async function saveSourceFile(fileHash: string, file: File | Blob, fileName?: string): Promise<void> {
+  if (!SAFE_STORAGE_KEY.test(fileHash)) return;
+  try {
+    const mime = file.type || 'application/octet-stream';
+    const name = fileName || (file instanceof File ? file.name : 'source.bin');
+    await fetch(
+      `/api/sources/${encodeURIComponent(fileHash)}?mime=${encodeURIComponent(mime)}&name=${encodeURIComponent(name)}`,
+      { method: 'PUT', body: file },
+    );
+  } catch {
+    // Best-effort source retention; in-memory rawFile remains primary during active session.
+  }
+}
+
+export async function getSourceFile(fileHash: string, fallbackName = 'source.pdf'): Promise<File | undefined> {
+  if (!SAFE_STORAGE_KEY.test(fileHash)) return undefined;
+  try {
+    const res = await fetch(`/api/sources/${encodeURIComponent(fileHash)}`);
+    if (!res.ok) return undefined;
+    const rawHeader = res.headers.get('X-Source-Filename');
+    const name = rawHeader ? decodeURIComponent(rawHeader) : fallbackName;
+    const blob = await res.blob();
+    return new File([blob], name, { type: blob.type || 'application/octet-stream' });
+  } catch {
+    return undefined;
+  }
 }
 
 export async function saveImageBlob(key: string, blob: Blob): Promise<void> {

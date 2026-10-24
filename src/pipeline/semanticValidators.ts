@@ -1,10 +1,11 @@
 /** 2A — Semantic local validators. Pure, deterministic, 0 model calls.
  * Run inside the assembly funnel so fresh/resumed/chunked/imported docs all get them.
  * Heuristic humility: shape suspicions are info, only structural contradictions warn. */
-import type { ExamSection, Question } from '../types';
+import type { ExamSection, LineSpan, Question } from '../types';
 import { normalizeForMatching } from './quality';
 import { isOptionMarkerLine } from './cleanup';
-import { spanLineNumbers } from './spans';
+import { isKeyInstruction } from './answerKey';
+import { isOffsetSpan, spanLineNumbers } from './spans';
 
 export interface SemanticIssue {
   code: 'ANSWER_ANCHOR_SUSPECT' | 'STEM_SHAPE_SUSPECT' | 'OPTION_DUPLICATE' | 'PASSAGE_DETACHED' | 'PASSAGE_CONTAINS_STEM' | 'SECTION_SPAN_OUTSIDE' | 'STEM_HOLLOW' | 'OPTIONS_MISSING' | 'OPTIONS_UNVERIFIED';
@@ -22,6 +23,53 @@ const PASSAGE_REF_RE = /passage|reading text|text above|listening|dialogue|conve
 function answerContainsNumber(text: string, no: number): boolean {
   const n = norm(text);
   return new RegExp(`(^|\\D)${no}(\\D|$)`).test(n);
+}
+
+function answerSpanSignature(spans?: LineSpan[]): string | undefined {
+  if (!spans || spans.length === 0) return undefined;
+  return spans
+    .map(sp =>
+      isOffsetSpan(sp)
+        ? `${sp.line}:${sp.start ?? 0}:${sp.end ?? 'end'}`
+        : `${sp[0]}-${sp[1]}`,
+    )
+    .join('|');
+}
+
+function hasInvalidAnswerSpan(spans?: LineSpan[]): boolean {
+  if (!spans) return false;
+  return spans.some(sp =>
+    isOffsetSpan(sp)
+      ? sp.line < 1 || (sp.start !== undefined && sp.end !== undefined && sp.end < sp.start)
+      : sp[0] < 1 || sp[1] < sp[0],
+  );
+}
+
+/**
+ * Part B1 — Recognizes valid carved answer patterns for an exam item:
+ * letter choice (`( a )`, `c`, `الف`), True/False (`True`, `(a) True`, `درست`),
+ * numbered key entry (`3. b`), or single short lexical/numeric token (`demand`, `54`).
+ */
+export function matchesKeyAnswerPattern(text: string | undefined, q?: Pick<Question, 'no' | 'type'>): boolean {
+  const raw = (text || '').trim();
+  if (!raw || isKeyInstruction(raw)) return false;
+  const n = norm(raw);
+  if (!n) return false;
+  if (q && answerContainsNumber(raw, q.no)) return true;
+  // Option letter pattern: `( a )`, `(c)`, `b)`, `[d]`, `a`, `الف`, etc.
+  if (/^(?:[(«["\s]*[a-hالفبپتجچحخد][\s)»\]".:-]*)$/iu.test(n)) return true;
+  // True/False pattern (with optional choice letter): `True`, `False`, `(a) True`, `درست`, `نادرست`
+  if (
+    /^(?:[(«["\s]*[a-d][\s)»\]".:-]*)?(?:true|false|t|f|درست|نادرست|صحیح|غلط)(?:\s*[(«["\s]*[a-d][\s)»\]"]*)?\.?$/iu.test(
+      n,
+    )
+  ) {
+    return true;
+  }
+  // Single short token (word / hyphenated token / numeric answer) without sentence/instruction whitespace
+  const unwrapped = n.replace(/^[([«"']+|[)\]»"'.!?,;،؛]+$/gu, '').trim();
+  if (unwrapped.length >= 1 && unwrapped.length <= 32 && !/\s/u.test(unwrapped)) return true;
+  return false;
 }
 
 /** (a)–(e) validators over assembled questions. */
@@ -66,6 +114,12 @@ export function validateSemantic(questions: Question[], sections: ExamSection[] 
   const sectionById = new Map((sections || []).map(s => [s.id, s]));
   const questionById = new Map((questions || []).map(q => [q.id, q]));
   const answerTexts = (questions || []).map(q => norm(q.answer?.text));
+  const answerSpanCounts = new Map<string, number>();
+  for (const item of questions || []) {
+    if (item.answer?.source !== 'paper' && item.answer?.source !== 'keyfile') continue;
+    const sig = answerSpanSignature(item.answer.spans);
+    if (sig) answerSpanCounts.set(sig, (answerSpanCounts.get(sig) || 0) + 1);
+  }
   for (const q of questions || []) {
     // C1 STEM_HOLLOW — a number with no question behind it (lazy one-line span, wrong anchor).
     if (isStemHollow(q, q.parentId ? questionById.get(q.parentId) : undefined)) {
@@ -74,12 +128,31 @@ export function validateSemantic(questions: Question[], sections: ExamSection[] 
     // C1 MCQ_OPTIONS
     const op = optionsProblem(q, sourceTextFor?.(q));
     if (op) issues.push({ code: op.code, severity: op.severity, questionId: q.id, message: op.message });
-    // (a) ANSWER-ANCHOR
-    if (q.answer?.source === 'paper' && q.answer.text && norm(q.answer.text)) {
-      const seg = norm(q.answer.text);
-      const distinctFromSiblings = answerTexts.filter(t => t && t === seg).length <= 1 && seg.length > 0;
-      if (!answerContainsNumber(q.answer.text, q.no) && !distinctFromSiblings) {
-        issues.push({ code: 'ANSWER_ANCHOR_SUSPECT', severity: 'warn', questionId: q.id, message: `Q${q.no}: paper answer segment neither contains printed number ${q.no} nor differs from sibling segments.` });
+    // (a) ANSWER-ANCHOR (Part B1): suspicion requires the answer to be empty, instruction-classified, or span-inconsistent.
+    if (q.answer && (q.answer.source === 'paper' || q.answer.source === 'keyfile')) {
+      const rawAns = (q.answer.text || '').trim();
+      const seg = norm(rawAns);
+      const isEmpty = !seg;
+      const isInstr = !isEmpty && isKeyInstruction(rawAns);
+      const sig = answerSpanSignature(q.answer.spans);
+      const sharedIdenticalSpan = Boolean(sig && (answerSpanCounts.get(sig) || 0) > 1 && !answerContainsNumber(rawAns, q.no));
+      const unanchoredDuplicateProse =
+        !sig &&
+        !isEmpty &&
+        !matchesKeyAnswerPattern(rawAns, q) &&
+        answerTexts.filter(t => t && t === seg).length > 1;
+      const isSpanInconsistent = hasInvalidAnswerSpan(q.answer.spans) || sharedIdenticalSpan || unanchoredDuplicateProse;
+      if (isEmpty || isInstr || isSpanInconsistent) {
+        issues.push({
+          code: 'ANSWER_ANCHOR_SUSPECT',
+          severity: 'warn',
+          questionId: q.id,
+          message: isEmpty
+            ? `Q${q.no}: key answer anchor produced empty text.`
+            : isInstr
+              ? `Q${q.no}: key segment contains instructions rather than an answer.`
+              : `Q${q.no}: paper answer anchor is span-inconsistent across sibling items.`,
+        });
       }
     }
     // (b) BLANK-POSITION (info only — heuristic humility)

@@ -24,6 +24,7 @@ import {
   compressLineNumbers,
   findInlineOptionMarkers,
   isOffsetSpan,
+  isOptionBoundaryStopLine,
   maskWatermarksSameLength,
   sliceSourceSpans,
   spanBounds,
@@ -724,10 +725,17 @@ function applyMatchingPoolForm(
       .map(ln => ({ lineNo: ln, text: lineMap.get(ln)?.text || '' }))
       .filter(it => it.text.trim().length > 0);
 
-    // Stop group lines before any trailing unrelated sub-header instruction (e.g. Row 6 word-bank instruction).
+    // Stop group lines before any trailing standalone score, instruction, or word-bank boundary (Part D1).
     let stopIdx = groupLinesAll.length;
-    for (let i = 1; i < groupLinesAll.length; i++) {
-      if (isRowSubInstructionLine(groupLinesAll[i].text)) {
+    let seenOptionLine = false;
+    for (let i = 0; i < groupLinesAll.length; i++) {
+      if (findInlineOptionMarkers(groupLinesAll[i].text).length > 0) seenOptionLine = true;
+      if (
+        i > 0 &&
+        (isRowSubInstructionLine(groupLinesAll[i].text) ||
+          isInstructionText(groupLinesAll[i].text) ||
+          (seenOptionLine && isOptionBoundaryStopLine(groupLinesAll[i].text)))
+      ) {
         stopIdx = i;
         break;
       }
@@ -742,10 +750,21 @@ function applyMatchingPoolForm(
     const hasSharedPool = Boolean((carvedPool && carvedPool.options.length >= 3) || (parent.options && parent.options.length >= 3));
     if (!hasParenthesizedGroupMarkers && !hasSharedPool && parent.type !== 'matching') continue;
 
+    const optionHasBoundaryLeak = (optText: string | undefined): boolean => {
+      if (!optText) return false;
+      const rawLines = optText.split(/\r?\n/);
+      if (rawLines.length > 1 && rawLines.slice(1).some(ln => isOptionBoundaryStopLine(ln) || isRowSubInstructionLine(ln) || isInstructionText(ln))) {
+        return true;
+      }
+      const norm = normalizeForMatching(optText);
+      return /(?:جملات?\s+زیر\s+را|کلمات?\s+داده\s+شده|یک\s+(?:کلمه|جمله|تعریف)\s+اضاف[یه])/iu.test(norm);
+    };
+
     const existingParentOptsClean =
       (parent.options || []).length >= 3 &&
       new Set((parent.options || []).map(o => normMatch(o.text)).filter(Boolean)).size === (parent.options || []).length &&
-      findInlineOptionMarkers(parent.stem || '').length < 2;
+      findInlineOptionMarkers(parent.stem || '').length < 2 &&
+      !(parent.options || []).some(o => optionHasBoundaryLeak(o.text));
 
     let parentChanged = false;
     if (!existingParentOptsClean && carvedPool && carvedPool.options.length >= 3 && carvedPool.stemSpans.length > 0) {
@@ -767,6 +786,28 @@ function applyMatchingPoolForm(
         parent.stem = nextStem;
         parent.options = slicedOpts;
       }
+    } else if ((parent.options || []).some(o => optionHasBoundaryLeak(o.text))) {
+      parent.options = (parent.options || []).map(opt => {
+        if (!optionHasBoundaryLeak(opt.text)) return opt;
+        const cleanSpans = (opt.spans || []).filter((sp, idx) => {
+          if (idx === 0) return true;
+          const txt = sliceSourceSpans([sp], sourceLines);
+          return !isOptionBoundaryStopLine(txt) && !isRowSubInstructionLine(txt) && !isInstructionText(txt);
+        });
+        const rawLines = (opt.text || '').split(/\r?\n/);
+        const keptLines = [rawLines[0]];
+        for (let k = 1; k < rawLines.length; k++) {
+          if (isOptionBoundaryStopLine(rawLines[k]) || isRowSubInstructionLine(rawLines[k]) || isInstructionText(rawLines[k])) break;
+          keptLines.push(rawLines[k]);
+        }
+        let cleanedText = keptLines.join('\n').trim();
+        cleanedText = cleanedText.replace(
+          /\s+\d{1,2}(?:\s+\d+\s*\/\s*\d+|\s+\d+[٫.]\d+)?\s*(?:[\u0600-\u06FF].*)$/su,
+          '',
+        ).trim();
+        parentChanged = true;
+        return { ...opt, spans: cleanSpans.length ? cleanSpans : opt.spans, text: cleanedText };
+      });
     }
 
     if (applyTypeFromForm(parent, 'matching', 'MATCHING-POOL', flags)) parentChanged = true;
@@ -907,19 +948,25 @@ function applyMatchingPoolForm(
   return filtered;
 }
 
-function isWordBankListLine(text: string): boolean {
+export function parseWordBankItems(text: string): string[] {
   const norm = normalizeStoredText(text).trim();
-  if (!norm || norm.length > 140) return false;
-  if (parsePrintedNumberFromStem(norm) !== undefined) return false;
-  if (isInstructionText(norm) || isRowSubInstructionLine(norm)) return false;
-  // Comma- or slash- or dash-separated short lexical items (3..8 items), e.g. `repeatedly, forever, demand, arrange`
+  if (!norm || norm.length > 140) return [];
   const parts = norm
     .replace(/^[([{]+|[)\]}]+$/g, '')
     .split(/\s*(?:,|،|\/|–|—|\s-\s)\s*/u)
     .map(p => p.trim())
     .filter(Boolean);
-  if (parts.length < 3 || parts.length > 8) return false;
-  return parts.every(p => p.length >= 1 && p.length <= 28 && !/[.?!؟]$/u.test(p));
+  if (parts.length < 3 || parts.length > 8) return [];
+  if (!parts.every(p => p.length >= 1 && p.length <= 28 && !/[.?!؟]$/u.test(p))) return [];
+  return parts;
+}
+
+export function isWordBankListLine(text: string): boolean {
+  const norm = normalizeStoredText(text).trim();
+  if (!norm || norm.length > 140) return false;
+  if (parsePrintedNumberFromStem(norm) !== undefined) return false;
+  if (isInstructionText(norm) || isRowSubInstructionLine(norm)) return false;
+  return parseWordBankItems(norm).length >= 3;
 }
 
 function hasInlineWordBankCue(text: string, inInstruction = false): boolean {
@@ -945,6 +992,7 @@ function applyWordBankForm(
   appliedRulesByQ: Map<string, string[]>,
 ): void {
   const sortedLineNos = [...lineMap.keys()].sort((a, b) => a - b);
+  const lineIdxByNo = new Map<number, number>(sortedLineNos.map((ln, idx) => [ln, idx]));
 
   for (const q of questions) {
     if (q.type === 'matching' || q.type === 'truefalse') continue;
@@ -962,16 +1010,28 @@ function applyWordBankForm(
     const qLines = spanLineNumbers(q.spans);
     const firstLn = qLines[0];
     let hasBankCue = hasInlineWordBankCue(stemText);
+    let extractedBank: string[] | undefined;
+    const inlineParenMatch = normalizeStoredText(stemText).match(/\(\s*([a-zA-Z]+(?:\s*,\s*[a-zA-Z]+){2,6})\s*\)/u);
+    if (inlineParenMatch) extractedBank = parseWordBankItems(inlineParenMatch[1]);
 
-    if (!hasBankCue && firstLn !== undefined) {
-      const idx = sortedLineNos.indexOf(firstLn);
+    if ((!hasBankCue || !extractedBank) && firstLn !== undefined) {
+      const idx = lineIdxByNo.get(firstLn) ?? -1;
       for (let k = idx - 1; k >= Math.max(0, idx - 10); k--) {
         const l = lineMap.get(sortedLineNos[k]);
         if (!l || l.furniture) continue;
         const isSubInstr = isRowSubInstructionLine(l.text);
         const isInstr = isSubInstr || isInstructionText(l.text);
-        if (isWordBankListLine(l.text) || hasInlineWordBankCue(l.text, isInstr)) {
+        if (isWordBankListLine(l.text)) {
           hasBankCue = true;
+          if (!extractedBank) extractedBank = parseWordBankItems(l.text);
+          break;
+        }
+        if (hasInlineWordBankCue(l.text, isInstr)) {
+          hasBankCue = true;
+          if (!extractedBank) {
+            const m = normalizeStoredText(l.text).match(/\b([a-zA-Z]{2,15}(?:\s*,\s*[a-zA-Z]{2,15}){2,6})\b/u);
+            if (m) extractedBank = parseWordBankItems(m[1]);
+          }
           break;
         }
         // Stop at the nearest row sub-header instruction so a word bank from an earlier row cannot leak downward.
@@ -982,6 +1042,10 @@ function applyWordBankForm(
     if (!hasBankCue) continue;
 
     let changed = false;
+    if (extractedBank && extractedBank.length >= 3 && JSON.stringify(q.wordBank) !== JSON.stringify(extractedBank)) {
+      q.wordBank = extractedBank;
+      changed = true;
+    }
     // Trim any leaked trailing row instruction lines out of `q.spans`.
     if (qLines.length > 1 && !q.spans.some(spanHasOffsets)) {
       const cleanLines: number[] = [qLines[0]];

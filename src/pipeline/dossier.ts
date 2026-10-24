@@ -70,7 +70,7 @@ export function buildDossier(doc: ExamDoc, existing?: Dossier): Dossier {
     structureMap,
     questionIndex,
     imageIndex,
-    healthSnapshot: { expected: health.expectedCount, parsed: health.parsedCount, missing: health.missing, duplicates: health.duplicates, pointsParsed: health.pointsParsed, pointsExpected: health.pointsExpected, pointDeficit: health.pointDeficit, coveragePercent: health.coveragePercent, state: health.state, complete: health.complete, lowConfidence: health.lowConfidenceCount, unplacedImages: health.unplacedImages.length, parentLinkIssues: health.parentLinkIssueCount },
+    healthSnapshot: { expected: health.expectedCount, parsed: health.parsedCount, missing: health.missing, duplicates: health.duplicates, pointsParsed: health.pointsParsed, pointsExpected: health.pointsExpected, pointDeficit: health.pointDeficit, coveragePercent: health.coveragePercent, state: health.state, complete: health.complete, lowConfidence: health.lowConfidenceCount, unplacedImages: health.unplacedImages.length, parentLinkIssues: health.parentLinkIssueCount, attentionCount: health.attentionCount },
     knownIssues,
     ledger,
     userNotes,

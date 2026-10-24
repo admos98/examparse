@@ -1,6 +1,7 @@
 /** Deterministic per-item answer-key anchors and bounded answer-span completion. */
 import type { LineSpan, OffsetSpan, SourceLine } from '../types';
 import { exciseWatermarks, matchingView, normalizeForMatching } from './quality';
+import { foldFurnitureForms, isStandaloneFurnitureLine } from './furniture';
 import { isInstructionText } from './cleanup';
 import { isOffsetSpan } from './spans';
 
@@ -129,7 +130,19 @@ export function isKeyInstruction(text: string): boolean {
 
 /** Slice-time furniture removal shared by every answer path, not an export scrub. */
 export function cleanAnswerText(text: string): string {
-  const clean = exciseWatermarks(text).text;
+  // Drop trailing continued-page / standalone furniture lines and any immediately preceding bare page/score number line.
+  const rawLines = text.split(/\r?\n/);
+  while (rawLines.length > 1 && isStandaloneFurnitureLine(rawLines[rawLines.length - 1])) {
+    rawLines.pop();
+    if (
+      rawLines.length > 1 &&
+      /^\s*\d{1,2}(?:\s*[/٫.]\s*\d{1,2})?\s*$/u.test(foldFurnitureForms(rawLines[rawLines.length - 1])) &&
+      /[A-Za-z\p{Script=Arabic}]{2,}/u.test(rawLines.slice(0, -1).join(' '))
+    ) {
+      rawLines.pop();
+    }
+  }
+  const clean = exciseWatermarks(rawLines.join('\n')).text;
   const view = matchingView(clean);
   const furniture = /(?:\d+\s*نمره|نمره|هر\s*پاسخ\s*صحیح|[()]\s*(?:[./][\d./]+|\d+[./][\d./]+)\s*[()]|[()]\s*\d+\s*[()]\s*نمره)/u.exec(view.text);
   return (furniture ? clean.slice(0, view.originalOffset(furniture.index)) : clean).trim();
@@ -172,6 +185,13 @@ export function extendIncompleteAnswer(spans: LineSpan[], lines: SourceLine[], k
     if (anchors.length || nextAnchorStart(nextLine.text, 0) !== undefined || isKeyInstruction(nextLine.text)) break;
     const nextText = nextLine.text.trim();
     if (!nextText) continue;
+    if (isStandaloneFurnitureLine(nextText)) break;
+    if (
+      /^\s*\d{1,2}(?:\s*[/٫.]\s*\d{1,2})?\s*$/u.test(foldFurnitureForms(nextText)) &&
+      /[A-Za-z\p{Script=Arabic}]{2,}/u.test(gathered)
+    ) {
+      break;
+    }
     // A continuation line starts lower-case or with punctuation; a fresh heading/answer is a hard stop.
     if (/^\s*(?:question|q\.?\s*\d|\d{1,3}\s*[.)-]|[A-Z][^,;]{0,25}:)/iu.test(nextText)) break;
     out.push([nextNo, nextNo]);

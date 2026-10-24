@@ -657,6 +657,12 @@ function applyMatchingPoolForm(
     }
     if (q.parentId) {
       const parent = byId.get(q.parentId);
+      const sharedContextParent = Boolean(parent?.receipt?.ruleChain.some(rule => ['dialogue-group', 'enumerative-group'].includes(rule)));
+      if (sharedContextParent && parent?.no === q.no) {
+        // Dialogue/enumeration context groups deliberately retain a first child with the parent's number.
+        filtered.push(q);
+        continue;
+      }
       const sameNoRoot = rootByNo.get(q.no);
       const sameNoRootIsParent = Boolean(
         sameNoRoot && sameNoRoot.id !== q.id && (
@@ -691,6 +697,17 @@ function applyMatchingPoolForm(
   for (const [parentId, children] of childrenByParent.entries()) {
     const parent = filtered.find(q => q.id === parentId);
     if (!parent) continue;
+    if (parent.receipt?.ruleChain.includes('dialogue-group')) {
+      for (const child of children) {
+        if (applyTypeFromForm(child, 'fillblank', 'DIALOGUE', flags)) {
+          appliedRulesByQ.set(child.id, [...(appliedRulesByQ.get(child.id) || []), FORM_RULE_ID.DIALOGUE]);
+        }
+        ensureRule(child, FORM_RULE_ID.DIALOGUE);
+      }
+      continue;
+    }
+    // Enumerative cloze groups have a shared instruction plus numbered item slices, not a matching pool.
+    if (parent.receipt?.ruleChain.includes('enumerative-group')) continue;
 
     // Skip intra-line cloze groups (`63. a) ... 64. b) ...`) where parent line has intra-line multi-numbers.
     const parentLineNos = [
@@ -1076,6 +1093,7 @@ function applyDialogueForm(
   appliedRulesByQ: Map<string, string[]>,
 ): void {
   for (const q of questions) {
+    if (!q.parentId && q.receipt?.ruleChain.includes('dialogue-group')) continue;
     const allLineNos = [
       ...new Set([
         ...spanLineNumbers(q.spans),

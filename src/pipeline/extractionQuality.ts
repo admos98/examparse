@@ -9,6 +9,62 @@ export interface TextItemPosition {
   h: number;
   dir: "rtl" | "ltr";
 }
+
+/**
+ * Reorders only contiguous LTR islands inside a right-to-left PDF line. PDF.js gives
+ * coordinates in visual order, so Arabic runs are read right-to-left while an English
+ * phrase embedded in the line must still be read left-to-right.
+ */
+export function orderBidiLiteTextItems(items: TextItemPosition[], rtl: boolean): { items: TextItemPosition[]; reorderedEnglishIsland: boolean } {
+  if (!rtl) return { items: [...items].sort((a, b) => a.x - b.x), reorderedEnglishIsland: false };
+  const visual = [...items].sort((a, b) => b.x - a.x);
+  const out: TextItemPosition[] = [];
+  let reorderedEnglishIsland = false;
+  for (let i = 0; i < visual.length;) {
+    if (visual[i].dir !== 'ltr') {
+      out.push(visual[i++]);
+      continue;
+    }
+    let end = i + 1;
+    while (end < visual.length && visual[end].dir === 'ltr') end++;
+    const island = visual.slice(i, end);
+    if (island.some(item => /\p{Script=Latin}/u.test(item.str))) {
+      out.push(...island.sort((a, b) => a.x - b.x));
+      reorderedEnglishIsland = reorderedEnglishIsland || island.length > 1;
+    } else {
+      out.push(...island);
+    }
+    i = end;
+  }
+  return { items: out, reorderedEnglishIsland };
+}
+
+/** Assemble positioned PDF runs with font-relative gap thresholds (not absolute pixels). */
+export function assemblePositionedTextItems(items: TextItemPosition[], rtl: boolean): { text: string; reorderedEnglishIsland: boolean } {
+  const ordered = orderBidiLiteTextItems(items, rtl);
+  let text = '';
+  for (let i = 0; i < ordered.items.length; i++) {
+    const item = ordered.items[i];
+    if (i === 0) {
+      text += item.str;
+      continue;
+    }
+    const prev = ordered.items[i - 1];
+    const avgFontHeight = (prev.h + item.h) / 2 || 12;
+    const sameEnglishIsland = rtl && prev.dir === 'ltr' && item.dir === 'ltr';
+    const gap = sameEnglishIsland
+      ? item.x - (prev.x + prev.w)
+      : rtl
+        ? prev.x - (item.x + item.w)
+        : item.x - (prev.x + prev.w);
+    // 0.3 em is scale-independent across PDF point sizes and remains byte-stable for LTR lines.
+    const avoidDuplicateSpace = rtl && (/\s$/u.test(prev.str) || /^\s/u.test(item.str));
+    if (gap / avgFontHeight > 0.3 && !avoidDuplicateSpace) text += ' ';
+    text += item.str;
+  }
+  return { text: text.trim(), reorderedEnglishIsland: ordered.reorderedEnglishIsland };
+}
+
 /** Split only on a wide gutter that no other row crosses. Uncertain layouts retain legacy reading order. */
 export function columnSegments(
   cluster: TextItemPosition[],

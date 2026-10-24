@@ -20,6 +20,7 @@ import {
   columnSegments,
   extractionDiagnostics,
   tagFurniture,
+  assemblePositionedTextItems,
 } from '../src/pipeline/extractionQuality';
 import {
   materializeMergedCrop,

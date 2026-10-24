@@ -125,6 +125,7 @@ test('T2 — Fix 2 & I11: intra-line multi-number splitter emits parent+children
     'Part B: Grammar',
     '19. a) go  b) goes    20. a) do  b) does    21. a) is  b) are',
     '22. She plays tennis every Friday.',
+    'جمع نمره: 2.5',
   ]);
   const intra = findIntraLineMultiNumbers(lines[1].text);
   assert.equal(intra.length, 3);

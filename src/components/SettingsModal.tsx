@@ -853,6 +853,19 @@ export const SettingsModal: React.FC<Props> = ({
 
                   <div className="flex items-center justify-between p-3.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] ">
                     <div>
+                      <div className="font-medium text-[var(--ink)] ">Text Repair Overlay (Stage 2.75, optional)</div>
+                      <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">One batched call for suspicious non-key lines. Conservative fences preserve digits, Latin islands and printed numbers; original extracted lines remain untouched. Off by default.</div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={current.textRepairEnabled === true}
+                      onChange={e => setCurrent(prev => ({ ...prev, textRepairEnabled: e.target.checked }))}
+                      className="w-4 h-4 rounded-[6px] text-[var(--accent-ink)]"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between p-3.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] ">
+                    <div>
                       <div className="font-medium text-[var(--ink)] ">LaTeX Math Normalization</div>
                       <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">When off, keeps mathematical formulas as raw text (saves tokens)</div>
                     </div>

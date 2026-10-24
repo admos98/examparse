@@ -49,7 +49,7 @@ const OPTION_MARKER_ANY = /(?:^|\s)(?:\(?[a-h][).:]|\([a-h]\)|\((?:الف|ب|پ|
 const BLANK_MARKER = /……|…{2,}|\.\.\.|_{2,}|-{3,}|\(\s*\)|\(\s*\.+\s*\)/;
 const GROUP_ENUM = /\(\d{1,3}\)\s*\(\d{1,3}\)/;
 const URL_ONLY = /^(?:https?:\/\/|www[.-])\S+$/i;
-const INSTRUCTION_RE = /^(?:instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|circle\b|underline\b|دستورالعمل|به سوالات|به پرسش|گزینه|جاهای خالی|جملات|جمله|کلمات|با توجه به|متن زیر|مکالمه|پاسخ\s+صحیح|دانش\s*اموز\s*عزیز|در\s+این\s+قسمت|در\s+سوالهای|توجه\s*:)/i;
+const INSTRUCTION_RE = /^(?:\(?یک\s+(?:تعریف|کلمه|جمله|مورد)\s+اضاف(?:ه|ی)\s+(?:است|می‌باشد|میباشد)|instructions?\b|directions?\b|read\b|choose\b|select\b|listen\b|complete\b|answer\b|fill\b|match\b|write\b|circle\b|underline\b|دستورالعمل|به سوالات|به پرسش|گزینه|جاهای خالی|جملات|جمله|کلمات|با توجه به|متن زیر|مکالمه|پاسخ\s+صحیح|دانش\s*اموز\s*عزیز|در\s+این\s+قسمت|در\s+سوالهای|توجه\s*:)/i;
 const TOTAL_POINTS_RE = /(?:جمع\s*نمره|جمع\s*نمرات|نمره\s*کل|total\s*(?:points|marks|score))/i;
 
 /** A line that carries a printed question number (leading, parenthesised, or a (15)(16) group line). */

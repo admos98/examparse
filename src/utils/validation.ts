@@ -36,7 +36,7 @@ const imageSchema = z.object({
   label: z.object({ role: z.enum(['stem', 'option', 'table', 'decoration']), questionRef: text(100).optional(), caption: text(500).optional(), reason: text(1000).optional(), kind: z.enum(['photo', 'diagram', 'chart', 'table', 'formula', 'handwriting', 'decoration']).optional(), needsText: z.boolean().optional() }).passthrough().optional(),
   blobKey: text(256), dataUrl: text(8 * 1024 * 1024).optional(), exportPath: text(512).optional(),
 }).passthrough();
-const usageSchema = z.object({ ts: text(100), role: z.enum(['fast', 'standard', 'escalation', 'vision', 'ocr', 'patch', 'agent', 'critic', 'consensus', 'cleanup']), provider: text(200), model: text(300), inputTokens: z.number().finite().nonnegative(), outputTokens: z.number().finite().nonnegative(), cachedTokens: z.number().finite().nonnegative().optional(), costUsd: z.number().finite().nonnegative().optional(), label: text(1000), isCachedHit: z.boolean().optional(), dedupeKey: text(300).optional() }).passthrough();
+const usageSchema = z.object({ ts: text(100), role: z.enum(['fast', 'standard', 'escalation', 'vision', 'ocr', 'patch', 'agent', 'critic', 'consensus', 'cleanup', 'text-repair']), provider: text(200), model: text(300), inputTokens: z.number().finite().nonnegative(), outputTokens: z.number().finite().nonnegative(), cachedTokens: z.number().finite().nonnegative().optional(), costUsd: z.number().finite().nonnegative().optional(), label: text(1000), isCachedHit: z.boolean().optional(), dedupeKey: text(300).optional() }).passthrough();
 
 export const ExamDocImportSchema = z.object({
   id: z.string().regex(SAFE_ID), fileHash: text(256), createdAt: text(100), displayName: text(300).optional(), nameSource: z.enum(['ai', 'manual']).optional(),
@@ -100,6 +100,7 @@ export const AppSettingsSchema = z.object({
   budget: z.object({ maxUsdPerRun: z.number().finite().nonnegative(), maxOutputTokens: z.number().int().min(256).max(65_536) }),
   agentLimits: z.object({ maxModelCalls: z.number().int().min(1).max(100).optional(), maxToolExecutions: z.number().int().min(1).max(400).optional() }).optional(),
   cleanupEnabled: z.boolean().optional(),
+  textRepairEnabled: z.boolean().optional(),
   assistantMonthlySoftCapUsd: z.number().finite().nonnegative().optional(),
   uiLanguage: z.enum(['fa', 'en']).optional(),
   themeMode: z.enum(['system', 'light', 'dark']).optional(),

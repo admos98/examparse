@@ -289,7 +289,7 @@ export interface StructurePassParams {
   escalationProviderConfig?: any;
   garbledEscalationBudget?: { count: number; max: number };
   /** B2 — deterministic segments wire v2 (advisory, never executive). When present, model labels/classifies/corrects per segment. */
-  segments?: Array<{ seg: string; kind: string; range: [number, number]; n?: number; childNos?: number[]; hint: string; preview: string }>;
+  segments?: Array<{ seg: string; kind: string; range: [number, number]; n?: number; childNos?: number[]; groupForm?: 'dialogue' | 'enumeration' | 'matching'; parentStemLines?: number[]; hint: string; preview: string }>;
   /** B4 — when true, skip segment wire and use legacy free-span flow */
   segmentFallback?: boolean;
 }

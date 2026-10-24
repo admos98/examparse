@@ -22,6 +22,7 @@ import { getPipelineCache } from '../store';
 import { PARSER_VERSION } from '../pipeline/prompts';
 import { estimateCleanupCall, cleanupKeySignature } from '../pipeline/cleanup';
 import { enumerateExpectedQuestionNos } from '../pipeline/quality';
+import { collectTextRepairCandidates, estimateTextRepairCall, textRepairCacheKey } from '../pipeline/textRepair';
 
 interface Props {
   extractedDoc: ExtractedDocument;
@@ -71,7 +72,8 @@ export const Step3Analyze: React.FC<Props> = ({
     vision: boolean;
     ocr: boolean;
     repair: boolean;
-  }>({ structure: false, vision: false, ocr: false, repair: true });
+    textRepair: boolean;
+  }>({ structure: false, vision: false, ocr: false, repair: true, textRepair: true });
 
 
 
@@ -198,15 +200,32 @@ export const Step3Analyze: React.FC<Props> = ({
           }
         }
 
+        let textRepairCached = settings.textRepairEnabled !== true;
+        if (settings.textRepairEnabled === true) {
+          const repairSelection = settings.roleMapping.cleanup || settings.roleMapping.fast;
+          const repairProvider = settings.providers.find(p => p.id === repairSelection.providerId) || settings.providers[0];
+          const keyLines = new Set(enumerateExpectedQuestionNos(effectiveLines).keyTerritory.lineNos);
+          const candidates = collectTextRepairCandidates(effectiveLines, keyLines);
+          textRepairCached = candidates.length === 0;
+          if (candidates.length && settings.thrift.cacheEnabled && repairProvider) {
+            textRepairCached = true;
+            for (const candidate of candidates) {
+              const key = await textRepairCacheKey(candidate.text, repairProvider.id, repairSelection.model);
+              if (!(await getPipelineCache(key))) { textRepairCached = false; break; }
+            }
+          }
+        }
+
         if (isMounted) {
           const status = {
             structure: Boolean(cachedStruct),
             vision: visionCached,
             ocr: ocrCached,
             repair: repairCached,
+            textRepair: textRepairCached,
           };
           setCachedStages(status);
-          const allCached = status.structure && status.vision && status.ocr && status.repair;
+          const allCached = status.structure && status.vision && status.ocr && status.repair && status.textRepair;
           setIsPreflightCached(allCached);
         }
       } catch {
@@ -232,6 +251,9 @@ export const Step3Analyze: React.FC<Props> = ({
     settings.roleMapping.escalation.model,
     settings.cleanupEnabled,
     settings.roleMapping.cleanup?.model,
+    settings.roleMapping.cleanup?.providerId,
+    settings.textRepairEnabled,
+    settings.thrift.cacheEnabled,
   ]);
 
   const isFullyCached =
@@ -239,7 +261,8 @@ export const Step3Analyze: React.FC<Props> = ({
     cachedStages.structure &&
     (extractedDoc.images.length === 0 || cachedStages.vision) &&
     (extractedDoc.scannedPageIndices.length === 0 || cachedStages.ocr) &&
-    cachedStages.repair;
+    cachedStages.repair &&
+    cachedStages.textRepair;
 
   // Calculate pre-flight token & cost estimate for uncached stages only (§5.7)
   // Detect RTL from extracted text rather than relying solely on settings
@@ -260,6 +283,7 @@ export const Step3Analyze: React.FC<Props> = ({
     visionModel: resolveModel('vision'),
     repairModel: resolveModel('escalation'),
     cleanupModel: resolveModel('cleanup'),
+    textRepairModel: resolveModel('cleanup'),
   };
 
   // A5 — Stage 2.5 cleanup judgment estimate (0 calls when the toggle is off; the local pre-pass is always free).
@@ -272,13 +296,27 @@ export const Step3Analyze: React.FC<Props> = ({
     } catch { return { chunks: 0, inputTokens: 0, outputTokens: 0, judged: 0 }; }
   }, [extractedDoc.lines, extractedDoc.pages, cleanupEnabled]);
 
+  const textRepairEnabled = settings.textRepairEnabled === true;
+  const textRepairEstimate = useMemo(() => {
+    if (!textRepairEnabled) return { candidates: 0, calls: 0, inputTokens: 0, outputTokens: 0 };
+    try {
+      const keyLines = new Set(enumerateExpectedQuestionNos(extractedDoc.lines).keyTerritory.lineNos);
+      const candidates = collectTextRepairCandidates(extractedDoc.lines, keyLines);
+      const estimate = estimateTextRepairCall(candidates);
+      return { candidates: candidates.length, ...estimate };
+    } catch { return { candidates: 0, calls: 0, inputTokens: 0, outputTokens: 0 }; }
+  }, [extractedDoc.lines, textRepairEnabled]);
+  const textRepairEstimateForRun = textRepairEnabled && (forceRerun || forcedStages.has('text-repair') || !cachedStages.textRepair)
+    ? { calls: textRepairEstimate.calls, inputTokens: textRepairEstimate.inputTokens, outputTokens: textRepairEstimate.outputTokens }
+    : undefined;
+
   // Applicable estimate: full estimate when forceRerun, else uncached-stages estimate
   const estimate = isFullyCached && !forceRerun
     ? {
         estimatedInputTokens: 0,
         estimatedOutputTokens: 0,
         estimatedCostUsd: 0,
-        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, ocrCalls: 0, cleanupCalls: 0, cleanupTokens: 0, cleanupCostUsd: 0 },
+        breakdown: { textTokens: 0, imageTokens: 0, visionCalls: 0, ocrCalls: 0, cleanupCalls: 0, cleanupTokens: 0, cleanupCostUsd: 0, textRepairCalls: 0, textRepairTokens: 0, textRepairCostUsd: 0 },
         exceedsBudget: false,
         warning50Percent: false,
       }
@@ -295,6 +333,7 @@ export const Step3Analyze: React.FC<Props> = ({
         maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
         providerKey: `${activeProvider.kind}:${activeProvider.id}`,
         cleanup: cachedStages.structure && !forceRerun ? undefined : cleanupEstimate,
+        textRepair: textRepairEstimateForRun,
       });
 
   const handleStartAnalysis = async () => {
@@ -323,6 +362,7 @@ export const Step3Analyze: React.FC<Props> = ({
       { id: 'extract', name: 'Local Text & Image Extraction', status: 'completed', message: '0 API calls (done)' },
       { id: 'ocr', name: 'Scanned Pages OCR', status: extractedDoc.scannedPageIndices.length > 0 ? 'idle' : 'skipped', message: 'Batched <= 3 pages' },
       { id: 'cleanup', name: 'Cleanup Tags (Stage 2.5)', status: cleanupEnabled ? 'idle' : 'skipped', message: cleanupEnabled ? `${cleanupEstimate.chunks} judgment call(s) · ${cleanupEstimate.judged} line(s) · local tags first` : 'AI off — local tags only' },
+      { id: 'text-repair', name: 'Text Repair Overlay (Stage 2.75)', status: textRepairEnabled ? 'idle' : 'skipped', message: textRepairEnabled ? `Up to ${textRepairEstimate.calls} batched call · ${textRepairEstimate.candidates} candidates · originals preserved` : 'Disabled in Settings — original text only' },
       { id: 'structure', name: 'Structure Pass (Span References)', status: 'idle', message: '1 text call' },
       { id: 'vision', name: 'Batched Vision Labeling', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
       { id: 'assemble', name: 'Assemble & Validate', status: 'idle', message: 'Local assembly' },
@@ -458,7 +498,7 @@ export const Step3Analyze: React.FC<Props> = ({
               {isPreflightCached && !forceRerun ? '0 toks' : `~${(estimate.estimatedInputTokens / 1000).toFixed(1)}k`}
             </div>
             <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">
-              {isPreflightCached && !forceRerun ? 'Cache hit' : `${estimate.breakdown.textTokens} text + ${estimate.breakdown.imageTokens} img${estimate.breakdown.cleanupCalls ? ` + ${estimate.breakdown.cleanupTokens} cleanup` : ''}`}
+              {isPreflightCached && !forceRerun ? 'Cache hit' : `${estimate.breakdown.textTokens} text + ${estimate.breakdown.imageTokens} img${estimate.breakdown.cleanupCalls ? ` + ${estimate.breakdown.cleanupTokens} cleanup` : ''}${estimate.breakdown.textRepairCalls ? ` + ${estimate.breakdown.textRepairTokens} text repair` : ''}`}
             </div>
           </div>
 
@@ -485,7 +525,7 @@ export const Step3Analyze: React.FC<Props> = ({
           <div className="p-3.5 rounded-[10px] bg-[var(--paper)]  border border-[var(--rule)]  space-y-1">
             <div className="text-[length:var(--type-12)] uppercase font-semibold text-[var(--ink-2)]">API Calls</div>
             <div className="text-lg font-bold font-mono text-[var(--ink)] ">
-              {isPreflightCached && !forceRerun ? '0 calls' : `${estimate.breakdown.cleanupCalls ? `${estimate.breakdown.cleanupCalls} cleanup + ` : ''}1 text + ${estimate.breakdown.visionCalls} vision`}
+              {isPreflightCached && !forceRerun ? '0 calls' : `${estimate.breakdown.cleanupCalls ? `${estimate.breakdown.cleanupCalls} cleanup + ` : ''}${estimate.breakdown.textRepairCalls ? `${estimate.breakdown.textRepairCalls} repair + ` : ''}1 text + ${estimate.breakdown.visionCalls} vision`}
             </div>
             <div className="text-[length:var(--type-12)] text-[var(--accent-ink)]  font-medium">
               {isPreflightCached && !forceRerun ? 'Cached result' : 'Target: ≤ 3 calls total'}

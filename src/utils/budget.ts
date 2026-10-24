@@ -96,6 +96,9 @@ export interface PreflightEstimate {
     cleanupCalls: number;
     cleanupTokens: number;
     cleanupCostUsd: number;
+    textRepairCalls: number;
+    textRepairTokens: number;
+    textRepairCostUsd: number;
   };
 }
 
@@ -105,6 +108,7 @@ export interface PreflightStageModels {
   visionModel?: string;
   repairModel?: string;
   cleanupModel?: string;
+  textRepairModel?: string;
 }
 
 export function calculatePreflightEstimate(params: {
@@ -121,6 +125,8 @@ export function calculatePreflightEstimate(params: {
   providerKey?: string;
   /** A5 — pre-computed cleanup call shape from estimateCleanupCall(); omit when cleanup is off or cached. */
   cleanup?: { chunks: number; inputTokens: number; outputTokens: number };
+  /** Stage 2.75: at most one repair batch; omitted when disabled or line-hash cache is complete. */
+  textRepair?: { calls: number; inputTokens: number; outputTokens: number };
 }): PreflightEstimate {
   const {
     text,
@@ -135,6 +141,7 @@ export function calculatePreflightEstimate(params: {
     maxImagesPerVisionCall = 16,
     providerKey = 'default',
     cleanup,
+    textRepair,
   } = params;
 
   // 1. Structure text input tokens (priced at structure model)
@@ -174,8 +181,17 @@ export function calculatePreflightEstimate(params: {
     (cleanupInput / 1_000_000) * cleanupRate.inputCostPerMillion +
     (cleanupOutput / 1_000_000) * cleanupRate.outputCostPerMillion;
 
-  const estimatedInputTokens = textTokens + ocrTokens + imageTokens + cleanupInput;
-  const estimatedOutputTokens = structureOutputTokens + ocrOutputTokens + visionOutputTokens + cleanupOutput;
+  const textRepairModel = stageModels?.textRepairModel || cleanupModel;
+  const textRepairRate = costTable[textRepairModel] || { inputCostPerMillion: 0.15, outputCostPerMillion: 0.60 };
+  const textRepairCalls = textRepair?.calls || 0;
+  const textRepairInput = textRepairCalls ? textRepair!.inputTokens : 0;
+  const textRepairOutput = textRepairCalls ? textRepair!.outputTokens : 0;
+  const textRepairCost =
+    (textRepairInput / 1_000_000) * textRepairRate.inputCostPerMillion +
+    (textRepairOutput / 1_000_000) * textRepairRate.outputCostPerMillion;
+
+  const estimatedInputTokens = textTokens + ocrTokens + imageTokens + cleanupInput + textRepairInput;
+  const estimatedOutputTokens = structureOutputTokens + ocrOutputTokens + visionOutputTokens + cleanupOutput + textRepairOutput;
   const estimatedTotalTokens = estimatedInputTokens + estimatedOutputTokens;
 
   // Cost per stage
@@ -189,7 +205,7 @@ export function calculatePreflightEstimate(params: {
     (imageTokens / 1_000_000) * visionRate.inputCostPerMillion +
     (visionOutputTokens / 1_000_000) * visionRate.outputCostPerMillion;
 
-  const estimatedCostUsd = structureCost + ocrCost + visionCost + cleanupCost;
+  const estimatedCostUsd = structureCost + ocrCost + visionCost + cleanupCost + textRepairCost;
 
   const exceedsBudget = maxUsdPerRun > 0 && estimatedCostUsd > maxUsdPerRun;
   const warning50Percent = maxUsdPerRun > 0 && estimatedCostUsd > maxUsdPerRun * 0.5;
@@ -209,6 +225,9 @@ export function calculatePreflightEstimate(params: {
       cleanupCalls,
       cleanupTokens: cleanupInput + cleanupOutput,
       cleanupCostUsd: cleanupCost,
+      textRepairCalls,
+      textRepairTokens: textRepairInput + textRepairOutput,
+      textRepairCostUsd: textRepairCost,
     },
   };
 }

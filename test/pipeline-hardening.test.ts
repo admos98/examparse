@@ -82,7 +82,8 @@ test('clips option and table spans out of answer-key territory while preserving 
   }], source, undefined, { keyTerritoryLineNos: [3, 4] });
   assert.ok(result.questions[0].options?.every(option => option.spans.every(sp => (Array.isArray(sp) ? sp[1] : sp.line) < 3)));
   assert.equal(result.questions[0].tables, undefined);
-  assert.deepEqual(result.questions[0].answer?.spans, [[4, 4]]);
+  assert.deepEqual(result.questions[0].answer?.spans, [{ line: 4, start: 3, end: 4 }]);
+  assert.equal(result.questions[0].answer?.text, 'B');
 });
 
 // (4) Printed numbering overrides a model-shifted sequence and is explicitly flagged.

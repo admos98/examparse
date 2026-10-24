@@ -23,7 +23,7 @@
     {"no": 51, "stemIncludes": "I have kept a diary", "optionPoolContains": ["to take something in", "book in which you record"]},
     {"no": 55, "stemIncludes": "Out of sight, out of mind", "optionPoolContains": ["People like to spend time", "You soon forget"]},
     {"no": 63, "children": [64, 65, 66], "stemIncludes": "Ferdowsi"},
-    {"no": 67, "points": 4, "stemIncludes": "Having a healthy lifestyle"},
+    {"no": 67, "points": 1.86, "stemIncludes": "Having a healthy lifestyle"},
     {"no": 40, "stemEquals": "40. Early humans discovered how to make fire.", "stemExcludes": ["a) True", "a)True", "b) False", "b)False"], "options": ["True", "False"]},
     {"no": 6, "stemEquals": "6. Her mother said to him to call the bus station.", "stemExcludes": ["a) True", "a)True", "b) False", "b)False"], "options": ["True", "False"]},
     {"no": 38, "stemIncludes": "Can doing good small things show your respect to your parents?", "maxStemLength": 300, "sectionPassageIncludes": "When early humans hunted and collected food", "noStemIncludesPassage": "When early humans hunted and collected food"},

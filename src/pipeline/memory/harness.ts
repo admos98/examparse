@@ -128,6 +128,7 @@ async function defaultReflectionUsageLogger(record: { label: string; inputTokens
 export interface EndJobParams {
   health: any;
   verifierDefects?: number;
+  defectFixRates?: { localFixed: number; cloudFixed: number; teacherLeft: number };
   /** Godlike-1 C3: key-table answer agreement for this job. */
   answerAccuracy?: { checked: number; agreed: number; corrected: number; conflicts: number };
   calls: number;
@@ -182,6 +183,7 @@ export async function endJob(handle: JobHandle, params: EndJobParams): Promise<E
     costUsd: params.costUsd, wallMs, ladderPath, flagsRaised, userCorrections: params.userCorrections || 0,
   });
   if (typeof params.verifierDefects === 'number') entry.verifierDefects = params.verifierDefects;
+  if (params.defectFixRates) entry.defectFixRates = { ...params.defectFixRates };
   if (params.answerAccuracy && params.answerAccuracy.checked > 0) entry.answerAccuracy = { ...params.answerAccuracy };
   if (params.baselineRevision) { entry.baselineRevision = params.baselineRevision; entry.baselineTs = new Date().toISOString(); }
   // B2/D3 — the ids credited/blamed for this job ride in the journal line itself so the

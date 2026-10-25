@@ -185,9 +185,12 @@ export const LLM_ROLES = [
   'consensus',
   'cleanup',
   'text-repair',
-  /** #38 AI-first spine: global line classification (labels only) + defect repair (operations only). */
-  'classify',
+  /** Canonical #39 spine roles. Legacy roles remain accepted for old saved journals only. */
+  'read',
+  'meta',
+  'cloud',
   'repair',
+  'classify',
 ] as const;
 export type LLMRole = (typeof LLM_ROLES)[number];
 
@@ -283,7 +286,7 @@ export interface ExamDoc {
   spine?: SpineRecord;
 }
 
-/** #38: what the AI-first spine did on this run. `fallback` means the legacy segmenter path was used (never silent). */
+/** Global Read receipt. `fallback` is retained for old documents; #39 never takes a parser fallback. */
 export interface SpineClassifyRecord {
   status: 'completed' | 'cached' | 'fallback' | 'unavailable' | 'skipped';
   provider?: string;
@@ -395,10 +398,16 @@ export interface RoleMapping {
   consensus?: RoleModelSelection;
   /** A2: cleanup role (defaults to the fast/structure model). */
   cleanup?: RoleModelSelection;
-  /** #38 Part A: global line classification. Defaults to cleanup's effective mapping (cleanup → fast); a local model is fine. */
-  classify?: RoleModelSelection;
-  /** #38 Part D: defect repair loop. Same defaulting as classify. */
+  /** #39: one whole-document semantic read; defaults to the fast mapping. */
+  read?: RoleModelSelection;
+  /** Tiny metadata reads; defaults to read. */
+  meta?: RoleModelSelection;
+  /** Defect-only escalation; defaults to escalation. */
+  cloud?: RoleModelSelection;
+  /** Local defect repair; defaults to read. */
   repair?: RoleModelSelection;
+  /** Legacy setting retained only so old settings JSON can migrate. Not used by the default path. */
+  classify?: RoleModelSelection;
 }
 
 export interface CostRate {
@@ -437,8 +446,9 @@ export interface AppSettings {
   assistantMonthlySoftCapUsd?: number;
   /** 2E: bounded section parallelism (1–6, default 3). */
   parallelSections?: number;
-  /** 2C: consensus toggle (default ON only when a distinct consensus model exists). */
+  /** Report-only proving-ground tools. Both are off by default and never gate a parse. */
   consensusEnabled?: boolean;
+  criticEnabled?: boolean;
   themeTokens?: Partial<Record<'primary' | 'background' | 'foreground', string>>;
   /** Manual light/dark override; system follows prefers-color-scheme. */
   themeMode?: 'system' | 'light' | 'dark';
@@ -504,7 +514,7 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'ocr' | 'cleanup' | 'text-repair' | 'classify' | 'structure' | 'vision' | 'assemble' | 'repair';
+export type PipelineStageId = 'extract' | 'read' | 'check' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
 
 export interface StageStatus {
   id: PipelineStageId;

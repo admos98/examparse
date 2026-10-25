@@ -1086,7 +1086,8 @@ app.delete('/api/usage', (_req: Request, res: Response) => {
 
 
 const REASONING_400_RE = /reasoning|thinking|enable_thinking|unsupported/i;
-const PARSE_ROLES = new Set(['fast', 'vision', 'ocr', 'escalation', 'patch']);
+const PARSE_ROLES = new Set(['read', 'meta', 'cloud', 'repair', 'fast', 'vision', 'ocr', 'escalation', 'patch']);
+const FORCED_REASONING_OFF_ROLES = new Set(['read', 'meta']);
 
 /** Extract the first balanced JSON value ({...} or [...]) starting at/after `fromIndex`. String-aware brace scan. */
 function extractBalancedJsonValue(text: string, fromIndex = 0): string | null {
@@ -1294,7 +1295,8 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       }
       // Disable thinking overhead for Flash / Flash-Lite models; Pro models have a provider minimum.
       const modelLower = model.toLowerCase();
-      if (modelLower.includes('flash')) {
+      if (FORCED_REASONING_OFF_ROLES.has(role) || modelLower.includes('flash')) {
+        // Global/meta reads must never spend tokens in a hidden thinking channel.
         config.thinkingConfig = { thinkingBudget: 0 };
       } else if (modelLower.includes('pro')) {
         config.thinkingConfig = { thinkingBudget: 128 };
@@ -1396,7 +1398,9 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       }
 
       // Reasoning kill-switch (per-provider, default on) + Extra body JSON merged last.
-      const disableReasoning = (providerConfig as any)?.disableReasoning !== false;
+      // read/meta are forcibly defused: provider settings and custom body JSON cannot re-enable thinking.
+      const forceReasoningOff = FORCED_REASONING_OFF_ROLES.has(role);
+      const disableReasoning = forceReasoningOff || (providerConfig as any)?.disableReasoning !== false;
       const extraBody = parseExtraBody((providerConfig as any)?.extraBodyJson);
       const buildAttemptBody = (rung: 0 | 1 | 2): any => {
         if (rung === 1) {
@@ -1429,6 +1433,14 @@ app.post('/api/llm', async (req: Request, res: Response) => {
         for (const [key, value] of Object.entries(extraBody)) {
           if (value === null) delete body[key];
           else body[key] = value;
+        }
+        if (forceReasoningOff) {
+          // Apply last so custom settings cannot silently re-enable reasoning for the read role.
+          delete body.thinking;
+          delete body.enable_thinking;
+          delete body.chat_template_kwargs;
+          body.reasoning = { effort: 'none', exclude: true };
+          body.reasoning_effort = 'none';
         }
         return body;
       };

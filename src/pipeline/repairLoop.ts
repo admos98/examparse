@@ -304,7 +304,6 @@ export function applyRepairOp(op: RepairOp, ctx: RepairContext): string {
         spans: [] as any,
         stem: '',
         type: owner.type,
-        points: 0,
         confidence: 0.5,
         images: [],
         answer: { source: 'paper', text: '' },
@@ -379,6 +378,11 @@ export interface RepairLoopResult {
 export const REPAIR_BATCH_SIZE = 15;
 export const REPAIR_MAX_ROUNDS = 3;
 
+export function renderDefectEvidenceOnly(defect: Defect): string {
+  const evidence = defect.evidence.map(e => `[L${String(e.line).padStart(4, '0')}] ${e.text}`).join('\n');
+  return `ONE DEFECT ONLY\nDEFECT ${defect.id} (${defect.kind})\nCOMPLAINT: ${defect.detail}${defect.questionIds.length ? `\nQUESTION IDS: ${defect.questionIds.join(', ')}` : ''}${evidence ? `\nEVIDENCE:\n${evidence}` : '\nEVIDENCE: none supplied'}\nReturn at most one operation for this defect.`;
+}
+
 export function renderDefectBatch(kind: DefectKind, defects: Defect[], state: RepairState): string {
   const byId = new Map(state.questions.map(q => [q.id, q]));
   const rows = defects.map(d => {
@@ -407,7 +411,7 @@ export async function runRepairLoop(params: {
   maxRounds?: number;
   /** Serialized prior loop outcome for identical content (0 calls on re-run). */
   cachedResult?: string;
-  onJournal?: (entry: { label: string; rawText: string }) => void | Promise<void>;
+  onJournal?: (entry: { label: string; rawText: string; requestText?: string }) => void | Promise<void>;
   onProgress?: (message: string) => void;
 }): Promise<RepairLoopResult> {
   const usage = { inputTokens: 0, outputTokens: 0 };
@@ -421,7 +425,7 @@ export async function runRepairLoop(params: {
     try {
       const cached = JSON.parse(params.cachedResult);
       if (Array.isArray(cached.questions) && Array.isArray(cached.sections)) {
-        return base('cached', { questions: cached.questions, sections: cached.sections }, [], {
+        return base('cached', { questions: cached.questions, sections: cached.sections }, Array.isArray(cached.remainingDefects) ? cached.remainingDefects : [], {
           rounds: cached.rounds || [], opsAccepted: cached.opsAccepted || 0, opsRejected: cached.opsRejected || 0,
           escalations: cached.escalations || 0, furnitureDropped: cached.furnitureDropped || [],
         });
@@ -480,21 +484,24 @@ export async function runRepairLoop(params: {
       const caller = shouldEscalate ? params.escalationCaller! : params.caller;
       if (!caller) continue;
       if (shouldEscalate) { escalatedOnce.add(kind); record.escalatedKinds.push(kind); escalations++; }
-      for (let i = 0; i < kindDefects.length; i += REPAIR_BATCH_SIZE) {
+      const batchSize = shouldEscalate ? 1 : REPAIR_BATCH_SIZE;
+      for (let i = 0; i < kindDefects.length; i += batchSize) {
         if (params.budget.calls >= params.budget.maxCalls || params.budget.units >= params.budget.maxUnits) break;
-        const batch = kindDefects.slice(i, i + REPAIR_BATCH_SIZE);
+        // Cloud locality is a hard privacy/cost boundary: exactly one defect and only its cited evidence.
+        const batch = kindDefects.slice(i, i + batchSize);
         const label = `Repair ${kind} (round ${round})${shouldEscalate ? ' — escalation' : ''}`;
         params.onProgress?.(`${label}: ${batch.length} defect(s)…`);
         let response;
+        const requestText = shouldEscalate ? renderDefectEvidenceOnly(batch[0]) : renderDefectBatch(kind, batch, state);
         try {
-          response = await caller({ system: REPAIR_OPS_SYSTEM, text: renderDefectBatch(kind, batch, state), maxOutputTokens: 8192, label });
+          response = await caller({ system: REPAIR_OPS_SYSTEM, text: requestText, maxOutputTokens: shouldEscalate ? 2048 : 8192, label });
         } catch { continue; }
         calls++;
         record.calls++;
         params.budget.calls++;
         const bucket = shouldEscalate ? escalationUsage : usage;
         if (response.usage) { bucket.inputTokens += response.usage.inputTokens || 0; bucket.outputTokens += response.usage.outputTokens || 0; }
-        await params.onJournal?.({ label, rawText: response.rawText.slice(0, 200000) });
+        await params.onJournal?.({ label, rawText: response.rawText.slice(0, 200000), requestText });
         const { ops, rejected } = parseRepairOps(response.rawText, response.json);
         record.rejected += rejected;
         opsRejected += rejected;
@@ -558,6 +565,7 @@ export function serializeRepairLoopResult(result: RepairLoopResult): string {
     opsAccepted: result.opsAccepted,
     opsRejected: result.opsRejected,
     escalations: result.escalations,
+    remainingDefects: result.remainingDefects,
     furnitureDropped: result.furnitureDropped,
   });
 }

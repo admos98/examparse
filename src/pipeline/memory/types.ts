@@ -33,6 +33,8 @@ export interface RunJournalEntry {
   /** D3 baseline for the 10-minute user-correction window. */
   /** 2D: verifier defect count for this run (scoreboard evidence). */
   verifierDefects?: number;
+  /** #39 repair outcome, attributed by role so the scoreboard shows the wing working. */
+  defectFixRates?: { localFixed: number; cloudFixed: number; teacherLeft: number };
   /** Godlike-1 C3: key-table answer agreement on this run (scoreboard answer-accuracy). */
   answerAccuracy?: { checked: number; agreed: number; corrected: number; conflicts: number };
   baselineRevision?: string;

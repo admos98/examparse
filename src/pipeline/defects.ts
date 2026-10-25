@@ -128,22 +128,20 @@ export function computeDefects(params: {
     });
   }
 
-  // --- Points unresolved (only repairable when a printed total exists as evidence).
-  if (totalPoints !== undefined) {
-    const parentIds = new Set(questions.map(q => q.parentId).filter(Boolean) as string[]);
-    for (const q of questions) {
-      if (q.parentId || parentIds.has(q.id)) continue; // priced at child level
-      if (Number(q.points) > 0) continue;
-      const nos = questionLineNos(q);
-      defects.push({
-        id: `points-unresolved:${q.id}`,
-        kind: 'points-unresolved',
-        questionIds: [q.id],
-        lineIds: nos,
-        evidence: ev(lineByNo, nos),
-        detail: `question ${q.no} has no printed marks assigned although the paper prints a total of ${totalPoints}`,
-      });
-    }
+  // --- Points unresolved. No defaults, no distribution, and no silent zero even when total is unreadable.
+  const parentIds = new Set(questions.map(q => q.parentId).filter(Boolean) as string[]);
+  for (const q of questions) {
+    if (q.parentId || parentIds.has(q.id)) continue; // priced at child level
+    if (Number(q.points) > 0) continue;
+    const nos = questionLineNos(q);
+    defects.push({
+      id: `points-unresolved:${q.id}`,
+      kind: 'points-unresolved',
+      questionIds: [q.id],
+      lineIds: nos,
+      evidence: ev(lineByNo, nos),
+      detail: `question ${q.no} has no usable printed marks evidence${totalPoints !== undefined ? ` (paper total ${totalPoints})` : ''}`,
+    });
   }
 
   // --- Invariant-based kinds (hollow / options / image ownership) via the existing checker.

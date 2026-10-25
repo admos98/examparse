@@ -638,19 +638,18 @@ export const SettingsModal: React.FC<Props> = ({
                 </div>
 
                 <div className="space-y-4">
-                  {(['fast', 'cleanup', 'classify', 'repair', 'standard', 'escalation', 'vision', 'agent', 'critic', 'consensus'] as const).map(role => {
-                    const sel = current.roleMapping[role] || current.roleMapping.fast;
+                  {(['read', 'meta', 'repair', 'cloud', 'vision', 'standard', 'agent', 'critic', 'consensus'] as const).map(role => {
+                    const sel = current.roleMapping[role] || (role === 'cloud' ? current.roleMapping.escalation : current.roleMapping.fast);
                     const labelMap: Record<string, string> = {
-                      agent: 'Assistant (defaults to Fast until configured)',
-                      cleanup: 'Cleanup (Stage 2.5 line judgment — defaults to Fast; cheapest model is fine)',
-                      classify: 'Classify (#38 line sorting — what each line IS; defaults to Cleanup; a local model is fine)',
-                      repair: 'Repair (#38 automatic fixes for check failures — defaults to Cleanup; only proposes from a fixed fix list)',
-                      fast: 'Fast (Structure Pass — Span references)',
+                      read: 'Read (one whole-paper proposal · reasoning always off)',
+                      meta: 'Meta (two tiny header reads · defaults to Read)',
+                      repair: 'Repair (local fixes from a closed operation list)',
+                      cloud: 'Cloud (one surviving defect and its evidence only)',
                       standard: 'Standard (General questions)',
-                      escalation: 'Escalation (Repair failing items & ambiguity)',
-                      vision: 'Vision (Image manifest labeling & OCR)',
-                      critic: 'Critic (2B adversarial verifier — defaults to Escalation)',
-                      consensus: 'Consensus (2C second parse of hard sections — defaults to Escalation; same as Structure = skipped)',
+                      vision: 'Vision (image captions, OCR, and metadata tie-break)',
+                      agent: 'Assistant (defaults to Read until configured)',
+                      critic: 'Critic (optional report only · off by default)',
+                      consensus: 'Consensus (optional report only · off by default)',
                     };
 
                     return (

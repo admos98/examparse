@@ -5,6 +5,8 @@ export interface JournalCall {
   label: string;
   rawText: string;
   reasoningText?: string;
+  /** Exact model payload for locality/replay audits (bounded like rawText). */
+  requestText?: string;
   finishReason?: string;
   usage?: { inputTokens: number; outputTokens: number; cachedTokens?: number };
   complete: boolean;
@@ -22,7 +24,7 @@ export async function appendJournalCall(key: string, entry: JournalCall): Promis
     const journal = (await loadJournal(key)) || { updatedAt: new Date().toISOString(), complete: false, calls: [] };
     journal.updatedAt = new Date().toISOString();
     journal.complete = false;
-    const storedEntry = { ...entry, rawText: (entry.rawText || '').slice(0, 200_000), reasoningText: entry.reasoningText?.slice(0, 200_000) };
+    const storedEntry = { ...entry, rawText: (entry.rawText || '').slice(0, 200_000), reasoningText: entry.reasoningText?.slice(0, 200_000), requestText: entry.requestText?.slice(0, 200_000) };
     let inFlightIndex = -1;
     for (let i = journal.calls.length - 1; i >= 0; i--) {
       if (journal.calls[i].label === entry.label && !journal.calls[i].complete) {

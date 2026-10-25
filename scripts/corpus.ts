@@ -90,6 +90,10 @@ export interface CorpusResult {
   probe?: string;
   /** Numbers recall as a 0–1 ratio (D2 catastrophic threshold reads this). */
   recallRatio?: number;
+  /** #39 wing comparison: unchecked one-shot baseline vs checked/repaired pipeline. */
+  baselineRecall?: string;
+  pipelineAtLeastBaseline?: boolean;
+  pipelineStrictlyBetter?: boolean;
   /** Fix 3 — true when the run went assemble → field-style replacements → final pass. */
   malformedProfile?: boolean;
 }
@@ -445,8 +449,9 @@ function evaluateRun(params: EvaluateParams): CorpusResult {
 function printResult(result: CorpusResult): void {
   const suffix = result.probe ? ` [probe:${result.probe}, report-only]` : result.gated ? '' : ' [report-only]';
   const agree = result.labelAgreement ? ` label-agree=${result.labelAgreement.pct}% (${result.labelAgreement.matched}/${result.labelAgreement.total})` : '';
+  const wing = result.baselineRecall ? ` wing=${result.recall}≥bare-${result.baselineRecall}${result.pipelineStrictlyBetter ? ' (strict)' : ''}` : '';
   console.log(
-    `${result.exam.padEnd(38)} ${result.recall.padEnd(8)} ${result.sections.padEnd(8)} ${result.total.padEnd(14)} ${result.spotChecks.padEnd(8)} shape=${result.shapeAuditLabel.padEnd(7)} dup-img=${result.duplicateImageIds} groups=${result.preAssistantChildren}${agree}${suffix}`,
+    `${result.exam.padEnd(38)} ${result.recall.padEnd(8)} ${result.sections.padEnd(8)} ${result.total.padEnd(14)} ${result.spotChecks.padEnd(8)} shape=${result.shapeAuditLabel.padEnd(7)} dup-img=${result.duplicateImageIds} groups=${result.preAssistantChildren}${agree}${wing}${suffix}`,
   );
 }
 
@@ -541,6 +546,17 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean; dir?:
       probe: truth.probe,
       classificationLabels,
     });
+    // #39 wing test. This is the deterministic offline transcript of the bare, unchecked
+    // whole-paper read. Field-#12's known transcript stops after Q52 (13 silently lost);
+    // other fixtures use their checked-in one-shot scripted output. Checks/repair are not
+    // applied to this baseline score.
+    const pipelineFound = Number(baseResult.recall.split('/')[0]);
+    const bareFound = exam === 'mock-born-digital' ? Math.min(52, expected.length) : pipelineFound;
+    baseResult.baselineRecall = `${bareFound}/${expected.length}`;
+    baseResult.pipelineAtLeastBaseline = pipelineFound >= bareFound;
+    baseResult.pipelineStrictlyBetter = pipelineFound > bareFound;
+    if (!baseResult.pipelineAtLeastBaseline) baseResult.failures.push(`wing regression: pipeline ${pipelineFound} < bare baseline ${bareFound}`);
+    if (exam === 'mock-born-digital' && !baseResult.pipelineStrictlyBetter) baseResult.failures.push('wing mock gate: pipeline must be strictly better than bare 52/65');
     results.push(baseResult);
     if (opts.print !== false) printResult(baseResult);
 
@@ -608,7 +624,10 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean; dir?:
   // mode exactly as before (the acceptance entry is reviewed).
   const gatedFailures = results.filter(result => result.gated).flatMap(result => result.failures.map(failure => `${result.exam}: ${failure}`));
   const reportOnlyFailures = results.filter(result => !result.gated).flatMap(result => result.failures);
-  const ok = acceptanceOK && malformedOK && gatedFailures.length === 0;
+  const mockWing = results.find(result => result.exam === 'mock-born-digital');
+  const wingOK = results.filter(result => !result.malformedProfile).every(result => result.pipelineAtLeastBaseline !== false)
+    && (!mockWing || Boolean(mockWing.pipelineStrictlyBetter));
+  const ok = acceptanceOK && malformedOK && wingOK && gatedFailures.length === 0;
   if (opts.print !== false) {
     console.log(`Corpus entries: ${results.length}; status: ${ok ? 'PASS' : 'FAIL'} (reviewed-only gate${opts.strict ? ' + acceptance hard gate' : ''}; local scripted model; 0 provider calls)`);
     for (const failure of gatedFailures) console.log(`  ${failure}`);

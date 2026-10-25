@@ -1,18 +1,23 @@
 {
-  "expectedNumbers": [
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8
-  ],
-  "types": {},
-  "sectionTitles": [
-    "Other"
-  ],
-  "totalPoints": 20,
-  "spotChecks": []
+ "status": "unreviewed",
+ "family": "synthetic-image",
+ "features": [
+  "image-heavy"
+ ],
+ "expectedNumbers": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8
+ ],
+ "types": {},
+ "sectionTitles": [
+  "Other"
+ ],
+ "totalPoints": 20,
+ "spotChecks": []
 }

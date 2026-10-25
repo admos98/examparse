@@ -12,6 +12,9 @@ export const FLAG_TEMPLATES: Record<string, string> = {
   POINTS_TOTAL_ASSERTION_FAILED: 'The marks do not match the exam total; check the marks.',
   ANSWER_ANCHOR_SUSPECT: 'The key contains instructions here, not an answer; check the key.',
   ANSWER_NUMBER_ONLY_MISSING: 'No answer text was found after the key number; check the key.',
+  ANSWER_CONFLICT: 'The printed key gives conflicting answers for this item; check the answer.',
+  ANSWER_TEXT_MISMATCH: 'The attached answer may not match the key; check the answer.',
+  ANSWER_CORRECTED_FROM_KEY: 'Answer corrected from the printed key',
   COVERAGE_MISSING: 'Some questions are missing; check the source.',
   COVERAGE_DUPLICATE: 'Unrelated questions share a number; check their numbering.',
   IMAGE_REF_DROPPED: 'An unavailable image reference was removed; check the source image.',
@@ -34,7 +37,7 @@ export const FLAG_TEMPLATES: Record<string, string> = {
   TEXT_REPAIR_APPLIED: 'Source text repaired',
 };
 
-const CONTENT_CODE = /(?:MISSING|HOLLOW|OPTION|POINTS|UNRESOLVED|IMAGE_REF_DROPPED|IMAGE_ASSET_ABSENT|PARTIAL_STORAGE|IMAGE_DISTRIBUTION|ANSWER_ANCHOR_SUSPECT|ANSWER_NUMBER_ONLY|COVERAGE|SHAPE_|STEM_OVERLONG)/;
+const CONTENT_CODE = /(?:MISSING|HOLLOW|OPTION|POINTS|UNRESOLVED|IMAGE_REF_DROPPED|IMAGE_ASSET_ABSENT|PARTIAL_STORAGE|IMAGE_DISTRIBUTION|ANSWER_ANCHOR_SUSPECT|ANSWER_NUMBER_ONLY|ANSWER_CONFLICT|ANSWER_TEXT_MISMATCH|COVERAGE|SHAPE_|STEM_OVERLONG)/;
 const REPAIR_CODE = /(?:STRIPPED|ABSORBED|EXTENDED|RECOVERED|DEMOTED|CORRECTED|DISTRIBUTED|REMAPPED|DETACHED|DERIVED|REPAIR_APPLIED|COMPLETED|EXCISED)/;
 
 /** Per-question codes whose root cause is inherently a shared storage failure unless overridden. */

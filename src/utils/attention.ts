@@ -9,7 +9,7 @@
  */
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 
-export type AttentionKind = 'answer-missing' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved';
+export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved';
 
 export interface AttentionAction {
   /** 'question' scrolls to + expands that card; 'image-tray' opens the tray filtered to these images. */
@@ -121,6 +121,26 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
       kind: 'answer-missing', rootCauseId: `question_${question.id}`, question,
       sentence: `${labelOf(question)} has no answer yet — solve it with AI or add it manually.`,
       actionLabel: 'Solve',
+    }));
+  }
+
+  // 1b. Answer correctness conflicts (Part C): the printed key itself is ambiguous, or a
+  // spot-check says the attached text answer may not match the key (both texts ride the flag
+  // message). Only a human can pick — the pipeline never auto-rewrites these answers.
+  const correctnessByQuestion = new Map<string, Flag>();
+  for (const flag of flags) {
+    if (!flag.questionId) continue;
+    if (flag.code !== 'ANSWER_CONFLICT' && flag.code !== 'ANSWER_TEXT_MISMATCH') continue;
+    if (!correctnessByQuestion.has(flag.questionId)) correctnessByQuestion.set(flag.questionId, flag);
+  }
+  for (const [questionId, flag] of correctnessByQuestion) {
+    const question = questionById(doc, questionId);
+    if (!question) continue;
+    const detail = flag.message.replace(/^Q\d+:\s*/, '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    items.push(questionItem({
+      kind: 'answer-conflict', rootCauseId: `question_${question.id}`, question,
+      sentence: `${labelOf(question)}'s answer needs a human check — ${detail} Check the answer.`,
+      actionLabel: 'Go',
     }));
   }
 

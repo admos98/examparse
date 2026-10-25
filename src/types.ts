@@ -185,6 +185,9 @@ export const LLM_ROLES = [
   'consensus',
   'cleanup',
   'text-repair',
+  /** #38 AI-first spine: global line classification (labels only) + defect repair (operations only). */
+  'classify',
+  'repair',
 ] as const;
 export type LLMRole = (typeof LLM_ROLES)[number];
 
@@ -270,10 +273,43 @@ export interface ExamDoc {
   };
   usage: UsageRecord[];
   modelInfo?: { fast?: string; escalation?: string; vision?: string };
+  /** Godlike-1 B1/B3: set when this exam was promoted to the local test corpus. */
+  corpus?: { slug: string; promotedAt: string };
   /** 2B/2F: critic verdicts (last 3/question) + per-question provenance traces. */
   guidanceTokens?: number;
   verdicts?: Record<string, any[]>;
   traces?: any[];
+  /** #38 AI-first spine receipt: classification provenance + defect-repair loop summary (parse report source). */
+  spine?: SpineRecord;
+}
+
+/** #38: what the AI-first spine did on this run. `fallback` means the legacy segmenter path was used (never silent). */
+export interface SpineClassifyRecord {
+  status: 'completed' | 'cached' | 'fallback' | 'unavailable' | 'skipped';
+  provider?: string;
+  model?: string;
+  calls: number;
+  labelledLines?: number;
+  /** Plain reason when status is fallback/unavailable/skipped. */
+  reason?: string;
+}
+
+export interface SpineRepairRecord {
+  status: 'completed' | 'cached' | 'skipped' | 'no-defects';
+  rounds: number;
+  calls: number;
+  opsAccepted: number;
+  opsRejected: number;
+  escalations: number;
+  defectsRemaining: number;
+  remainingKinds: string[];
+}
+
+export interface SpineRecord {
+  classify: SpineClassifyRecord;
+  repairLoop: SpineRepairRecord;
+  /** Shared executor budget accounting (model calls / weighted units) across classify + repair. */
+  budget: { calls: number; units: number; maxCalls: number; maxUnits: number };
 }
 
 /** Strip a trailing file extension, e.g. "exam.pdf" -> "exam". */
@@ -359,6 +395,10 @@ export interface RoleMapping {
   consensus?: RoleModelSelection;
   /** A2: cleanup role (defaults to the fast/structure model). */
   cleanup?: RoleModelSelection;
+  /** #38 Part A: global line classification. Defaults to cleanup's effective mapping (cleanup → fast); a local model is fine. */
+  classify?: RoleModelSelection;
+  /** #38 Part D: defect repair loop. Same defaulting as classify. */
+  repair?: RoleModelSelection;
 }
 
 export interface CostRate {
@@ -408,6 +448,8 @@ export interface AppSettings {
   agentLimits?: { maxModelCalls?: number; maxToolExecutions?: number };
   /** A4/F3: Stage 2.5 cleanup on/off (default on). Off ⇒ no tags, byte-identical pre-cleanup behaviour. */
   cleanupEnabled?: boolean;
+  /** #38: AI-first line classification as the primary spine (default on). Off → legacy segmenter path with visible CLASSIFY_FALLBACK. */
+  classifyEnabled?: boolean;
   /** Optional Stage 2.75 OCR/PDF text readability repair (default off; overlays only). */
   textRepairEnabled?: boolean;
 }
@@ -462,7 +504,7 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'ocr' | 'cleanup' | 'text-repair' | 'structure' | 'vision' | 'assemble' | 'repair';
+export type PipelineStageId = 'extract' | 'ocr' | 'cleanup' | 'text-repair' | 'classify' | 'structure' | 'vision' | 'assemble' | 'repair';
 
 export interface StageStatus {
   id: PipelineStageId;

@@ -212,6 +212,26 @@ export const LibraryView: React.FC<Props> = ({
     setPendingExport(null);
   };
 
+  // Godlike-1 B1 — promote this parsed exam into the local test corpus (dev flywheel).
+  const [promoteMsg, setPromoteMsg] = useState<string | null>(null);
+  const handlePromoteToCorpus = async (summary: ExamSummary) => {
+    setPromoteMsg(null);
+    try {
+      const response = await fetch(`/api/corpus/promote/${encodeURIComponent(summary.id)}`, { method: 'POST' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Promotion failed (${response.status})`);
+      const doc = await loadExamDoc(summary.id);
+      if (doc) {
+        const stamped: ExamDoc = { ...doc, corpus: { slug: data.slug, promotedAt: new Date().toISOString() } };
+        await saveExamDoc(stamped);
+        onExamRenamed(stamped);
+      }
+      setPromoteMsg(`Promoted to corpus as “${data.slug}” (unreviewed — runs report-only until truth is spot-checked; see test/fixtures/corpus/README.md). Future fixes to this exam are recorded in its entry notes.`);
+    } catch (error: any) {
+      setPromoteMsg(error?.message || 'Promotion failed.');
+    }
+  };
+
   const confirmDelete = async () => {
     if (!pendingDelete) return;
     const id = pendingDelete.id;
@@ -362,6 +382,13 @@ export const LibraryView: React.FC<Props> = ({
           <div className="p-3 rounded-[10px] bg-[var(--danger-soft)] border border-[var(--danger)] text-[var(--danger)]  text-xs flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>{errorMsg}</span>
+          </div>
+        )}
+
+        {promoteMsg && (
+          <div role="status" className="p-3 rounded-[10px] bg-[var(--paper)] border border-[var(--rule)] text-[var(--ink-2)] text-xs flex items-center gap-2">
+            <Database className="w-4 h-4 shrink-0" />
+            <span>{promoteMsg}</span>
           </div>
         )}
 
@@ -543,6 +570,13 @@ export const LibraryView: React.FC<Props> = ({
                         className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"
                       >
                         <Download className="w-3 h-3" /> Export JSON
+                      </button>
+                      <button
+                        onClick={() => void handlePromoteToCorpus(s)}
+                        title="Add this parsed exam to the local test corpus as an unreviewed entry (report-only until truth is reviewed)"
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"
+                      >
+                        <Database className="w-3 h-3" /> Promote to corpus
                       </button>
                       <button
                         onClick={() => setPendingDelete(s)}

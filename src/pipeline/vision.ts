@@ -195,7 +195,7 @@ export async function processVisionChunk(
  * choice that restores caption affinity (see imageOwnership).
  */
 export async function adjudicateImageAssignments(params: {
-  cases: Array<{ groupId: string; imageId: string; caption?: string; candidates: Array<{ ref: string; label: string; stem: string }> }>;
+  cases: Array<{ groupId: string; imageId: string; caption?: string; sharedContext?: string; candidates: Array<{ ref: string; label: string; stem: string }> }>;
   providerConfig: any;
   maxOutputTokens?: number;
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
@@ -204,7 +204,9 @@ export async function adjudicateImageAssignments(params: {
   if (!cases.length) return {};
   const manifest = cases.map(item => [
     `Image ${item.imageId} caption: "${item.caption || '(none)'}"`,
-    `Candidates (choose ONLY from these ids): ${item.candidates.map(candidate => `${candidate.ref}=Q${candidate.label} "${String(candidate.stem || '').slice(0, 120)}"`).join(' | ')}`,
+    // Part A2: shared parent sentences are the matching targets when children are bare tokens.
+    ...(item.sharedContext ? [`Shared parent sentences: ${item.sharedContext.slice(0, 600)}`] : []),
+    `Candidates (choose ONLY from these ids): ${item.candidates.map(candidate => `${candidate.ref}=Q${candidate.label} "${String(candidate.stem || '').slice(0, 200)}"`).join(' | ')}`,
   ].join('\n')).join('\n---\n');
   const text = `Each image below was paired with a question by PRINTED ORDER but its caption may contradict that pairing.\nFor every image choose the single candidate id whose printed text best matches the caption, or "keep" if the printed order is right.\nNever invent an id.\n\n${manifest}\n\nReturn JSON {"items":[{"imageId":string,"ref":string|"keep","reason":"short"}]}`;
   const response = await LLMAdapter.execute(

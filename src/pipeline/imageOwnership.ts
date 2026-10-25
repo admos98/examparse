@@ -2,16 +2,22 @@
  * Follow-up #36 Part B — image assignment, exact.
  *
  * Ownership is decided by PRINTED GEOMETRY + COUNTS, never by a model vote:
- *  - B2 order-preserving bijection for a group whose candidate-image count equals its child count;
+ *  - B2 order-preserving bijection for a group whose candidate-image count equals its item count;
  *  - B3 caption affinity verifies each pair (deterministic, no model);
  *  - a contradiction may be resolved by ONE bundled constrained adjudication call (caller-injected);
  *  - B5 determinism lock: same doc + same vision captions ⇒ identical assignment.
  * Single ownership (I13) is enforced here and again at the save boundary.
+ *
+ * Godlike Batch 1 (Part A) — parent-as-item bijection: when the group parent's own printed
+ * number belongs to the group's enumerated set (page-2 picture matching 15–18 modelled as
+ * parent(15) + children 16/17/18), the ITEM SET is [parent-as-item, …children by number], so
+ * four pictures pair 4↔4 instead of shifting every picture one item late. A same-number child
+ * (parent 63 + child 63) already represents that item, so the parent is not counted twice.
  */
 import type { ExamDoc, Flag, ImageAsset, Question, SourceLine } from '../types';
 import { spanEndLine, spanStartLine } from './spans';
 
-export type ImageRule = 'order-bijection' | 'caption-verified' | 'vision-adjudicated' | 'geometry' | 'tray' | 'parent-level';
+export type ImageRule = 'order-bijection' | 'caption-verified' | 'vision-adjudicated' | 'geometry' | 'tray' | 'parent-level' | 'parent-as-item';
 
 export interface ImageAssignmentReceipt {
   imageId: string;
@@ -29,6 +35,12 @@ export interface AdjudicationCase {
   groupId: string;
   imageId: string;
   caption?: string;
+  /**
+   * Part A2: the parent's shared option/sentence texts (labelled by option key). On page-2
+   * picture matching these sentences ARE the children's matching targets while the children
+   * themselves carry only token stems like "(16)", so the referee needs them as context.
+   */
+  sharedContext?: string;
   candidates: Array<{ ref: string; label: string; stem: string }>;
 }
 
@@ -109,6 +121,57 @@ function questionText(question: Question | undefined): string {
   ].join(' ').slice(0, 600);
 }
 
+/** A bare printed-number token such as "(16)" — the child carries no text of its own. */
+function isTokenStem(question: Question | undefined): boolean {
+  const stem = (question?.stem || '').trim();
+  return !stem || /^\(?\d{1,3}\)?[.)]?$/.test(stem);
+}
+
+/** Printed question-number tokens on one source line: "(15)" items and "15." / "15)" starts. */
+function printedNumberTokens(text: string): number[] {
+  const out = new Set<number>();
+  for (const match of (text || '').matchAll(/\((\d{1,3})\)|(?:^|\s)(\d{1,3})\s*[.)]/g)) {
+    const no = Number(match[1] || match[2]);
+    if (Number.isInteger(no) && no >= 1 && no <= 300) out.add(no);
+  }
+  return [...out];
+}
+
+/** The single option letter an answer text names ("( c )", "c)", "False ( b)"), if any. */
+function answerLetter(text: string | undefined): string | undefined {
+  const value = (text || '').trim().toLowerCase();
+  if (!value) return undefined;
+  const paren = value.match(/\(\s*([a-j])\s*\)/);
+  if (paren) return paren[1];
+  const bare = value.match(/^([a-j])[.)]?$/);
+  return bare ? bare[1] : undefined;
+}
+
+/** The parent's shared option/sentence pool, labelled by key — adjudication context (A2). */
+function sharedContextText(parent: Question): string {
+  const options = (parent.options || [])
+    .filter(option => (option.text || '').trim())
+    .map(option => `${option.key}) ${(option.text || '').trim()}`);
+  return [parent.stem || '', ...options].filter(Boolean).join(' | ').slice(0, 900);
+}
+
+/**
+ * Caption-affinity text for one item of a group. A matching child's own target sentence lives
+ * in the PARENT's shared pool, addressed by the child's answer letter — resolve that one
+ * sentence (never the whole pool, which would match every caption equally). The
+ * parent-as-item likewise scores against its own resolved sentence, not the full pool.
+ */
+function itemAffinityText(member: Question, parent: Question, parentAsItem: boolean): string {
+  const letter = answerLetter(member.answer?.text);
+  const resolved = letter
+    ? (parent.options || []).find(option => option.key.toLowerCase() === letter)?.text || ''
+    : '';
+  if (member.id === parent.id && parentAsItem) {
+    return [member.stem || '', resolved, member.answer?.text || ''].join(' ').slice(0, 600);
+  }
+  return [questionText(member), resolved].join(' ').slice(0, 600);
+}
+
 function questionLines(question: Question): number[] {
   const lines: number[] = [];
   const visit = (spans: Question['spans'] | undefined) => {
@@ -139,6 +202,12 @@ interface GroupUnit {
   id: string;
   parent: Question;
   children: Question[];
+  /** Bijection item set, decided in the pairing loop: [parent-as-item?, …children]. */
+  items: Question[];
+  /** True when the parent served as the first enumerated item of its own group (Part A). */
+  parentAsItem: boolean;
+  /** A source line enumerates the parent's number together with at least one child's. */
+  enumeratedEvidence: boolean;
   startLine: number;
   endLine: number;
   zoneEnd: number;
@@ -219,10 +288,30 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
       .filter(line => line > startLine && line !== Number.MAX_SAFE_INTEGER);
     const nextRoot = nextRootStarts.length ? Math.min(...nextRootStarts) : Number.MAX_SAFE_INTEGER;
     const zoneEnd = Math.max(endLine, Math.min(nextRoot - 1, endLine + 40));
+    const sortedChildren = [...children].sort((a, b) => a.no - b.no || startLineOf(a) - startLineOf(b) || a.id.localeCompare(b.id));
+    // Part A1 evidence: one printed line inside the group's zone enumerates the parent's own
+    // number alongside a child's ("(15) (16) (17) (18)", "66. d) … 63. a) …"), or the parent's
+    // deterministic receipt already fired the enumerative-group rule.
+    const childNos = new Set(sortedChildren.map(child => child.no));
+    const textByLine = new Map<number, string>();
+    for (const line of sourceLines) {
+      const n = lineNumber(line.id);
+      if (n !== undefined) textByLine.set(n, line.text);
+    }
+    let enumeratedEvidence = Boolean(parent.receipt?.ruleChain?.some(rule => rule === 'enumerative-group'));
+    if (!enumeratedEvidence) {
+      for (let n = startLine; n <= zoneEnd && !enumeratedEvidence; n++) {
+        const tokens = printedNumberTokens(textByLine.get(n) || '');
+        if (tokens.includes(parent.no) && tokens.some(token => childNos.has(token))) enumeratedEvidence = true;
+      }
+    }
     groups.push({
       id: parent.id,
       parent,
-      children: [...children].sort((a, b) => a.no - b.no || startLineOf(a) - startLineOf(b) || a.id.localeCompare(b.id)),
+      children: sortedChildren,
+      items: sortedChildren,
+      parentAsItem: false,
+      enumeratedEvidence,
       startLine,
       endLine,
       zoneEnd,
@@ -269,8 +358,17 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
       .filter(image => !claimed.has(image.id) && imageInGroupZone(image, group))
       .sort(readingOrder);
     if (!pool.length) continue;
-    const members = group.children;
-    if (!members.length) continue;
+    if (!group.children.length) continue;
+    // Part A1 — the ITEM SET is [parent-as-item, …children] when the parent's printed number
+    // belongs to the group's enumerated set and no same-number child already represents it.
+    // Evidence: an enumerating source line / enumerative receipt, or the exact field
+    // arithmetic (children run parent+1… contiguously and the pool holds children+1 pictures).
+    const hasSameNumberChild = group.children.some(child => child.no === group.parent.no);
+    const contiguousFromParent = group.children.every((child, index) => child.no === group.parent.no + 1 + index);
+    group.parentAsItem = !hasSameNumberChild
+      && (group.enumeratedEvidence || (contiguousFromParent && pool.length === group.children.length + 1));
+    const members = group.parentAsItem ? [group.parent, ...group.children] : group.children;
+    group.items = members;
 
     const pairedCount = Math.min(pool.length, members.length);
     for (let index = 0; index < pairedCount; index++) {
@@ -278,8 +376,8 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
       const target = members[index];
       claimed.add(image.id);
       const caption = image.label?.caption;
-      const ownScore = captionAffinity(caption, questionText(target));
-      const scores = members.map(member => captionAffinity(caption, questionText(member)));
+      const ownScore = captionAffinity(caption, itemAffinityText(target, group.parent, group.parentAsItem));
+      const scores = members.map(member => captionAffinity(caption, itemAffinityText(member, group.parent, group.parentAsItem)));
       const best = Math.max(...scores);
       const bestIndex = scores.indexOf(best);
       const strong = ownScore > 0 && ownScore >= best;
@@ -324,6 +422,12 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
     pair.target = target;
     pairQuestions.set(pair.image.id, target.id);
     bump(rule[rule.length - 1]);
+    // Part A3: the receipt names parent-as-item service explicitly; I13 (owner-map rebuild
+    // below) then guarantees the parent keeps ONLY this item picture — never the group's set.
+    const isParentItem = pair.group.parentAsItem && target.id === pair.group.parent.id;
+    const ruleChain: ImageRule[] = isParentItem && !rule.includes('parent-as-item')
+      ? [rule[0], 'parent-as-item', ...rule.slice(1)]
+      : rule;
     receipts.push({
       imageId: pair.image.id,
       questionId: target.id,
@@ -331,8 +435,8 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
       groupId: pair.group.id,
       order: pair.order,
       caption: pair.image.label?.caption,
-      ruleChain: rule,
-      note: noteText,
+      ruleChain,
+      note: isParentItem ? [noteText, 'parent served as its own first enumerated item'].filter(Boolean).join('; ') : noteText,
     });
     if (score !== undefined) pair.ownScore = score;
   };
@@ -355,8 +459,8 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
     // unique, and they are exactly the children the suspects currently hold (a closed cycle/swap).
     const desired = new Map<Pair, { child: Question; score: number }>();
     for (const pair of groupPairs) {
-      const scored = group.children
-        .map(child => ({ child, score: captionAffinity(pair.image.label?.caption, questionText(child)) }))
+      const scored = group.items
+        .map(child => ({ child, score: captionAffinity(pair.image.label?.caption, itemAffinityText(child, group.parent, group.parentAsItem)) }))
         .sort((a, b) => b.score - a.score || a.child.no - b.child.no);
       if (!scored.length || scored[0].score <= pair.ownScore) continue;
       desired.set(pair, scored[0]);
@@ -377,12 +481,22 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
   // Remaining suspects: ONE bundled constrained adjudication call across the whole document.
   const remaining = uncertain.filter(pair => !correctedPairs.has(pair));
   let adjudicated = 0;
-  const adjudicationCases: AdjudicationCase[] = remaining.map(pair => ({
-    groupId: pair.group.id,
-    imageId: pair.image.id,
-    caption: pair.image.label?.caption,
-    candidates: pair.group.children.map(child => ({ ref: child.id, label: child.label, stem: questionText(child).slice(0, 200) })),
-  }));
+  const adjudicationCases: AdjudicationCase[] = remaining.map(pair => {
+    const shared = sharedContextText(pair.group.parent);
+    return {
+      groupId: pair.group.id,
+      imageId: pair.image.id,
+      caption: pair.image.label?.caption,
+      // Part A2: token-stem children ("(16)") have no text of their own — the referee sees the
+      // parent's shared sentences both as case context and inside each token candidate.
+      ...(shared ? { sharedContext: shared } : {}),
+      candidates: pair.group.items.map(item => {
+        const own = itemAffinityText(item, pair.group.parent, pair.group.parentAsItem);
+        const stem = isTokenStem(item) && shared ? `${own} | shared: ${shared}` : own;
+        return { ref: item.id, label: item.label, stem: stem.slice(0, 400) };
+      }),
+    };
+  });
   let adjudication: Record<string, string> = {};
   if (adjudicationCases.length && params.adjudicate) {
     try {
@@ -393,9 +507,9 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
   }
   for (const pair of remaining) {
     const choice = adjudication[pair.image.id];
-    const chosen = choice ? pair.group.children.find(child => child.id === choice || child.label === choice || String(child.no) === choice) : undefined;
-    const originalScore = captionAffinity(pair.image.label?.caption, questionText(pair.target));
-    if (chosen && chosen.id !== pair.target.id && captionAffinity(pair.image.label?.caption, questionText(chosen)) > originalScore) {
+    const chosen = choice ? pair.group.items.find(child => child.id === choice || child.label === choice || String(child.no) === choice) : undefined;
+    const originalScore = captionAffinity(pair.image.label?.caption, itemAffinityText(pair.target, pair.group.parent, pair.group.parentAsItem));
+    if (chosen && chosen.id !== pair.target.id && captionAffinity(pair.image.label?.caption, itemAffinityText(chosen, pair.group.parent, pair.group.parentAsItem)) > originalScore) {
       applyTarget(pair, chosen, ['order-bijection', 'vision-adjudicated'], 'constrained adjudication restored caption affinity');
       adjudicated++;
       bump('vision-adjudicated');

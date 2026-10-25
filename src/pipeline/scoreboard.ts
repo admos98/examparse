@@ -24,19 +24,23 @@ export interface ScoreboardRow {
   /** meanCostPerCleanQuestion = Σcost / ΣcleanQuestions, cleanQuestions = max(0, parsed − defects). */
   meanCostPerCleanQuestion: number;
   truncationRate: number;         // jobs with a truncation flag / jobs
+  /** Godlike-1 C3: Σagreed/Σchecked key-table letter agreement; null = no evidence yet. */
+  answerAccuracy: number | null;
+  /** Total letter answers checked against the key table across jobs. */
+  answerChecked: number;
   insufficientData: boolean;      // n<3 — never fake a %
 }
 
 type RunLike = RunJournalEntry & { verifierDefects?: number };
 
 export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
-  const acc = new Map<string, { role: string; modelId: string; bucket: string; jobs: number; cov: number; defects: number; recoveries: number; cost: number; cleanQs: number; trunc: number }>();
+  const acc = new Map<string, { role: string; modelId: string; bucket: string; jobs: number; cov: number; defects: number; recoveries: number; cost: number; cleanQs: number; trunc: number; ansChecked: number; ansAgreed: number }>();
   for (const run of runs || []) {
     const bucket = bucketKey(docTraitBucket(run.docTraits as any));
     const defects = typeof run.verifierDefects === 'number' ? run.verifierDefects : (run.flagsRaised?.length || 0);
     for (const [role, modelId] of Object.entries(run.models || {})) {
       const key = `${role}|${modelId}|${bucket}`;
-      const row = acc.get(key) || { role, modelId, bucket, jobs: 0, cov: 0, defects: 0, recoveries: 0, cost: 0, cleanQs: 0, trunc: 0 };
+      const row = acc.get(key) || { role, modelId, bucket, jobs: 0, cov: 0, defects: 0, recoveries: 0, cost: 0, cleanQs: 0, trunc: 0, ansChecked: 0, ansAgreed: 0 };
       row.jobs++;
       row.cov += (run.outcome?.health?.coveragePercent || 0) / 100;
       row.defects += defects;
@@ -44,6 +48,10 @@ export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
       row.cost += run.outcome?.cost || 0;
       row.cleanQs += Math.max(0, (run.outcome?.health?.parsed || 0) - defects);
       if ((run.flagsRaised || []).some(f => /TRUNCAT/i.test(f))) row.trunc++;
+      // C3: answers are produced by the run's models collectively, so agreement evidence
+      // accrues to every (role×model) on the run — same attribution as the other traits.
+      row.ansChecked += Math.max(0, Number(run.answerAccuracy?.checked) || 0);
+      row.ansAgreed += Math.max(0, Number(run.answerAccuracy?.agreed) || 0);
       acc.set(key, row);
     }
   }
@@ -54,6 +62,8 @@ export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
     recoveries: r.recoveries,
     meanCostPerCleanQuestion: r.cleanQs > 0 ? Number((r.cost / r.cleanQs).toFixed(6)) : 0,
     truncationRate: Number((r.trunc / r.jobs).toFixed(4)),
+    answerAccuracy: r.ansChecked > 0 ? Number((r.ansAgreed / r.ansChecked).toFixed(4)) : null,
+    answerChecked: r.ansChecked,
     insufficientData: r.jobs < 3,
   })).sort((a, b) => a.role.localeCompare(b.role) || b.cleanCoverageRate - a.cleanCoverageRate);
 }

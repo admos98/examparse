@@ -225,3 +225,87 @@ test('T2/B3 caption affinity is a deterministic, normalized token overlap', () =
   assert.equal(captionAffinity('Clean energy city', 'Ferdowsi'), 0);
   assert.equal(captionAffinity(undefined, 'anything'), 0);
 });
+
+// ============================================================================
+// Godlike Batch 1, Part A — parent-as-item bijection (the last image defect)
+// ============================================================================
+import {
+  acceptanceFieldImages,
+  acceptanceFieldLines,
+  acceptanceFieldQuestions,
+} from './fixtures/acceptance-image-assignment';
+
+test('T1 (Godlike-1/A1): field shape parent(15)+3 token children deals 4↔4 — full 11/11 acceptance table', async () => {
+  const result = await assignImagesExact({
+    questions: acceptanceFieldQuestions(),
+    images: acceptanceFieldImages(),
+    sourceLines: acceptanceFieldLines,
+  });
+  // The full T1 image table, now on the field modelling (parent IS item 15 / topic 63).
+  assert.deepEqual(ownerByImage(result.questions), acceptanceAssignment);
+  const questionNo = (imageId: string) => result.questions.find(q => q.images.some(ref => ref.imageId === imageId))!.no;
+  assert.equal(questionNo('img_dict'), 15);
+  assert.equal(questionNo('img_mother'), 16);
+  assert.equal(questionNo('img_boy'), 17);
+  assert.equal(questionNo('img_solar'), 18, 'solar picture placed on its own item (was UNOWNED pre-fix)');
+  assert.equal(questionNo('img_study_a'), 49);
+  assert.equal(questionNo('img_study_b'), 49);
+  assert.equal(questionNo('img_ferdowsi'), 63);
+  assert.equal(questionNo('img_tv'), 64);
+  assert.equal(questionNo('img_sport'), 65);
+  assert.equal(questionNo('img_clean'), 66);
+  assert.equal(questionNo('img_healthy'), 67);
+  assert.equal(result.tray.length, 0, 'no picture left unowned');
+  assert.equal(result.suspects, 0);
+
+  // A3: parent-as-item receipts exist, and the parent retains NO image beyond its own item
+  // picture (single ownership I13 — never the whole group set as in the old Q63 defect).
+  const dictReceipt = result.receipts.find(receipt => receipt.imageId === 'img_dict')!;
+  assert.ok(dictReceipt.ruleChain.includes('parent-as-item'), `parent-as-item receipt present: ${dictReceipt.ruleChain.join('>')}`);
+  assert.equal(dictReceipt.questionId, 'q15');
+  const ferdowsiReceipt = result.receipts.find(receipt => receipt.imageId === 'img_ferdowsi')!;
+  assert.ok(ferdowsiReceipt.ruleChain.includes('parent-as-item'));
+  assert.deepEqual(result.questions.find(q => q.id === 'q15')!.images.map(ref => ref.imageId), ['img_dict'],
+    'parent Q15 holds exactly its own item picture and no parent-level set');
+  assert.deepEqual(result.questions.find(q => q.id === 'q63')!.images.map(ref => ref.imageId), ['img_ferdowsi']);
+  const seen = new Set<string>();
+  for (const q of result.questions) for (const ref of q.images) {
+    assert.ok(!seen.has(ref.imageId), `${ref.imageId} owned twice (I13)`);
+    seen.add(ref.imageId);
+  }
+  assert.equal(seen.size, 11);
+  // Token children were verified through their answer-letter → shared-sentence resolution.
+  const solarReceipt = result.receipts.find(receipt => receipt.imageId === 'img_solar')!;
+  assert.equal(solarReceipt.questionId, 'q18');
+  assert.ok(solarReceipt.ruleChain.includes('caption-verified'), 'solar caption verified against sentence d via answer letter');
+});
+
+test('A2 (Godlike-1): adjudication context carries the parent shared sentences for token-stem children', async () => {
+  const images = acceptanceFieldImages();
+  // Two "mother" captions: the first picture (dealt to parent-as-item 15/dictionary) contradicts
+  // its resolved sentence, but no closed caption permutation exists → ONE adjudication call.
+  for (const id of ['img_dict', 'img_mother']) {
+    const image = images.find(item => item.id === id)!;
+    image.label = { role: 'stem', kind: 'photo', caption: 'Mother hugging child' };
+  }
+  let seenCases: any[] = [];
+  const result = await assignImagesExact({
+    questions: acceptanceFieldQuestions(),
+    images,
+    sourceLines: acceptanceFieldLines,
+    adjudicate: (cases: any[]) => { seenCases = cases; return { img_dict: 'q16' }; },
+  });
+  assert.equal(seenCases.length, 1, 'one bundled adjudication case');
+  const adjudicationCase = seenCases[0];
+  assert.equal(adjudicationCase.imageId, 'img_dict');
+  assert.match(adjudicationCase.sharedContext || '', /mother is hugging her little child/i,
+    'shared context includes sentence a (the children matching targets)');
+  assert.match(adjudicationCase.sharedContext || '', /sits in the balcony/i, 'shared context includes sentence b');
+  const tokenCandidate = adjudicationCase.candidates.find((candidate: any) => candidate.ref === 'q16');
+  assert.match(tokenCandidate.stem, /mother is hugging/i, 'token candidate "(16)" carries its target sentence');
+  assert.deepEqual(adjudicationCase.candidates.map((candidate: any) => candidate.ref), ['q15', 'q16', 'q17', 'q18'],
+    'candidates are the full item set incl. parent-as-item, constrained to the group');
+  // Vision refereed; order dealt: the choice stands only because affinity is restored.
+  assert.equal(result.adjudicated, 1);
+  assert.equal(ownerByImage(result.questions).img_dict, 16);
+});

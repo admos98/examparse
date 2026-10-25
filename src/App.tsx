@@ -29,6 +29,7 @@ import { StyleGuideView } from './design/StyleGuideView';
 import { UiLanguage, uiText } from './design/i18n';
 import { getExamHealth } from './pipeline/quality';
 import { revertTextRepairOverlays } from './pipeline/textRepair';
+import { maybeRecordCorpusFixes } from './pipeline/corpusPromote';
 
 export default function App() {
   const [currentStep, setCurrentStep] = useState<StepNumber>(1);
@@ -209,6 +210,9 @@ export default function App() {
     void refreshSummaries();
   };
   const handleDocUpdated = (updated: ExamDoc) => {
+    // B3 regression memory: fixes to a promoted exam are recorded in its corpus entry's
+    // notes (kind/question/before+after hashes) — fire-and-forget, never edits truth.
+    void maybeRecordCorpusFixes(examDoc, updated, 'step4-edit');
     setExamDoc(updated);
     setUsageRecords(loadUsageLog());
     void refreshSummaries();
@@ -357,7 +361,7 @@ export default function App() {
         <Button size="sm" variant="ghost" aria-pressed={assistantMode === 'page'} disabled={!examDoc} onClick={() => handleOpenAssistant(false)}>{t('Assistant', 'دستیار')}</Button>
         {examDoc && currentStep >= 4 && assistantMode !== 'page' && <Button size="sm" variant="ghost" onClick={() => handleOpenAssistant(true)}>{t('Check this exam', 'بررسی این آزمون')}</Button>}
       </div>
-      {assistantMode !== 'closed' && examDoc && <AssistantView mode={assistantMode} verifyOnOpen={verifyOnOpen} key={examDoc.id} doc={examDoc} settings={settings} onUpdateDoc={updated => { setExamDoc(current => current?.id === updated.id ? updated : current); setUsageRecords(loadUsageLog()); }} onSettings={handleUpdateSettings} onClose={() => setAssistantMode('closed')} />}
+      {assistantMode !== 'closed' && examDoc && <AssistantView mode={assistantMode} verifyOnOpen={verifyOnOpen} key={examDoc.id} doc={examDoc} settings={settings} onUpdateDoc={updated => { void maybeRecordCorpusFixes(examDoc, updated, 'assistant-fix'); setExamDoc(current => current?.id === updated.id ? updated : current); setUsageRecords(loadUsageLog()); }} onSettings={handleUpdateSettings} onClose={() => setAssistantMode('closed')} />}
       {assistantMode !== 'page' && <React.Fragment>
         {examDoc && currentStep === 4 && <div className="ep-main-content print:hidden"><ExamVersions doc={examDoc} onRestore={handleDocUpdated} /></div>}
         {currentStep === 2 && examDoc && <div className="ep-main-content"><ExamHealthBanner doc={examDoc} /></div>}

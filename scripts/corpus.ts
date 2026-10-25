@@ -28,6 +28,8 @@ import {
   parsePrintedNumberFromStem,
 } from '../src/pipeline/quality';
 import type { ExamSection, Question, SourceLine } from '../src/types';
+import { buildCoverageTable, coverageMarkdown, entryMetaFromTruth, type CorpusEntryMeta } from '../src/pipeline/corpusCoverage';
+import { classificationAgreement, impliedLabelsFromAssembly, type LineLabel } from '../src/pipeline/classify';
 
 interface SpotCheck {
   no: number;
@@ -44,6 +46,14 @@ interface SpotCheck {
   points?: number;
 }
 interface Truth {
+  /** B2: only "reviewed" entries gate; everything else runs report-only. */
+  status?: 'reviewed' | 'unreviewed';
+  /** B4: coverage-table row. */
+  family?: string;
+  /** B4: explicit feature tags (derived when absent). */
+  features?: string[];
+  /** Part D: synthetic format-probe kind ('two-column' | 'scanned-noise'). */
+  probe?: string;
   expectedNumbers: number[];
   types?: Record<string, Question['type']>;
   headerLines?: number[];
@@ -70,6 +80,16 @@ export interface CorpusResult {
   duplicateImageIds: number;
   preAssistantChildren: string;
   failures: string[];
+  /** #38 E3 — classification agreement (label quality, report-only; never gates). */
+  labelAgreement?: { matched: number; total: number; pct: number };
+  /** B2 — truth status; the gate applies only to reviewed entries. */
+  status?: 'reviewed' | 'unreviewed';
+  /** B2 — true when this result can fail the corpus gate. */
+  gated?: boolean;
+  /** Part D — probe kind when this entry is a synthetic format probe. */
+  probe?: string;
+  /** Numbers recall as a 0–1 ratio (D2 catastrophic threshold reads this). */
+  recallRatio?: number;
   /** Fix 3 — true when the run went assemble → field-style replacements → final pass. */
   malformedProfile?: boolean;
 }
@@ -255,7 +275,11 @@ interface EvaluateParams {
   duplicateImageIds: number;
   /** Acceptance entries (base + malformed profiles) must end at shape 0/0/0. */
   shapeGate: boolean;
+  status: 'reviewed' | 'unreviewed';
+  probe?: string;
   malformedProfile?: boolean;
+  /** #38 E3: explicit classification shipped by the entry (labels.json), when present. */
+  classificationLabels?: Map<number, LineLabel>;
 }
 
 function evaluateRun(params: EvaluateParams): CorpusResult {
@@ -362,6 +386,29 @@ function evaluateRun(params: EvaluateParams): CorpusResult {
   const shapeAuditAllZero = shapeAudit.optionIncludesStem === 0 && shapeAudit.duplicateSiblingStems === 0 && shapeAudit.overlongStems === 0;
   const groupResults = (truth.groups || []).map(group => `${group.parent}:${getChildren(questions, group.parent).join(',')}`);
   const preAssistantChildren = groupResults.join(';') || '—';
+  // #38 E3 — classification agreement (report-only). Truth-implied labels come from the
+  // entry's printed truth (expected-number anchor lines, truth header lines, key territory,
+  // furniture flags); the candidate is the entry's shipped labels.json when present, else
+  // the labels implied by this run's assembly. Visible, never gated.
+  const truthImplied = new Map<number, LineLabel>();
+  for (const line of lines) {
+    const n = lineNo(line);
+    if (!line.text.trim()) truthImplied.set(n, 'blank');
+    else if (line.furniture) truthImplied.set(n, 'furniture');
+    else if (keyLines.has(n)) truthImplied.set(n, 'answer-key');
+  }
+  for (const h of truth.headerLines || []) truthImplied.set(h, 'section-header');
+  {
+    const starts = enumerateExpectedQuestionNos(lines).lineByNumber;
+    for (const no of expected) { const l = starts.get(no); if (l !== undefined) truthImplied.set(l, 'question-start'); }
+  }
+  const candidateLabels = params.classificationLabels ?? impliedLabelsFromAssembly({
+    questions,
+    sections: sections.map((section, i) => ({ spans: section.spans as Array<[number, number]>, ...(params.detectedHeaderLines.length === sections.length ? { headerLine: params.detectedHeaderLines[i] } : {}) })),
+    keyLineNos: [...keyLines],
+    lines,
+  });
+  const labelAgreement = classificationAgreement(candidateLabels, truthImplied);
   const recall = `${numbers.filter(number => expected.includes(number)).length}/${expected.length}`;
   const sectionMatches = `${actualTitles.filter((title, index) => title === (truth.sectionTitles || [])[index]).length}/${(truth.sectionTitles || []).length}`;
   const result: CorpusResult = {
@@ -377,6 +424,11 @@ function evaluateRun(params: EvaluateParams): CorpusResult {
     duplicateImageIds: params.duplicateImageIds,
     preAssistantChildren,
     failures,
+    labelAgreement,
+    status: params.status,
+    gated: params.status === 'reviewed',
+    recallRatio: expected.length ? numbers.filter(number => expected.includes(number)).length / expected.length : 1,
+    ...(params.probe ? { probe: params.probe } : {}),
     ...(params.malformedProfile ? { malformedProfile: true } : {}),
   };
   if (numbers.length !== expected.length || expected.some(number => !numbers.includes(number))) failures.push(`number recall ${recall}`);
@@ -391,18 +443,68 @@ function evaluateRun(params: EvaluateParams): CorpusResult {
 }
 
 function printResult(result: CorpusResult): void {
+  const suffix = result.probe ? ` [probe:${result.probe}, report-only]` : result.gated ? '' : ' [report-only]';
+  const agree = result.labelAgreement ? ` label-agree=${result.labelAgreement.pct}% (${result.labelAgreement.matched}/${result.labelAgreement.total})` : '';
   console.log(
-    `${result.exam.padEnd(38)} ${result.recall.padEnd(8)} ${result.sections.padEnd(8)} ${result.total.padEnd(14)} ${result.spotChecks.padEnd(8)} shape=${result.shapeAuditLabel.padEnd(7)} dup-img=${result.duplicateImageIds} groups=${result.preAssistantChildren}`,
+    `${result.exam.padEnd(38)} ${result.recall.padEnd(8)} ${result.sections.padEnd(8)} ${result.total.padEnd(14)} ${result.spotChecks.padEnd(8)} shape=${result.shapeAuditLabel.padEnd(7)} dup-img=${result.duplicateImageIds} groups=${result.preAssistantChildren}${agree}${suffix}`,
   );
 }
 
-export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}): Promise<{ results: CorpusResult[]; ok: boolean }> {
-  const dirs = fs.readdirSync(CORPUS_DIR, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+/** Entry metadata for the coverage table, read straight from the fixture folders. */
+export function readCorpusEntryMetas(dir: string = CORPUS_DIR): CorpusEntryMeta[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => entry.name)
+    .sort()
+    .map(slug => {
+      const entryDir = path.join(dir, slug);
+      const truth = JSON.parse(fs.readFileSync(path.join(entryDir, 'truth.json'), 'utf8'));
+      const linesPath = path.join(entryDir, 'source-lines.json');
+      const lines = fs.existsSync(linesPath) ? JSON.parse(fs.readFileSync(linesPath, 'utf8')) as SourceLine[] : [];
+      const manifestPath = path.join(entryDir, 'images.json');
+      const imageCount = fs.existsSync(manifestPath) ? (JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as unknown[]).length : undefined;
+      return entryMetaFromTruth({ slug, truth, lines, imageCount });
+    });
+}
+
+const COVERAGE_START = '<!-- CORPUS-COVERAGE:START (auto-generated by `npm run corpus -- --write-coverage`; do not edit by hand) -->';
+const COVERAGE_END = '<!-- CORPUS-COVERAGE:END -->';
+
+/** B4 — regenerate the coverage section of the corpus README from entry truth metadata. */
+export function writeCoverageReadme(dir: string = CORPUS_DIR): string {
+  const readmePath = path.join(dir, 'README.md');
+  const markdown = coverageMarkdown(readCorpusEntryMetas(dir));
+  const section = `${COVERAGE_START}\n\n${markdown}\n\n${COVERAGE_END}`;
+  const existing = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, 'utf8') : '';
+  const start = existing.indexOf(COVERAGE_START);
+  const end = existing.indexOf(COVERAGE_END);
+  const next = start >= 0 && end > start
+    ? existing.slice(0, start) + section + existing.slice(end + COVERAGE_END.length)
+    : `${existing.trimEnd()}\n\n## Coverage (diversity targets — report, don't gate)\n\n${section}\n`;
+  fs.writeFileSync(readmePath, next);
+  return markdown;
+}
+
+export async function runCorpus(opts: { strict?: boolean; print?: boolean; dir?: string; only?: string[] } = {}): Promise<{ results: CorpusResult[]; ok: boolean }> {
+  const corpusDir = opts.dir || CORPUS_DIR;
+  const dirs = fs.readdirSync(corpusDir, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort()
+    .filter(name => !opts.only || opts.only.includes(name));
   const results: CorpusResult[] = [];
   for (const exam of dirs) {
-    const dir = path.join(CORPUS_DIR, exam);
+    const dir = path.join(corpusDir, exam);
     const lines = JSON.parse(fs.readFileSync(path.join(dir, 'source-lines.json'), 'utf8')) as SourceLine[];
     const truth = JSON.parse(fs.readFileSync(path.join(dir, 'truth.json'), 'utf8')) as Truth;
+    // #38 E3: an entry may ship its ground-truth classification (labels.json) for the agreement metric.
+    let classificationLabels: Map<number, LineLabel> | undefined;
+    try {
+      const labelsPath = path.join(dir, 'labels.json');
+      if (fs.existsSync(labelsPath)) {
+        const parsed = JSON.parse(fs.readFileSync(labelsPath, 'utf8'));
+        classificationLabels = new Map(Object.entries(parsed.labels || {}).map(([k, v]) => [Number(k), v as LineLabel]));
+      }
+    } catch { classificationLabels = undefined; }
+    const status: 'reviewed' | 'unreviewed' = truth.status === 'reviewed' ? 'reviewed' : 'unreviewed';
     const keyLines = detectKeyTerritory(lines).lineNos;
     const expected = [...truth.expectedNumbers].sort((a, b) => a - b);
     const enumerated = enumerateExpectedQuestionNos(lines);
@@ -435,6 +537,9 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
       exam, expected, truth, questions: base.questions, sections: base.sections, totalPoints: base.totalPoints,
       lines, keyLines, detectedHeaderLines: detectedHeaders.map(header => header.headerLine), duplicateImageIds,
       shapeGate: exam === ACCEPTANCE_ID,
+      status,
+      probe: truth.probe,
+      classificationLabels,
     });
     results.push(baseResult);
     if (opts.print !== false) printResult(baseResult);
@@ -466,6 +571,8 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
         expected, truth, questions: final.questions, sections: final.sections, totalPoints: malformed.totalPoints,
         lines, keyLines, detectedHeaderLines: detectedHeaders.map(header => header.headerLine), duplicateImageIds,
         shapeGate: true,
+        status,
+        probe: truth.probe,
         malformedProfile: true,
       });
       results.push(malformedResult);
@@ -495,19 +602,35 @@ export async function runCorpus(opts: { strict?: boolean; print?: boolean } = {}
   );
   if (!acceptanceOK && acceptance) acceptance.failures.push('F1 acceptance gate not met');
   if (!malformedOK && malformed) malformed.failures.push('F3 malformed-profile acceptance gate not met');
-  // This batch's hard corpus gate is the declared English-final acceptance exam; historical fixtures
-  // remain replayable/report-only (including shape-audit reporting without gating).
-  const legacyFailures = results.filter(result => result.exam !== ACCEPTANCE_ID && result.exam !== `${ACCEPTANCE_ID}·${MALFORMED_PROFILE}`).flatMap(result => result.failures);
-  const ok = acceptanceOK && malformedOK && (!opts.strict ? legacyFailures.length === 0 : true);
+  // B2 — the runner GATES only on reviewed entries. Unreviewed entries (fresh promotions,
+  // format probes, historical fixtures not yet ratcheted) run report-only: their diffs are
+  // printed but can never fail the gate. The acceptance hard gate above applies in strict
+  // mode exactly as before (the acceptance entry is reviewed).
+  const gatedFailures = results.filter(result => result.gated).flatMap(result => result.failures.map(failure => `${result.exam}: ${failure}`));
+  const reportOnlyFailures = results.filter(result => !result.gated).flatMap(result => result.failures);
+  const ok = acceptanceOK && malformedOK && gatedFailures.length === 0;
   if (opts.print !== false) {
-    console.log(`Corpus entries: ${results.length}; status: ${ok ? 'PASS' : 'FAIL'} (${opts.strict ? 'acceptance hard gate' : 'all-entry gate'}; local scripted model; 0 provider calls)`);
-    const shown = opts.strict ? results.filter(result => result.exam === ACCEPTANCE_ID || result.exam === `${ACCEPTANCE_ID}·${MALFORMED_PROFILE}`) : results;
-    for (const result of shown) for (const failure of result.failures) console.log(`  ${result.exam}: ${failure}`);
-    if (opts.strict && legacyFailures.length) console.log(`  Historical fixture differences reported, not gated: ${legacyFailures.length} (acceptance entry is the gate for this batch).`);
+    console.log(`Corpus entries: ${results.length}; status: ${ok ? 'PASS' : 'FAIL'} (reviewed-only gate${opts.strict ? ' + acceptance hard gate' : ''}; local scripted model; 0 provider calls)`);
+    for (const failure of gatedFailures) console.log(`  ${failure}`);
+    if (reportOnlyFailures.length) console.log(`  Report-only differences (unreviewed entries, never gated): ${reportOnlyFailures.length}.`);
+    // Part D — probe scores are reported honestly, whatever they are; below 80% numbers
+    // recall is catastrophic and named a Godlike-2 candidate (D2 — naming, not fixing).
+    for (const result of results.filter(item => item.probe)) {
+      console.log(`  PROBE ${result.exam} (${result.probe}): numbers ${result.recall}, sections ${result.sections}, spots ${result.spotChecks}, shape ${result.shapeAuditLabel}`);
+      if ((result.recallRatio ?? 1) < 0.8) console.log(`  GODLIKE-2 CANDIDATE: ${result.exam} numbers recall ${result.recall} (<80%) — probe-robustness work needed.`);
+    }
+    try {
+      const coverage = buildCoverageTable(readCorpusEntryMetas(corpusDir));
+      console.log(`  Coverage: ${coverage.families.length} families × features; uncovered corpus-wide: ${coverage.uncoveredFeatures.length ? coverage.uncoveredFeatures.join(', ') : 'none'}; empty cells: ${coverage.emptyCells.length} (see corpus README).`);
+    } catch { /* coverage is report-only */ }
   }
   return { results, ok };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
-  runCorpus({ strict: true }).then(({ ok }) => { if (!ok) process.exitCode = 1; }).catch(error => { console.error(error); process.exitCode = 1; });
+  if (process.argv.includes('--write-coverage')) {
+    console.log(writeCoverageReadme());
+  } else {
+    runCorpus({ strict: true }).then(({ ok }) => { if (!ok) process.exitCode = 1; }).catch(error => { console.error(error); process.exitCode = 1; });
+  }
 }

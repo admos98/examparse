@@ -363,6 +363,7 @@ export const Step3Analyze: React.FC<Props> = ({
       { id: 'ocr', name: 'Scanned Pages OCR', status: extractedDoc.scannedPageIndices.length > 0 ? 'idle' : 'skipped', message: 'Batched <= 3 pages' },
       { id: 'cleanup', name: 'Cleanup Tags (Stage 2.5)', status: cleanupEnabled ? 'idle' : 'skipped', message: cleanupEnabled ? `${cleanupEstimate.chunks} judgment call(s) · ${cleanupEstimate.judged} line(s) · local tags first` : 'AI off — local tags only' },
       { id: 'text-repair', name: 'Text Repair Overlay (Stage 2.75)', status: textRepairEnabled ? 'idle' : 'skipped', message: textRepairEnabled ? `Up to ${textRepairEstimate.calls} batched call · ${textRepairEstimate.candidates} candidates · originals preserved` : 'Disabled in Settings — original text only' },
+      { id: 'classify', name: 'Line Sorting (Classify)', status: settings.classifyEnabled !== false ? 'idle' : 'skipped', message: settings.classifyEnabled !== false ? 'AI labels what every line is (question, section, furniture, key…)' : 'Off — standard structuring method' },
       // Part A (#36): vision now runs BEFORE structure so captions inform section labelling.
       { id: 'vision', name: 'Batched Vision Labeling (captions before structure)', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
       { id: 'structure', name: 'Structure Pass (Span References)', status: 'idle', message: '1 text call' },

@@ -8,7 +8,7 @@ import { PARSER_VERSION, PROMPT_VERSION } from './prompts';
 
 export interface StageCacheKeyParams {
   fileHash: string;
-  stage: 'extract' | 'ocr' | 'cleanup' | 'text-repair' | 'structure' | 'vision' | 'repair';
+  stage: 'extract' | 'ocr' | 'cleanup' | 'text-repair' | 'classify' | 'structure' | 'vision' | 'repair' | 'defect-repair';
   provider: string;
   model: string;
   options?: any;

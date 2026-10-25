@@ -668,6 +668,7 @@ function summarizeStoredExam(doc: any): any {
   const healthState: 'green' | 'amber' | 'red' | 'PARTIAL' = isPartialDoc
     ? 'PARTIAL'
     : ((health.state as 'green' | 'amber' | 'red') || (health.complete ? 'green' : 'amber'));
+  const attentionCount = Number((health as any).attentionCount) || 0;
   const modelUsed =
     doc?.modelInfo?.fast ||
     usage.find((u: any) => u?.role === 'standard' || u?.role === 'fast')?.model ||
@@ -692,6 +693,7 @@ function summarizeStoredExam(doc: any): any {
     pointsParsed: health.pointsParsed,
     pointsExpected: (health as any).pointsExpected ?? doc.meta?.totalPoints,
     healthState,
+    attentionCount,
     modelUsed,
     coveragePercent: health.coveragePercent,
     missingQuestionNos: health.missing,

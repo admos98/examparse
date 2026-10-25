@@ -135,7 +135,8 @@ test('T4: triage is presentation-only; repair groups have counts and are collaps
   assert.match(html, /<details><summary[^>]*>WHAT THE APP ALREADY FIXED/);
   assert.match(html, /<details><summary[^>]*>TECHNICAL LOG/);
   assert.doesNotMatch(html, /<details open|Integrity Flags \(14\)/);
-  assert.match(html, /Q1: Answer choices are missing/);
+  // Part C (#36): the row is a plain sentence ending in the user's action, not a flag template.
+  assert.match(html, /Q1 has no answer choices — add the printed options\. \[Fix\]/);
   assert.equal(input.flags.length, 14);
 });
 

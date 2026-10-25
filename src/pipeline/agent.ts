@@ -16,6 +16,7 @@ import {
   examContentRevision,
 } from "./quality";
 import { detectShapeProblemQuestions } from "./forms";
+import { computeAttention } from "../utils/attention";
 
 /** Part D2 — Executor confidence floor for shape-class questions. */
 export const EXECUTOR_CONFIDENCE_FLOOR = 0.6;
@@ -175,6 +176,8 @@ export function compactResult(value: unknown, call = "get_questions"): string {
 export function healthSummary(doc: ExamDoc) {
   const h = getExamHealth(doc);
   const shapeProblems = detectShapeProblemQuestions(doc).length;
+  // Follow-up #36 C2 — the Assistant's count is the SAME number the Step-4 header/chip show.
+  const attentionItems = computeAttention(doc);
   return {
     expected: h.expectedCount,
     parsed: h.parsedCount,
@@ -185,6 +188,8 @@ export function healthSummary(doc: ExamDoc) {
     unresolvedImages: h.unresolvedImageRefs.length,
     lowConfidence: h.lowConfidenceCount,
     shapeProblems,
+    attention: attentionItems.length,
+    attentionKinds: [...new Set(attentionItems.map(item => item.kind))],
     state: h.state === "green" && shapeProblems > 0 ? ("amber" as const) : h.state,
   };
 }

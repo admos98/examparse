@@ -675,6 +675,8 @@ export interface ExamSummary {
   pointsParsed?: number;
   pointsExpected?: number;
   healthState?: 'green' | 'amber' | 'red' | 'PARTIAL';
+  /** Follow-up #36 C2 — the one attention count (computeAttention) for the Library health chip. */
+  attentionCount?: number;
   modelUsed?: string;
 }
 

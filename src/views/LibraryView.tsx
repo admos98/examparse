@@ -460,10 +460,12 @@ export const LibraryView: React.FC<Props> = ({
                           )}
                           <span
                             data-library-health={healthChip}
-                            title={`Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`}
+                            data-library-attention={s.attentionCount ?? 0}
+                            title={`${s.attentionCount ? `${s.attentionCount} ${s.attentionCount === 1 ? 'thing needs' : 'things need'} attention; ` : ''}Coverage ${summaryCoverage.toFixed(0)}%${summaryMissing.length ? `; missing ${summaryMissing.join(', ')}` : ''}${summaryDuplicates.length ? `; duplicates ${summaryDuplicates.join(', ')}` : ''}`}
                             className={`ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] border align-middle ${healthChipCls}`}
                           >
                             {healthChip}
+                            {(s.attentionCount ?? 0) > 0 ? ` · ${s.attentionCount} to finish` : ''}
                           </span>
                           {s.complete !== true && healthChip !== 'PARTIAL' && (
                             <span className="ms-2 text-[length:var(--type-12)] px-1.5 py-0.5 rounded-[6px] bg-[var(--warn-soft)] text-[var(--warn-ink)]  border border-[var(--warn)] align-middle">

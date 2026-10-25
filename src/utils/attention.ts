@@ -9,7 +9,7 @@
  */
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 
-export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved';
+export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed';
 
 export interface AttentionAction {
   /** 'question' scrolls to + expands that card; 'image-tray' opens the tray filtered to these images. */
@@ -245,6 +245,13 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
       severity: 'warn',
     });
   }
+
+  // 5. Metadata and a failed Global Read are explicit teacher work, never silent parse state.
+  for (const flag of flags.filter(flag => flag.code === 'META_MISSING')) {
+    items.push({ id: `metadata-missing_${flag.rootCauseId || flag.id}`, kind: 'metadata-missing', rootCauseId: flag.rootCauseId || flag.id, plainSentence: `${flag.message} [Set]`, action: { target: 'question', label: 'Set' }, questionIds: [], imageIds: [], count: 1, severity: 'warn' });
+  }
+  const readFailure = flags.find(flag => flag.code === 'GLOBAL_READ_FAILED');
+  if (readFailure) items.push({ id: 'read-failed', kind: 'read-failed', rootCauseId: readFailure.id, plainSentence: 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]', action: { target: 'question', label: 'Review' }, questionIds: [], imageIds: [], count: 1, severity: 'error' });
 
   return items;
 }

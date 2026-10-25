@@ -1028,11 +1028,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                   Built by: {q.receipt.ruleChain.map(rule => rule === 'question-start' ? 'seg-number' : rule === 'watermark-excised' ? 'excision' : rule).join(' → ')} · conf {Math.round(q.receipt.ruleConfidence)}
                                 </span>
                               )}
-                              {(q.flags || []).map(code => {
-                                const isError = code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS';
-                                const label = code === 'GAP_ABSORBED' ? 'gap absorbed' : code === 'REWRITE_APPLIED' ? 'rewrite' : code === 'OPTIONS_SYNTHESIZED' ? 'options synthesized' : code === 'SECTION_REASSIGNED' ? 'section reassigned' : code.toLowerCase().replace(/_/g, ' ');
-                                return <span key={code} title={code} className={`px-1.5 py-0.5 rounded-[6px] border ${isError ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger-soft)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{label}</span>;
-                              })}
+
                             </div>
                           )}
 

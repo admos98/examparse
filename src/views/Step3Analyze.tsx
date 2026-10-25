@@ -359,16 +359,11 @@ export const Step3Analyze: React.FC<Props> = ({
 
     // Initial stage statuses
     const initialStages: StageStatus[] = [
-      { id: 'extract', name: 'Local Text & Image Extraction', status: 'completed', message: '0 API calls (done)' },
-      { id: 'ocr', name: 'Scanned Pages OCR', status: extractedDoc.scannedPageIndices.length > 0 ? 'idle' : 'skipped', message: 'Batched <= 3 pages' },
-      { id: 'cleanup', name: 'Cleanup Tags (Stage 2.5)', status: cleanupEnabled ? 'idle' : 'skipped', message: cleanupEnabled ? `${cleanupEstimate.chunks} judgment call(s) · ${cleanupEstimate.judged} line(s) · local tags first` : 'AI off — local tags only' },
-      { id: 'text-repair', name: 'Text Repair Overlay (Stage 2.75)', status: textRepairEnabled ? 'idle' : 'skipped', message: textRepairEnabled ? `Up to ${textRepairEstimate.calls} batched call · ${textRepairEstimate.candidates} candidates · originals preserved` : 'Disabled in Settings — original text only' },
-      { id: 'classify', name: 'Line Sorting (Classify)', status: settings.classifyEnabled !== false ? 'idle' : 'skipped', message: settings.classifyEnabled !== false ? 'AI labels what every line is (question, section, furniture, key…)' : 'Off — standard structuring method' },
-      // Part A (#36): vision now runs BEFORE structure so captions inform section labelling.
-      { id: 'vision', name: 'Batched Vision Labeling (captions before structure)', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
-      { id: 'structure', name: 'Structure Pass (Span References)', status: 'idle', message: '1 text call' },
-      { id: 'assemble', name: 'Assemble & Validate', status: 'idle', message: 'Local assembly' },
-      { id: 'repair', name: 'Escalation Repair', status: 'idle', message: 'Failing items only' },
+      { id: 'extract', name: 'Extract', status: 'completed', message: `Addressed lines and images (OCR${textRepairEnabled ? ' + optional text overlay' : ''} included)` },
+      { id: 'read', name: 'Global Read', status: 'idle', message: 'One whole-paper semantic read · reasoning forced off' },
+      { id: 'check', name: 'Check', status: 'idle', message: 'Arithmetic and identity checks only' },
+      { id: 'repair', name: 'Repair', status: 'idle', message: 'Local twice, then defect-only cloud escalation' },
+      { id: 'present', name: 'Present', status: 'idle', message: 'Document + surviving attention items' },
     ];
     onStagesUpdate(initialStages);
 

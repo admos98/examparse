@@ -74,6 +74,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     standard: { providerId: 'google-gemini', model: 'gemini-2.5-flash' },
     escalation: { providerId: 'google-gemini', model: 'gemini-2.5-pro' },
     vision: { providerId: 'google-gemini', model: 'gemini-2.5-flash' },
+    read: { providerId: '9router-local', model: 'qwen3:4b' },
+    meta: { providerId: '9router-local', model: 'qwen3:4b' },
+    cloud: { providerId: 'google-gemini', model: 'gemini-2.5-pro' },
+    repair: { providerId: '9router-local', model: 'qwen3:4b' },
   },
   costTable: {
     'gemini-2.5-flash-lite': {
@@ -108,8 +112,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxModelCalls: 30,
     maxToolExecutions: 200,
   },
-  // A5: Stage 2.5 cleanup on by default; off ⇒ byte-identical pre-cleanup behaviour (tags aside).
-  cleanupEnabled: true,
+  // Semantic cleanup is not a default-path stage in the five-stage wing.
+  cleanupEnabled: false,
+  consensusEnabled: false,
+  criticEnabled: false,
   textRepairEnabled: false,
   document: {
     defaultLanguage: 'auto',
@@ -267,7 +273,9 @@ export function loadSettings(): AppSettings {
       budget: { ...DEFAULT_SETTINGS.budget, ...(parsed.budget || {}) },
       document: { ...DEFAULT_SETTINGS.document, ...(parsed.document || {}) },
       agentLimits: { ...DEFAULT_SETTINGS.agentLimits, ...(parsed.agentLimits || {}) },
-      cleanupEnabled: typeof parsed.cleanupEnabled === 'boolean' ? parsed.cleanupEnabled : true,
+      cleanupEnabled: typeof parsed.cleanupEnabled === 'boolean' ? parsed.cleanupEnabled : false,
+      consensusEnabled: typeof parsed.consensusEnabled === 'boolean' ? parsed.consensusEnabled : false,
+      criticEnabled: typeof parsed.criticEnabled === 'boolean' ? parsed.criticEnabled : false,
       textRepairEnabled: typeof parsed.textRepairEnabled === 'boolean' ? parsed.textRepairEnabled : false,
     };
     return validateAppSettings(merged);

@@ -26,6 +26,11 @@ import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpecte
 import { runEscalationRepair } from './repair';
 import { canonicalizeForms, runFinalCanonicalization } from './forms';
 import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership';
+import { runAnswerCorrectness, type AnswerSpotCache, type SpotVerdict } from './answerCorrectness';
+import { assembleFromLabels, lineNo as classifyLineNo, runClassifyStage, type ClassifyStageResult, type LabelAssembly, type SpineBudget } from './classify';
+import { runRepairLoop, serializeRepairLoopResult, type RepairLoopResult } from './repairLoop';
+import { appendJournalCall } from './journal';
+import { extractDocumentTotals } from './quality';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
 import { appendUsageRecord, getPipelineCache, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
@@ -271,7 +276,9 @@ export async function runFullPipeline(
   const language = detected.language;
   const expectedEnumeration = enumerateExpectedQuestionNos(workingLines);
   const expectedQuestionNos = expectedEnumeration.numbers;
-  const keyTerritoryLineNos = [...expectedEnumeration.keyTerritory.lineNos].sort((a, b) => a - b);
+  // #38: pattern-derived key territory is the FALLBACK seed only. When the classify spine runs,
+  // this is replaced below by the model's answer-key/marks labels (meaning is the model's job).
+  let keyTerritoryLineNos = [...expectedEnumeration.keyTerritory.lineNos].sort((a, b) => a - b);
 
   // 2.5 STAGE: CLEANUP — AI judges lines, deterministic code tags them; nothing is deleted or edited.
   const cleanupEnabled = settings.cleanupEnabled !== false;
@@ -383,12 +390,125 @@ export async function runFullPipeline(
     });
   }
 
+  // 2.8 STAGE (#38 AI-first spine — Part A: global line classification; Part B: label assembly).
+  // The model decides what each line IS (furniture / section header / question start / key…);
+  // code then assembles mechanically. Pattern-based furniture/section/key deciders survive only
+  // as prompt context here and inside the legacy fallback path (old segmenter, below). On any
+  // classify failure the legacy path runs unchanged and CLASSIFY_FALLBACK is recorded — never silent.
+  const spineBudget: SpineBudget = {
+    calls: 0, units: 0,
+    maxCalls: settings.agentLimits?.maxModelCalls ?? 30,
+    maxUnits: settings.agentLimits?.maxToolExecutions ?? 200,
+  };
+  const spineJournalKey = `spine:${fileHash}:${linesHash}`;
+  const spineFlags: any[] = [];
+  const spineInfo: { classify: any; repairLoop: any } = {
+    classify: { status: 'skipped', calls: 0 },
+    repairLoop: { status: 'skipped', rounds: 0, calls: 0, opsAccepted: 0, opsRejected: 0, escalations: 0, defectsRemaining: 0, remainingKinds: [] },
+  };
+  const journalSpine = async (label: string, rawText: string) => {
+    if (!cacheEnabled) return;
+    try { await appendJournalCall(spineJournalKey, { ts: new Date().toISOString(), label, rawText, complete: true }); } catch { /* journal is best-effort */ }
+  };
+  let classifyOk = false;
+  let labelAssembly: LabelAssembly | undefined;
+  let classifyStageResult: ClassifyStageResult | undefined;
+  {
+    const classifyStageName = 'Line Sorting (Classify)';
+    // Default mapping: same provider/model as cleanup's effective mapping (classify → cleanup → fast).
+    const classifySel = settings.roleMapping.classify || settings.roleMapping.cleanup || settings.roleMapping.fast;
+    const classifyProvider = settings.providers.find(p => p.id === classifySel.providerId) || settings.providers[0];
+    const classifyEnabledSetting = settings.classifyEnabled !== false;
+    const classifyProviderConfig = classifyEnabledSetting && classifyProvider ? { ...classifyProvider, model: classifySel.model } : undefined;
+    const recordFallback = (status: string, reason: string, stageStatus: 'skipped' | 'completed-with-problems') => {
+      spineInfo.classify = { status: 'fallback', calls: classifyStageResult?.calls || 0, reason, ...(classifyProviderConfig ? { provider: classifyProviderConfig.id, model: classifyProviderConfig.model } : {}) };
+      spineFlags.push({
+        id: 'flag_CLASSIFY_FALLBACK', code: 'CLASSIFY_FALLBACK', severity: 'info',
+        message: `Automatic line sorting was not used (${reason}); the standard structuring method sorted this paper instead.`,
+      });
+      onStageUpdate({ id: 'classify', name: classifyStageName, status: stageStatus, message: `Line sorting not used — ${reason}. Continuing with the standard method.` });
+      void status;
+    };
+    if (!classifyEnabledSetting) {
+      recordFallback('skipped', 'turned off in Settings', 'skipped');
+    } else if (!classifyProviderConfig) {
+      recordFallback('unavailable', 'no AI provider is configured', 'skipped');
+    } else {
+      onStageUpdate({ id: 'classify', name: classifyStageName, status: 'running', message: `Asking ${classifyProviderConfig.model} what each of the ${workingLines.length} lines is…` });
+      const classifyCacheParams = { fileHash, stage: 'classify' as const, provider: classifyProviderConfig.id, model: classifyProviderConfig.model, options: { linesHash, cleanup: cleanupSignature } };
+      const cachedClassify = !stageForced('classify') ? await getCachedStageResult<any>(classifyCacheParams) : undefined;
+      const localTags = new Map<number, string>();
+      for (const line of workingLines) if (line.tag) localTags.set(classifyLineNo(line), line.tag);
+      const t0 = Date.now();
+      classifyStageResult = await runClassifyStage({
+        lines: workingLines,
+        cached: cachedClassify ? (cachedClassify.invalid ? { invalid: true, problems: cachedClassify.problems } : cachedClassify.serialized) : undefined,
+        localTags,
+        budget: spineBudget,
+        onJournal: entry => journalSpine(entry.label, entry.rawText),
+        onProgress: message => onStageUpdate({ id: 'classify', name: classifyStageName, status: 'running', message }),
+        caller: async req => {
+          const response = await LLMAdapter.execute(
+            { role: 'classify', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: classifyProviderConfig },
+            { onDelta: (channel, full) => onLiveText?.('classify', req.label, channel, full), onInfo: note => onLiveText?.('classify', req.label, 'info', note) },
+          );
+          return { rawText: response.rawText, json: response.json, usage: response.usage };
+        },
+      });
+      const result = classifyStageResult;
+      if (result.calls > 0) {
+        const cost = calculateActualCost(result.usage.inputTokens, result.usage.outputTokens, classifyProviderConfig.model, settings.costTable);
+        const rec: UsageRecord = { ts: new Date().toISOString(), role: 'classify', provider: classifyProviderConfig.name, model: classifyProviderConfig.model, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, costUsd: cost, label: `Classify (${result.calls} call${result.calls > 1 ? 's' : ''})` };
+        usageRecords.push(rec); appendUsageRecord(rec); onUsageUpdate?.(rec);
+      } else if (result.status === 'cached') {
+        const rec: UsageRecord = { ts: new Date().toISOString(), role: 'classify', provider: classifyProviderConfig.name, model: classifyProviderConfig.model, inputTokens: 0, outputTokens: 0, costUsd: 0, label: 'Classify (Cache Hit)', isCachedHit: true };
+        usageRecords.push(rec); appendUsageRecord(rec, `${examIdForDedupe(fileHash)}:classify:${classifyProviderConfig.model}`); onUsageUpdate?.(rec);
+      }
+      if ((result.status === 'completed' || result.status === 'cached') && result.classification) {
+        labelAssembly = assembleFromLabels({ lines: workingLines, classification: result.classification });
+        if (labelAssembly.rawQuestions.length > 0) {
+          classifyOk = true;
+          // Labels decide key/marks territory from here on (Part B4) — not the pattern detector.
+          keyTerritoryLineNos = labelAssembly.keyLineNos;
+          spineInfo.classify = { status: result.status, provider: classifyProviderConfig.id, model: classifyProviderConfig.model, calls: result.calls, labelledLines: result.classification.labels.size };
+          if (result.status === 'completed' && result.serialized) await writeStageCache(classifyCacheParams, { serialized: result.serialized });
+          onStageUpdate({
+            id: 'classify', name: classifyStageName,
+            status: result.status === 'cached' ? 'cached' : 'completed',
+            durationMs: Date.now() - t0, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens,
+            attempts: result.attempts,
+            message: `${result.status === 'cached' ? 'Line sorting from cache (0 calls)' : `Sorted every line in ${result.calls} call(s)`} · ${labelAssembly.sections.length} section(s) · ${labelAssembly.rawQuestions.length} question record(s) · ${labelAssembly.furnitureLineNos.length} furniture line(s) set aside · ${labelAssembly.keyLineNos.length} answer-key/marks line(s).`,
+          });
+        }
+      }
+      if (!classifyOk) {
+        // Cache invalid output (not provider failures) so an identical re-run costs 0 classify calls.
+        if (result.status === 'invalid') await writeStageCache(classifyCacheParams, { invalid: true, problems: result.problems });
+        labelAssembly = undefined;
+        recordFallback(result.status, result.reason || result.problems?.[0] || 'line sorting failed', result.status === 'unavailable' ? 'skipped' : 'completed-with-problems');
+      }
+    }
+  }
+
   // F2/B: SEGMENTATION SUMMARY BEFORE STRUCTURE (shown before any structure token spent)
   // B1 deterministic 100% coverage + B4 fallback (>20% mismatch → legacy) + lens preview
   let segmentation: any = null;
   let segmentWireForStructure: any = null;
   let segmentFallback = false;
-  try {
+  if (classifyOk && labelAssembly) {
+    // #38 Part B: label-derived segments replace the deterministic segmenter (kept as fallback only).
+    segmentation = {
+      segments: labelAssembly.segments,
+      diagnostics: { coverage: 100, sectionsDetected: labelAssembly.sections.length, segmentsByKind: {}, perSection: [], fallbackSections: [] },
+    };
+    onStageUpdate({
+      id: 'structure',
+      name: 'Structure Pass',
+      status: 'running',
+      message: `Line labels give ${labelAssembly.segments.length} segments across ${labelAssembly.sections.length} section(s); the deterministic segmenter is not needed on this run.`,
+    });
+  }
+  if (!classifyOk) try {
     const { segmentDocument } = await import('./segment');
     const segRes = segmentDocument({ lines: workingLines, keyLines: new Set(keyTerritoryLineNos), pages: extracted.pages });
     segmentation = segRes;
@@ -621,7 +741,29 @@ export async function runFullPipeline(
       cachedStructure && Array.isArray((cachedStructure as any).rawQuestions) && (cachedStructure as any).rawQuestions.length > 0 &&
       !(cachedStructure as any).jsonNull && cachedCoverage?.complete
     );
-    if (cachedStructureUsable) {
+    if (classifyOk && labelAssembly) {
+      // #38 Part B: structure comes from the labels — printed total read from the paper itself;
+      // no structure model call. Downstream (assemble/gates/forms/images/answers) is unchanged.
+      const printedTotals = extractDocumentTotals(workingLines, keyTerritoryLineNos);
+      structureData = {
+        meta: { totalPoints: printedTotals.documentTotal, language },
+        sections: labelAssembly.sections,
+        rawQuestions: labelAssembly.rawQuestions,
+        flags: [],
+        usage: { inputTokens: 0, outputTokens: 0 },
+        callUsage: [],
+        attempts: 0,
+        label: 'Line-label assembly',
+        wireFormat: 'labels',
+        isCachedHit: classifyStageResult?.status === 'cached',
+      };
+      onStageUpdate({
+        id: 'structure',
+        name: 'Structure Pass',
+        status: structureData.isCachedHit ? 'cached' : 'completed',
+        message: `Assembled from line labels — ${labelAssembly.rawQuestions.length} preliminary question(s) across ${labelAssembly.sections.length} section(s)${printedTotals.documentTotal !== undefined ? `; printed total ${printedTotals.documentTotal}` : ''}. No structure model call was needed.`,
+      });
+    } else if (cachedStructureUsable) {
       structureData = { ...cachedStructure, isCachedHit: true };
       const cachedUsageRec: UsageRecord = {
         ts: new Date().toISOString(),
@@ -755,6 +897,7 @@ export async function runFullPipeline(
   let finalQuestions = assembled.questions;
   let allFlags: any[] = [
     ...cleanupFlags,
+    ...spineFlags,
     ...textRepairFlags,
     ...(structureData.flags || []),
     ...assembled.flags,
@@ -985,7 +1128,90 @@ export async function runFullPipeline(
   if (coverage.missing.length && !allFlags.some(f => f.code === 'PARTIAL_COVERAGE')) allFlags.push({ id: 'flag_partial_coverage', severity: 'error', code: 'PARTIAL_COVERAGE', message: `Recovery exhausted with ${coverage.missing.length} missing question(s): ${coverage.missing.join(', ')}.` });
   if (!finalQuestions.length && !allFlags.some(f => f.code === 'STRUCTURE_EMPTY')) allFlags.push({ id: 'flag_structure_empty', severity: 'error', code: 'STRUCTURE_EMPTY', message: 'No questions were reconstructed; the document remains incomplete.' });
 
-  const sectionAssembly = { sections: gates.sections };
+  // #38 Part C + D — VERIFY, THEN BOUNDED AI REPAIR. Code computes the typed defect list from
+  // the assembled document (existing invariants/coverage/ownership); the repair role may only
+  // answer with operations from the closed vocabulary, which code validates and applies before
+  // re-verifying (≤3 rounds, escalation once per surviving kind, executor budgets shared with
+  // classify). Consensus/critic below consume this post-loop document. Survivors reach the
+  // teacher through the single attention function — defect kinds never surface directly.
+  let finalSections = gates.sections;
+  {
+    const repairSel = settings.roleMapping.repair || settings.roleMapping.cleanup || settings.roleMapping.fast;
+    const repairProvider = settings.providers.find(p => p.id === repairSel.providerId) || settings.providers[0];
+    const repairProviderConfig = repairProvider ? { ...repairProvider, model: repairSel.model } : undefined;
+    const escSel = settings.roleMapping.escalation;
+    const escProvider = settings.providers.find(p => p.id === escSel.providerId) || settings.providers[0];
+    const escProviderConfig = escProvider ? { ...escProvider, model: escSel.model } : undefined;
+    const questionsHash = (await sha256(JSON.stringify(finalQuestions.map(q => [q.id, q.no, q.spans, q.points, q.sectionId])))).slice(0, 16);
+    const repairCacheParams = { fileHash, stage: 'defect-repair' as const, provider: repairProviderConfig?.id || 'none', model: repairProviderConfig?.model || 'none', options: { linesHash, questionsHash, path: classifyOk ? 'labels' : 'legacy' } };
+    const cachedLoop = cacheEnabled && !stageForced('repair') ? await getCachedStageResult<any>(repairCacheParams) : undefined;
+    const loopResult: RepairLoopResult = await runRepairLoop({
+      state: { questions: finalQuestions, sections: finalSections },
+      lines: workingLines,
+      expectedNumbers: expectedQuestionNos,
+      expectedStarts: [...expectedEnumeration.lineByNumber.entries()].map(([no, line]) => ({ no, line })),
+      keyLineNos: keyTerritoryLineNos,
+      accountedLineNos: [...(labelAssembly?.furnitureLineNos || []), ...(labelAssembly ? Object.values(labelAssembly.sectionPreludes).flat() : [])],
+      totalPoints: reconciledTotalPoints,
+      images: updatedImages,
+      budget: spineBudget,
+      cachedResult: cachedLoop?.serialized,
+      onJournal: entry => journalSpine(entry.label, entry.rawText),
+      onProgress: message => onStageUpdate({ id: 'assemble', name: 'Assemble & Validate', status: 'running', message }),
+      caller: repairProviderConfig ? async req => {
+        const response = await LLMAdapter.execute(
+          { role: 'repair', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: repairProviderConfig },
+          { onDelta: (channel, full) => onLiveText?.('repair', req.label, channel, full), onInfo: note => onLiveText?.('repair', req.label, 'info', note) },
+        );
+        return { rawText: response.rawText, json: response.json, usage: response.usage };
+      } : undefined,
+      escalationCaller: escProviderConfig ? async req => {
+        const response = await LLMAdapter.execute(
+          { role: 'escalation', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: escProviderConfig },
+          { onDelta: (channel, full) => onLiveText?.('repair', req.label, channel, full), onInfo: note => onLiveText?.('repair', req.label, 'info', note) },
+        );
+        return { rawText: response.rawText, json: response.json, usage: response.usage };
+      } : undefined,
+    });
+    finalQuestions = loopResult.state.questions;
+    finalSections = loopResult.state.sections;
+    spineInfo.repairLoop = {
+      status: loopResult.status, rounds: loopResult.rounds.length, calls: loopResult.calls,
+      opsAccepted: loopResult.opsAccepted, opsRejected: loopResult.opsRejected, escalations: loopResult.escalations,
+      defectsRemaining: loopResult.remainingDefects.length,
+      remainingKinds: [...new Set(loopResult.remainingDefects.map(d => d.kind))],
+    };
+    if (loopResult.status === 'completed' && loopResult.calls > 0) {
+      if (repairProviderConfig && (loopResult.usage.inputTokens || loopResult.usage.outputTokens)) {
+        const rec: UsageRecord = { ts: new Date().toISOString(), role: 'repair', provider: repairProviderConfig.name, model: repairProviderConfig.model, inputTokens: loopResult.usage.inputTokens, outputTokens: loopResult.usage.outputTokens, costUsd: calculateActualCost(loopResult.usage.inputTokens, loopResult.usage.outputTokens, repairProviderConfig.model, settings.costTable), label: `Defect repair (${loopResult.rounds.length} round(s))` };
+        usageRecords.push(rec); appendUsageRecord(rec); onUsageUpdate?.(rec);
+      }
+      if (escProviderConfig && (loopResult.escalationUsage.inputTokens || loopResult.escalationUsage.outputTokens)) {
+        const rec: UsageRecord = { ts: new Date().toISOString(), role: 'escalation', provider: escProviderConfig.name, model: escProviderConfig.model, inputTokens: loopResult.escalationUsage.inputTokens, outputTokens: loopResult.escalationUsage.outputTokens, costUsd: calculateActualCost(loopResult.escalationUsage.inputTokens, loopResult.escalationUsage.outputTokens, escProviderConfig.model, settings.costTable), label: 'Defect repair — second opinion' };
+        usageRecords.push(rec); appendUsageRecord(rec); onUsageUpdate?.(rec);
+      }
+      if (cacheEnabled) await writeStageCache(repairCacheParams, { serialized: serializeRepairLoopResult(loopResult) });
+    } else if (loopResult.status === 'cached' && repairProviderConfig) {
+      const rec: UsageRecord = { ts: new Date().toISOString(), role: 'repair', provider: repairProviderConfig.name, model: repairProviderConfig.model, inputTokens: 0, outputTokens: 0, costUsd: 0, label: 'Defect repair (Cache Hit)', isCachedHit: true };
+      usageRecords.push(rec); appendUsageRecord(rec, `${examIdForDedupe(fileHash)}:defect-repair:${repairProviderConfig.model}`); onUsageUpdate?.(rec);
+    }
+    if (loopResult.opsAccepted > 0) {
+      allFlags.push({
+        id: 'flag_DEFECT_REPAIR', code: 'DEFECT_REPAIR', severity: 'info',
+        message: `Automatic checks fixed ${loopResult.opsAccepted} problem(s) in the paper's bookkeeping${loopResult.escalations ? ` (${loopResult.escalations} needed a second opinion from a stronger model)` : ''}${loopResult.remainingDefects.length ? `; ${loopResult.remainingDefects.length} thing(s) still need your eye` : ''}.`,
+      });
+    }
+    onStageUpdate({
+      id: 'assemble', name: 'Assemble & Validate', status: 'running',
+      message: loopResult.status === 'no-defects'
+        ? 'Arithmetic checks pass: every printed number and line is accounted for; no automatic fixes needed.'
+        : loopResult.status === 'skipped'
+          ? `Arithmetic checks found ${loopResult.remainingDefects.length} open item(s); no model was available for automatic fixes.`
+          : `Automatic fix check: ${loopResult.rounds.length} round(s), ${loopResult.opsAccepted} fix(es) applied, ${loopResult.opsRejected} suggestion(s) rejected, ${loopResult.escalations} second opinion(s); ${loopResult.remainingDefects.length} item(s) still open.`,
+    });
+  }
+
+  const sectionAssembly = { sections: finalSections };
 
   // Fix 2 (Marvel Batch 6) — ADOPTION-TIME CANONICALIZATION (defense in depth).
   // Every replacement question (consensus winner, critic reparse candidate, recovery insert)
@@ -1224,6 +1450,7 @@ export async function runFullPipeline(
   allFlags.push(...imageAssignment.flags);
   const assignmentSummary = [
     `order-bijection ${imageAssignment.byRule['order-bijection'] || 0}`,
+    ...(imageAssignment.byRule['parent-as-item'] ? [`parent-as-item ${imageAssignment.byRule['parent-as-item']}`] : []),
     `caption-verified ${imageAssignment.byRule['caption-verified'] || 0}`,
     `vision-adjudicated ${imageAssignment.adjudicated}`,
     `geometry ${imageAssignment.byRule.geometry || 0}`,
@@ -1236,6 +1463,47 @@ export async function runFullPipeline(
     name: 'Assemble & Validate',
     status: imageAssignment.suspects ? 'completed-with-problems' : 'completed',
     message: `Image assignment (exact): ${assignmentSummary}; every image has at most one owning question (I13).`,
+  });
+
+  // 6.6 PART C (Godlike Batch 1) — ANSWER CORRECTNESS. C1 is pure local: letter answers are
+  // checked against the {no → letter} table sliced from key territory (table wins, ambiguity
+  // → ANSWER_CONFLICT attention). C2 spends at most ONE batched fast-role call spot-checking
+  // short/fill text answers against the key's own text (cached per stem+answers hash, skipped
+  // silently with no available model); mismatches are attention items, never rewrites.
+  const correctness = await runAnswerCorrectness({
+    questions: finalQuestions,
+    lines: workingLines,
+    keyLines: keyTerritoryLineNos,
+    spotProvider: structProviderConfig.id,
+    spotModel: structProviderConfig.model,
+    spotCache: {
+      get: async key => { try { return await getPipelineCache<SpotVerdict>(key); } catch { return undefined; } },
+      set: async (key, value) => { if (cacheEnabled) await setPipelineCache<SpotVerdict>(key, value); },
+    } satisfies AnswerSpotCache,
+    spotCaller: async req => {
+      const response = await LLMAdapter.execute(
+        { role: 'fast', system: req.system, text: req.text, maxOutputTokens: req.maxOutputTokens, label: req.label, providerConfig: structProviderConfig },
+        { onDelta: (channel, full) => onLiveText?.('assemble', req.label, channel, full), onInfo: note => onLiveText?.('assemble', req.label, 'info', note) },
+      );
+      return { rawText: response.rawText, json: response.json, usage: response.usage };
+    },
+  });
+  finalQuestions = correctness.questions;
+  allFlags.push(...correctness.flags);
+  if (correctness.spot.calls) {
+    const spotCost = calculateActualCost(correctness.spot.inputTokens, correctness.spot.outputTokens, structProviderConfig.model, settings.costTable);
+    const rec: UsageRecord = {
+      ts: new Date().toISOString(), role: 'fast', provider: structProviderConfig.name, model: structProviderConfig.model,
+      inputTokens: correctness.spot.inputTokens, outputTokens: correctness.spot.outputTokens, costUsd: spotCost,
+      label: `Answer spot-check (${correctness.spot.candidates} item${correctness.spot.candidates === 1 ? '' : 's'}; one batch)`,
+    };
+    usageRecords.push(rec); appendUsageRecord(rec); onUsageUpdate?.(rec);
+  }
+  onStageUpdate({
+    id: 'assemble',
+    name: 'Assemble & Validate',
+    status: correctness.letter.conflicts || correctness.spot.mismatches ? 'completed-with-problems' : 'completed',
+    message: `Answer correctness: ${correctness.letter.checked} letter answer(s) checked against the key table (${correctness.letter.agreed} agreed, ${correctness.letter.corrected} corrected from the key, ${correctness.letter.conflicts} conflict(s)); text spot-check ${correctness.spot.status} (${correctness.spot.calls} call, ${correctness.spot.mismatches} mismatch(es) for review).`,
   });
 
 
@@ -1336,6 +1604,12 @@ export async function runFullPipeline(
     },
     flags: allFlags,
     usage: usageRecords,
+    // #38 spine receipt (classify provenance + repair-loop summary + shared budget accounting).
+    spine: {
+      classify: spineInfo.classify,
+      repairLoop: spineInfo.repairLoop,
+      budget: { calls: spineBudget.calls, units: spineBudget.units, maxCalls: spineBudget.maxCalls, maxUnits: spineBudget.maxUnits },
+    },
     guidanceTokens: Number(structureData.guidanceTokens) || 0,
     verdicts: verdictStore,
     traces: tracesForDoc({ id: examId, questions: finalQuestions } as any, { callLabel: 'Structure Pass', model: structProviderConfig.model, journalResumed: Boolean(structureData.isCachedHit) }),
@@ -1419,6 +1693,8 @@ export async function runFullPipeline(
           overlongStems: finalPass.stemOverlong,
         },
         verifierDefects: allFlags.filter(f => ['ANSWER_ANCHOR_SUSPECT','OPTION_DUPLICATE','PASSAGE_DETACHED','SECTION_SPAN_OUTSIDE','CRITIC_DEFECT'].includes(String(f?.code))).length,
+        // C3 — key-table agreement feeds the scoreboard's answer-accuracy trait.
+        answerAccuracy: correctness.accuracy.checked ? { ...correctness.accuracy } : undefined,
         calls: liveCalls.length,
         tokens: {
           input: usageRecords.reduce((sum, record) => sum + (record.inputTokens || 0), 0),

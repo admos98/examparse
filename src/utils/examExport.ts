@@ -22,6 +22,8 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
     consensusSections: [...new Set((doc.flags || []).filter(f => f.code.startsWith('CONSENSUS')).map(f => f.questionId || 'section'))],
     critic: { calls: (doc.usage || []).filter(u => (u as any).role === 'critic').length, defects: verdicts.filter(v => v.verdict === 'defect').length, ok: verdicts.filter(v => v.verdict === 'ok').length },
     memory: { playbookIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.playbookIds || []))], skillIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.skillIds || []))], guidanceTokens: Number((doc as any).guidanceTokens) || 0 },
+    classify: doc.spine?.classify,
+    repairLoop: doc.spine?.repairLoop,
     config: { models },
   });
 }

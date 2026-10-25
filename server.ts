@@ -13,6 +13,7 @@ import { lintSkill, parseSkillFile, serializeSkill } from './src/pipeline/memory
 import { draftEligibleForActivation, evaluateSkillStaleness } from './src/pipeline/memory/skills';
 import { addProposal, applyCredit, expireCandidates, lessonIsSafe } from './src/pipeline/memory/playbook';
 import { countUserCorrections, USER_CORRECTION_WINDOW_MS } from './src/pipeline/memory/harness';
+import { buildCorpusEntry, formatCorpusFixNotes, type CorpusFixRecord } from './src/pipeline/corpusPromote';
 
 dotenv.config();
 
@@ -816,6 +817,64 @@ app.post('/api/exams/:id/usage', (req, res) => {
   const doc = readJsonFile<any>(file, null); if (!doc) return res.status(404).json({ error: 'Exam not found' });
   if (req.body?.role !== 'agent' || typeof req.body?.label !== 'string' || !hasSafeJsonSize(res, req.body, 32768)) return res.status(400).json({ error: 'Invalid agent usage record' });
   doc.usage = [...(doc.usage || []), req.body].slice(-500); atomicWriteJson(file, doc); return res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------ */
+/* Corpus flywheel (Godlike Batch 1, Part B) — dev-side test corpus.   */
+/* Writes only inside the corpus dir; truth.json is never auto-edited. */
+/* ------------------------------------------------------------------ */
+const CORPUS_DIR = process.env.EXAMPARSE_CORPUS_DIR || path.join(process.cwd(), 'test/fixtures/corpus');
+const CORPUS_SLUG = /^[a-z0-9][a-z0-9-]{0,80}$/;
+
+app.post('/api/corpus/promote/:id', (req: Request, res: Response) => {
+  if (!safeSegment(res, req.params.id)) return;
+  const file = assertInsideDir(res, EXAMS_DIR, path.join(EXAMS_DIR, `${req.params.id}.json`));
+  if (!file) return;
+  const doc = readJsonFile<any>(file, null);
+  if (!doc) return res.status(404).json({ error: 'Exam not found' });
+  let entry;
+  try { entry = buildCorpusEntry(doc); } catch (error) { return res.status(400).json({ error: `Could not build a corpus entry: ${String(error)}` }); }
+  if (!CORPUS_SLUG.test(entry.slug)) return res.status(400).json({ error: 'Invalid corpus slug' });
+  const entryDir = assertInsideDir(res, CORPUS_DIR, path.join(CORPUS_DIR, entry.slug));
+  if (!entryDir) return;
+  if (fs.existsSync(entryDir)) return res.status(409).json({ error: `Corpus entry "${entry.slug}" already exists; review it in place instead of re-promoting.`, slug: entry.slug });
+  fs.mkdirSync(entryDir, { recursive: true });
+  for (const [name, content] of Object.entries(entry.files)) {
+    const target = assertInsideDir(res, entryDir, path.join(entryDir, name));
+    if (!target) return;
+    atomicWriteFile(target, content);
+  }
+  return res.json({ ok: true, slug: entry.slug, files: Object.keys(entry.files), status: 'unreviewed' });
+});
+
+app.post('/api/corpus/:slug/fixes', (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '');
+  if (!CORPUS_SLUG.test(slug)) return res.status(400).json({ error: 'Invalid corpus slug' });
+  const entryDir = assertInsideDir(res, CORPUS_DIR, path.join(CORPUS_DIR, slug));
+  if (!entryDir) return;
+  const notesFile = assertInsideDir(res, entryDir, path.join(entryDir, 'notes.md'));
+  if (!notesFile) return;
+  if (!fs.existsSync(entryDir)) return res.status(404).json({ error: 'Corpus entry not found' });
+  const raw = Array.isArray(req.body?.records) ? req.body.records.slice(0, 100) : null;
+  if (!raw || !hasSafeJsonSize(res, req.body, 65536)) return res.status(400).json({ error: 'Invalid fix records' });
+  const clean = (value: unknown, max: number) => String(value ?? '').replace(/[\r\n`]/g, ' ').slice(0, max);
+  const records: CorpusFixRecord[] = raw.map((record: any) => ({
+    ts: clean(record?.ts, 40) || new Date().toISOString(),
+    kind: clean(record?.kind, 40) || 'fix',
+    questionId: clean(record?.questionId, 80),
+    questionNo: Number.isFinite(Number(record?.questionNo)) ? Number(record.questionNo) : null,
+    change: ['edited', 'added', 'removed'].includes(record?.change) ? record.change : 'edited',
+    beforeHash: clean(record?.beforeHash, 24),
+    afterHash: clean(record?.afterHash, 24),
+  })).filter((record: CorpusFixRecord) => record.questionId);
+  if (!records.length) return res.json({ ok: true, recorded: 0 });
+  // Recording only (B3): append to notes.md; truth.json changes stay human commits.
+  let notes = fs.existsSync(notesFile) ? fs.readFileSync(notesFile, 'utf8') : `# ${slug}\n`;
+  if (!notes.includes('## Field fixes')) notes += '\n## Field fixes (recorded automatically; truth changes are human commits)\n';
+  if (!notes.endsWith('\n')) notes += '\n';
+  notes += formatCorpusFixNotes(records) + '\n';
+  atomicWriteFile(notesFile, notes);
+  return res.json({ ok: true, recorded: records.length });
 });
 
 app.delete('/api/exams/:id', (req: Request, res: Response) => {

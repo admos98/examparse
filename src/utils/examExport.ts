@@ -201,6 +201,7 @@ export function summarizeExamForLibrary(doc: ExamDoc) {
     pointsParsed: health.pointsParsed,
     pointsExpected: health.pointsExpected ?? doc.meta?.totalPoints,
     healthState,
+    attentionCount: health.attentionCount ?? 0,
     modelUsed,
     coveragePercent: health.coveragePercent,
     missingQuestionNos: health.missing,

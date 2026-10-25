@@ -1,7 +1,7 @@
 /** Deterministic completeness, key-territory, and exam-health helpers. */
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, OffsetSpan, Question, SourceLine } from '../types';
 import { buildQuestionTree } from '../utils/questionTree';
-import { groupAttentionFlags } from '../utils/flagPresentation';
+import { attentionCount as computeAttentionCount } from '../utils/attention';
 import {
   MATCHING_VIEW_GUILLEMET_ORDINAL_RE,
   SHARED_FURNITURE_FAST_RE,
@@ -665,7 +665,8 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
   }
   const missingBlobImages = (doc.images || []).filter(img => Boolean(img.storageMissing) && img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
   const unplacedImages = (doc.images || []).filter(img => !img.storageMissing && !referenced.has(img.id) && img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
-  const attentionCount = groupAttentionFlags(doc.flags || [], doc).length;
+  // Follow-up #36 C1/C2 — the ONE human-action count (same function the UI/Assistant read).
+  const attentionCount = computeAttentionCount(doc);
   const lowConfidenceCount = (doc.questions || []).filter(q => q.confidence < 0.6).length;
   const hasCoverageProblem = coverage.missing.length > 0 || !coverage.pointsMatch;
   const hasQuestions = (doc.questions || []).length > 0;

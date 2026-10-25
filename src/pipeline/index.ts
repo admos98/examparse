@@ -5,7 +5,7 @@ import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences } fro
  * Coordinates Extract → OCR → Structure → Vision → Assemble & Validate → Escalation Repair
  * with content-hash caching, token thrift enforcement, and live stage status.
  */
-import { AppSettings, ExamDoc, LineTag, Question, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
+import { AppSettings, ExamDoc, ImageAsset, LineTag, Question, SourceLine, StageStatus, UsageRecord, computeDisplayName } from '../types';
 import { CLEANUP_VERSION, runCleanupStage, cleanupKeySignature } from './cleanup';
 import { applyTextRepairOverlay, runTextRepairStage, TextRepairCache, TextRepairCacheEntry, TextRepairStats } from './textRepair';
 import { computeOwnership, orphanFlag } from './ownership';
@@ -13,8 +13,8 @@ import { applyLocalGates } from './gates';
 import { extractDocument, ExtractedDocument } from './extract';
 import { tagFurniture, extractionDiagnostics } from './extractionQuality';
 import { runBatchedOcr } from './ocr';
-import { runStructurePass } from './structure';
-import { labelImagesBatched, fallbackImageKind } from './vision';
+import { runStructurePass, rawCoverageQuestions } from './structure';
+import { adjudicateImageAssignments, labelImagesBatched, fallbackImageKind } from './vision';
 import { assembleAndValidateQuestions, sliceSourceSpans, validateAndFixDuplicateImageIds } from './assemble';
 import { spanLineNumbers, spansContainLine } from './spans';
 import { validateSemantic } from './semanticValidators';
@@ -25,7 +25,7 @@ import { LLMAdapter } from '../providers/adapter';
 import { autoDecorateRepeatedImages, computeImageQuestionHints, enumerateExpectedQuestionNos, evaluateCoverage, markPartialForInvariantViolations, parsePrintedNumberFromStem, validateExamInvariants } from './quality';
 import { runEscalationRepair } from './repair';
 import { canonicalizeForms, runFinalCanonicalization } from './forms';
-import { distributeGroupImages } from './groupImages';
+import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership';
 import { sha256 } from '../utils/hash';
 import { getCachedStageResult, setCachedStageResult } from './cache';
 import { appendUsageRecord, getPipelineCache, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
@@ -446,6 +446,133 @@ export async function runFullPipeline(
   // Expose segmentation wire for structure cache key (deterministic-before-LLM)
   const segmentSignature = segmentation && !segmentFallback ? `seg:${segmentation.segments.length}:${segmentation.diagnostics.coverage.toFixed(0)}` : 'seg:off';
 
+  // 3.5 STAGE: VISION CALL (Part A — moved BEFORE structure labelling).
+  // Vision reads the segmenter's candidate segments (pure geometry), returns {caption, kind, role}.
+  // Roles are PROVISIONAL here: ownership is decided afterwards by printed geometry + counts (Part B).
+  // Cached on image content + segment content, so an unchanged re-run still costs 0 calls.
+  let updatedImages = autoDecorateRepeatedImages(extracted.images);
+  const lineTextByNo = new Map(workingLines.map(line => [Number(String(line.id).replace(/\D/g, '')), line]));
+  const segmentList: any[] = (!segmentFallback && segmentation?.segments) ? segmentation.segments : [];
+  const segmentCandidates: Record<string, Array<{ ref: string; stem: string }>> = {};
+  const segmentHints: Record<string, { questionRef: string; group: string; page: number }> = {};
+  if (segmentList.length) {
+    for (const img of updatedImages) {
+      if (img.label?.role === 'decoration' || img.label?.kind === 'decoration') continue;
+      const anchor = img.anchorLine;
+      const samePage = (seg: any) => {
+        const first = lineTextByNo.get(seg.parentStemLines?.[0] ?? seg.startLine) || lineTextByNo.get(seg.startLine);
+        return first?.page === img.page;
+      };
+      let chosen: any[] = anchor === undefined
+        ? []
+        : segmentList.filter(seg => seg.startLine <= anchor && seg.endLine >= anchor && samePage(seg));
+      if (!chosen.length) {
+        const preceding = segmentList.filter(seg => samePage(seg) && seg.endLine < (anchor ?? 0)).sort((a, b) => b.endLine - a.endLine)[0];
+        const following = segmentList.filter(seg => samePage(seg) && seg.startLine > (anchor ?? 0)).sort((a, b) => a.startLine - b.startLine)[0];
+        chosen = [preceding, following].filter(Boolean);
+      }
+      if (!chosen.length) chosen = segmentList.filter(samePage).slice(0, 2);
+      const candidates = chosen.slice(0, 4).map((seg: any) => {
+        const first = lineTextByNo.get(seg.parentStemLines?.[0] ?? seg.startLine) || lineTextByNo.get(seg.startLine);
+        return {
+          ref: String(seg.id),
+          stem: `segment ${seg.id} (${seg.kind}${seg.printedNo !== undefined ? `, n=${seg.printedNo}` : ''}) ${String(first?.text || '').slice(0, 120)}`,
+        };
+      });
+      if (candidates.length) {
+        segmentCandidates[img.id] = candidates;
+        segmentHints[img.id] = { questionRef: String(chosen[0].id), group: String(chosen[0].id), page: img.page };
+      }
+    }
+  }
+  const visionRole = settings.roleMapping.vision;
+  const visionProvider = settings.providers.find(p => p.id === visionRole.providerId) || settings.providers[0];
+  const visionProviderConfig = { ...visionProvider, model: visionRole.model };
+  let visionStageFlags: any[] = [];
+  const visionCandidates = updatedImages.filter(img => img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
+  // Segment refs are not question refs: park them on `segmentRef` and keep the verdict provisional.
+  const markProvisional = (images: ImageAsset[]): ImageAsset[] => images.map(img => {
+    if (!img.label) return img;
+    const rawLabel = img.label as any;
+    const segmentRef = rawLabel.segmentRef || (candidateSegmentRefs.has(String(rawLabel.questionRef)) ? String(rawLabel.questionRef) : undefined);
+    const { questionRef: _segmentRefOnly, ...rest } = rawLabel;
+    return { ...img, label: { ...rest, segmentRef, provisional: true, source: rawLabel.source || 'vision' } as any };
+  });
+  const candidateSegmentRefs = new Set(Object.values(segmentCandidates).flat().map(candidate => candidate.ref));
+  if (updatedImages.length > 0 && visionCandidates.length > 0) {
+    onStageUpdate({
+      id: 'vision',
+      name: 'Batched Vision Labeling',
+      status: 'running',
+      message: `Labeling ${visionCandidates.length} image(s) in ${Math.ceil(visionCandidates.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} bundled call(s) BEFORE structure, so captions inform section labelling; repeated logos were classified locally.`,
+    });
+
+    const cachedVision = !stageForced('vision')
+      ? await getCachedStageResult<any>({
+          fileHash,
+          stage: 'vision',
+          provider: visionProviderConfig.id,
+          model: visionProviderConfig.model,
+          options: { linesHash, imgShas: visionImgShas, segments: segmentSignature },
+        })
+      : null;
+
+    if (cachedVision) {
+      const cachedImages = autoDecorateRepeatedImages(cachedVision.updatedImages || []);
+      const cachedById = new Map(cachedImages.map((img: any) => [img.id, img]));
+      updatedImages = markProvisional(updatedImages.map(img => {
+        const cached = cachedById.get(img.id);
+        return cached ? { ...img, ...cached, label: cached.label || img.label } : img;
+      }));
+      visionStageFlags = cachedVision.flags || [];
+      const cachedUsageRec: UsageRecord = {
+        ts: new Date().toISOString(), role: 'vision', provider: visionProviderConfig.name, model: visionProviderConfig.model,
+        inputTokens: cachedVision.usage?.inputTokens || 0, outputTokens: cachedVision.usage?.outputTokens || 0, costUsd: 0,
+        label: 'Vision Labeling (Cache Hit)', isCachedHit: true,
+      };
+      usageRecords.push(cachedUsageRec);
+      appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:vision:${visionProviderConfig.model}`);
+      onUsageUpdate?.(cachedUsageRec);
+      onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'cached', message: 'Image captions/roles loaded from cache (0 calls); structure will see them.' });
+    } else {
+      const t0 = Date.now();
+      const visionRes = await labelImagesBatched({
+        images: visionCandidates,
+        sourceLines: workingLines,
+        providerConfig: visionProviderConfig,
+        maxLongEdge: settings.thrift.imageMaxLongEdge,
+        quality: settings.thrift.jpegQuality / 100,
+        maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
+        maxOutputTokens: settings.budget.maxOutputTokens,
+        questionHints: segmentHints,
+        candidatesByImage: segmentCandidates,
+        onLiveText: (label, channel, text) => onLiveText?.('vision', label, channel, text),
+      });
+      const visionById = new Map(visionRes.updatedImages.map(img => [img.id, img]));
+      updatedImages = markProvisional(updatedImages.map(img => visionById.get(img.id) || img));
+      visionStageFlags = visionRes.flags || [];
+      const costUsd = calculateActualCost(visionRes.usage.inputTokens, visionRes.usage.outputTokens, visionProviderConfig.model, settings.costTable);
+      const usageRec: UsageRecord = {
+        ts: new Date().toISOString(), role: 'vision', provider: visionProviderConfig.name, model: visionProviderConfig.model,
+        inputTokens: visionRes.usage.inputTokens, outputTokens: visionRes.usage.outputTokens, costUsd,
+        label: `Vision Labeling (${visionCandidates.length} images)`,
+      };
+      usageRecords.push(usageRec); appendUsageRecord(usageRec); onUsageUpdate?.(usageRec);
+      await writeStageCache({ fileHash, stage: 'vision', provider: visionProviderConfig.id, model: visionProviderConfig.model, options: { linesHash, imgShas: visionImgShas, segments: segmentSignature } }, visionRes);
+      onStageUpdate({
+        id: 'vision', name: 'Batched Vision Labeling', status: 'completed', durationMs: Date.now() - t0,
+        inputTokens: visionRes.usage.inputTokens, outputTokens: visionRes.usage.outputTokens, costUsd,
+        message: `Captioned ${visionCandidates.length} image(s) against the segmenter's candidates; roles stay provisional until Part B decides ownership.`,
+      });
+    }
+  } else if (updatedImages.length > 0) {
+    onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'skipped', message: 'All detected images were repeated page decorations; classified locally (0 calls).' });
+  } else {
+    onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'skipped', message: 'No images detected in document (0 calls).' });
+  }
+  // Structure sees the captions: a compact, deterministic signature keeps the structure cache honest.
+  const visionLabelSignature = (await sha256(JSON.stringify(updatedImages.map(img => [img.id, img.page, img.label?.caption || '', img.label?.kind || '', img.label?.role || ''])))).slice(0, 16);
+
   const structRole = settings.roleMapping.fast;
   const structProvider = settings.providers.find(p => p.id === structRole.providerId) || settings.providers[0];
   const structProviderConfig = { ...structProvider, model: structRole.model };
@@ -481,14 +608,14 @@ export async function runFullPipeline(
         stage: 'structure',
         provider: structProviderConfig.id,
         model: structProviderConfig.model,
-        options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature, segments: segmentSignature },
+        options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature, segments: segmentSignature, images: visionLabelSignature },
       })
     : null;
 
   let structureData: any;
     // Never serve empty, json:null, or incomplete structure caches. Incomplete results must re-enter the journal-aware recovery path.
     const cachedCoverage = cachedStructure && Array.isArray((cachedStructure as any).rawQuestions)
-      ? evaluateCoverage(expectedQuestionNos, (cachedStructure as any).rawQuestions.map((q: any) => ({ ...q, stem: sliceSourceSpans(q.spans || [], workingLines) })), (cachedStructure as any).meta?.totalPoints)
+      ? evaluateCoverage(expectedQuestionNos, rawCoverageQuestions((cachedStructure as any).rawQuestions, workingLines), (cachedStructure as any).meta?.totalPoints)
       : null;
     const cachedStructureUsable = Boolean(
       cachedStructure && Array.isArray((cachedStructure as any).rawQuestions) && (cachedStructure as any).rawQuestions.length > 0 &&
@@ -523,7 +650,7 @@ export async function runFullPipeline(
       try {
         structRes = await runStructurePass({
           sourceLines: workingLines,
-          images: extracted.images,
+          images: updatedImages,
           languageHint: language,
           latexEnabled: settings.thrift.latexNormalization,
           providerConfig: structProviderConfig,
@@ -578,7 +705,10 @@ export async function runFullPipeline(
       }
 
     // Cache only complete coverage; partial structure is persisted via the journal and visible partial ExamDoc.
-    const structCoverage = evaluateCoverage(expectedQuestionNos, structRes.rawQuestions.map((q: any) => ({ ...q, stem: sliceSourceSpans(q.spans || [], workingLines) })), structRes.meta?.totalPoints);
+    // Coverage uses the same stem discipline as the structure pass itself: a group child shares its
+    // parent's printed line, so slicing that line would score every sibling as the parent's number and
+    // wrongly reject a complete parse from the cache.
+    const structCoverage = evaluateCoverage(expectedQuestionNos, rawCoverageQuestions(structRes.rawQuestions, workingLines), structRes.meta?.totalPoints);
     if (structRes.rawQuestions.length > 0 && !structRes.jsonNull && structCoverage.complete) {
       await writeStageCache(
         {
@@ -586,7 +716,7 @@ export async function runFullPipeline(
           stage: 'structure',
           provider: structProviderConfig.id,
           model: structProviderConfig.model,
-          options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature, segments: segmentSignature },
+          options: { latex: settings.thrift.latexNormalization, linesHash, cleanup: cleanupSignature, segments: segmentSignature, images: visionLabelSignature },
         },
         structRes
       );
@@ -603,101 +733,6 @@ export async function runFullPipeline(
       attempts: structRes.attempts,
       message: `${structRes.flags?.some((f: any) => f.code === 'RESUMED_FROM_JOURNAL') ? `Resumed partial parse — ${structRes.rawQuestions.length} questions recovered, continuing at line ${structRes.resumeLine || 1}. ` : ''}Parsed ${structRes.rawQuestions.length} preliminary question(s) across ${structRes.sections.length} sections. Wire ${structRes.wireFormat || 'v2'}; estimated ${Math.round(structRes.outputTokensSavedPct || 0)}% fewer output tokens than v1.`,
     });
-  }
-
-  // 4. STAGE: VISION CALL — geometric hints are set locally before the single bundled model pass.
-  let updatedImages = autoDecorateRepeatedImages(extracted.images);
-  const questionHints = computeImageQuestionHints(updatedImages, structureData.rawQuestions || [], workingLines);
-  updatedImages = updatedImages.map(img => {
-    const hint = questionHints[img.id];
-    if (!hint || hint.page !== img.page || img.label?.role === 'decoration' || img.label?.kind === 'decoration') return img;
-    return {
-      ...img,
-      label: {
-        ...(img.label || {}),
-        role: img.label?.role || 'stem',
-        kind: img.label?.kind || fallbackImageKind(img),
-        questionRef: img.label?.questionRef || hint.questionRef,
-        source: img.label ? (img.label as any).source : 'geometry',
-      } as any,
-    };
-  });
-  let visionStageFlags: any[] = [];
-  const visionCandidates = updatedImages.filter(img => img.label?.role !== 'decoration' && img.label?.kind !== 'decoration');
-  if (updatedImages.length > 0 && visionCandidates.length > 0) {
-    onStageUpdate({
-      id: 'vision',
-      name: 'Batched Vision Labeling',
-      status: 'running',
-      message: `Labeling ${visionCandidates.length} image(s) in ${Math.ceil(visionCandidates.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} bundled call(s); repeated logos were classified locally.`,
-    });
-
-    const visionRole = settings.roleMapping.vision;
-    const visionProvider = settings.providers.find(p => p.id === visionRole.providerId) || settings.providers[0];
-    const visionProviderConfig = { ...visionProvider, model: visionRole.model };
-
-    const cachedVision = !stageForced('vision')
-      ? await getCachedStageResult<any>({
-          fileHash,
-          stage: 'vision',
-          provider: visionProviderConfig.id,
-          model: visionProviderConfig.model,
-          options: { linesHash, imgShas: visionImgShas },
-        })
-      : null;
-
-    if (cachedVision) {
-      const cachedImages = autoDecorateRepeatedImages(cachedVision.updatedImages || []);
-      const cachedById = new Map(cachedImages.map((img: any) => [img.id, img]));
-      updatedImages = updatedImages.map(img => {
-        const cached = cachedById.get(img.id);
-        const hint = questionHints[img.id];
-        return cached ? { ...img, ...cached, label: cached.label || img.label } : img.label?.questionRef || !hint ? img : { ...img, label: { ...(img.label || {}), role: 'stem', questionRef: hint.questionRef } };
-      });
-      visionStageFlags = cachedVision.flags || [];
-      const cachedUsageRec: UsageRecord = {
-        ts: new Date().toISOString(), role: 'vision', provider: visionProviderConfig.name, model: visionProviderConfig.model,
-        inputTokens: cachedVision.usage?.inputTokens || 0, outputTokens: cachedVision.usage?.outputTokens || 0, costUsd: 0,
-        label: 'Vision Labeling (Cache Hit)', isCachedHit: true,
-      };
-      usageRecords.push(cachedUsageRec);
-      appendUsageRecord(cachedUsageRec, `${examIdForDedupe(fileHash)}:vision:${visionProviderConfig.model}`);
-      onUsageUpdate?.(cachedUsageRec);
-      onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'cached', message: 'Image labels loaded from cache; local geometric hints retained (0 calls).' });
-    } else {
-      const t0 = Date.now();
-      const visionRes = await labelImagesBatched({
-        images: visionCandidates,
-        sourceLines: workingLines,
-        providerConfig: visionProviderConfig,
-        maxLongEdge: settings.thrift.imageMaxLongEdge,
-        quality: settings.thrift.jpegQuality / 100,
-        maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
-        maxOutputTokens: settings.budget.maxOutputTokens,
-        questionHints,
-        onLiveText: (label, channel, text) => onLiveText?.('vision', label, channel, text),
-      });
-      const visionById = new Map(visionRes.updatedImages.map(img => [img.id, img]));
-      updatedImages = updatedImages.map(img => visionById.get(img.id) || img);
-      visionStageFlags = visionRes.flags || [];
-      const costUsd = calculateActualCost(visionRes.usage.inputTokens, visionRes.usage.outputTokens, visionProviderConfig.model, settings.costTable);
-      const usageRec: UsageRecord = {
-        ts: new Date().toISOString(), role: 'vision', provider: visionProviderConfig.name, model: visionProviderConfig.model,
-        inputTokens: visionRes.usage.inputTokens, outputTokens: visionRes.usage.outputTokens, costUsd,
-        label: `Vision Labeling (${visionCandidates.length} images)`,
-      };
-      usageRecords.push(usageRec); appendUsageRecord(usageRec); onUsageUpdate?.(usageRec);
-      await writeStageCache({ fileHash, stage: 'vision', provider: visionProviderConfig.id, model: visionProviderConfig.model, options: { linesHash, imgShas: visionImgShas } }, visionRes);
-      onStageUpdate({
-        id: 'vision', name: 'Batched Vision Labeling', status: 'completed', durationMs: Date.now() - t0,
-        inputTokens: visionRes.usage.inputTokens, outputTokens: visionRes.usage.outputTokens, costUsd,
-        message: `Mapped ${visionCandidates.length} image(s); geometric hints supplied before model confirmation.`,
-      });
-    }
-  } else if (updatedImages.length > 0) {
-    onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'skipped', message: 'All detected images were repeated page decorations; classified locally (0 calls).' });
-  } else {
-    onStageUpdate({ id: 'vision', name: 'Batched Vision Labeling', status: 'skipped', message: 'No images detected in document (0 calls).' });
   }
 
   // 5. STAGE: ASSEMBLE & VALIDATE (Local)
@@ -1170,10 +1205,38 @@ export async function runFullPipeline(
   for (const formFlag of finalPass.flags) {
     if (!allFlags.some(existing => existing.code === formFlag.code && existing.questionId === formFlag.questionId)) allFlags.push(formFlag);
   }
-  const imageDistribution = distributeGroupImages(finalQuestions, updatedImages);
-  finalQuestions = imageDistribution.questions;
-  allFlags.push(...imageDistribution.flags);
-  if (imageDistribution.unassigned) allFlags.push({ id: 'flag_GROUP_IMAGE_UNASSIGNED', severity: 'warn', code: 'GROUP_IMAGE_UNASSIGNED', message: `${imageDistribution.unassigned} shared group image reference(s) could not be assigned to a child; retained for review.` });
+  // 6.5 PART B (follow-up #36) — EXACT image assignment, replacing the old heuristic distributor.
+  // Ownership is decided by printed geometry + counts (B2 bijection), verified by caption affinity (B3),
+  // and never by a run-to-run model vote (B5). Single ownership (I13) is rebuilt from the owner map.
+  const imageAssignment = await assignImagesExact({
+    questions: finalQuestions,
+    images: updatedImages,
+    sourceLines: workingLines,
+    adjudicate: (cases) => adjudicateImageAssignments({
+      cases,
+      providerConfig: visionProviderConfig,
+      maxOutputTokens: settings.budget.maxOutputTokens,
+      onLiveText: (label, channel, text) => onLiveText?.('vision', label, channel, text),
+    }) as any,
+  });
+  finalQuestions = imageAssignment.questions;
+  updatedImages = imageAssignment.images;
+  allFlags.push(...imageAssignment.flags);
+  const assignmentSummary = [
+    `order-bijection ${imageAssignment.byRule['order-bijection'] || 0}`,
+    `caption-verified ${imageAssignment.byRule['caption-verified'] || 0}`,
+    `vision-adjudicated ${imageAssignment.adjudicated}`,
+    `geometry ${imageAssignment.byRule.geometry || 0}`,
+    `tray ${imageAssignment.tray.length}`,
+    `${imageAssignment.corrected} caption correction(s)`,
+    `${imageAssignment.suspects} suspect`,
+  ].join(' · ');
+  onStageUpdate({
+    id: 'assemble',
+    name: 'Assemble & Validate',
+    status: imageAssignment.suspects ? 'completed-with-problems' : 'completed',
+    message: `Image assignment (exact): ${assignmentSummary}; every image has at most one owning question (I13).`,
+  });
 
 
   // Typed against `ShapeProblemDiagnosis['kinds']` so a new final-pass shape class cannot be
@@ -1282,6 +1345,8 @@ export async function runFullPipeline(
   // can safely rewrite question references as well as image metadata and flags.
   examDoc = validateAndFixDuplicateImageIds(examDoc).doc;
   examDoc = reconcileFinalFlags(repairImageReferences(examDoc, examDoc.images));
+  // I13 (Part B1) — enforced in the final pass exactly like I12: no image id may appear in two questions.
+  examDoc = enforceSingleImageOwnership(examDoc).doc;
 
   // C2 — a finished parse always persists. Any error-severity violation that survived the
   // deterministic fixes demotes this doc to visibly PARTIAL (persisted `partial` marker +

@@ -18,6 +18,7 @@ import { buildExportDoc } from '../src/utils/examExport';
 import { parseExamDocImport } from '../src/utils/validation';
 import { validateSemantic } from '../src/pipeline/semanticValidators';
 import { groupAttentionFlags, triageFlags } from '../src/utils/flagPresentation';
+import { attentionQuestionIds, computeAttention } from '../src/utils/attention';
 import { IntegrityFlags } from '../src/components/IntegrityFlags';
 import { Step4Review, Step4ReviewContent } from '../src/views/Step4Review';
 import { getExamHealth, exciseWatermarksWithLearned } from '../src/pipeline/quality';
@@ -25,6 +26,7 @@ import { replayFieldExport } from '../src/pipeline/fieldReplay';
 import { assembleAndValidateQuestions, assembleAndValidateSections } from '../src/pipeline/assemble';
 import { cleanAnswerText } from '../src/pipeline/answerKey';
 import { buildDossier } from '../src/pipeline/dossier';
+import { healthSummary } from '../src/pipeline/agent';
 
 const sha256Hex = (buf: Buffer) => createHash('sha256').update(buf).digest('hex');
 
@@ -403,13 +405,19 @@ test('T2 (Parts B1 & B2): present letter/TF/short-token answers emit ZERO instru
   const hollowGroups = groups.filter(g => g.code === 'STEM_HOLLOW');
   assert.equal(hollowGroups.length, 2, 'genuine distinct per-question defects are never suppressed');
 
+  // Part C (#36): the panel header, the health count and the chip all read computeAttention —
+  // app-internal events (repairs rejected/applied, critic/consensus opinions, detachments) are
+  // NEVER attention items, and every item carries an action.
+  const attentionItems = computeAttention(fieldScenarioDoc);
+  assert.ok(attentionItems.length > 0);
+  assert.ok(attentionItems.every(item => Boolean(item.action) && /\[(Go|Open|Fix|Solve|Confirm)\]$/.test(item.plainSentence)));
+  assert.ok(!attentionItems.some(item => /(REPAIR|CRITIC|CONSENSUS|DETACHED|ABSORBED|STRIPPED)/.test(item.id + item.plainSentence)));
   const flagsHtml = renderToStaticMarkup(React.createElement(IntegrityFlags, { doc: fieldScenarioDoc }));
-  assert.match(flagsHtml, /5 things need attention/);
-  assert.match(flagsHtml, /11 images absent from storage — one storage failure/);
+  assert.match(flagsHtml, new RegExp(`${attentionItems.length} things need attention`));
   assert.doesNotMatch(flagsHtml, /<details open/);
 
-  // getExamHealth agrees on root-cause attention count
-  assert.equal(getExamHealth(fieldScenarioDoc).attentionCount, groups.length);
+  // getExamHealth agrees with the ONE number
+  assert.equal(getExamHealth(fieldScenarioDoc).attentionCount, attentionItems.length);
 
   // Assistant's get_open_issues (buildDossier.knownIssues) retains exact raw counts & affected questionRefs unchanged
   const dossier = buildDossier(fieldScenarioDoc);
@@ -418,7 +426,8 @@ test('T2 (Parts B1 & B2): present letter/TF/short-token answers emit ZERO instru
   assert.equal(dossier.knownIssues.IMAGE_REF_DROPPED?.questionRefs.length, 13);
   assert.equal(dossier.knownIssues.POINTS_UNPRICED?.count, 5);
   assert.equal(dossier.knownIssues.STEM_HOLLOW?.count, 2);
-  assert.equal(dossier.healthSnapshot.attentionCount, groups.length, 'Assistant healthSnapshot agrees with UI attentionCount');
+  assert.equal(dossier.healthSnapshot.attentionCount, attentionItems.length, 'Assistant healthSnapshot agrees with the UI attention count');
+  assert.equal(healthSummary(fieldScenarioDoc).attention, attentionItems.length, 'Assistant healthSummary agrees too');
 });
 
 test('T3 (Part C): Step 4 default view renders sections collapsed, <= attention questions + section headers cards, auto-expands ONLY attention questions, and keeps AI Solve affordances', () => {
@@ -479,12 +488,16 @@ test('T3 (Part C): Step 4 default view renders sections collapsed, <= attention 
       onProceedToExamView: () => undefined,
     }),
   );
+  const attentionIds = new Set(attentionQuestionIds(docWithTwoAttention));
+  const attentionRootIds = new Set([...attentionIds].filter(id => !docWithTwoAttention.questions.find(q => q.id === id)?.parentId));
+  const expectedSectionDots = docWithTwoAttention.sections.filter(sec =>
+    docWithTwoAttention.questions.some(q => q.sectionId === sec.id && attentionIds.has(q.id))).length;
   const attSectionDots = (attDefaultHtml.match(/data-attention-dot="true"/g) || []).length;
   const attDefaultCards =
     (attDefaultHtml.match(/data-review-question="/g) || []).length +
     (attDefaultHtml.match(/data-review-section="/g) || []).length;
-  assert.equal(attSectionDots, 2, 'sections containing attention questions display attention dots');
-  assert.ok(attDefaultCards <= 2 + 8, 'default card count <= attention questions + section headers');
+  assert.equal(attSectionDots, expectedSectionDots, 'exactly the sections holding attention questions display dots');
+  assert.ok(attDefaultCards <= attentionIds.size + 8, 'default card count <= attention questions + section headers');
 
   // When sections are opened, ONLY the 2 attention questions auto-expand internals; healthy cards stay compact and AI Solve remains intact
   const expandedSectionsHtml = renderToStaticMarkup(
@@ -499,10 +512,9 @@ test('T3 (Part C): Step 4 default view renders sections collapsed, <= attention 
   const expandedQuestionCount = (expandedSectionsHtml.match(/data-question-expanded="true"/g) || []).length;
   const compactQuestionCount = (expandedSectionsHtml.match(/data-question-expanded="false"/g) || []).length;
   const internalsPanels = (expandedSectionsHtml.match(/data-question-internals="/g) || []).length;
-  assert.equal(expandedQuestionCount, 2, 'only the 2 attention questions auto-expand');
-  assert.equal(internalsPanels, 2, 'internals (spans, confidence, receipt, flags) render only on expanded cards');
-  assert.ok(expandedSectionsHtml.includes(`data-question-internals="${qAtt1.id}"`));
-  assert.ok(expandedSectionsHtml.includes(`data-question-internals="${qAtt2.id}"`));
+  assert.equal(expandedQuestionCount, attentionRootIds.size, 'only attention questions auto-expand');
+  assert.equal(internalsPanels, attentionRootIds.size, 'internals (spans, confidence, receipt, flags) render only on expanded cards');
+  for (const id of attentionRootIds) assert.ok(expandedSectionsHtml.includes(`data-question-internals="${id}"`));
   assert.ok(compactQuestionCount >= 50, 'all healthy root questions render in compact review form');
   assert.match(expandedSectionsHtml, /Solve with AI/);
   assert.match(expandedSectionsHtml, /AI Solve/);

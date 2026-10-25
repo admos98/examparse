@@ -363,8 +363,9 @@ export const Step3Analyze: React.FC<Props> = ({
       { id: 'ocr', name: 'Scanned Pages OCR', status: extractedDoc.scannedPageIndices.length > 0 ? 'idle' : 'skipped', message: 'Batched <= 3 pages' },
       { id: 'cleanup', name: 'Cleanup Tags (Stage 2.5)', status: cleanupEnabled ? 'idle' : 'skipped', message: cleanupEnabled ? `${cleanupEstimate.chunks} judgment call(s) · ${cleanupEstimate.judged} line(s) · local tags first` : 'AI off — local tags only' },
       { id: 'text-repair', name: 'Text Repair Overlay (Stage 2.75)', status: textRepairEnabled ? 'idle' : 'skipped', message: textRepairEnabled ? `Up to ${textRepairEstimate.calls} batched call · ${textRepairEstimate.candidates} candidates · originals preserved` : 'Disabled in Settings — original text only' },
+      // Part A (#36): vision now runs BEFORE structure so captions inform section labelling.
+      { id: 'vision', name: 'Batched Vision Labeling (captions before structure)', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
       { id: 'structure', name: 'Structure Pass (Span References)', status: 'idle', message: '1 text call' },
-      { id: 'vision', name: 'Batched Vision Labeling', status: extractedDoc.images.length > 0 ? 'idle' : 'skipped', message: `${Math.ceil(extractedDoc.images.length / Math.max(1, settings.thrift.maxImagesPerVisionCall))} batched call(s)` },
       { id: 'assemble', name: 'Assemble & Validate', status: 'idle', message: 'Local assembly' },
       { id: 'repair', name: 'Escalation Repair', status: 'idle', message: 'Failing items only' },
     ];

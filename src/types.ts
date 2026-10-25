@@ -133,6 +133,22 @@ export interface ImageAsset {
     reason?: string;
     kind?: 'photo' | 'diagram' | 'chart' | 'table' | 'formula' | 'handwriting' | 'decoration';
     needsText?: boolean;
+    /** Part A: segment chosen by pre-structure vision (provisional; ownership is decided later). */
+    segmentRef?: string;
+    /** Part A: vision verdicts are provisional until Part B decides ownership. */
+    provisional?: boolean;
+    /** Local/vision/geometry provenance of the label. */
+    source?: 'geometry' | 'vision' | 'user';
+    /** Part B: assignment receipt (rule chain) shown in the image inspector. */
+    assignment?: {
+      questionId?: string;
+      questionLabel?: string;
+      groupId?: string;
+      order?: number;
+      ruleChain: string[];
+      caption?: string;
+      note?: string;
+    };
   };
   blobKey: string; // Folder image key; binary is NEVER base64'd into JSON exports
   dataUrl?: string; // cached in-memory preview
@@ -148,6 +164,8 @@ export interface Flag {
   code: string;
   message: string;
   questionId?: string;
+  /** Set when the row is about one image asset (image tray/tests can jump straight to it). */
+  imageId?: string;
   rootCauseId?: string;
 }
 

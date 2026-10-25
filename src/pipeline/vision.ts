@@ -189,6 +189,55 @@ export async function processVisionChunk(
   return { labelMap, flags, usage: response.usage };
 }
 
+/**
+ * Part B3 — ONE bundled constrained adjudication call for all suspect image/child pairings.
+ * Candidates are constrained to the suspect's own group children; the caller still only accepts a
+ * choice that restores caption affinity (see imageOwnership).
+ */
+export async function adjudicateImageAssignments(params: {
+  cases: Array<{ groupId: string; imageId: string; caption?: string; candidates: Array<{ ref: string; label: string; stem: string }> }>;
+  providerConfig: any;
+  maxOutputTokens?: number;
+  onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
+}): Promise<Record<string, string>> {
+  const cases = params.cases.filter(item => item && item.imageId && (item.candidates || []).length);
+  if (!cases.length) return {};
+  const manifest = cases.map(item => [
+    `Image ${item.imageId} caption: "${item.caption || '(none)'}"`,
+    `Candidates (choose ONLY from these ids): ${item.candidates.map(candidate => `${candidate.ref}=Q${candidate.label} "${String(candidate.stem || '').slice(0, 120)}"`).join(' | ')}`,
+  ].join('\n')).join('\n---\n');
+  const text = `Each image below was paired with a question by PRINTED ORDER but its caption may contradict that pairing.\nFor every image choose the single candidate id whose printed text best matches the caption, or "keep" if the printed order is right.\nNever invent an id.\n\n${manifest}\n\nReturn JSON {"items":[{"imageId":string,"ref":string|"keep","reason":"short"}]}`;
+  const response = await LLMAdapter.execute(
+    {
+      role: 'vision',
+      system: T2_IMAGE_LABELING_SYSTEM,
+      text,
+      images: [],
+      maxOutputTokens: params.maxOutputTokens ? Math.min(params.maxOutputTokens, 800) : 800,
+      label: `Image assignment adjudication (${cases.length} suspect(s))`,
+      providerConfig: params.providerConfig,
+    },
+    { onDelta: (channel, full) => params.onLiveText?.('Image assignment adjudication', channel, full), onInfo: note => params.onLiveText?.('Image assignment adjudication', 'info', note) },
+  );
+  const raw: any[] = Array.isArray(response.json)
+    ? response.json
+    : Array.isArray((response.json as any)?.items)
+      ? (response.json as any).items
+      : Array.isArray((response.json as any)?.results)
+        ? (response.json as any).results
+        : [];
+  const allowed = new Map(cases.map(item => [item.imageId, new Set(item.candidates.map(candidate => candidate.ref))]));
+  const out: Record<string, string> = {};
+  for (const item of raw) {
+    const imageId = String(item?.imageId || item?.id || '');
+    const ref = String(item?.ref || item?.questionRef || '');
+    if (!imageId || !ref || ref === 'keep') continue;
+    if (!allowed.get(imageId)?.has(ref)) continue; // constrained: reject invented refs
+    out[imageId] = ref;
+  }
+  return out;
+}
+
 export async function labelImagesBatched(params: {
   images: ImageAsset[];
   sourceLines: SourceLine[];
@@ -199,6 +248,12 @@ export async function labelImagesBatched(params: {
   maxOutputTokens?: number;
   questionHints?: Record<string, { questionRef: string; group: string; page: number }>;
   questions?: Question[];
+  /**
+   * Part A — candidate refs supplied by the caller (e.g. deterministic segments S1..Sn).
+   * When present these REPLACE the question-derived candidate set: vision may only choose among them
+   * (or say decoration); ownership is decided later from printed geometry + counts.
+   */
+  candidatesByImage?: Record<string, Array<{ ref: string; stem: string }>>;
   onLiveText?: (label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
 }): Promise<VisionLabelResult> {
   const {
@@ -266,9 +321,16 @@ export async function labelImagesBatched(params: {
     chunks.push(prepared.slice(i, i + chunkSize));
   }
 
-  // D1: build candidate sets per image (≤4) from geometric hints + question stems (truncated 120)
+  // D1: build candidate sets per image (≤4) from geometric hints + question stems (truncated 120).
+  // Part A: when the caller supplies segment candidates, they are authoritative (no invented refs).
   const candidatesByImage: Record<string, Array<{ref:string, stem:string}>> = {};
-  if (params.questionHints) {
+  if (params.candidatesByImage) {
+    for (const [imageId, candidates] of Object.entries(params.candidatesByImage)) {
+      if (Array.isArray(candidates) && candidates.length) {
+        candidatesByImage[imageId] = candidates.slice(0, 4).map(candidate => ({ ref: candidate.ref, stem: String(candidate.stem || '').slice(0, 120) }));
+      }
+    }
+  } else if (params.questionHints) {
     // params may carry questions for stem slicing; we use hints as base and add nearby questions if available
     for (const img of prepared.map(p=>p.img)) {
       const hint = params.questionHints?.[(img as any).id];

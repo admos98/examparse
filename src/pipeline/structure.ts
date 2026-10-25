@@ -364,6 +364,24 @@ const COMPACT_T1_SCHEMA = {
   q: [{ n: 'printed number', s: 'section id?', t: 'm|f|b|s|l|a|u|n|d|?', p: 'line|range|ranges', v: 'points, omit 0.5', o: [['key', 'spans']], a: 'answer spans', c: '0..9, omit=9', i: ['image id'], x: ['table spans'], g: 'parent printed number?' }],
 };
 
+/** Part A — compact image block: `[img_007 p6 "Ferdowsi statue portrait"]` (captions from pre-structure vision). */
+function formatImageBlock(images: ImageAsset[], startLine?: number, endLine?: number): string {
+  const scoped = images.filter(image => {
+    if (startLine === undefined || endLine === undefined || image.anchorLine === undefined) return true;
+    return image.anchorLine >= startLine && image.anchorLine <= endLine;
+  });
+  return scoped
+    .map(image => `[${image.id} p${image.page}${image.label?.caption ? ` "${String(image.label.caption).replace(/"/g, "'").slice(0, 48)}"` : ''}]`)
+    .join(' ');
+}
+
+/** Ids of images whose anchor sits inside a segment's line range (advisory for the segment wire). */
+function segmentImageIds(images: ImageAsset[], startLine: number, endLine: number): string[] {
+  return images
+    .filter(image => image.anchorLine !== undefined && image.anchorLine >= startLine && image.anchorLine <= endLine)
+    .map(image => image.id);
+}
+
 interface SectionPlan { id: string; index: number; title: string; start: number; end: number; expected: number[] }
 
 function isSectionHeading(text: string): string | undefined {
@@ -476,12 +494,22 @@ function shortSourceText(spans: any, sourceLines: SourceLine[], maxLines = 20): 
 }
 
 function rawQuestionNumber(q: any, sourceLines: SourceLine[]): number | undefined {
-  const printed = parsePrintedNumberFromStem(shortSourceText(q?.spans, sourceLines));
-  const n = printed ?? Number(q?.no ?? q?.n);
-  return Number.isInteger(n) && n >= 1 && n <= 300 ? n : undefined;
+  const raw = Number(q?.no ?? q?.n);
+  const declared = Number.isInteger(raw) && raw >= 1 && raw <= 300 ? raw : undefined;
+  const text = shortSourceText(q?.spans, sourceLines);
+  const printed = parsePrintedNumberFromStem(text);
+  if (declared !== undefined && (printed === undefined || printed === declared)) return declared;
+  // Enumerated siblings share ONE printed line (`15. a) … 16. b) … 17. c) …`), so the line's leading
+  // number is not this child's number. Keep the declared number when the shared line really carries it
+  // as a marker; otherwise the printed number wins (a model renumber is a real duplicate to flag).
+  if (declared !== undefined && printed !== undefined) {
+    const marker = new RegExp(`(?:^|\\s|\\()${declared}\\s*(?:[.):-]|\\))`, 'u');
+    if (marker.test(text)) return declared;
+  }
+  return printed ?? declared;
 }
 
-function rawCoverageQuestions(rawQuestions: any[], sourceLines: SourceLine[]): any[] {
+export function rawCoverageQuestions(rawQuestions: any[], sourceLines: SourceLine[]): any[] {
   const keyLines = enumerateExpectedQuestionNos(sourceLines).keyTerritory.lineNos;
   return rawQuestions.filter(q => {
     if (!Array.isArray(q?.spans)) return false;
@@ -494,7 +522,13 @@ function rawCoverageQuestions(rawQuestions: any[], sourceLines: SourceLine[]): a
       for (let n = start; n <= end && checked < 5_000; n++, checked++) if (!keyLines.has(n)) return true;
     }
     return false;
-  }).map(q => ({ ...q, stem: shortSourceText(q?.spans, sourceLines) }));
+  }).map(q => ({
+    ...q,
+    // A group child shares its parent's printed line, so slicing that line yields the parent's leading
+    // number for every sibling. Children are numbered by declaration here; the assembler carves their
+    // real item slices (char offsets) afterwards.
+    stem: q?.g !== undefined || q?.parentId !== undefined ? '' : shortSourceText(q?.spans, sourceLines),
+  }));
 }
 
 function rawQuestionIdentity(q: any, sourceLines: SourceLine[]): string | undefined {
@@ -619,7 +653,15 @@ export function responseTripwires(data: any, plan: SectionPlan, sourceLines: Sou
   const declaredIds = new Set((data?.sections || []).map((section: any) => String(section.id)));
   for (const q of questions) {
     const number = rawQuestionNumber(q, sourceLines);
-    if (number !== undefined && seen.has(number)) duplicates = true;
+    // A group's first item may legitimately carry the parent's printed number (`63. a) …` under
+    // parent 63, `15. (15) …` under 15): the field's enumerated groups do this, so it is not a
+    // duplicate-number tripwire. Any other repeat still is.
+    const declaredParentNo = q?.g ?? q?.groupNo
+      ?? (q?.parentId !== undefined && q?.parentId !== null ? String(q.parentId).replace(/\D/g, '') : undefined);
+    const selfNumberedGroupChild = declaredParentNo !== undefined
+      && Number.isFinite(Number(declaredParentNo))
+      && Number(declaredParentNo) === number;
+    if (number !== undefined && seen.has(number) && !selfNumberedGroupChild) duplicates = true;
     if (number !== undefined) seen.add(number);
     const spans: any[] = [...(Array.isArray(q?.spans) ? q.spans : []), ...(Array.isArray(q?.options) ? q.options.flatMap((o: any) => Array.isArray(o?.spans) ? o.spans : []) : []), ...(Array.isArray(q?.tables) ? q.tables.flatMap((t: any) => Array.isArray(t?.spans) ? t.spans : []) : [])];
     for (const raw of spans) {
@@ -828,19 +870,29 @@ async function runSectionCall(params: StructurePassParams, plan: SectionPlan, al
     ? keyAnswerLines
     : keyAnswerLines.filter(line => normalizedTargets.some(n => new RegExp(`(?:^|\\D)${n}\\s*[.)：:-]`).test(normalizeForMatching(line.text))));
   const lines = [...new Map([...sectionLines, ...relevantKeyLines].map(line => [line.id, line])).values()].sort((a, b) => Number(a.id.replace(/\D/g, '')) - Number(b.id.replace(/\D/g, '')));
-  const manifest = params.images.filter(img => img.anchorLine && img.anchorLine >= plan.start && img.anchorLine <= plan.end).map(img => ({ id: img.id, page: img.page, nearLine: img.anchorLine }));
+  const manifest = params.images.filter(img => img.anchorLine && img.anchorLine >= plan.start && img.anchorLine <= plan.end).map(img => ({
+    id: img.id,
+    page: img.page,
+    nearLine: img.anchorLine,
+    ...(img.label?.caption ? { caption: img.label.caption } : {}),
+    ...(img.label?.kind ? { kind: img.label.kind } : {}),
+  }));
   const las = formatLas(lines, keyLines);
   // B2 segment subset wire for this section (advisory-never-executive)
   let segmentBlockSec = '';
   if (segmentSubset && segmentSubset.length) {
-    const segLines = segmentSubset.map(s => `${s.seg} [${s.range[0]}-${s.range[1]}] ${s.kind || ''} n=${(s as any).n ?? '-'} hint=${s.hint || ''} preview="${(s.preview || '').replace(/"/g,"'").slice(0,80)}"`).join('\n');
+    const segLines = segmentSubset.map(s => {
+      const ids = segmentImageIds(params.images, s.range[0], s.range[1]);
+      return `${s.seg} [${s.range[0]}-${s.range[1]}] ${s.kind || ''} n=${(s as any).n ?? '-'} hint=${s.hint || ''} preview="${(s.preview || '').replace(/"/g,"'").slice(0,80)}"${ids.length ? ` images=[${ids.map(id => `'${id}'`).join(',')}]` : ''}`;
+    }).join('\n');
     segmentBlockSec = `\nSEGMENTS (section subset, advisory):\n${segLines}\nFor each seg output {seg,action,type,points,options,answerSpans,images,confidence} (do not emit free-form p spans; use seg ids).`;
   }
   const rangeText = targetNumbers.length ? `REQUIRED PRINTED QUESTIONS: ${targetNumbers.join(', ')}. Do not omit any listed number; output only these questions plus the section spans.` : 'Output all questions from this section.';
   const keyPreamble = keyLines.size ? 'Lines after the key marker are the official answer key; use them ONLY for answer spans. [KEY] lines are excluded from the question hunt.\n' : '';
   const sessionMemory = priorQuestions.length ? `SESSION MEMORY: already parsed numbers ${priorQuestions.map(q => rawQuestionNumber(q, params.sourceLines)).filter(Boolean).join(',')}; section ids ${priorSections.map(s => s.id).join(',')}. Do not repeat existing question numbers.\n` : '';
   const retryHint = phase.includes('hint') ? `\nYour previous output missed ${targetNumbers.join(', ')}; output ONLY the missing numbers, with valid spans.\n` : '';
-  const text = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: params.latexEnabled, languageHint: params.languageHint || null })}\n${sessionMemory}${rangeText}${retryHint}\nSECTION ${plan.index}/${allPlans.length} ${plan.title} (${plan.start}-${plan.end})\nIMAGE MANIFEST: ${JSON.stringify(manifest)}\nSOURCE:\n${las}${segmentBlockSec}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}${segmentBlockSec ? ' + seg' : ''}`;
+  const sectionImageBlock = formatImageBlock(params.images, plan.start, plan.end);
+  const text = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: params.latexEnabled, languageHint: params.languageHint || null })}\n${sessionMemory}${rangeText}${retryHint}\nSECTION ${plan.index}/${allPlans.length} ${plan.title} (${plan.start}-${plan.end})\nIMAGE MANIFEST: ${JSON.stringify(manifest)}${sectionImageBlock ? `\nIMAGE CAPTIONS: ${sectionImageBlock}` : ''}\nSOURCE:\n${las}${segmentBlockSec}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}${segmentBlockSec ? ' + seg' : ''}`;
   const budget = params.maxBudgetTokens || 16384;
   const maxOutputTokens = Math.min(budget, Math.max(2048, Math.ceil(Math.max(lines.length * 12, lines.reduce((s, l) => s + l.text.length, 0) / 3.2 * 0.3) * 1.25)));
   const label = `${phase.startsWith('recovery') ? `Structure Recovery ${phase}: ${plan.id}` : `Structure Section: ${plan.id} [${plan.index}/${allPlans.length}] ${plan.title}`}${escalate ? ' (garbled → escalation model)' : ''}`;
@@ -1056,6 +1108,8 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
     id: img.id,
     page: img.page,
     nearLine: img.anchorLine || 'unknown',
+    ...(img.label?.caption ? { caption: img.label.caption } : {}),
+    ...(img.label?.kind ? { kind: img.label.kind } : {}),
   }));
 
   const isGemini = providerConfig?.kind === 'gemini';
@@ -1064,10 +1118,14 @@ async function runSingleStructurePass(params: StructurePassParams): Promise<Stru
   // B2: segment wire (deterministic-before-LLM) — when present, model only labels/classifies/corrects
   let segmentBlock = '';
   if (params.segments && !params.segmentFallback) {
-    const segLines = params.segments.map(s => `${s.seg} [${s.range[0]}-${s.range[1]}] ${s.kind} n=${s.n ?? '-'} hint=${s.hint} preview="${s.preview.replace(/"/g, "'")}"`).join('\n');
+    const segLines = params.segments.map(s => {
+      const ids = segmentImageIds(images, s.range[0], s.range[1]);
+      return `${s.seg} [${s.range[0]}-${s.range[1]}] ${s.kind} n=${s.n ?? '-'} hint=${s.hint} preview="${s.preview.replace(/"/g, "'")}"${ids.length ? ` images=[${ids.map(id => `'${id}'`).join(',')}]` : ''}`;
+    }).join('\n');
     segmentBlock = `\n\nSEGMENTS (deterministic, 100% coverage, advisory-never-executive — you ONLY label/correct, never invent spans):\n${segLines}\nFor each segment, output one object in "seg": [{"seg":"S1","action":"accept|relabel|split|merge-next|drop","type":"m|f|b|s|l|a|u|n|d|?","points":1,"options":[["a",1]],"answerSpans":[1],"images":["img_001"],"confidence":9}] where confidence 0-9 (9=certain). accept=relabel use segment lines as question spans; split=one segment is two questions; merge-next=merge with next; drop=header/passage/instruction. Do not emit free-form p spans; use only seg ids.`;
   }
-  let userPrompt = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint: languageHint || null })}\nIMAGE MANIFEST: ${JSON.stringify(manifestEntries)}\nSOURCE:\n${lasText}${segmentBlock}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}${params.segments && !params.segmentFallback ? ' + seg' : ''}`;
+  const imageBlockText = formatImageBlock(images);
+  let userPrompt = `${keyPreamble}CONFIG: ${JSON.stringify({ latex: latexEnabled, languageHint: languageHint || null })}\nIMAGE MANIFEST: ${JSON.stringify(manifestEntries)}${imageBlockText ? `\nIMAGE CAPTIONS (page-ordered, from vision BEFORE structure): ${imageBlockText}` : ''}\nAttach images with i:[id] exactly as listed; never invent an image id, and never copy one picture onto every child of a group (local code assigns group pictures by printed order).\nSOURCE:\n${lasText}${segmentBlock}\nWIRE FORMAT: compact JSON v2. ${JSON.stringify(COMPACT_T1_SCHEMA)}${params.segments && !params.segmentFallback ? ' + seg' : ''}`;
 
   // For non-Gemini providers, embed a compact JSON schema directly in user prompt
   if (!isGemini) {

@@ -46,6 +46,7 @@ import {
   SectionCandidate,
   sectionDiffView,
 } from "./reparseSection";
+import { computeAttention } from '../utils/attention';
 import { buildDossier } from "./dossier";
 import { traceForAgent } from "./provenance";
 const empty = z.object({}).strict();
@@ -896,13 +897,25 @@ export function createToolRegistry(ctx: ToolContext): ToolRegistry {
       },
     },
     get_open_issues: {
-      description: "{} → flags grouped, with affected questions",
+      description: "{} → the SAME attention items Step 4 shows (kind, plain sentence, action), grouped by root cause",
       schema: empty,
       access: "read",
       execute: () => {
         const doc = ctx.getDoc();
-        const dossier = ctx.getDossier?.() || buildDossier(doc);
-        return { ok:true, summary:`${Object.keys(dossier.knownIssues).length} issue codes`, data: dossier.knownIssues };
+        const items = computeAttention(doc);
+        return {
+          ok: true,
+          summary: `${items.length} ${items.length === 1 ? 'thing needs' : 'things need'} attention`,
+          data: items.map(item => ({
+            kind: item.kind,
+            rootCauseId: item.rootCauseId,
+            sentence: item.plainSentence,
+            action: item.action,
+            questions: item.questionIds.map(id => doc.questions.find(question => question.id === id)?.no).filter(Boolean),
+            images: item.imageIds,
+            count: item.count,
+          })),
+        };
       },
     },
     // MEMORY

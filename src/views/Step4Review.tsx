@@ -1,6 +1,6 @@
 import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences, restoreMissingImageFromSource } from '../pipeline/reviewIntegrity';
 import { IntegrityFlags } from '../components/IntegrityFlags';
-import { groupAttentionFlags, triageFlags } from '../utils/flagPresentation';
+import { attentionQuestionIds, computeAttention, type AttentionItem } from '../utils/attention';
 import { getReviewImageBlob, getSourceFile } from '../store';
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
@@ -149,15 +149,9 @@ export const Step4ReviewContent: React.FC<Props> = ({
   for (const questions of Object.values(questionsBySection)) questions.sort((a, b) => (a.confidence ?? 1) - (b.confidence ?? 1) || a.no - b.no);
 
   const health = getExamHealth(examDoc);
-  const attention = triageFlags(examDoc.flags).attention;
-  const attentionGroups = groupAttentionFlags(examDoc.flags, examDoc);
-  const attentionQuestionIdSet = new Set<string>([
-    ...attention.map(f => f.questionId).filter((id): id is string => Boolean(id)),
-    ...examDoc.questions
-      .filter(q => (q.flags || []).some(code => code === 'STEM_HOLLOW' || code === 'OPTIONS_MISSING' || code === 'SECTION_AMBIGUOUS'))
-      .map(q => q.id),
-  ]);
-  const checkCount = attentionQuestionIdSet.size;
+  // Part C — ONE definition: the header sentence, the collapsed chip and the panel all read this.
+  const attentionItems = computeAttention(examDoc);
+  const attentionQuestionIdSet = new Set<string>(attentionQuestionIds(examDoc));
 
   // Part C — Calm by default: all sections start collapsed; ONLY questions with attention items auto-expand.
   const [expandedSections, setExpandedSections] = useState<Set<string>>(() => new Set(initialExpandedSectionIds));
@@ -175,6 +169,30 @@ export const Step4ReviewContent: React.FC<Props> = ({
       return next;
     });
   };
+  // C3 — every attention row IS the button: scroll to + expand exactly that question, or open the tray.
+  const openAttentionItem = (item: AttentionItem) => {
+    if (item.action.target === 'image-tray') {
+      setShowImageManager(true);
+      setShowFlagsPanel(true);
+      if (item.kind === 'image-unplaced') {
+        document.getElementById('unplaced-images')?.scrollIntoView({ behavior: 'smooth' });
+      } else if (typeof document !== 'undefined') {
+        document.getElementById('image-manager')?.scrollIntoView({ behavior: 'smooth' });
+      }
+      return;
+    }
+    setShowFlagsPanel(true);
+    const questionId = item.action.questionId;
+    if (!questionId) {
+      document.getElementById('review-issues')?.scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
+    setExpandedQuestions(prev => new Set([...prev, questionId]));
+    const question = examDoc.questions.find(candidate => candidate.id === questionId);
+    if (question) setExpandedSections(prev => new Set([...prev, question.sectionId || sections[0].id]));
+    document.getElementById(`review-q-${questionId}`)?.scrollIntoView({ behavior: 'smooth' });
+  };
+
   const toggleQuestionExpanded = (qId: string) => {
     setExpandedQuestions(prev => {
       const next = new Set(prev);
@@ -492,12 +510,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-6">
       <section className="p-4 rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] space-y-3">
-        <h1 className="font-bold text-sm">{health.parsedCount} of {health.expectedCount} questions · {health.pointsParsed} of {health.pointsExpected ?? health.pointsParsed} points · {health.unplacedImages.length} images to place · {checkCount} questions to check</h1>
+        <h1 className="font-bold text-sm">{health.parsedCount} of {health.expectedCount} questions · {health.pointsParsed} of {health.pointsExpected ?? health.pointsParsed} points · {health.unplacedImages.length} images to place · {attentionItems.length} {attentionItems.length === 1 ? 'thing needs' : 'things need'} attention</h1>
         <button className="px-4 py-2 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] text-xs font-semibold" onClick={() => {
           if (health.unplacedImages.length) document.getElementById('unplaced-images')?.scrollIntoView({ behavior: 'smooth' });
-          else if (attention.length || health.missing.length) { setShowFlagsPanel(true); document.getElementById('review-issues')?.scrollIntoView({ behavior: 'smooth' }); }
+          else if (attentionItems.length || health.missing.length) { setShowFlagsPanel(true); document.getElementById('review-issues')?.scrollIntoView({ behavior: 'smooth' }); }
           else onProceedToExamView();
-        }}>{health.unplacedImages.length ? 'Place images' : attention.length || health.missing.length ? 'Review questions' : 'Preview & Print'}</button>
+        }}>{health.unplacedImages.length ? 'Place images' : attentionItems.length || health.missing.length ? 'Review questions' : 'Preview & Print'}</button>
       </section>
       <details><summary className="cursor-pointer text-xs text-[var(--ink-2)]">Editing tools & exam details</summary>
       {/* Control Bar */}
@@ -562,13 +580,13 @@ export const Step4ReviewContent: React.FC<Props> = ({
           <button
             onClick={() => setShowFlagsPanel(!showFlagsPanel)}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] border transition cursor-pointer ${
-              showFlagsPanel && attentionGroups.length > 0
+              showFlagsPanel && attentionItems.length > 0
                 ? 'bg-[var(--warn-soft)]  border-[var(--warn)]  text-[var(--warn-ink)] '
                 : 'border-[var(--rule)]  hover:bg-[var(--paper)] '
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5 text-[var(--warn-ink)]" />
-            <span>{attentionGroups.length} {attentionGroups.length === 1 ? 'thing needs' : 'things need'} attention</span>
+            <span data-attention-chip={attentionItems.length}>{attentionItems.length} {attentionItems.length === 1 ? 'thing needs' : 'things need'} attention</span>
           </button>
 
           <button
@@ -703,7 +721,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
         </div>
       )}
 
-      <div id="review-issues">{showFlagsPanel && <IntegrityFlags doc={examDoc} />}</div>
+      <div id="review-issues">{showFlagsPanel && <IntegrityFlags doc={examDoc} onOpenItem={openAttentionItem} />}</div>
 
       {/* 2F Provenance — per-question Trace disclosure + 2B critic verdict badges */}
       {(((examDoc as any).traces?.length || Object.keys((examDoc as any).verdicts || {}).length) ? (
@@ -739,7 +757,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
       {/* Local Image Manager Modal / Panel */}
       {showImageManager && (
-        <div className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 space-y-4  text-xs">
+        <div id="image-manager" className="bg-[var(--paper-raised)]  border border-[var(--rule)]  rounded-[10px] p-4 space-y-4  text-xs">
           <div className="flex justify-between items-center pb-2 border-b border-[var(--rule)] ">
             <div>
               <h3 className="font-bold text-[var(--ink)]  flex items-center gap-1.5">
@@ -785,6 +803,11 @@ export const Step4ReviewContent: React.FC<Props> = ({
                     <span>{img.id} (P{img.page})</span>
                     <span>{img.width}×{img.height}</span>
                   </div>
+                  {img.label?.assignment && (
+                    <div data-image-assignment-rule={img.label.assignment.ruleChain.join('>')} className="text-[length:var(--type-12)] text-[var(--ink-2)]">
+                      {img.label.caption ? `"${img.label.caption}" · ` : ''}{img.label.assignment.ruleChain.join(' → ')}{img.label.assignment.note ? ` · ${img.label.assignment.note}` : ''}
+                    </div>
+                  )}
 
                   <div className="flex gap-2">
                     <select
@@ -838,7 +861,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
             return <div className={`${depth === 1 ? 'ms-4 border-s-2 border-[var(--accent)] ps-3 ' : 'ms-4 border-s border-[var(--accent)] ps-3 '} space-y-2`}>
               {children.map((child, childIndex) => {
                 const childExpanded = expandedQuestions.has(child.id) || activeQuestionId === child.id;
-                return <div key={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
+                return <div key={child.id} id={`review-q-${child.id}`} data-review-question={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
                   <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span>{child.points !== undefined && <span className="font-mono text-[var(--ok)]">{child.points} pts</span>}{childExpanded && <span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {formatSpans(child.spans)}</span>}</div><button onClick={() => toggleQuestionExpanded(child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{childExpanded ? 'Close edit' : 'Inspect / Edit'}</button></div>
                   {childExpanded ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
                   {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
@@ -906,6 +929,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                       return (
                         <div
                           key={q.id}
+                          id={`review-q-${q.id}`}
                           data-review-question={q.id}
                           data-question-expanded={isExpanded ? 'true' : 'false'}
                           tabIndex={-1}

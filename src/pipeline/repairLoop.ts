@@ -13,6 +13,7 @@
 import type { ExamDoc, Question, SourceLine } from '../types';
 import { computeDefects, defectsByKind, defectsSignature, type Defect, type DefectKind } from './defects';
 import { lineNo, readMarksEvidence, type SpineBudget } from './classify';
+import { assignImagesExact } from './imageOwnership';
 import { sliceSourceSpans } from './spans';
 import { parsePrintedNumberFromStem } from './quality';
 import { REPAIR_OPS_SYSTEM } from './prompts';
@@ -116,18 +117,26 @@ export interface RepairContext {
   lines: SourceLine[];
   lineByNo: Map<number, SourceLine>;
   keySet: Set<number>;
+  /** Lines on pages whose Global Read failed (cannot be dropped or absorbed by repair). */
+  failedLineNos: Set<number>;
   /** Lines dropped as furniture by accepted ops (excluded from later orphan checks). */
   furnitureDropped: Set<number>;
   defectById: Map<string, Defect>;
   seq: number;
 }
 
-export function makeRepairContext(state: RepairState, lines: SourceLine[], keyLineNos: number[], defects: Defect[]): RepairContext {
+export function makeRepairContext(state: RepairState, lines: SourceLine[], keyLineNos: number[], defects: Defect[], failedPages?: ReadonlySet<number> | number[]): RepairContext {
+  const failedPageSet = failedPages instanceof Set ? failedPages : new Set<number>(failedPages || []);
+  const failedLineNos = new Set<number>();
+  if (failedPageSet.size) {
+    for (const line of lines) if (failedPageSet.has(line.page)) failedLineNos.add(lineNo(line));
+  }
   return {
     state,
     lines,
     lineByNo: new Map(lines.map(line => [lineNo(line), line])),
     keySet: new Set(keyLineNos),
+    failedLineNos,
     furnitureDropped: new Set<number>(),
     defectById: new Map(defects.map(d => [d.id, d])),
     seq: 0,
@@ -191,6 +200,7 @@ export function validateRepairOp(op: RepairOp, ctx: RepairContext): OpVerdict {
     case 'dropAsFurniture': {
       const nos = rangeNos(op.lines);
       if (nos.some(n => !ctx.lineByNo.has(n))) return { ok: false, reason: 'line outside document' };
+      if (nos.some(n => ctx.failedLineNos.has(n))) return { ok: false, reason: 'line belongs to a read-failed page; retry the page instead' };
       for (const q of questions) {
         const owned = nosOf(q);
         if (owned.length && owned.every(n => nos.includes(n))) return { ok: false, reason: `would hollow question ${q.no} completely` };
@@ -202,6 +212,7 @@ export function validateRepairOp(op: RepairOp, ctx: RepairContext): OpVerdict {
       if (!target) return { ok: false, reason: 'assign target does not exist' };
       const nos = rangeNos(op.lines);
       if (nos.some(n => !ctx.lineByNo.has(n))) return { ok: false, reason: 'line outside document' };
+      if (nos.some(n => ctx.failedLineNos.has(n))) return { ok: false, reason: 'line belongs to a read-failed page; retry the page instead' };
       if (nos.some(n => ctx.keySet.has(n))) return { ok: false, reason: 'lines are answer-key territory' };
       const conflict = nos.find(n => { const owner = ownerOf(ctx, n); return owner && owner.id !== target.id; });
       if (conflict !== undefined) return { ok: false, reason: `line ${conflict} already belongs to another question (overlap)` };
@@ -209,6 +220,7 @@ export function validateRepairOp(op: RepairOp, ctx: RepairContext): OpVerdict {
     }
     case 'setSection': {
       if (!ctx.lineByNo.has(op.line)) return { ok: false, reason: 'line outside document' };
+      if (ctx.failedLineNos.has(op.line)) return { ok: false, reason: 'line belongs to a read-failed page; retry the page instead' };
       if (ctx.keySet.has(op.line)) return { ok: false, reason: 'line is answer-key territory' };
       if (!op.title.trim()) return { ok: false, reason: 'empty section title' };
       return { ok: true };
@@ -228,6 +240,7 @@ export function validateRepairOp(op: RepairOp, ctx: RepairContext): OpVerdict {
       if (!targetId || !byId.has(targetId)) return { ok: false, reason: 'no target question for marks' };
       const nos = rangeNos(op.lines);
       if (nos.some(n => !ctx.lineByNo.has(n))) return { ok: false, reason: 'line outside document' };
+      if (nos.some(n => ctx.failedLineNos.has(n))) return { ok: false, reason: 'line belongs to a read-failed page; retry the page instead' };
       const value = readMarksEvidence(nos.map(n => ctx.lineByNo.get(n)?.text || ''));
       if (value === undefined) return { ok: false, reason: 'no printed marks evidence on those lines' };
       return { ok: true };
@@ -405,6 +418,7 @@ export async function runRepairLoop(params: {
   accountedLineNos?: number[];
   totalPoints?: number;
   images?: ExamDoc['images'];
+  failedPages?: number[];
   caller?: RepairCaller;
   escalationCaller?: RepairCaller;
   budget: SpineBudget;
@@ -433,8 +447,9 @@ export async function runRepairLoop(params: {
     } catch { /* fall through to a live loop */ }
   }
 
+  let currentImages: ExamDoc['images'] | undefined = params.images ? params.images.map(img => ({ ...img, ...(img.label ? { label: { ...img.label } } : {}) })) : undefined;
   const computeNow = (state: RepairState) => computeDefects({
-    doc: { questions: state.questions, sections: state.sections, images: params.images, totalPoints: params.totalPoints },
+    doc: { questions: state.questions, sections: state.sections, images: currentImages, totalPoints: params.totalPoints },
     lines: params.lines,
     expectedNumbers: params.expectedNumbers,
     expectedStarts: params.expectedStarts,
@@ -475,7 +490,7 @@ export async function runRepairLoop(params: {
       calls: 0, proposed: 0, accepted: 0, rejected: 0, noFix: 0,
       escalatedKinds: [], defectsAfter: before, receipts: [],
     };
-    const ctx = makeRepairContext(state, params.lines, params.keyLineNos, defects);
+    const ctx = makeRepairContext(state, params.lines, params.keyLineNos, defects, params.failedPages);
     ctx.furnitureDropped = new Set(furnitureDropped);
 
     for (const [kind, kindDefects] of byKind) {
@@ -529,6 +544,18 @@ export async function runRepairLoop(params: {
     }
     furnitureDropped.splice(0, furnitureDropped.length, ...ctx.furnitureDropped);
     sortQuestions(state);
+    if (record.accepted > 0 && currentImages?.length) {
+      try {
+        const assigned = await assignImagesExact({
+          questions: state.questions,
+          images: currentImages,
+          sourceLines: params.lines,
+          failedPages: params.failedPages,
+        });
+        state.questions = assigned.questions;
+        currentImages = assigned.images;
+      } catch { /* keep state as-is */ }
+    }
     const previousSignature = defectsSignature(defects);
     try { defects = computeNow(state); } catch { record.defectsAfter = before; rounds.push(record); break; }
     record.defectsAfter = defects.length;

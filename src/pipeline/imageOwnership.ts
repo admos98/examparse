@@ -219,6 +219,8 @@ export interface AssignImagesExactParams {
   questions: Question[];
   images: ImageAsset[];
   sourceLines: SourceLine[];
+  /** Pages whose Global Read failed: skip the 0-question decoration presumption so their pictures stay unplaced. */
+  failedPages?: ReadonlySet<number> | number[];
   /** Optional single bundled constrained adjudication call for suspect pairs only. */
   adjudicate?: ImageAdjudicator;
   /** Test/diagnostic hook: never used for behaviour. */
@@ -231,6 +233,7 @@ export interface AssignImagesExactParams {
  */
 export async function assignImagesExact(params: AssignImagesExactParams): Promise<ExactAssignmentResult> {
   const sourceLines = params.sourceLines || [];
+  const failedPagesSet = params.failedPages instanceof Set ? params.failedPages : new Set<number>(params.failedPages || []);
   const pageByLine = new Map<number, number>();
   for (const line of sourceLines) {
     const n = lineNumber(line.id);
@@ -538,6 +541,25 @@ export async function assignImagesExact(params: AssignImagesExactParams): Promis
     const onPage = (question: Question) => questionLines(question).some(line => pageByLine.get(line) === image.page);
     const pageQuestions = questions.filter(onPage);
     if (!pageQuestions.length) {
+      if (failedPagesSet.has(image.page)) {
+        const wasDecoration = image.label?.role === 'decoration' || image.label?.kind === 'decoration';
+        if (!wasDecoration) {
+          image.label = {
+            ...(image.label || { role: 'stem' }),
+            role: image.label?.role || 'stem',
+            kind: image.label?.kind || 'photo',
+          } as ImageAsset['label'];
+        }
+        bump('tray');
+        receipts.push({
+          imageId: image.id,
+          caption: image.label?.caption,
+          ruleChain: ['tray'],
+          note: `page ${image.page} read failed; image held unplaced until page is retried`,
+        });
+        looseUnresolved.push(image.id);
+        continue;
+      }
       // No candidate question on this page at all: the decoration presumption stands.
       const label = image.label || { role: 'decoration' as const };
       image.label = { ...label, role: label.role || 'decoration', kind: label.kind || 'decoration' } as ImageAsset['label'];

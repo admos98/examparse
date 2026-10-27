@@ -1,8 +1,9 @@
 /**
- * #39 default pipeline: Extract → Global Read → Check → Repair → Present.
- * The model proposes document meaning. Code only slices source text and checks the closed arithmetic list.
+ * #39 / #40 default pipeline: Extract → Global Read → Check → Repair → Present.
+ * The model proposes document meaning page by page (sheet by sheet). Code only slices source text
+ * and checks the closed arithmetic list. Failure of one page is a defect, never an empty document.
  */
-import type { AppSettings, ExamDoc, Flag, ImageAsset, LLMRequest, SourceLine, StageStatus, UsageRecord } from '../types';
+import type { AppSettings, ExamDoc, Flag, ImageAsset, PipelineStageId, SourceLine, SpinePageReadRecord, StageStatus, UsageRecord } from '../types';
 import { computeDisplayName } from '../types';
 import { extractDocument, type ExtractedDocument } from './extract';
 import { runBatchedOcr } from './ocr';
@@ -11,10 +12,18 @@ import { LLMAdapter } from '../providers/adapter';
 import { sha256 } from '../utils/hash';
 import { appendJournalCall } from './journal';
 import { getCachedStageResult, setCachedStageResult } from './cache';
-import { appendUsageRecord, getPipelineCache, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
+import { appendUsageRecord, getPipelineCache, getReviewImageBlob, loadExamDoc, loadPageThumbDataUrls, saveExamDoc, setPipelineCache } from '../store';
 import { calculateActualCost } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
-import { assembleReadProposal, runGlobalReadStage, validateReadProposal, parseReadProposal, serializeReadProposal, type ReadBudget, type ReadProposal } from './globalRead';
+import {
+  assembleReadProposal,
+  runGlobalReadStage,
+  serializeReadProposal,
+  type PageReadCache,
+  type PageReadCacheEntry,
+  type ReadBudget,
+  type ReadProposal,
+} from './globalRead';
 import { imageAsMetaInput, runMetaRead, type MetaReadResult } from './metaRead';
 import { computeDefects, type Defect } from './defects';
 import { runRepairLoop, serializeRepairLoopResult } from './repairLoop';
@@ -23,7 +32,6 @@ import { labelImagesBatched } from './vision';
 import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership';
 import { validateAndFixDuplicateImageIds } from './assemble';
 import { prepareReviewDocument } from './reviewIntegrity';
-import { getReviewImageBlob } from '../store';
 import { beginJob, endJob, guidanceSummary, type JobHandle } from './memory/harness';
 
 export interface PipelineCallbacks {
@@ -33,7 +41,6 @@ export interface PipelineCallbacks {
   onLiveText?: (stageId: string, label: string, channel: 'output' | 'reasoning' | 'info', fullText: string) => void;
 }
 
-const lineNo = (line: SourceLine) => Number(String(line.id).replace(/\D/g, ''));
 const providerFor = (settings: AppSettings, role: 'read' | 'meta' | 'cloud' | 'repair' | 'vision') => {
   const selection = role === 'read'
     ? settings.roleMapping.read || settings.roleMapping.fast
@@ -73,16 +80,33 @@ async function topThirdPage(dataUrl: string | undefined): Promise<string | undef
 function defectFlags(defects: Defect[]): Flag[] {
   return defects.map((defect, i): Flag => {
     const qid = defect.questionIds[0];
-    const map: Record<string, string> = { 'hollow-question': 'STEM_HOLLOW', 'options-missing': 'OPTIONS_MISSING', 'points-unresolved': 'POINTS_UNPRICED', 'points-sum': 'POINTS_MISMATCH', 'image-ownership': 'IMAGE_ORDER_SUSPECT' };
-    return { id: `attention_survivor_${i + 1}`, severity: defect.kind === 'hollow-question' || defect.kind === 'options-missing' ? 'error' : 'warn', code: map[defect.kind] || 'PARSE_CHECK_SURVIVOR', message: defect.detail, ...(qid ? { questionId: qid } : {}), rootCauseId: defect.id };
+    const imageId = defect.kind === 'image-unplaced' ? defect.id.replace(/^image-unplaced:/, '') : undefined;
+    const map: Record<string, string> = {
+      'hollow-question': 'STEM_HOLLOW',
+      'options-missing': 'OPTIONS_MISSING',
+      'points-unresolved': 'POINTS_UNPRICED',
+      'points-sum': 'POINTS_MISMATCH',
+      'image-ownership': 'IMAGE_ORDER_SUSPECT',
+      'image-unplaced': 'IMAGE_UNPLACED',
+    };
+    return {
+      id: `attention_survivor_${i + 1}`,
+      severity: defect.kind === 'hollow-question' || defect.kind === 'options-missing' ? 'error' : 'warn',
+      code: map[defect.kind] || 'PARSE_CHECK_SURVIVOR',
+      message: defect.detail,
+      ...(qid ? { questionId: qid } : {}),
+      ...(imageId ? { imageId } : {}),
+      rootCauseId: defect.id,
+    };
   });
 }
 
-export async function runFullPipeline(file: File, settings: AppSettings, callbacks: PipelineCallbacks, options?: { forceRerun?: boolean; answerKeyFile?: File | null; preExtracted?: ExtractedDocument; fileHash?: string; forceStages?: import('../types').PipelineStageId[] }): Promise<ExamDoc> {
+export async function runFullPipeline(file: File, settings: AppSettings, callbacks: PipelineCallbacks, options?: { forceRerun?: boolean; answerKeyFile?: File | null; preExtracted?: ExtractedDocument; fileHash?: string; forceStages?: PipelineStageId[] }): Promise<ExamDoc> {
   const stage = callbacks.onStageUpdate; const usageRecords: UsageRecord[] = [];
   const record = (r: UsageRecord) => { usageRecords.push(r); appendUsageRecord(r); callbacks.onUsageUpdate?.(r); };
   const fileHash = options?.fileHash || await sha256(await file.arrayBuffer());
   const force = Boolean(options?.forceRerun) || !settings.thrift.cacheEnabled;
+  const forceStage = (id: PipelineStageId) => force || Boolean(options?.forceStages?.includes(id));
   const cacheWrite = async (p: any, value: unknown) => { if (settings.thrift.cacheEnabled) await setCachedStageResult(p, value); };
 
   // 1 — EXTRACT. OCR and the fenced text-repair overlay are capabilities inside this stage, not semantic parser stages.
@@ -98,7 +122,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
         pageImages = Array.from({ length: extracted.pages }, (_, i) => thumbs.get(i + 1) || '');
       }
       const ocrCache = { fileHash, stage: 'ocr' as any, provider: vision.id, model: vision.model, options: extracted.scannedPageIndices };
-      const cachedOcr = !force ? await getCachedStageResult<any>(ocrCache) : undefined;
+      const cachedOcr = !forceStage('extract') ? await getCachedStageResult<any>(ocrCache) : undefined;
       if (cachedOcr?.mergedLines) { lines = cachedOcr.mergedLines; ocrUsed = true; record(usageRecord('ocr', vision, {}, 'Extract · OCR (Cache Hit)', true)); }
       else {
         const ocr = await runBatchedOcr({ pageImages, scannedPageIndices: extracted.scannedPageIndices, startLineNum: 1, providerConfig: vision, maxOutputTokens: settings.budget.maxOutputTokens, onLiveText: (label, channel, text) => callbacks.onLiveText?.('extract', label, channel, text) });
@@ -113,7 +137,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   if (settings.textRepairEnabled) {
     const readProvider = providerFor(settings, 'read');
     const lineCache: TextRepairCache = { get: async key => { try { return await getPipelineCache<TextRepairCacheEntry>(key); } catch { return undefined; } }, set: async (key, value) => { if (settings.thrift.cacheEnabled) await setPipelineCache(key, value); } };
-    const repaired = await runTextRepairStage({ lines, keyLines: new Set(), enabled: true, provider: readProvider?.id, model: readProvider?.model, force, cache: lineCache, caller: readProvider ? async req => {
+    const repaired = await runTextRepairStage({ lines, keyLines: new Set(), enabled: true, provider: readProvider?.id, model: readProvider?.model, force: forceStage('extract'), cache: lineCache, caller: readProvider ? async req => {
       const r = await LLMAdapter.execute({ role: 'text-repair', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: readProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage };
     } : undefined });
     lineRepairs = repaired.lineRepairs; textRepairStats = repaired.stats; lines = applyTextRepairOverlay(lines, lineRepairs);
@@ -122,7 +146,8 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   stage({ id: 'extract', name: 'Extract', status: 'completed', message: `${lines.length} addressed lines · ${extracted.images.length} images · ${extracted.pages} pages${ocrUsed ? ' · OCR used' : ''}.` });
 
   const readProviderRaw = providerFor(settings, 'read'); const readProvider = readProviderRaw ? forcedOff(readProviderRaw) : undefined;
-  const cloudProvider = providerFor(settings, 'cloud'); const repairProvider = providerFor(settings, 'repair'); const metaProviderRaw = providerFor(settings, 'meta'); const metaProvider = metaProviderRaw ? forcedOff(metaProviderRaw) : undefined;
+  const cloudProvider = providerFor(settings, 'cloud'); const cloudReadProvider = cloudProvider ? forcedOff(cloudProvider) : undefined;
+  const repairProvider = providerFor(settings, 'repair'); const metaProviderRaw = providerFor(settings, 'meta'); const metaProvider = metaProviderRaw ? forcedOff(metaProviderRaw) : undefined;
   const visionProvider = providerFor(settings, 'vision');
   const budget: ReadBudget = { calls: 0, units: 0, maxCalls: settings.agentLimits?.maxModelCalls || 30, maxUnits: settings.agentLimits?.maxToolExecutions || 200 };
   const journalKey = `wing:${fileHash}:${linesHash}`;
@@ -131,40 +156,114 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   let job: JobHandle | undefined;
   try { job = await beginJob({ kind: 'pipeline', sourceLines: lines, images: extracted.images, pages: extracted.pages, languageHint: detectLanguageAndDirection(lines.slice(0, 50).map(l => l.text).join(' ')).language, modelId: readProvider?.model || '', models: Object.fromEntries(Object.entries(settings.roleMapping).map(([k, v]) => [k, v?.model || ''])), role: 'read' as any }); } catch { job = undefined; }
 
-  // 2 — GLOBAL READ.
-  stage({ id: 'read', name: 'Global Read', status: 'running', message: 'One model is reading the whole paper; reasoning is forced off…' });
-  const readCache = { fileHash, stage: 'global-read' as any, provider: readProvider?.id || 'none', model: readProvider?.model || 'none', options: { linesHash, version: 'global-read-v1' } };
-  const cachedRead = !force ? await getCachedStageResult<any>(readCache) : undefined;
-  const readResult = await runGlobalReadStage({ lines, cached: cachedRead?.serialized, budget, guidance: job?.playbook.block, onJournal: e => journal(e.label, e.rawText, e.requestText), caller: readProvider ? async req => {
-    const response = await LLMAdapter.execute({ role: 'read', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: readProvider }, { onDelta: (channel, full) => channel === 'output' && callbacks.onLiveText?.('read', req.label, channel, full) });
-    return { rawText: response.rawText, json: response.json, usage: response.usage };
-  } : undefined });
-  let proposal: ReadProposal | undefined = readResult.proposal; let readEscalated = false;
-  if (!proposal && cloudProvider && readResult.complaints.length) {
-    // Validation failure is itself repaired; there is deliberately no deterministic parser resurrection.
-    const evidenceNos = [...new Set(readResult.complaints.flatMap(c => [...c.matchAll(/\b(\d{1,5})\b/g)].map(m => Number(m[1]))))].slice(0, 30);
-    const evidence = lines.filter(l => evidenceNos.includes(lineNo(l))).map(l => `[${l.id}] ${l.text}`).join('\n');
-    const text = `ONE DEFECT ONLY\nCOMPLAINT:\n${readResult.complaints.join('\n')}\nEVIDENCE ONLY:\n${evidence || '(validator supplied no line ids)'}\nReturn a corrected complete Global Read JSON proposal; do not discuss.`;
-    try {
-      const r = await LLMAdapter.execute({ role: 'cloud', system: 'Repair this single invalid Global Read proposal from only the complaint and evidence. JSON only.', text, label: 'Cloud · Global Read defect', maxOutputTokens: 32000, providerConfig: cloudProvider });
-      budget.calls++; readEscalated = true; await journal('Cloud · Global Read defect', r.rawText, text);
-      const candidate = parseReadProposal(r.rawText, r.json); if (validateReadProposal(candidate, lines).ok) { proposal = candidate; await cacheWrite(readCache, { serialized: serializeReadProposal(candidate) }); }
-      record(usageRecord('cloud', cloudProvider, r.usage, 'Cloud · Global Read defect'));
-    } catch { /* teacher receives a visible failed-read item below */ }
-  }
-  if (proposal && readResult.status === 'completed' && readResult.serialized) await cacheWrite(readCache, { serialized: readResult.serialized });
-  if (readResult.calls) record(usageRecord('read', readProvider, readResult.usage, `Global Read (${readResult.calls} call${readResult.calls === 1 ? '' : 's'})`));
-  stage({ id: 'read', name: 'Global Read', status: proposal ? (readResult.status === 'cached' ? 'cached' : 'completed') : 'completed-with-problems', message: proposal ? `${proposal.questions.length} proposed questions · ${proposal.sections.length} proposed sections${readEscalated ? ' · recovered by cloud' : ''}.` : `Global Read failed validation; no code-first fallback was used. ${readResult.complaints.join('; ')}` });
-
-  const assembled = proposal ? assembleReadProposal(proposal, lines) : { questions: [], sections: [], keyLineNos: [], furnitureLineNos: [] };
-  let questions = assembled.questions; let sections = assembled.sections; let updatedImages: ImageAsset[] = autoDecorateRepeatedImages(extracted.images);
-  // Bundled vision captions are retained, but captions never create question boundaries.
+  // 2 — GLOBAL READ (bundled vision captions first so each sheet prompt receives its page's image captions + addresses).
+  stage({ id: 'read', name: 'Global Read', status: 'running', message: 'Reading sheet by sheet; reasoning is forced off…' });
+  let updatedImages: ImageAsset[] = autoDecorateRepeatedImages(extracted.images);
   if (updatedImages.some(i => i.label?.role !== 'decoration') && visionProvider) {
     const visionCache = { fileHash, stage: 'vision' as any, provider: visionProvider.id, model: visionProvider.model, options: { linesHash, images: updatedImages.map(i => i.sha) } };
-    const cachedVision = !force ? await getCachedStageResult<any>(visionCache) : undefined;
+    const cachedVision = !forceStage('read') ? await getCachedStageResult<any>(visionCache) : undefined;
     if (cachedVision?.updatedImages) { updatedImages = cachedVision.updatedImages; record(usageRecord('vision', visionProvider, {}, 'Global Read · image captions (Cache Hit)', true)); }
-    else try { const vision = await labelImagesBatched({ images: updatedImages.filter(i => i.label?.role !== 'decoration'), sourceLines: lines, providerConfig: visionProvider, maxLongEdge: settings.thrift.imageMaxLongEdge, quality: settings.thrift.jpegQuality / 100, maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall, maxOutputTokens: settings.budget.maxOutputTokens }); updatedImages = vision.updatedImages; await cacheWrite(visionCache, { updatedImages, usage: vision.usage }); record(usageRecord('vision', visionProvider, vision.usage, 'Global Read · bundled image captions')); } catch { /* check(d) will leave unowned images visible */ }
+    else {
+      try {
+        const vision = await labelImagesBatched({
+          images: updatedImages.filter(i => i.label?.role !== 'decoration'),
+          sourceLines: lines,
+          providerConfig: visionProvider,
+          maxLongEdge: settings.thrift.imageMaxLongEdge,
+          quality: settings.thrift.jpegQuality / 100,
+          maxImagesPerVisionCall: settings.thrift.maxImagesPerVisionCall,
+          maxOutputTokens: settings.budget.maxOutputTokens,
+        });
+        const labelledById = new Map(vision.updatedImages.filter(i => Boolean(i.label)).map(i => [i.id, i]));
+        updatedImages = updatedImages.map(i => labelledById.get(i.id) || i);
+        await cacheWrite(visionCache, { updatedImages, usage: vision.usage });
+        record(usageRecord('vision', visionProvider, vision.usage, 'Global Read · bundled image captions'));
+      } catch { /* unowned images surface through image-unplaced defect */ }
+    }
   }
+
+  const pageCache: PageReadCache = {
+    get: async key => {
+      if (forceStage('read')) return undefined;
+      try { return await getPipelineCache<PageReadCacheEntry>(key); } catch { return undefined; }
+    },
+    set: async (key, value) => {
+      if (settings.thrift.cacheEnabled) {
+        try { await setPipelineCache(key, value); } catch { /* ignore storage errors */ }
+      }
+    },
+  };
+  const readResult = await runGlobalReadStage({
+    lines,
+    images: updatedImages,
+    model: readProvider?.model,
+    pageCache,
+    budget,
+    guidance: job?.playbook.block,
+    onJournal: e => journal(e.label, e.rawText, e.requestText),
+    onPageUpdate: (pageReport: SpinePageReadRecord, completed: number, total: number) => {
+      const detail = pageReport.status === 'failed'
+        ? `page ${pageReport.page} failed`
+        : `page ${pageReport.page} ${pageReport.status} (${pageReport.questions} question${pageReport.questions === 1 ? '' : 's'})`;
+      stage({ id: 'read', name: 'Global Read', status: 'running', message: `Sheet ${completed}/${total} · ${detail}…` });
+      callbacks.onLiveText?.('read', 'Page progress', 'info', `Page ${pageReport.page}/${total}: ${pageReport.status}${pageReport.cached ? ' (cached)' : ''} — ${pageReport.questions} question(s)`);
+    },
+    caller: readProvider ? async req => {
+      const response = await LLMAdapter.execute(
+        { role: 'read', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: readProvider },
+        { onDelta: (channel, full) => channel === 'output' && callbacks.onLiveText?.('read', req.label, channel, full) },
+      );
+      return { rawText: response.rawText, json: response.json, usage: response.usage };
+    } : undefined,
+    cloudCaller: cloudReadProvider ? async req => {
+      const response = await LLMAdapter.execute(
+        { role: 'cloud', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: cloudReadProvider },
+        { onDelta: (channel, full) => channel === 'output' && callbacks.onLiveText?.('read', req.label, channel, full) },
+      );
+      return { rawText: response.rawText, json: response.json, usage: response.usage };
+    } : undefined,
+  });
+
+  const proposal: ReadProposal | undefined = readResult.proposal;
+  if (readResult.calls) {
+    record(usageRecord('read', readProvider, readResult.usage, `Global Read (${readResult.calls} call${readResult.calls === 1 ? '' : 's'})`));
+  } else if (readResult.status === 'cached') {
+    record(usageRecord('read', readProvider, readResult.usage, 'Global Read (Cache Hit)', true));
+  }
+  if (readResult.cloudCalls) {
+    record(usageRecord('cloud', cloudProvider, readResult.cloudUsage, `Cloud · Page Read (${readResult.cloudCalls} page${readResult.cloudCalls === 1 ? '' : 's'})`));
+  }
+  const cloudOkCount = readResult.pages.filter(p => p.status === 'cloud ok').length;
+  stage({
+    id: 'read',
+    name: 'Global Read',
+    status: !proposal
+      ? 'completed-with-problems'
+      : readResult.failedPages.length > 0
+        ? 'completed-with-problems'
+        : readResult.status === 'cached'
+          ? 'cached'
+          : 'completed',
+    message: proposal
+      ? `${proposal.questions.length} proposed questions · ${proposal.sections.length} proposed sections · ${readResult.pages.length - readResult.failedPages.length}/${readResult.pages.length} page(s) read${cloudOkCount ? ` (${cloudOkCount} via cloud)` : ''}${readResult.failedPages.length ? ` · ${readResult.failedPages.length} failed` : ''}.`
+      : `Global Read failed on all ${readResult.pages.length || extracted.pages} page(s); no code-first fallback was used. ${readResult.complaints.join('; ')}`,
+  });
+
+  const assembled = proposal ? assembleReadProposal(proposal, lines) : { questions: [], sections: [], keyLineNos: [], furnitureLineNos: [] };
+  let questions = assembled.questions; let sections = assembled.sections;
+
+  // Hard rule (#40 B3): the pipeline may NEVER ship 0 questions when ≥1 page read succeeded with questions.
+  const succeededQuestionPages = readResult.pages.filter(p => p.status !== 'failed' && p.questions > 0);
+  if (succeededQuestionPages.length > 0 && questions.length === 0) {
+    throw new Error(`Invariant violation: ${succeededQuestionPages.length} page(s) read succeeded with questions, but assembled document has 0 questions.`);
+  }
+
+  // `assignImagesExact` bijection/I13 after assembly (#40 Part C): pairs images to questions on succeeded pages
+  // while keeping images on failed pages unplaced so they flow through Check → Repair → Cloud → Attention.
+  try {
+    const initialAssigned = await assignImagesExact({ questions, images: updatedImages, sourceLines: lines, failedPages: readResult.failedPages });
+    questions = initialAssigned.questions; updatedImages = initialAssigned.images;
+  } catch { /* unowned image becomes image-unplaced defect */ }
 
   // Dedicated metadata path: two tiny reads, then one-image vision tie-break.
   const printedTotalLine = proposal?.meta.total?.evidenceLine;
@@ -172,7 +271,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const callMeta = metaProvider ? async (req: any) => { const r = await LLMAdapter.execute({ role: 'meta', system: req.system, text: req.text, images: req.images, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: metaProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage }; } : undefined;
   const callVisionMeta = visionProvider ? async (req: any) => { const r = await LLMAdapter.execute({ role: 'vision', system: req.system, text: req.text, images: req.images, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: visionProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage }; } : undefined;
   const metaCache = { fileHash, stage: 'meta-read' as any, provider: metaProvider?.id || 'none', model: metaProvider?.model || 'none', options: { linesHash, totalLine: printedTotalLine || null, version: 'meta-read-v1' } };
-  const cachedMeta = !force ? await getCachedStageResult<any>(metaCache) : undefined;
+  const cachedMeta = !forceStage('read') ? await getCachedStageResult<any>(metaCache) : undefined;
   const metaRead: MetaReadResult = cachedMeta?.meta
     ? { ...cachedMeta, calls: 0, usage: { inputTokens: 0, outputTokens: 0 } } as MetaReadResult
     : await runMetaRead({ lines, printedTotalLine, caller: callMeta, visionCaller: callVisionMeta, firstPageTopThird: firstPageInput, onJournal: e => journal(e.label, e.rawText, e.requestText) });
@@ -185,25 +284,59 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   // 3 — CHECK: closed arithmetic list only.
   stage({ id: 'check', name: 'Check', status: 'running', message: 'Checking identity, counts, spans, marks, images, and metadata vocabulary…' });
   const ownMax = Math.max(0, ...questions.map(q => q.no)); const expectedNumbers = Array.from({ length: ownMax }, (_, i) => i + 1);
-  let defects = computeDefects({ doc: { questions, sections, images: updatedImages, totalPoints }, lines, expectedNumbers, keyLineNos: assembled.keyLineNos, accountedLineNos: proposal ? [...proposal.labels.keys()].filter(n => !questions.some(q => q.spans.some((s: any) => Array.isArray(s) && n >= s[0] && n <= s[1]))) : [] });
+  const accountedLineNos = proposal ? [...proposal.labels.keys()].filter(n => !questions.some(q => q.spans.some((s: any) => Array.isArray(s) && n >= s[0] && n <= s[1]))) : [];
+  let defects = computeDefects({ doc: { questions, sections, images: updatedImages, totalPoints }, lines, expectedNumbers, keyLineNos: assembled.keyLineNos, accountedLineNos });
   stage({ id: 'check', name: 'Check', status: defects.length || metaRead.defects.length ? 'completed-with-problems' : 'completed', message: `${defects.length} document defect(s) · ${metaRead.defects.length} metadata field(s) unresolved.` });
 
   // 4 — REPAIR: local at most twice; each survivor alone to canonical cloud role.
   stage({ id: 'repair', name: 'Repair', status: defects.length ? 'running' : 'skipped', message: defects.length ? `Repairing ${defects.length} checked defect(s)…` : 'No arithmetic defects.' });
-  const repairCache = { fileHash, stage: 'defect-repair' as any, provider: repairProvider?.id || 'none', model: repairProvider?.model || 'none', options: { linesHash, proposal: proposal ? (await sha256(serializeReadProposal(proposal))).slice(0, 16) : 'invalid' } };
-  const cachedRepair = !force ? await getCachedStageResult<any>(repairCache) : undefined;
-  const loop = await runRepairLoop({ state: { questions, sections }, lines, expectedNumbers, keyLineNos: assembled.keyLineNos, accountedLineNos: proposal ? [...proposal.labels.keys()].filter(n => !questions.some(q => q.spans.some((s: any) => Array.isArray(s) && n >= s[0] && n <= s[1]))) : [], totalPoints, images: updatedImages, budget, cachedResult: cachedRepair?.serialized, onJournal: e => journal(e.label, e.rawText, e.requestText), caller: repairProvider ? async req => { const r = await LLMAdapter.execute({ role: 'repair', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: repairProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage }; } : undefined, escalationCaller: cloudProvider ? async req => { const r = await LLMAdapter.execute({ role: 'cloud', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: cloudProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage }; } : undefined });
+  const repairCache = { fileHash, stage: 'defect-repair' as any, provider: repairProvider?.id || 'none', model: repairProvider?.model || 'none', options: { linesHash, failedPages: readResult.failedPages, proposal: proposal ? (await sha256(serializeReadProposal(proposal))).slice(0, 16) : 'invalid' } };
+  const cachedRepair = !forceStage('repair') ? await getCachedStageResult<any>(repairCache) : undefined;
+  const loop = await runRepairLoop({
+    state: { questions, sections },
+    lines,
+    expectedNumbers,
+    keyLineNos: assembled.keyLineNos,
+    accountedLineNos,
+    totalPoints,
+    images: updatedImages,
+    failedPages: readResult.failedPages,
+    budget,
+    cachedResult: cachedRepair?.serialized,
+    onJournal: e => journal(e.label, e.rawText, e.requestText),
+    caller: repairProvider ? async req => { const r = await LLMAdapter.execute({ role: 'repair', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: repairProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage }; } : undefined,
+    escalationCaller: cloudProvider ? async req => { const r = await LLMAdapter.execute({ role: 'cloud', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: cloudProvider }); return { rawText: r.rawText, json: r.json, usage: r.usage }; } : undefined,
+  });
   questions = loop.state.questions; sections = loop.state.sections; defects = loop.remainingDefects;
+  if (succeededQuestionPages.length > 0 && questions.length === 0) {
+    throw new Error(`Invariant violation after repair: ${succeededQuestionPages.length} page(s) succeeded, but repaired document has 0 questions.`);
+  }
   if (loop.status === 'completed') await cacheWrite(repairCache, { serialized: serializeRepairLoopResult(loop) });
   if (loop.usage.inputTokens || loop.usage.outputTokens) record(usageRecord('repair', repairProvider, loop.usage, 'Local defect repair'));
   if (loop.escalationUsage.inputTokens || loop.escalationUsage.outputTokens) record(usageRecord('cloud', cloudProvider, loop.escalationUsage, 'Cloud defect repair'));
   stage({ id: 'repair', name: 'Repair', status: defects.length ? 'completed-with-problems' : loop.status === 'cached' ? 'cached' : 'completed', message: `${loop.opsAccepted} fix(es) accepted · ${loop.escalations} cloud escalation(s) · ${defects.length} survivor(s) for the teacher.` });
 
-  // Image bijection/I13 is arithmetic ownership and therefore remains in check/presentation.
-  try { const assigned = await assignImagesExact({ questions, images: updatedImages, sourceLines: lines }); questions = assigned.questions; updatedImages = assigned.images; } catch { /* unowned image becomes attention */ }
+  // Final image bijection/I13 pass after repair.
+  try {
+    const assigned = await assignImagesExact({ questions, images: updatedImages, sourceLines: lines, failedPages: readResult.failedPages });
+    questions = assigned.questions; updatedImages = assigned.images;
+  } catch { /* unowned image becomes attention */ }
   const detection = detectLanguageAndDirection(lines.slice(0, 60).map(l => l.text).join(' '));
   const flags: Flag[] = [...defectFlags(defects), ...metaRead.defects.map((d, i) => ({ id: `meta_missing_${i}`, code: 'META_MISSING', severity: 'warn' as const, message: d.complaint, rootCauseId: `meta_${d.field}` }))];
-  if (!proposal) flags.push({ id: 'global_read_failed', code: 'GLOBAL_READ_FAILED', severity: 'error', message: 'Global Read failed validation and no parser fallback was used. Set up the paper manually or retry with another read model.' });
+  if (!proposal) {
+    flags.push({ id: 'global_read_failed', code: 'GLOBAL_READ_FAILED', severity: 'error', message: 'Global Read failed validation and no parser fallback was used. Set up the paper manually or retry with another read model.' });
+  } else {
+    for (const failedPage of readResult.failedPages) {
+      flags.push({
+        id: `page_read_failed_${failedPage}`,
+        code: 'PAGE_READ_FAILED',
+        severity: 'error',
+        rootCauseId: `page_read_failed_${failedPage}`,
+        message: `Page ${failedPage} couldn't be read — its questions are missing.`,
+      });
+    }
+  }
+  const orphanLineNos = [...new Set(defects.filter(d => d.kind === 'unaccounted-lines').flatMap(d => d.lineIds))].sort((a, b) => a - b);
 
   // 5 — PRESENT. Raw internal flags are persisted for audit; UI surfaces must consume computeAttention only.
   stage({ id: 'present', name: 'Present', status: 'running', message: 'Preparing the checked document and teacher attention list…' });
@@ -212,7 +345,64 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   // Never build a confident title from half-read metadata.
   let displayName = meta.subject && meta.grade ? computeDisplayName(meta, file.name) : file.name.replace(/\.[^/.]+$/, '') || 'Exam'; let nameSource: 'ai' | 'manual' = 'ai';
   try { const old = await loadExamDoc(examId); if (old?.nameSource === 'manual' && old.displayName) { displayName = old.displayName; nameSource = 'manual'; } } catch { /* first parse */ }
-  let doc: ExamDoc = { id: examId, fileHash, createdAt: new Date().toISOString(), displayName, nameSource, meta, sections, questions, images: updatedImages, source: { lines: storedLines, pages: extracted.pages, ocrUsed, fileName: file.name, pageImages: extracted.pageImages, pageThumbKeys: extracted.pageThumbKeys || [], expectedQuestionNos: expectedNumbers, keyTerritoryLineNos: assembled.keyLineNos, ...(Object.keys(lineRepairs).length ? { lineRepairs } : {}), ...(textRepairStats ? { textRepairStats } : {}) }, flags, usage: usageRecords, guidanceTokens: job?.playbook.tokens || 0, spine: { classify: { status: proposal ? (readResult.status === 'cached' ? 'cached' : 'completed') : 'unavailable', provider: readProvider?.id, model: readProvider?.model, calls: readResult.calls, labelledLines: proposal?.labels.size, ...(!proposal ? { reason: readResult.complaints.join('; ') } : {}) }, repairLoop: { status: loop.status, rounds: loop.rounds.length, calls: loop.calls, opsAccepted: loop.opsAccepted, opsRejected: loop.opsRejected, escalations: loop.escalations, defectsRemaining: defects.length + metaRead.defects.length, remainingKinds: [...new Set([...defects.map(d => d.kind), ...metaRead.defects.map(d => `meta-${d.field}`)])] }, budget: { ...budget } } };
+  const classifyStatus = !proposal
+    ? 'unavailable'
+    : readResult.failedPages.length > 0
+      ? 'partial'
+      : readResult.status === 'cached'
+        ? 'cached'
+        : 'completed';
+  let doc: ExamDoc = {
+    id: examId,
+    fileHash,
+    createdAt: new Date().toISOString(),
+    displayName,
+    nameSource,
+    meta,
+    sections,
+    questions,
+    images: updatedImages,
+    source: {
+      lines: storedLines,
+      pages: extracted.pages,
+      ocrUsed,
+      fileName: file.name,
+      pageImages: extracted.pageImages,
+      pageThumbKeys: extracted.pageThumbKeys || [],
+      expectedQuestionNos: expectedNumbers,
+      keyTerritoryLineNos: assembled.keyLineNos,
+      orphanLineNos,
+      ...(Object.keys(lineRepairs).length ? { lineRepairs } : {}),
+      ...(textRepairStats ? { textRepairStats } : {}),
+    },
+    flags,
+    usage: usageRecords,
+    guidanceTokens: job?.playbook.tokens || 0,
+    spine: {
+      classify: {
+        status: classifyStatus,
+        provider: readProvider?.id,
+        model: readProvider?.model,
+        calls: readResult.calls,
+        cloudCalls: readResult.cloudCalls,
+        labelledLines: proposal?.labels.size,
+        pages: readResult.pages,
+        pageProposals: readResult.pageProposals,
+        ...(!proposal || readResult.complaints.length ? { reason: readResult.complaints.join('; ') } : {}),
+      },
+      repairLoop: {
+        status: loop.status,
+        rounds: loop.rounds.length,
+        calls: loop.calls,
+        opsAccepted: loop.opsAccepted,
+        opsRejected: loop.opsRejected,
+        escalations: loop.escalations,
+        defectsRemaining: defects.length + metaRead.defects.length,
+        remainingKinds: [...new Set([...defects.map(d => d.kind), ...metaRead.defects.map(d => `meta-${d.field}`)])],
+      },
+      budget: { ...budget },
+    },
+  };
   doc = validateAndFixDuplicateImageIds(doc).doc;
   doc = enforceSingleImageOwnership(doc).doc;
   if (flags.some(flag => flag.severity === 'error')) doc = { ...doc, partial: true, flags: [...doc.flags, { id: 'partial_exam', code: 'PARTIAL_EXAM', severity: 'error', message: 'Some checked defects remain; the document is saved as partial.' }] };
@@ -229,3 +419,4 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
 export { sliceSourceSpans, carveOptionsAcrossLines, carveGroupChildSpans } from './spans';
 export { canonicalizeForms, computeShapeAudit, runFinalCanonicalization, FORM_EXECUTION_ORDER, FORM_RULE_ID } from './forms';
 export { replayFieldExport } from './fieldReplay';
+export { retryFailedPage } from './pageRetry';

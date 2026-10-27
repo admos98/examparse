@@ -20,6 +20,8 @@ export function reconcileFinalFlags(doc: ExamDoc): ExamDoc {
       !(
         !flag.questionId &&
         flag.code !== 'PARTIAL_STORAGE' &&
+        flag.code !== 'PAGE_READ_FAILED' &&
+        flag.code !== 'GLOBAL_READ_FAILED' &&
         /\d/.test(flag.message) &&
         /(?:total|sum|deficit|count|missing|unresolved|coverage|duplicate numbers)/i.test(flag.message)
       ),

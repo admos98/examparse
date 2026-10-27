@@ -360,7 +360,7 @@ export const Step3Analyze: React.FC<Props> = ({
     // Initial stage statuses
     const initialStages: StageStatus[] = [
       { id: 'extract', name: 'Extract', status: 'completed', message: `Addressed lines and images (OCR${textRepairEnabled ? ' + optional text overlay' : ''} included)` },
-      { id: 'read', name: 'Global Read', status: 'idle', message: 'One whole-paper semantic read · reasoning forced off' },
+      { id: 'read', name: 'Global Read', status: 'idle', message: 'Sheet-by-sheet semantic read · reasoning forced off' },
       { id: 'check', name: 'Check', status: 'idle', message: 'Arithmetic and identity checks only' },
       { id: 'repair', name: 'Repair', status: 'idle', message: 'Local twice, then defect-only cloud escalation' },
       { id: 'present', name: 'Present', status: 'idle', message: 'Document + surviving attention items' },

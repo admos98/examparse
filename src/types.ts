@@ -286,15 +286,31 @@ export interface ExamDoc {
   spine?: SpineRecord;
 }
 
-/** Global Read receipt. `fallback` is retained for old documents; #39 never takes a parser fallback. */
+export type SpinePageReadStatus = 'local ok' | 'cloud ok' | 'failed';
+
+export interface SpinePageReadRecord {
+  page: number;
+  status: SpinePageReadStatus;
+  cached?: boolean;
+  calls: number;
+  questions: number;
+  reason?: string;
+}
+
+/** Global Read receipt. `fallback` is retained for old documents; #39/#40 never take a parser fallback. */
 export interface SpineClassifyRecord {
-  status: 'completed' | 'cached' | 'fallback' | 'unavailable' | 'skipped';
+  status: 'completed' | 'cached' | 'partial' | 'fallback' | 'unavailable' | 'skipped';
   provider?: string;
   model?: string;
   calls: number;
+  cloudCalls?: number;
   labelledLines?: number;
-  /** Plain reason when status is fallback/unavailable/skipped. */
+  /** Plain reason when status is fallback/unavailable/skipped/partial. */
   reason?: string;
+  /** #40: per-page Global Read status for every sheet. */
+  pages?: SpinePageReadRecord[];
+  /** Serialized validated proposals keyed by page number so single-page retry never re-reads other pages. */
+  pageProposals?: Record<string, string>;
 }
 
 export interface SpineRepairRecord {

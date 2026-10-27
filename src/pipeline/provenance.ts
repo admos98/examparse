@@ -1,6 +1,6 @@
 /** 2F — Provenance. Per-question decision trace + exam-level Parse report.
  * The export receipt must never embed secrets (test greps for the dummy key). */
-import type { ExamDoc, Question, SpineClassifyRecord, SpineRepairRecord } from '../types';
+import type { ExamDoc, Question, SpineClassifyRecord, SpinePageReadRecord, SpineRepairRecord } from '../types';
 import type { CriticVerdict } from './critic';
 import { estimateTokens } from './memory/tokens';
 
@@ -99,6 +99,8 @@ export interface ParseReport {
   consensusSections: string[]; critic: { calls: number; defects: number; ok: number };
   /** #38: line-sorting provenance (classify role/model/calls; fallback is explicit, never silent). */
   classify?: SpineClassifyRecord;
+  /** #40: per-page Global Read status (`local ok` / `cloud ok` / `failed`) for every sheet. */
+  pages?: SpinePageReadRecord[];
   /** #38: automatic fix loop summary (rounds, fixes applied/rejected, second opinions). */
   repairLoop?: SpineRepairRecord;
   memory: { playbookIds: string[]; skillIds: string[]; guidanceTokens: number };

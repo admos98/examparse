@@ -23,6 +23,8 @@ export const DEFECT_KINDS = [
   'span-overlap',
   'image-ownership',
   'image-unplaced',
+  /** #43: a decision-audit catch that survived its scoped re-ask → the teacher. */
+  'audit-catch',
 ] as const;
 export type DefectKind = (typeof DEFECT_KINDS)[number];
 

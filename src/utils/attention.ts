@@ -9,7 +9,7 @@
  */
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 
-export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed';
+export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed' | 'audit-catch';
 
 export interface AttentionAction {
   /** 'question' scrolls to + expands that card; 'image-tray' opens the tray; 'page-retry' re-reads one failed page; 'source-page' opens that page in Source. */
@@ -319,6 +319,17 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
       count: bucket.length,
       severity: 'warn',
     });
+  }
+
+  // #43: decision-audit catches that survived their scoped re-ask go to the teacher.
+  for (const flag of flags.filter(flag => flag.code === 'AUDIT_CATCH')) {
+    const question = questionById(doc, flag.questionId);
+    if (!question) continue;
+    items.push(questionItem({
+      kind: 'audit-catch', rootCauseId: flag.rootCauseId || flag.id, question,
+      sentence: `${labelOf(question)} failed the decision audit — ${flag.message}`,
+      actionLabel: 'Go', severity: 'warn',
+    }));
   }
 
   // 5. Metadata and failed Global Read (per-page or whole-paper) are explicit teacher work, never silent parse state.

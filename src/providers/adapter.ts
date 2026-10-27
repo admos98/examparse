@@ -152,6 +152,45 @@ export class LLMAdapter {
   }
 
   /**
+   * #43 Decision audit transport. POSTs the OpenAI-shaped decisions request
+   * ({ input, questions: [{ type, name, instructions, choices?} ]}) directly to the
+   * provider's decisions path (baseURL + decisionsPath, default /v1/decisions).
+   * No streaming, no reasoning fields, 30s timeout. The model never authors text;
+   * it returns calibrated probabilities for typed questions.
+   */
+  static async executeDecisions(params: {
+    providerConfig: ProviderConfig & { model: string };
+    body: { input: unknown; questions: Array<{ type: string; name: string; instructions: string; choices?: string[] }> };
+    timeoutMs?: number;
+  }): Promise<{ results: Array<{ name: string; probability: number; choice?: string }> }> {
+    const { providerConfig, body, timeoutMs = 30000 } = params;
+    const base = providerConfig.baseURL.replace(/\/+$/, '');
+    const path = providerConfig.decisionsPath || '/v1/decisions';
+    const url = `${base}${path}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (providerConfig.apiKey) headers['Authorization'] = `Bearer ${providerConfig.apiKey}`;
+    if (providerConfig.defaultHeaders) Object.assign(headers, providerConfig.defaultHeaders);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal });
+      if (!response.ok) throw new Error(`Decisions endpoint HTTP ${response.status}`);
+      const data = await response.json();
+      if (!data || !Array.isArray(data.results)) throw new Error('Decisions endpoint returned no results array');
+      return {
+        results: data.results.map((result: any) => ({
+          name: String(result.name ?? ''),
+          probability: Math.min(1, Math.max(0, Number(result.probability) || 0)),
+          ...(result.choice === undefined ? {} : { choice: String(result.choice) }),
+        })),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
    * Test connection to a configured provider
    */
   static async testConnection(providerConfig: ProviderConfig & { model?: string }): Promise<{

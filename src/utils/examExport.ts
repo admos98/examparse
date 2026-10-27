@@ -32,6 +32,8 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
     classify: cleanClassify,
     ...(cleanClassify?.pages ? { pages: cleanClassify.pages } : {}),
     repairLoop: doc.spine?.repairLoop,
+    ...(doc.spine?.compile ? { reconcile: { total: doc.spine.compile.reconciliations, byKind: doc.spine.compile.byKind } } : {}),
+    audit: doc.spine?.audit,
     config: { models },
   });
 }

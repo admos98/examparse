@@ -78,6 +78,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     meta: { providerId: '9router-local', model: 'qwen3:4b' },
     cloud: { providerId: 'google-gemini', model: 'gemini-2.5-pro' },
     repair: { providerId: '9router-local', model: 'qwen3:4b' },
+    decide: { providerId: 'google-gemini', model: 'gemini-2.5-flash-lite' },
   },
   costTable: {
     'gemini-2.5-flash-lite': {
@@ -117,6 +118,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   consensusEnabled: false,
   criticEnabled: false,
   textRepairEnabled: false,
+  // #43 decision audit mode: shadow (compute + journal + report, never route) by default; never auto-promote.
+  decideMode: 'shadow',
   document: {
     defaultLanguage: 'auto',
     paperSize: 'A4',

@@ -1,6 +1,6 @@
 /** 2F — Provenance. Per-question decision trace + exam-level Parse report.
  * The export receipt must never embed secrets (test greps for the dummy key). */
-import type { ExamDoc, Question, SpineClassifyRecord, SpinePageReadRecord, SpineRepairRecord } from '../types';
+import type { AuditSummary, ExamDoc, Question, SpineClassifyRecord, SpinePageReadRecord, SpineRepairRecord } from '../types';
 import type { CriticVerdict } from './critic';
 import { estimateTokens } from './memory/tokens';
 
@@ -103,6 +103,10 @@ export interface ParseReport {
   pages?: SpinePageReadRecord[];
   /** #38: automatic fix loop summary (rounds, fixes applied/rejected, second opinions). */
   repairLoop?: SpineRepairRecord;
+  /** #43: deterministic reconciliation counts for page proposals. */
+  reconcile?: { total: number; byKind: Record<string, number> };
+  /** #43: decision audit summary, or the skip line when no decide role is configured. */
+  audit?: AuditSummary;
   memory: { playbookIds: string[]; skillIds: string[]; guidanceTokens: number };
   generatedAt: string;
 }

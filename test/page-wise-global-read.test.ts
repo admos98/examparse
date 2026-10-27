@@ -368,7 +368,9 @@ test('#40 Part B1 / Acceptance #4: cloud locality — cloud receives ONLY failed
   });
 
   assert.equal(localCallsByPage.get(1), 1);
-  assert.equal(localCallsByPage.get(2), 2, 'failed page tried locally twice before cloud');
+  // #41 format-failure fast-path: `{"r":[],"q":[]}` on a page with numbered lines is a schema failure, so the
+  // page spends ONE local call and goes straight to the cloud rescue (no local complaint-retry).
+  assert.equal(localCallsByPage.get(2), 1, 'format-failed page goes to cloud after one local attempt');
   assert.equal(localCallsByPage.get(3), 1);
   assert.equal(cloudPrompts.length, 1, 'cloud called ONLY for page 2');
 
@@ -590,7 +592,7 @@ test('#40 Acceptance #3, #5, B2, B3, C1, C2: failing page 2 of 3 ships pages 1+3
     const p3Reads = callLog.filter(c => c.role === 'read' && c.text.startsWith('Page 3/3.'));
     const p2Clouds = callLog.filter(c => c.role === 'cloud' && c.label === 'Cloud · Page 2 Read');
     assert.equal(p1Reads.length, 1);
-    assert.equal(p2Reads.length, 2);
+    assert.equal(p2Reads.length, 1, '#41: format failure on page 2 is not complaint-retried locally');
     assert.equal(p3Reads.length, 1);
     assert.equal(p2Clouds.length, 1);
 
@@ -598,7 +600,7 @@ test('#40 Acceptance #3, #5, B2, B3, C1, C2: failing page 2 of 3 ships pages 1+3
     assert.match(p2Reads[0].text, /PAGE IMAGES \(picture content on page 2/);
     assert.match(p2Reads[0].text, /\[img_p2_1 p2 near L0006 y100\] caption: "Illustrated vocabulary item 1"/);
     assert.match(p2Reads[0].text, /\[img_p2_5 p2 near L0010 y500\] caption: "Illustrated vocabulary item 5"/);
-    assert.match(p2Reads[1].text, /VALIDATOR COMPLAINT \(fix this exactly\):/, 'local retry receives complaint verbatim');
+    assert.match(p2Clouds[0].text, /VALIDATOR COMPLAINT \(fix this exactly\):/, 'cloud rescue receives the local complaint verbatim');
     assert.doesNotMatch(p3Reads[0].text, /img_p2_1/, 'page 3 does not receive page 2 images');
     assert.match(p2Clouds[0].text, /Illustrated vocabulary item 5/, 'cloud page 2 read also receives page 2 captions');
     assert.doesNotMatch(p2Clouds[0].text, /\[L0011 /, 'cloud page 2 read never receives page 3 lines');

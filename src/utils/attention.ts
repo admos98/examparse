@@ -110,6 +110,15 @@ function failedReadPages(doc: ExamDoc): Set<number> {
   return pages;
 }
 
+/** #41: pages the read gave up on only because the read call allowance ran out (never a bare "couldn't be read"). */
+function budgetExhaustedReadPages(doc: ExamDoc): Set<number> {
+  const pages = new Set<number>();
+  for (const p of doc.spine?.classify?.pages || []) {
+    if (p.status === 'failed' && p.reason?.includes('read allowance exhausted')) pages.add(p.page);
+  }
+  return pages;
+}
+
 export function computeAttention(doc: ExamDoc): AttentionItem[] {
   const items: AttentionItem[] = [];
   const questions = doc.questions || [];
@@ -119,11 +128,14 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
   // #40 Part B3: if ALL pages failed (0 questions + GLOBAL_READ_FAILED), ship the empty document
   // with the read-failure attention item as today (never pad with secondary tray/meta noise).
   if (readFailure && questions.length === 0) {
+    const exhaustedAll = budgetExhaustedReadPages(doc);
     return [{
       id: 'read-failed',
       kind: 'read-failed',
       rootCauseId: readFailure.id,
-      plainSentence: 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]',
+      plainSentence: exhaustedAll.size
+        ? 'The exam was only partially read because of the read call budget — retry the pages or set up the paper manually. [Review]'
+        : 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]',
       action: { target: 'question', label: 'Review' },
       questionIds: [],
       imageIds: [],
@@ -314,9 +326,11 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     items.push({ id: `metadata-missing_${flag.rootCauseId || flag.id}`, kind: 'metadata-missing', rootCauseId: flag.rootCauseId || flag.id, plainSentence: `${flag.message} [Set]`, action: { target: 'question', label: 'Set' }, questionIds: [], imageIds: [], count: 1, severity: 'warn' });
   }
   if (readFailure) {
-    items.push({ id: 'read-failed', kind: 'read-failed', rootCauseId: readFailure.id, plainSentence: 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]', action: { target: 'question', label: 'Review' }, questionIds: [], imageIds: [], count: 1, severity: 'error' });
+    const exhaustedAll = budgetExhaustedReadPages(doc);
+    items.push({ id: 'read-failed', kind: 'read-failed', rootCauseId: readFailure.id, plainSentence: exhaustedAll.size ? 'The exam was only partially read because of the read call budget — retry the pages or set up the paper manually. [Review]' : 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]', action: { target: 'question', label: 'Review' }, questionIds: [], imageIds: [], count: 1, severity: 'error' });
   } else {
     const lines = doc.source?.lines || [];
+    const exhaustedPages = budgetExhaustedReadPages(doc);
     for (const p of [...failedPages].sort((a, b) => a - b)) {
       const firstLine = lines
         .filter(l => l.page === p)
@@ -327,7 +341,9 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
         id: `read-failed_page_${p}`,
         kind: 'read-failed',
         rootCauseId: `page_read_failed_${p}`,
-        plainSentence: `Page ${p} couldn't be read — its questions are missing [Retry page] [Open page]`,
+        plainSentence: exhaustedPages.has(p)
+          ? `Page ${p} couldn't be read — the exam was only partially read because of the call budget; its questions are missing [Retry page] [Open page]`
+          : `Page ${p} couldn't be read — its questions are missing [Retry page] [Open page]`,
         action: { target: 'page-retry', page: p, lineNo: firstLine, label: 'Retry page' },
         secondaryAction: { target: 'source-page', page: p, lineNo: firstLine, label: 'Open page' },
         questionIds: [],

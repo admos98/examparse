@@ -33,7 +33,21 @@ export interface ReadValidation { ok: boolean; complaints: string[] }
 export interface ReadCaller {
   (request: { system: string; text: string; label: string; maxOutputTokens: number; reasoningOff: true }): Promise<{ rawText: string; json?: unknown; usage?: { inputTokens: number; outputTokens: number } }>;
 }
-export interface ReadBudget { calls: number; units: number; maxCalls: number; maxUnits: number }
+/**
+ * The Global Read's own call allowance (#41). Owned by the read stage and computed from the document:
+ * a page may spend at most 3 calls (local attempt, local complaint-retry, cloud rescue) and 6 slack calls
+ * cover the whole exam. Never drawn from `agentLimits` (that governs the Assistant executor only).
+ */
+export const READ_CALLS_PER_PAGE = 3;
+export const READ_ALLOWANCE_SLACK = 6;
+export const readAllowanceForPages = (pages: number): number => Math.max(0, pages) * READ_CALLS_PER_PAGE + READ_ALLOWANCE_SLACK;
+export const readAllowanceExhaustedReason = (allowance: number): string => `read allowance exhausted (${allowance} calls)`;
+export const isAllowanceExhaustedReason = (reason?: string): boolean => Boolean(reason && reason.includes('read allowance exhausted'));
+/** Used by a teacher's [Retry page]: one fresh page allowance, independent of the original run. */
+export const PAGE_RETRY_ALLOWANCE = READ_CALLS_PER_PAGE;
+
+/** Shared budget shape. `calls` counts every call made against the allowance, local or cloud. */
+export interface ReadBudget { calls: number; maxCalls: number }
 
 export interface ReadPageChunk {
   page: number;
@@ -62,6 +76,8 @@ export interface GlobalReadResult {
   complaints: string[];
   calls: number;
   cloudCalls: number;
+  /** #41: the allowance this run was given; `calls + cloudCalls` never exceeds it. */
+  readAllowance: number;
   attempts: number;
   usage: { inputTokens: number; outputTokens: number };
   cloudUsage: { inputTokens: number; outputTokens: number };
@@ -134,6 +150,40 @@ export function validateReadProposal(proposal: ReadProposal, lines: SourceLine[]
   return validatePageProposal(proposal, lines, { hasOpenQuestion: false, allowKeyOnlyPage: false });
 }
 
+export const NO_QUESTIONS_COMPLAINT = 'the proposal contains no questions';
+const UNPARSEABLE_COMPLAINT = 'output is not a JSON object';
+
+/** True when the model returned a JSON object at all (format), independent of what it labelled (content). */
+export function readOutputParses(rawText: string, json?: unknown): boolean {
+  const value = candidate(rawText, json);
+  return Boolean(value) && typeof value === 'object';
+}
+
+const toLatinDigits = (text: string): string => text.replace(/[۰-۹]/g, d => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))).replace(/[٠-٩]/g, d => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
+/** A printed question-number line such as `12. …`, `(3) …` or `4) …`. */
+export const isNumberedLine = (text: string): boolean => /^\s*\(?\d{1,3}\s*[.)]\s+\S/.test(toLatinDigits(text || ''));
+
+/**
+ * #41 format failure = the model cannot speak the schema: unparseable output, "no questions" on a page,
+ * or no owned line labelled at all on a page that plainly has numbered lines. Content complaints
+ * (overlaps, gaps, boundaries) are NOT format failures and still get the local complaint-retry.
+ */
+export function isFormatFailure(input: { parses: boolean; complaints: string[]; owned: SourceLine[]; proposal: ReadProposal }): boolean {
+  if (!input.parses) return true;
+  if (input.complaints.includes(NO_QUESTIONS_COMPLAINT)) return true;
+  const ownedNos = input.owned.map(lineNo);
+  const nothingLabelled = ownedNos.length > 0 && ownedNos.every(n => !input.proposal.labels.has(n));
+  return nothingLabelled && input.owned.some(l => isNumberedLine(l.text));
+}
+
+/** Plain-language page failure (flag + attention). An exhausted page says the exam was only partially read. */
+export function pageReadFailedMessage(page: number, reason?: string): string {
+  if (isAllowanceExhaustedReason(reason)) {
+    return `Page ${page} couldn't be read — the exam was only partially read because of the call budget; its questions are missing.`;
+  }
+  return `Page ${page} couldn't be read — its questions are missing.`;
+}
+
 export function validatePageProposal(
   proposal: ReadProposal,
   ownedLines: SourceLine[],
@@ -165,7 +215,7 @@ export function validatePageProposal(
     const hasValidContinuation = Boolean(opts.hasOpenQuestion) && ownedLabels.some(l => l === 'continuation' || l === 'option');
     const hasKey = opts.allowKeyOnlyPage !== false && Object.keys(proposal.answerKey).length > 0 && ownedLabels.includes('key');
     if (hasQuestionLabel || (!hasValidContinuation && !hasKey)) {
-      complaints.push('the proposal contains no questions');
+      complaints.push(NO_QUESTIONS_COMPLAINT);
     }
   }
 
@@ -600,6 +650,8 @@ export async function readSinglePageWithFallback(params: {
   usage: { inputTokens: number; outputTokens: number };
   cloudUsage: { inputTokens: number; outputTokens: number };
   complaints: string[];
+  /** #41: one entry per local attempt ("attempt N: …"), kept even when cloud rescued the page. */
+  localComplaints: string[];
 }> {
   const usage = { inputTokens: 0, outputTokens: 0 };
   const cloudUsage = { inputTokens: 0, outputTokens: 0 };
@@ -631,6 +683,7 @@ export async function readSinglePageWithFallback(params: {
             usage,
             cloudUsage,
             complaints: [],
+            localComplaints: [],
           };
         }
       }
@@ -638,13 +691,16 @@ export async function readSinglePageWithFallback(params: {
   }
 
   let complaints: string[] = [];
+  const localComplaints: string[] = [];
   let localCalls = 0;
   let cloudCalls = 0;
+  const allowanceOpen = () => !params.budget || params.budget.calls < params.budget.maxCalls;
+  const exhausted = () => [readAllowanceExhaustedReason(params.budget?.maxCalls ?? 0)];
 
   if (params.caller) {
     for (let attempt = 1; attempt <= 2; attempt++) {
-      if (params.budget && params.budget.calls >= params.budget.maxCalls) {
-        complaints = ['model-call budget exhausted'];
+      if (!allowanceOpen()) {
+        complaints = exhausted();
         break;
       }
       const label = totalPages === 1
@@ -660,6 +716,9 @@ export async function readSinglePageWithFallback(params: {
         guidance: params.guidance,
         complaints: attempt > 1 ? complaints : undefined,
       });
+      // Every attempt is charged to the allowance before it is made, so a call that throws is never free.
+      localCalls++;
+      if (params.budget) params.budget.calls++;
       try {
         const response = await params.caller({
           system: GLOBAL_READ_SYSTEM,
@@ -668,14 +727,13 @@ export async function readSinglePageWithFallback(params: {
           maxOutputTokens: 32000,
           reasoningOff: true,
         });
-        localCalls++;
-        if (params.budget) params.budget.calls++;
         if (response.usage) {
           usage.inputTokens += response.usage.inputTokens || 0;
           usage.outputTokens += response.usage.outputTokens || 0;
         }
         await params.onJournal?.({ label, rawText: response.rawText, requestText: text });
         const parsed = parseReadProposal(response.rawText, response.json);
+        const parses = readOutputParses(response.rawText, response.json);
         const checked = validatePageProposal(parsed, chunk.owned, {
           hasOpenQuestion: Boolean(params.openQuestion),
           allowKeyOnlyPage: params.allowKeyOnlyPage,
@@ -693,51 +751,62 @@ export async function readSinglePageWithFallback(params: {
             usage,
             cloudUsage,
             complaints: [],
+            localComplaints,
           };
         }
         complaints = checked.complaints;
+        localComplaints.push(`attempt ${attempt}: ${(parses ? checked.complaints : [UNPARSEABLE_COMPLAINT, ...checked.complaints]).join('; ')}`);
+        // #41 fast-path: a model that cannot speak the schema gains nothing from the complaint read back.
+        // Spend the call on the cloud rescue instead (only when a rescue exists; otherwise retry locally).
+        if (attempt === 1 && params.cloudCaller && isFormatFailure({ parses, complaints, owned: chunk.owned, proposal: parsed })) break;
       } catch (err: any) {
         complaints = [String(err?.message || err)];
+        localComplaints.push(`attempt ${attempt}: ${complaints[0]}`);
       }
     }
   } else {
     complaints = ['no read model configured'];
   }
 
-  if (params.cloudCaller && (!params.budget || params.budget.calls < params.budget.maxCalls)) {
-    const cloud = await cloudPageRead({
-      page: chunk.page,
-      totalPages,
-      owned: chunk.owned,
-      context: chunk.context,
-      openQuestion: params.openQuestion,
-      images: params.images,
-      complaints,
-      guidance: params.guidance,
-      allowKeyOnlyPage: params.allowKeyOnlyPage,
-      caller: params.cloudCaller,
-      onJournal: params.onJournal,
-    });
-    cloudCalls++;
-    if (params.budget) params.budget.calls++;
-    cloudUsage.inputTokens += cloud.usage.inputTokens;
-    cloudUsage.outputTokens += cloud.usage.outputTokens;
-    if (cloud.ok && cloud.proposal) {
-      if (params.pageCache && cacheKey) {
-        await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(cloud.proposal), source: 'cloud' });
+  if (params.cloudCaller) {
+    if (!allowanceOpen()) {
+      complaints = exhausted();
+    } else {
+      cloudCalls++;
+      if (params.budget) params.budget.calls++;
+      const cloud = await cloudPageRead({
+        page: chunk.page,
+        totalPages,
+        owned: chunk.owned,
+        context: chunk.context,
+        openQuestion: params.openQuestion,
+        images: params.images,
+        complaints,
+        guidance: params.guidance,
+        allowKeyOnlyPage: params.allowKeyOnlyPage,
+        caller: params.cloudCaller,
+        onJournal: params.onJournal,
+      });
+      cloudUsage.inputTokens += cloud.usage.inputTokens;
+      cloudUsage.outputTokens += cloud.usage.outputTokens;
+      if (cloud.ok && cloud.proposal) {
+        if (params.pageCache && cacheKey) {
+          await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(cloud.proposal), source: 'cloud' });
+        }
+        return {
+          proposal: cloud.proposal,
+          status: 'cloud ok',
+          cached: false,
+          localCalls,
+          cloudCalls,
+          usage,
+          cloudUsage,
+          complaints: [],
+          localComplaints,
+        };
       }
-      return {
-        proposal: cloud.proposal,
-        status: 'cloud ok',
-        cached: false,
-        localCalls,
-        cloudCalls,
-        usage,
-        cloudUsage,
-        complaints: [],
-      };
+      complaints = cloud.complaints.length ? cloud.complaints : complaints;
     }
-    complaints = cloud.complaints.length ? cloud.complaints : complaints;
   }
 
   return {
@@ -749,6 +818,7 @@ export async function readSinglePageWithFallback(params: {
     usage,
     cloudUsage,
     complaints,
+    localComplaints,
   };
 }
 
@@ -793,6 +863,7 @@ export async function runGlobalReadStage(params: {
         complaints: [],
         calls: 0,
         cloudCalls: 0,
+        readAllowance: readAllowanceForPages(chunks.length),
         attempts: 0,
         usage,
         cloudUsage,
@@ -809,6 +880,7 @@ export async function runGlobalReadStage(params: {
       complaints: ['no read model configured'],
       calls: 0,
       cloudCalls: 0,
+      readAllowance: 0,
       attempts: 0,
       usage,
       cloudUsage,
@@ -819,12 +891,16 @@ export async function runGlobalReadStage(params: {
   }
 
   const chunks = buildReadChunks(params.lines);
+  // #41: the read stage owns its allowance (pages × 3 + 6). Nothing here is rationed by agentLimits.
+  const readAllowance = readAllowanceForPages(chunks.length);
+  const readBudget: ReadBudget = params.budget ?? { calls: 0, maxCalls: readAllowance };
   if (!chunks.length) {
     return {
       status: 'invalid',
-      complaints: ['the proposal contains no questions'],
+      complaints: [NO_QUESTIONS_COMPLAINT],
       calls: 0,
       cloudCalls: 0,
+      readAllowance: 0,
       attempts: 0,
       usage,
       cloudUsage,
@@ -856,7 +932,7 @@ export async function runGlobalReadStage(params: {
       cloudCaller: params.cloudCaller,
       model: params.model,
       pageCache: params.pageCache,
-      budget: params.budget,
+      budget: readBudget,
       guidance: params.guidance,
       allowKeyOnlyPage: chunks.length > 1 && questionsSeenSoFar > 0,
       onJournal: params.onJournal,
@@ -880,6 +956,9 @@ export async function runGlobalReadStage(params: {
       status: result.status,
       ...(result.cached ? { cached: true } : {}),
       calls: result.localCalls + result.cloudCalls,
+      cloudCalls: result.cloudCalls,
+      runningCalls: calls + cloudCalls,
+      localComplaints: result.localComplaints,
       questions: qCount,
       ...(result.complaints.length ? { reason: result.complaints.join('; ') } : {}),
     };
@@ -901,9 +980,10 @@ export async function runGlobalReadStage(params: {
   if (!proposal) {
     return {
       status: 'invalid',
-      complaints: allComplaints.length ? allComplaints : ['the proposal contains no questions'],
+      complaints: allComplaints.length ? allComplaints : [NO_QUESTIONS_COMPLAINT],
       calls,
       cloudCalls,
+      readAllowance,
       attempts: maxAttempts || 1,
       usage,
       cloudUsage,
@@ -926,6 +1006,7 @@ export async function runGlobalReadStage(params: {
     complaints: allComplaints,
     calls,
     cloudCalls,
+    readAllowance,
     attempts: maxAttempts,
     usage,
     cloudUsage,

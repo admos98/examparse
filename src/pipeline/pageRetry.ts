@@ -5,16 +5,19 @@ import { calculateActualCost } from '../utils/budget';
 import { validateAndFixDuplicateImageIds } from './assemble';
 import { computeDefects, type Defect } from './defects';
 import {
+  PAGE_RETRY_ALLOWANCE,
   assembleReadProposal,
   buildReadChunks,
   deserializeReadProposal,
   mergePageProposals,
   openQuestionAfterPage,
+  pageReadFailedMessage,
   readSinglePageWithFallback,
   serializeReadProposal,
   type OpenQuestionCarryOver,
   type PageReadCache,
   type PageReadCacheEntry,
+  type ReadBudget,
   type ReadCaller,
   type ReadProposal,
 } from './globalRead';
@@ -170,6 +173,8 @@ export async function retryFailedPage(
   }
 
   options?.onProgress?.(`Retrying page ${page}/${chunks.length}…`);
+  // #41: a teacher's [Retry page] always gets a fresh page allowance, whatever the original run spent.
+  const retryBudget: ReadBudget = { calls: 0, maxCalls: PAGE_RETRY_ALLOWANCE };
   const readRes = await readSinglePageWithFallback({
     chunk: targetChunk,
     totalPages: chunks.length,
@@ -180,6 +185,7 @@ export async function retryFailedPage(
     cloudCaller,
     model: readProvider?.model,
     pageCache: writeOnlyCache,
+    budget: retryBudget,
     allowKeyOnlyPage: chunks.length > 1 && (doc.questions?.length || 0) > 0,
   });
 
@@ -206,10 +212,13 @@ export async function retryFailedPage(
     page,
     status: readRes.status,
     calls: readRes.localCalls + readRes.cloudCalls,
+    cloudCalls: readRes.cloudCalls,
+    runningCalls: (doc.spine?.classify?.calls || 0) + (doc.spine?.classify?.cloudCalls || 0) + readRes.localCalls + readRes.cloudCalls,
+    localComplaints: readRes.localComplaints,
     questions: readRes.proposal?.questions.length || 0,
     ...(readRes.complaints.length ? { reason: readRes.complaints.join('; ') } : {}),
   };
-  const nextPageRecords = prevPages.some(p => p.page === page)
+  const nextPageRecords: SpinePageReadRecord[] = prevPages.some(p => p.page === page)
     ? prevPages.map(p => (p.page === page ? updatedPageRecord : p))
     : [...prevPages, updatedPageRecord].sort((a, b) => a.page - b.page);
 
@@ -329,7 +338,7 @@ export async function retryFailedPage(
     code: 'PAGE_READ_FAILED',
     severity: 'error',
     rootCauseId: `page_read_failed_${fp}`,
-    message: `Page ${fp} couldn't be read — its questions are missing.`,
+    message: pageReadFailedMessage(fp, nextPageRecords.find(p => p.page === fp)?.reason),
   }));
   const rebuiltFlags: Flag[] = [...defectFlags(defects), ...metaFlags, ...pageReadFailedFlags];
   const hasErrorFlag = rebuiltFlags.some(f => f.severity === 'error');

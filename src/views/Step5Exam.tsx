@@ -200,8 +200,13 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
       <div>{t('Coverage after', 'پوشش پس از اجرا')}: {report.coverageAfter ?? '—'}% · {t('Consensus sections', 'بخش‌های اجماع')}: {report.consensusSections.length} · {t('Critic', 'ممیز')}: {report.critic.calls} {t('calls', 'فراخوانی')}, {report.critic.defects} {t('defects', 'ایراد')}, {report.critic.ok} {t('ok', 'مورد تأیید')}</div>
       <div>{t('Memory injected', 'حافظه تزریق‌شده')}: {t('playbook', 'راهنمای پایه')} [{report.memory.playbookIds.join(', ') || t('none', 'هیچ')}] · {t('skills', 'مهارت‌ها')} [{report.memory.skillIds.join(', ') || t('none', 'هیچ')}] · {report.memory.guidanceTokens} {t('tokens', 'توکن')}</div>
       {report.classify && <div>{t('Line sorting', 'مرتب‌سازی خط‌ها')}: {report.classify.status === 'fallback' || report.classify.status === 'unavailable' || report.classify.status === 'skipped'
-        ? t(`standard method (${report.classify.reason || 'AI sorting not used'})`, `روش استاندارد (${report.classify.reason || 'از مرتب‌سازی هوش مصنوعی استفاده نشد'})`)
+        ? t(`unavailable — no fallback parser used (${report.classify.reason || 'AI read failed'})`, `انجام نشد (${report.classify.reason || 'خوانش هوش مصنوعی ناموفق بود'})`)
         : t(`done by AI — ${report.classify.model || 'model'}${report.classify.status === 'cached' ? ', from cache (0 calls)' : `, ${report.classify.calls} call(s)`}${report.classify.labelledLines ? `, ${report.classify.labelledLines} lines sorted` : ''}`, `با هوش مصنوعی — ${report.classify.model || 'مدل'}${report.classify.status === 'cached' ? '، از حافظه (۰ فراخوانی)' : `، ${report.classify.calls} فراخوانی`}`)}</div>}
+      {(report.pages || report.classify?.pages)?.length ? (
+        <div data-testid="parse-report-pages">
+          {t('Pages', 'صفحه‌ها')}: {(report.pages || report.classify?.pages || []).map(p => `page ${p.page}: ${p.status}`).join(' · ')}
+        </div>
+      ) : null}
       {report.repairLoop && report.repairLoop.status !== 'skipped' && <div>{t('Automatic fixes', 'اصلاحات خودکار')}: {report.repairLoop.status === 'no-defects'
         ? t('none needed — the paper\'s numbers and marks already add up', 'نیازی نبود؛ شماره‌ها و نمره‌های برگه از پیش درست بودند')
         : t(`${report.repairLoop.rounds} round(s) · ${report.repairLoop.opsAccepted} fix(es) applied · ${report.repairLoop.opsRejected} suggestion(s) rejected · ${report.repairLoop.escalations} second opinion(s) · ${report.repairLoop.defectsRemaining} thing(s) still open`, `${report.repairLoop.rounds} دور · ${report.repairLoop.opsAccepted} اصلاح اعمال شد · ${report.repairLoop.opsRejected} پیشنهاد رد شد · ${report.repairLoop.escalations} نظر دوم · ${report.repairLoop.defectsRemaining} مورد باز`)}</div>}

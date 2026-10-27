@@ -22,6 +22,7 @@ export const DEFECT_KINDS = [
   'points-unresolved',
   'span-overlap',
   'image-ownership',
+  'image-unplaced',
 ] as const;
 export type DefectKind = (typeof DEFECT_KINDS)[number];
 
@@ -216,6 +217,39 @@ export function computeDefects(params: {
         detail: `questions ${a.no} and ${b.no} both claim printed line(s) ${shared.slice(0, 6).join(', ')}`,
       });
     }
+  }
+
+  // --- Unplaced images (#40 C2: stays a defect through repair → cloud).
+  const ownedImageIds = new Set<string>();
+  for (const q of questions) {
+    for (const ref of q.images || []) if (ref.imageId) ownedImageIds.add(ref.imageId);
+  }
+  const linesByPage = new Map<number, SourceLine[]>();
+  for (const line of params.lines) {
+    const list = linesByPage.get(line.page);
+    if (list) list.push(line);
+    else linesByPage.set(line.page, [line]);
+  }
+  for (const img of params.doc.images || []) {
+    if (img.duplicateOf || ownedImageIds.has(img.id)) continue;
+    if (img.label?.role === 'decoration' || img.label?.kind === 'decoration') continue;
+    const pageLines = [...(linesByPage.get(img.page) || [])].sort((a, b) => lineNo(a) - lineNo(b));
+    const anchor = img.anchorLine ?? (pageLines[0] ? lineNo(pageLines[0]) : undefined);
+    const nearLines = anchor !== undefined
+      ? pageLines
+          .map(lineNo)
+          .sort((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor) || a - b)
+          .slice(0, MAX_EVIDENCE_LINES)
+          .sort((a, b) => a - b)
+      : pageLines.slice(0, MAX_EVIDENCE_LINES).map(lineNo);
+    defects.push({
+      id: `image-unplaced:${img.id}`,
+      kind: 'image-unplaced',
+      questionIds: [],
+      lineIds: nearLines,
+      evidence: ev(lineByNo, nearLines),
+      detail: `image ${img.id} on page ${img.page}${img.label?.caption ? ` ("${img.label.caption}")` : ''} is not placed on any question`,
+    });
   }
 
   // --- Unaccounted lines (ownership orphans ∪ label-accounted subtraction on the classify path).

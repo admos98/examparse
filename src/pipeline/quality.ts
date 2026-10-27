@@ -679,7 +679,9 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     .filter(q => (q.stem || '').length > 500)
     .map(q => ({ id: q.id, no: q.no, label: q.label || String(q.no), length: (q.stem || '').length }));
   const shapeAudit = doc.source?.finalShapeAudit;
-  const complete = hasQuestions && coverage.complete && unplacedImages.length === 0 && missingBlobImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0 && hollowQuestions.length === 0;
+  const hasReadFailure = (doc.flags || []).some(f => f.code === 'PAGE_READ_FAILED' || f.code === 'GLOBAL_READ_FAILED')
+    || Boolean(doc.spine?.classify?.pages?.some(p => p.status === 'failed'));
+  const complete = hasQuestions && !hasReadFailure && coverage.complete && unplacedImages.length === 0 && missingBlobImages.length === 0 && unresolved.size === 0 && parentLinkIssueCount === 0 && hollowQuestions.length === 0;
   const state = coverage.expected.length > 0 && coverage.coveragePercent < 80
     ? 'red'
     : complete ? 'green' : 'amber';

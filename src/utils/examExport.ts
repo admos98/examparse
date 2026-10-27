@@ -13,6 +13,13 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
   const models: Record<string, string> = {};
   for (const u of doc.usage || []) if (u.role && u.model) models[u.role] = u.model;
   const verdicts = Object.values((doc as any).verdicts || {}).flat() as any[];
+  const rawClassify = doc.spine?.classify;
+  const cleanClassify = rawClassify
+    ? (() => {
+        const { pageProposals: _omit, ...rest } = rawClassify;
+        return rest;
+      })()
+    : undefined;
   return buildParseReport(doc as any, {
     models,
     calls: (doc.usage || []).filter(u => !(u as any).isCachedHit).length,
@@ -22,7 +29,8 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
     consensusSections: [...new Set((doc.flags || []).filter(f => f.code.startsWith('CONSENSUS')).map(f => f.questionId || 'section'))],
     critic: { calls: (doc.usage || []).filter(u => (u as any).role === 'critic').length, defects: verdicts.filter(v => v.verdict === 'defect').length, ok: verdicts.filter(v => v.verdict === 'ok').length },
     memory: { playbookIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.playbookIds || []))], skillIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.skillIds || []))], guidanceTokens: Number((doc as any).guidanceTokens) || 0 },
-    classify: doc.spine?.classify,
+    classify: cleanClassify,
+    ...(cleanClassify?.pages ? { pages: cleanClassify.pages } : {}),
     repairLoop: doc.spine?.repairLoop,
     config: { models },
   });
@@ -70,9 +78,11 @@ export function partialExportIssues(doc: ExamDoc): string[] {
     : [];
   const health = getExamHealth(doc);
   if (health.complete && invariantIssues.length === 0) return [];
+  const failedPages = (doc.spine?.classify?.pages || []).filter(p => p.status === 'failed').map(p => p.page);
   return [
     ...invariantIssues,
     ...(health.complete ? [] : [
+      failedPages.length ? `unread pages: ${failedPages.join(', ')}` : '',
       health.missing.length ? `missing questions: ${health.missing.join(', ')}` : '',
       health.duplicates.length ? `duplicate question numbers: ${health.duplicates.join(', ')}` : '',
       health.pointsExpected !== undefined && Math.abs(health.pointDeficit) > 0.51 ? `points deficit: ${health.pointDeficit}` : '',

@@ -12,11 +12,13 @@ import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed';
 
 export interface AttentionAction {
-  /** 'question' scrolls to + expands that card; 'image-tray' opens the tray filtered to these images. */
-  target: 'question' | 'image-tray';
+  /** 'question' scrolls to + expands that card; 'image-tray' opens the tray; 'page-retry' re-reads one failed page; 'source-page' opens that page in Source. */
+  target: 'question' | 'image-tray' | 'page-retry' | 'source-page';
   questionId?: string;
   imageIds?: string[];
-  /** Button label, e.g. "Go" / "Open". */
+  page?: number;
+  lineNo?: number;
+  /** Button label, e.g. "Go" / "Open" / "Retry page" / "Open page". */
   label: string;
 }
 
@@ -24,9 +26,10 @@ export interface AttentionItem {
   id: string;
   kind: AttentionKind;
   rootCauseId: string;
-  /** One plain sentence that always ENDS with the action the user can take. */
+  /** One plain sentence that always ENDS with the action(s) the user can take. */
   plainSentence: string;
   action: AttentionAction;
+  secondaryAction?: AttentionAction;
   questionIds: string[];
   imageIds: string[];
   /** Number of underlying rows folded into this item (1 for a single row). */
@@ -92,10 +95,44 @@ function suspectImages(doc: ExamDoc): ImageAsset[] {
   );
 }
 
+function failedReadPages(doc: ExamDoc): Set<number> {
+  const pages = new Set<number>();
+  for (const flag of doc.flags || []) {
+    if (flag.code !== 'PAGE_READ_FAILED') continue;
+    const m = flag.id.match(/(\d+)$/) || flag.message.match(/Page\s+(\d+)/i);
+    if (m) pages.add(Number(m[1]));
+  }
+  if ((doc.questions || []).length > 0 && !(doc.flags || []).some(f => f.code === 'GLOBAL_READ_FAILED')) {
+    for (const p of doc.spine?.classify?.pages || []) {
+      if (p.status === 'failed') pages.add(p.page);
+    }
+  }
+  return pages;
+}
+
 export function computeAttention(doc: ExamDoc): AttentionItem[] {
   const items: AttentionItem[] = [];
   const questions = doc.questions || [];
   const flags: Flag[] = doc.flags || [];
+  const readFailure = flags.find(flag => flag.code === 'GLOBAL_READ_FAILED');
+
+  // #40 Part B3: if ALL pages failed (0 questions + GLOBAL_READ_FAILED), ship the empty document
+  // with the read-failure attention item as today (never pad with secondary tray/meta noise).
+  if (readFailure && questions.length === 0) {
+    return [{
+      id: 'read-failed',
+      kind: 'read-failed',
+      rootCauseId: readFailure.id,
+      plainSentence: 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]',
+      action: { target: 'question', label: 'Review' },
+      questionIds: [],
+      imageIds: [],
+      count: 1,
+      severity: 'error',
+    }];
+  }
+
+  const failedPages = failedReadPages(doc);
 
   // 1. Answer missing — only a human can finish an answer (AI Solve is the offered action).
   // Gated on the document actually carrying answers: a paper-only import (no key, 0 answers) is not
@@ -169,23 +206,49 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     }
   }
 
-  // 3. Images: unplaced tray (one item, root cause = the tray) + order-suspect pairings.
+  // 3. Images: unplaced tray (or #40 C2 explanatory failed-page notice) + order-suspect pairings.
   const tray = unplacedImages(doc);
   if (tray.length) {
-    const sentence = tray.length === 1
-      ? `1 picture isn't placed — place it from the tray.`
-      : `${tray.length} pictures aren't placed — place them from the tray.`;
-    items.push({
-      id: 'image-unplaced',
-      kind: 'image-unplaced',
-      rootCauseId: 'image_tray',
-      plainSentence: `${sentence} [Open]`,
-      action: { target: 'image-tray', imageIds: tray.map(image => image.id), label: 'Open' },
-      questionIds: [],
-      imageIds: tray.map(image => image.id),
-      count: tray.length,
-      severity: 'warn',
-    });
+    const failedTray = questions.length > 0 ? tray.filter(img => failedPages.has(img.page)) : [];
+    const regularTray = questions.length > 0 ? tray.filter(img => !failedPages.has(img.page)) : tray;
+
+    if (failedTray.length) {
+      const trayPages = [...new Set(failedTray.map(img => img.page))].sort((a, b) => a - b);
+      const n = failedTray.length;
+      const pronoun = n === 1 ? 'it' : 'them';
+      const noun = n === 1 ? '1 picture' : `${n} pictures`;
+      const sentence = trayPages.length === 1
+        ? `${noun} couldn't be placed because page ${trayPages[0]} couldn't be read — retry the page to place ${pronoun}`
+        : `${noun} couldn't be placed because pages ${trayPages.join(', ')} couldn't be read — retry the pages to place ${pronoun}`;
+      items.push({
+        id: `image-unplaced_failed_page_${trayPages.join('_')}`,
+        kind: 'image-unplaced',
+        rootCauseId: `page_read_failed_${trayPages[0]}`,
+        plainSentence: `${sentence} [Retry page]`,
+        action: { target: 'page-retry', page: trayPages[0], imageIds: failedTray.map(image => image.id), label: 'Retry page' },
+        questionIds: [],
+        imageIds: failedTray.map(image => image.id),
+        count: failedTray.length,
+        severity: 'warn',
+      });
+    }
+
+    if (regularTray.length) {
+      const sentence = regularTray.length === 1
+        ? `1 picture isn't placed — place it from the tray.`
+        : `${regularTray.length} pictures aren't placed — place them from the tray.`;
+      items.push({
+        id: 'image-unplaced',
+        kind: 'image-unplaced',
+        rootCauseId: 'image_tray',
+        plainSentence: `${sentence} [Open]`,
+        action: { target: 'image-tray', imageIds: regularTray.map(image => image.id), label: 'Open' },
+        questionIds: [],
+        imageIds: regularTray.map(image => image.id),
+        count: regularTray.length,
+        severity: 'warn',
+      });
+    }
   }
   const suspects = suspectImages(doc);
   if (suspects.length) {
@@ -246,12 +309,34 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     });
   }
 
-  // 5. Metadata and a failed Global Read are explicit teacher work, never silent parse state.
+  // 5. Metadata and failed Global Read (per-page or whole-paper) are explicit teacher work, never silent parse state.
   for (const flag of flags.filter(flag => flag.code === 'META_MISSING')) {
     items.push({ id: `metadata-missing_${flag.rootCauseId || flag.id}`, kind: 'metadata-missing', rootCauseId: flag.rootCauseId || flag.id, plainSentence: `${flag.message} [Set]`, action: { target: 'question', label: 'Set' }, questionIds: [], imageIds: [], count: 1, severity: 'warn' });
   }
-  const readFailure = flags.find(flag => flag.code === 'GLOBAL_READ_FAILED');
-  if (readFailure) items.push({ id: 'read-failed', kind: 'read-failed', rootCauseId: readFailure.id, plainSentence: 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]', action: { target: 'question', label: 'Review' }, questionIds: [], imageIds: [], count: 1, severity: 'error' });
+  if (readFailure) {
+    items.push({ id: 'read-failed', kind: 'read-failed', rootCauseId: readFailure.id, plainSentence: 'The whole-paper read failed and no fallback parser was used — retry or set up the paper manually. [Review]', action: { target: 'question', label: 'Review' }, questionIds: [], imageIds: [], count: 1, severity: 'error' });
+  } else {
+    const lines = doc.source?.lines || [];
+    for (const p of [...failedPages].sort((a, b) => a - b)) {
+      const firstLine = lines
+        .filter(l => l.page === p)
+        .map(l => Number(String(l.id).replace(/\D/g, '')))
+        .filter(n => n > 0)
+        .sort((a, b) => a - b)[0] || 1;
+      items.push({
+        id: `read-failed_page_${p}`,
+        kind: 'read-failed',
+        rootCauseId: `page_read_failed_${p}`,
+        plainSentence: `Page ${p} couldn't be read — its questions are missing [Retry page] [Open page]`,
+        action: { target: 'page-retry', page: p, lineNo: firstLine, label: 'Retry page' },
+        secondaryAction: { target: 'source-page', page: p, lineNo: firstLine, label: 'Open page' },
+        questionIds: [],
+        imageIds: [],
+        count: 1,
+        severity: 'error',
+      });
+    }
+  }
 
   return items;
 }

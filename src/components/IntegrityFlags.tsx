@@ -9,7 +9,15 @@ import { computeAttention, type AttentionItem } from '../utils/attention';
  * button that takes the user to the thing that needs finishing (never a dead-end statement).
  * App-internal events stay in "What the app already fixed" / "Technical log".
  */
-export function IntegrityFlags({ doc, onOpenItem }: { doc: ExamDoc; onOpenItem?: (item: AttentionItem) => void }) {
+export function IntegrityFlags({
+  doc,
+  onOpenItem,
+  onSecondaryAction,
+}: {
+  doc: ExamDoc;
+  onOpenItem?: (item: AttentionItem) => void;
+  onSecondaryAction?: (item: AttentionItem) => void;
+}) {
   const { repairs, technical } = triageFlags(doc.flags || []);
   const items = computeAttention(doc);
   return <section className="border border-[var(--rule)] rounded-[10px] p-4 space-y-3 text-xs" aria-label="Integrity Flags">
@@ -17,21 +25,38 @@ export function IntegrityFlags({ doc, onOpenItem }: { doc: ExamDoc; onOpenItem?:
     <h3 className="font-semibold">NEEDS ATTENTION</h3>
     {items.length ? (
       <ul className="space-y-2">
-        {items.map((item, index) => (
-          <li key={`${item.id}_${index}`}>
-            <button
-              type="button"
-              data-attention-kind={item.kind}
-              data-attention-target={item.action.target}
-              data-attention-question={item.action.questionId || ''}
-              onClick={() => onOpenItem?.(item)}
-              className="w-full text-start rounded-[6px] px-2 py-1.5 border border-[var(--rule)] bg-[var(--paper)] hover:bg-[var(--paper-raised)] cursor-pointer"
-              title={item.action.target === 'image-tray' ? 'Open the image tray' : 'Go to this question'}
-            >
-              {item.plainSentence}
-            </button>
-          </li>
-        ))}
+        {items.map((item, index) => {
+          const secondarySuffix = item.secondaryAction ? ` [${item.secondaryAction.label}]` : '';
+          const primaryText = secondarySuffix && item.plainSentence.endsWith(secondarySuffix)
+            ? item.plainSentence.slice(0, -secondarySuffix.length)
+            : item.plainSentence;
+          return (
+            <li key={`${item.id}_${index}`} className={item.secondaryAction ? 'flex items-center gap-1.5' : undefined}>
+              <button
+                type="button"
+                data-attention-kind={item.kind}
+                data-attention-target={item.action.target}
+                data-attention-question={item.action.questionId || ''}
+                onClick={() => onOpenItem?.(item)}
+                className="flex-1 w-full text-start rounded-[6px] px-2 py-1.5 border border-[var(--rule)] bg-[var(--paper)] hover:bg-[var(--paper-raised)] cursor-pointer"
+                title={item.action.target === 'image-tray' ? 'Open the image tray' : item.action.target === 'page-retry' ? `Retry reading page ${item.action.page}` : 'Go to this question'}
+              >
+                {primaryText}
+              </button>
+              {item.secondaryAction && (
+                <button
+                  type="button"
+                  data-attention-secondary-target={item.secondaryAction.target}
+                  onClick={() => onSecondaryAction?.(item)}
+                  className="shrink-0 rounded-[6px] px-2 py-1.5 border border-[var(--rule)] bg-[var(--paper)] hover:bg-[var(--paper-raised)] cursor-pointer"
+                  title={`Open page ${item.secondaryAction.page} in Source`}
+                >
+                  [{item.secondaryAction.label}]
+                </button>
+              )}
+            </li>
+          );
+        })}
       </ul>
     ) : (
       <p>Nothing needs your attention.</p>

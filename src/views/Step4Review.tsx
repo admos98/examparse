@@ -33,6 +33,7 @@ import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { getExamHealth } from '../pipeline/quality';
 import { applyBulk, exportSelected } from '../pipeline/bulkOps';
 import { retryMissingCoverage } from '../pipeline/retryCoverage';
+import { retryFailedPage } from '../pipeline/pageRetry';
 import { buildQuestionTree } from '../utils/questionTree';
 import { computeSuggestions } from '../pipeline/suggestions';
 import { computeQualityScore } from '../utils/qualityScore';
@@ -169,8 +170,33 @@ export const Step4ReviewContent: React.FC<Props> = ({
       return next;
     });
   };
-  // C3 — every attention row IS the button: scroll to + expand exactly that question, or open the tray.
+  const handleRetryFailedPage = async (page: number) => {
+    if (retryingCoverage) return;
+    setRetryingCoverage(true);
+    setRetryProgress(`Retrying page ${page}…`);
+    setCoverageError(null);
+    try {
+      const result = await retryFailedPage(examDoc, page, settings, { onProgress: setRetryProgress });
+      onUpdateDoc(result.doc);
+      if (result.status === 'failed') setCoverageError(result.message);
+      setRetryProgress('');
+    } catch (error: any) {
+      setCoverageError(error?.message || `Page ${page} retry failed. The exam remains visibly partial.`);
+    } finally {
+      setRetryingCoverage(false);
+    }
+  };
+
+  // C3 — every attention row IS the button: scroll to + expand exactly that question, retry a failed page, or open the tray.
   const openAttentionItem = (item: AttentionItem) => {
+    if (item.action.target === 'page-retry' && item.action.page) {
+      void handleRetryFailedPage(item.action.page);
+      return;
+    }
+    if (item.action.target === 'source-page' && item.action.lineNo) {
+      onJumpToSource?.(item.action.lineNo);
+      return;
+    }
     if (item.action.target === 'image-tray') {
       setShowImageManager(true);
       setShowFlagsPanel(true);
@@ -191,6 +217,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
     const question = examDoc.questions.find(candidate => candidate.id === questionId);
     if (question) setExpandedSections(prev => new Set([...prev, question.sectionId || sections[0].id]));
     document.getElementById(`review-q-${questionId}`)?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const openAttentionSecondary = (item: AttentionItem) => {
+    if (item.secondaryAction?.target === 'source-page' && item.secondaryAction.lineNo) {
+      onJumpToSource?.(item.secondaryAction.lineNo);
+    }
   };
 
   const toggleQuestionExpanded = (qId: string) => {
@@ -721,7 +753,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
         </div>
       )}
 
-      <div id="review-issues">{showFlagsPanel && <IntegrityFlags doc={examDoc} onOpenItem={openAttentionItem} />}</div>
+      <div id="review-issues">{showFlagsPanel && <IntegrityFlags doc={examDoc} onOpenItem={openAttentionItem} onSecondaryAction={openAttentionSecondary} />}</div>
 
       {/* 2F Provenance — per-question Trace disclosure + 2B critic verdict badges */}
       {(((examDoc as any).traces?.length || Object.keys((examDoc as any).verdicts || {}).length) ? (

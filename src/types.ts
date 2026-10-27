@@ -190,6 +190,8 @@ export const LLM_ROLES = [
   'meta',
   'cloud',
   'repair',
+  /** #43 decision audit role: votes with probabilities, never authors or repairs text. */
+  'decide',
   'classify',
 ] as const;
 export type LLMRole = (typeof LLM_ROLES)[number];
@@ -345,9 +347,41 @@ export interface SpineRepairRecord {
   remainingKinds: string[];
 }
 
+export type CompileStatus = 'ok' | 'ok-reconciled' | 'partial' | 'read-failed';
+
+export interface CompileSpineRecord {
+  reconciliations: number;
+  byKind: Record<string, number>;
+  pages: Array<{ page: number; status: CompileStatus }>;
+  /** Targeted re-ask calls spent by the compiler (read + cloud), outside the read allowance and repair budget. */
+  calls: number;
+  /** Compile survivors that repair could not close — handed to the teacher. */
+  defectsRemaining: number;
+}
+
+export type AuditMode = 'skipped' | 'shadow' | 'active';
+
+export interface AuditSummary {
+  mode: AuditMode;
+  skipReason?: string; // set when mode === 'skipped'
+  decisions: number; // catalogue items decided (cache hits count)
+  catches: number; // confident-wrong items (<= 0.20) turned into defects
+  uncertain: number; // items in the 0.20-0.80 band
+  meanLatencyMs: number;
+  inputTokens: number; // input-only token estimate
+  estimatedCostUsd: number; // input-only cost at the model's rate
+  transportError?: string; // configured but unreachable; nothing routed
+  /** Shadow only: agreement with the generative pipeline's own outcome, per catalogue item. */
+  agreementByItem?: Record<string, { agreements: number; decisions: number; rate: number }>;
+}
+
 export interface SpineRecord {
   classify: SpineClassifyRecord;
   repairLoop: SpineRepairRecord;
+  /** #43 deterministic reconciliation of page proposals (compile → correct). */
+  compile?: CompileSpineRecord;
+  /** #43 decision audit summary (skipped when no decide role is configured). */
+  audit?: AuditSummary;
   /** Shared executor budget accounting (model calls / weighted units) across classify + repair. */
   budget: { calls: number; units: number; maxCalls: number; maxUnits: number };
 }
@@ -410,6 +444,8 @@ export interface ProviderConfig {
   kind: ProviderKind;
   baseURL: string;
   apiKey: string; // stored locally
+  /** #43: the decisions endpoint path on baseURL (e.g. /v1/decisions or /v1/systemone). Defaults to /v1/decisions. */
+  decisionsPath?: string;
   defaultHeaders?: Record<string, string>;
   /** When true (default), reasoning/thinking is disabled (or minimised for the solver) on OpenAI-compatible calls. */
   disableReasoning?: boolean;
@@ -443,6 +479,8 @@ export interface RoleMapping {
   cloud?: RoleModelSelection;
   /** Local defect repair; defaults to read. */
   repair?: RoleModelSelection;
+  /** #43 decision audit (base URL + model; POSTs to the provider's decisions path). Defaults to read. */
+  decide?: RoleModelSelection;
   /** Legacy setting retained only so old settings JSON can migrate. Not used by the default path. */
   classify?: RoleModelSelection;
 }
@@ -499,6 +537,8 @@ export interface AppSettings {
   classifyEnabled?: boolean;
   /** Optional Stage 2.75 OCR/PDF text readability repair (default off; overlays only). */
   textRepairEnabled?: boolean;
+  /** #43 decision audit mode: shadow (compute + report only, never routes) or active (routes confident-wrong catches to repair/teacher). Default shadow. */
+  decideMode?: 'shadow' | 'active';
 }
 
 /**
@@ -551,7 +591,7 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'read' | 'check' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
+export type PipelineStageId = 'extract' | 'read' | 'check' | 'compile' | 'audit' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
 
 export interface StageStatus {
   id: PipelineStageId;

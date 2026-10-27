@@ -82,7 +82,8 @@ export function validateHeaders(value: unknown): value is Record<string, string>
 const selection = z.object({ providerId: z.string().regex(SAFE_ID), model: text(300).min(1) });
 const providerSchema = z.object({
   id: z.string().regex(SAFE_ID), name: text(200).min(1), kind: z.enum(['gemini', 'openai-compatible']), baseURL: z.string().refine(validateProviderBaseUrl, 'Must be an http(s) URL without credentials, query, or fragment'),
-  apiKey: text(8192), defaultHeaders: z.record(z.string(), text(4000)).optional(), disableReasoning: z.boolean().optional(), structuredOutputs: z.boolean().optional(), extraBodyJson: text(65_536).optional(),
+  apiKey: text(8192),
+  decisionsPath: z.string().optional(), defaultHeaders: z.record(z.string(), text(4000)).optional(), disableReasoning: z.boolean().optional(), structuredOutputs: z.boolean().optional(), extraBodyJson: text(65_536).optional(),
 }).passthrough().superRefine((provider, ctx) => {
   if (!validateHeaders(provider.defaultHeaders)) ctx.addIssue({ code: 'custom', path: ['defaultHeaders'], message: 'Invalid HTTP headers.' });
   if (provider.extraBodyJson?.trim()) {
@@ -94,7 +95,7 @@ const providerSchema = z.object({
 });
 export const AppSettingsSchema = z.object({
   providers: z.array(providerSchema).min(1).max(50),
-  roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional(), critic: selection.optional(), consensus: selection.optional(), cleanup: selection.optional(), classify: selection.optional(), read: selection.optional(), meta: selection.optional(), cloud: selection.optional(), repair: selection.optional() }),
+  roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional(), critic: selection.optional(), consensus: selection.optional(), cleanup: selection.optional(), classify: selection.optional(), read: selection.optional(), meta: selection.optional(), cloud: selection.optional(), repair: selection.optional(), decide: selection.optional() }),
   costTable: z.record(z.string(), z.object({ inputCostPerMillion: z.number().finite().nonnegative(), outputCostPerMillion: z.number().finite().nonnegative() })),
   thrift: z.object({ latexNormalization: z.boolean(), maxImagesPerVisionCall: z.number().int().min(1).max(64), imageMaxLongEdge: z.number().int().min(64).max(8192), jpegQuality: z.number().int().min(1).max(100), cacheEnabled: z.boolean() }),
   budget: z.object({ maxUsdPerRun: z.number().finite().nonnegative(), maxOutputTokens: z.number().int().min(256).max(65_536) }),
@@ -102,6 +103,7 @@ export const AppSettingsSchema = z.object({
   cleanupEnabled: z.boolean().optional(),
   classifyEnabled: z.boolean().optional(),
   textRepairEnabled: z.boolean().optional(),
+  decideMode: z.enum(['shadow', 'active']).optional(),
   assistantMonthlySoftCapUsd: z.number().finite().nonnegative().optional(),
   uiLanguage: z.enum(['fa', 'en']).optional(),
   themeMode: z.enum(['system', 'light', 'dark']).optional(),

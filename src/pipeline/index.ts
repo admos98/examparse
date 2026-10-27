@@ -3,7 +3,7 @@
  * The model proposes document meaning page by page (sheet by sheet). Code only slices source text
  * and checks the closed arithmetic list. Failure of one page is a defect, never an empty document.
  */
-import type { AppSettings, ExamDoc, Flag, ImageAsset, PipelineStageId, SourceLine, SpinePageReadRecord, StageStatus, UsageRecord } from '../types';
+import type { AppSettings, CompileSpineRecord, ExamDoc, Flag, ImageAsset, PipelineStageId, SourceLine, SpinePageReadRecord, StageStatus, UsageRecord } from '../types';
 import { computeDisplayName } from '../types';
 import { extractDocument, type ExtractedDocument } from './extract';
 import { runBatchedOcr } from './ocr';
@@ -32,6 +32,8 @@ const SPINE_META_REPAIR_MAX_UNITS = 200;
 import { imageAsMetaInput, runMetaRead, type MetaReadResult } from './metaRead';
 import { computeDefects, type Defect } from './defects';
 import { runRepairLoop, serializeRepairLoopResult } from './repairLoop';
+import { compileDocument } from './compile';
+import { runDecisionAudit } from './audit';
 import { autoDecorateRepeatedImages } from './quality';
 import { labelImagesBatched } from './vision';
 import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership';
@@ -93,10 +95,11 @@ function defectFlags(defects: Defect[]): Flag[] {
       'points-sum': 'POINTS_MISMATCH',
       'image-ownership': 'IMAGE_ORDER_SUSPECT',
       'image-unplaced': 'IMAGE_UNPLACED',
+      'audit-catch': 'AUDIT_CATCH',
     };
     return {
       id: `attention_survivor_${i + 1}`,
-      severity: defect.kind === 'hollow-question' || defect.kind === 'options-missing' ? 'error' : 'warn',
+      severity: defect.kind === 'hollow-question' || defect.kind === 'options-missing' || defect.kind === 'audit-catch' ? 'error' : 'warn',
       code: map[defect.kind] || 'PARSE_CHECK_SURVIVOR',
       message: defect.detail,
       ...(qid ? { questionId: qid } : {}),
@@ -154,6 +157,15 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const cloudProvider = providerFor(settings, 'cloud'); const cloudReadProvider = cloudProvider ? forcedOff(cloudProvider) : undefined;
   const repairProvider = providerFor(settings, 'repair'); const metaProviderRaw = providerFor(settings, 'meta'); const metaProvider = metaProviderRaw ? forcedOff(metaProviderRaw) : undefined;
   const visionProvider = providerFor(settings, 'vision');
+  // #43: shared generative callers for compile re-asks (read role first, cloud rescue).
+  const compileCaller = readProvider ? async (req: { system: string; text: string; maxOutputTokens?: number; label: string }) => {
+    const r = await LLMAdapter.execute({ role: 'read', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: readProvider });
+    return { rawText: r.rawText, json: r.json, usage: r.usage };
+  } : undefined;
+  const compileCloudCaller = cloudReadProvider ? async (req: { system: string; text: string; maxOutputTokens?: number; label: string }) => {
+    const r = await LLMAdapter.execute({ role: 'cloud', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: cloudReadProvider });
+    return { rawText: r.rawText, json: r.json, usage: r.usage };
+  } : undefined;
   // #41: `agentLimits` governs only the Assistant executor. Meta + repair draw from this spine budget; Global Read does not.
   const budget: SpineBudget = { calls: 0, units: 0, maxCalls: SPINE_META_REPAIR_MAX_CALLS, maxUnits: SPINE_META_REPAIR_MAX_UNITS };
   const journalKey = `wing:${fileHash}:${linesHash}`;
@@ -326,6 +338,63 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
     message: `${loop.opsAccepted} fix(es) accepted · ${loop.opsRejected} rejected · ${loop.opsDeduped} duplicate(s) skipped${loop.abandonedKinds.length ? ` · ${loop.abandonedKinds.length} kind(s) abandoned` : ''} · ${loop.escalations} cloud escalation(s) · ${defects.length} survivor(s) for the teacher.${loop.droppedReadFailedDefects ? ` ${loop.droppedReadFailedDefects} item(s) on unread pages wait for [Retry page].` : ''}`,
   });
 
+  // #43 Part A — Compile: reconcile page proposals instead of wholesale rejection.
+  // Salvages everything salvageable; remaining defects become a scoped work list for the teacher.
+  stage({ id: 'compile', name: 'Compile', status: 'running', message: 'Reconciling page proposals and scoping remaining defects…' });
+  const compiled = await compileDocument({
+    questions, sections, lines,
+    keyLineNos: assembled.keyLineNos,
+    // The classifier's accounted lines (furniture + key + section labels) are not claims:
+    // the compiler must treat them as accounted, exactly like computeDefects does.
+    accountedLineNos,
+    failedPages: readResult.failedPages,
+    caller: compileCaller,
+    cloudCaller: compileCloudCaller,
+    onJournal: e => journal(e.label, e.rawText, e.requestText),
+    // Compile re-asks sit outside the read allowance and the repair budget.
+    budget: { calls: 0, units: 0, maxCalls: 100, maxUnits: 1000 },
+  });
+  questions = compiled.questions;
+  sections = compiled.sections;
+  const compileByKind: Record<string, number> = {};
+  for (const rec of compiled.reconciliations) compileByKind[rec.kind] = (compileByKind[rec.kind] || 0) + 1;
+  const compileRecord: CompileSpineRecord = {
+    reconciliations: compiled.reconciliations.length,
+    byKind: compileByKind,
+    pages: [...compiled.pageStatus.entries()].map(([page, status]) => ({ page, status })),
+    calls: compiled.calls,
+    defectsRemaining: compiled.defects.length,
+  };
+  defects = [...defects, ...compiled.defects];
+  if (compiled.calls) record(usageRecord('read', readProvider, compiled.usage, `Compile · scoped re-asks (${compiled.calls} call${compiled.calls === 1 ? '' : 's'})`));
+  stage({ id: 'compile', name: 'Compile', status: compiled.defects.length ? 'completed-with-problems' : 'completed', message: `${compiled.reconciliations.length} reconciliation(s) · ${compiled.calls} scoped re-ask(s) · ${compiled.defects.length} defect(s) to the teacher.` });
+
+  // #43 Part B — Decision Audit: probability votes on the settled document; routes nothing in shadow mode.
+  // Never consumes the read allowance or the repair budget.
+  stage({ id: 'audit', name: 'Decision Audit', status: 'running', message: 'Running the decision audit over the settled document…' });
+  const auditResult = await runDecisionAudit({
+    doc: { questions, sections, images: updatedImages, totalPoints, meta: metaRead?.meta as ExamDoc['meta'] | undefined },
+    lines,
+    settings,
+    fileHash,
+    caller: compileCaller,
+    cloudCaller: compileCloudCaller,
+    keyLineNos: assembled.keyLineNos,
+    failedPages: readResult.failedPages,
+    existingDefects: defects,
+    onJournal: e => journal(e.label, e.rawText, e.requestText),
+  });
+  questions = auditResult.questions;
+  sections = auditResult.sections;
+  defects = [...defects, ...auditResult.defects];
+  const auditSummary = auditResult.summary;
+  const decideSelection = settings.roleMapping.decide;
+  const decideProvider = decideSelection ? (settings.providers.find(p => p.id === decideSelection.providerId) || settings.providers[0]) : undefined;
+  if (auditResult.calls || auditResult.usage.inputTokens) {
+    record(usageRecord('decide', decideProvider, auditResult.usage, `Decision Audit (${auditResult.calls} vote${auditResult.calls === 1 ? '' : 's'})`));
+  }
+  stage({ id: 'audit', name: 'Decision Audit', status: auditSummary.mode === 'skipped' ? 'skipped' : (auditSummary.catches ? 'completed-with-problems' : 'completed'), message: `${auditSummary.decisions} decision vote(s) · ${auditSummary.catches} catch(es) · ${auditSummary.uncertain} uncertain · ${auditSummary.mode}${auditSummary.transportError ? ` · transport: ${auditSummary.transportError}` : ''}` });
+
   // Final image bijection/I13 pass after repair.
   try {
     const assigned = await assignImagesExact({ questions, images: updatedImages, sourceLines: lines, failedPages: readResult.failedPages });
@@ -416,6 +485,8 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
         defectsRemaining: defects.length + metaRead.defects.length,
         remainingKinds: [...new Set([...defects.map(d => d.kind), ...metaRead.defects.map(d => `meta-${d.field}`)])],
       },
+      compile: compileRecord,
+      audit: auditSummary,
       budget: { ...budget },
     },
   };
@@ -428,7 +499,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   if (job) try {
     const localFixed = loop.rounds.filter(round => !round.escalatedKinds.length).reduce((sum, round) => sum + round.accepted, 0);
     const cloudFixed = loop.rounds.filter(round => round.escalatedKinds.length).reduce((sum, round) => sum + round.accepted, 0);
-    await endJob(job, { health: { expected: expectedNumbers.length, parsed: questions.length, missing: defects.filter(d => d.kind === 'missing-number').length, duplicates: defects.filter(d => d.kind === 'duplicate-number').length, coveragePercent: expectedNumbers.length ? questions.length / expectedNumbers.length * 100 : 0, state: flags.length ? 'partial' : 'complete', complete: flags.length === 0, pointsParsed: questions.reduce((s, q) => s + (q.points || 0), 0), pointsExpected: totalPoints }, verifierDefects: defects.length, defectFixRates: { localFixed, cloudFixed, teacherLeft: defects.length + metaRead.defects.length }, calls: usageRecords.filter(r => !r.isCachedHit).length, tokens: { input: usageRecords.reduce((s, r) => s + r.inputTokens, 0), output: usageRecords.reduce((s, r) => s + r.outputTokens, 0), cached: 0 }, costUsd: usageRecords.reduce((s, r) => s + (r.costUsd || 0), 0), isCacheHit: readResult.status === 'cached' && loop.status === 'cached', settings, baselineRevision: `${questions.length}:${sections.length}:${totalPoints ?? 'null'}`, sourceLines: lines.slice(0, 500).map(l => l.text) }); callbacks.onLiveText?.('present', 'Memory', 'info', guidanceSummary(job)); } catch { /* memory is report-only */ }
+    await endJob(job, { health: { expected: expectedNumbers.length, parsed: questions.length, missing: defects.filter(d => d.kind === 'missing-number').length, duplicates: defects.filter(d => d.kind === 'duplicate-number').length, coveragePercent: expectedNumbers.length ? questions.length / expectedNumbers.length * 100 : 0, state: flags.length ? 'partial' : 'complete', complete: flags.length === 0, pointsParsed: questions.reduce((s, q) => s + (q.points || 0), 0), pointsExpected: totalPoints, audit: { decisions: auditSummary.decisions, catches: auditSummary.catches, uncertain: auditSummary.uncertain } }, verifierDefects: defects.length, defectFixRates: { localFixed, cloudFixed, teacherLeft: defects.length + metaRead.defects.length }, audit: { decisions: auditSummary.decisions, catches: auditSummary.catches, uncertain: auditSummary.uncertain }, calls: usageRecords.filter(r => !r.isCachedHit).length, tokens: { input: usageRecords.reduce((s, r) => s + r.inputTokens, 0), output: usageRecords.reduce((s, r) => s + r.outputTokens, 0), cached: 0 }, costUsd: usageRecords.reduce((s, r) => s + (r.costUsd || 0), 0), isCacheHit: readResult.status === 'cached' && loop.status === 'cached', settings, baselineRevision: `${questions.length}:${sections.length}:${totalPoints ?? 'null'}`, sourceLines: lines.slice(0, 500).map(l => l.text) }); callbacks.onLiveText?.('present', 'Memory', 'info', guidanceSummary(job)); } catch { /* memory is report-only */ }
   return doc;
 }
 

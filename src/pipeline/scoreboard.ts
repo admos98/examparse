@@ -32,19 +32,23 @@ export interface ScoreboardRow {
   localFixed: number;
   cloudFixed: number;
   teacherLeft: number;
+  /** #43 decision-audit statistics summed over jobs, per decide model. */
+  auditDecisions: number;
+  auditCatches: number;
+  auditUncertain: number;
   insufficientData: boolean;      // n<3 — never fake a %
 }
 
 type RunLike = RunJournalEntry & { verifierDefects?: number };
 
 export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
-  const acc = new Map<string, { role: string; modelId: string; bucket: string; jobs: number; cov: number; defects: number; recoveries: number; cost: number; cleanQs: number; trunc: number; ansChecked: number; ansAgreed: number; localFixed: number; cloudFixed: number; teacherLeft: number }>();
+  const acc = new Map<string, { role: string; modelId: string; bucket: string; jobs: number; cov: number; defects: number; recoveries: number; cost: number; cleanQs: number; trunc: number; ansChecked: number; ansAgreed: number; localFixed: number; cloudFixed: number; teacherLeft: number; auditDecisions: number; auditCatches: number; auditUncertain: number }>();
   for (const run of runs || []) {
     const bucket = bucketKey(docTraitBucket(run.docTraits as any));
     const defects = typeof run.verifierDefects === 'number' ? run.verifierDefects : (run.flagsRaised?.length || 0);
     for (const [role, modelId] of Object.entries(run.models || {})) {
       const key = `${role}|${modelId}|${bucket}`;
-      const row = acc.get(key) || { role, modelId, bucket, jobs: 0, cov: 0, defects: 0, recoveries: 0, cost: 0, cleanQs: 0, trunc: 0, ansChecked: 0, ansAgreed: 0, localFixed: 0, cloudFixed: 0, teacherLeft: 0 };
+      const row = acc.get(key) || { role, modelId, bucket, jobs: 0, cov: 0, defects: 0, recoveries: 0, cost: 0, cleanQs: 0, trunc: 0, ansChecked: 0, ansAgreed: 0, localFixed: 0, cloudFixed: 0, teacherLeft: 0, auditDecisions: 0, auditCatches: 0, auditUncertain: 0 };
       row.jobs++;
       row.cov += (run.outcome?.health?.coveragePercent || 0) / 100;
       row.defects += defects;
@@ -59,6 +63,9 @@ export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
       row.localFixed += Math.max(0, Number(run.defectFixRates?.localFixed) || 0);
       row.cloudFixed += Math.max(0, Number(run.defectFixRates?.cloudFixed) || 0);
       row.teacherLeft += Math.max(0, Number(run.defectFixRates?.teacherLeft) || 0);
+      row.auditDecisions += Math.max(0, Number(run.audit?.decisions) || 0);
+      row.auditCatches += Math.max(0, Number(run.audit?.catches) || 0);
+      row.auditUncertain += Math.max(0, Number(run.audit?.uncertain) || 0);
       acc.set(key, row);
     }
   }
@@ -74,6 +81,9 @@ export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
     localFixed: r.localFixed,
     cloudFixed: r.cloudFixed,
     teacherLeft: r.teacherLeft,
+    auditDecisions: r.auditDecisions,
+    auditCatches: r.auditCatches,
+    auditUncertain: r.auditUncertain,
     insufficientData: r.jobs < 3,
   })).sort((a, b) => a.role.localeCompare(b.role) || b.cleanCoverageRate - a.cleanCoverageRate);
 }

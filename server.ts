@@ -1247,6 +1247,12 @@ app.post('/api/llm', async (req: Request, res: Response) => {
   }
   const { role, system, text, images, jsonSchema, maxOutputTokens, label, providerConfig, stream } = payload;
 
+  // #43: decide casts probability votes via the provider decisions endpoint; it never
+  // generates text and never edits, so it is not served by the generative /api/llm proxy.
+  if (role === 'decide') {
+    return res.status(400).json({ error: 'The decide role is not generative: it votes on the provider decisions endpoint and is not served by /api/llm.' });
+  }
+
   const kind = providerConfig?.kind || 'gemini';
   const model = providerConfig?.model || (role === 'escalation' ? 'gemini-2.5-pro' : 'gemini-2.5-flash');
 

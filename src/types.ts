@@ -292,7 +292,14 @@ export interface SpinePageReadRecord {
   page: number;
   status: SpinePageReadStatus;
   cached?: boolean;
+  /** Total read calls for this page (local attempts + retries + cloud rescue). */
   calls: number;
+  /** Cloud rescue calls among `calls` (#41). */
+  cloudCalls?: number;
+  /** Running total of read calls across the exam up to and including this page (#41). */
+  runningCalls?: number;
+  /** Validator complaint / error from EACH local attempt, kept even when cloud rescued the page (#41). */
+  localComplaints?: string[];
   questions: number;
   reason?: string;
 }
@@ -311,6 +318,8 @@ export interface SpineClassifyRecord {
   pages?: SpinePageReadRecord[];
   /** Serialized validated proposals keyed by page number so single-page retry never re-reads other pages. */
   pageProposals?: Record<string, string>;
+  /** #41: the Global Read's own per-exam call allowance (pages × 3 + 6). Not shared with Assistant limits. */
+  readAllowance?: number;
 }
 
 export interface SpineRepairRecord {

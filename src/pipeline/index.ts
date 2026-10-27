@@ -17,13 +17,18 @@ import { calculateActualCost } from '../utils/budget';
 import { detectLanguageAndDirection } from '../utils/numbers';
 import {
   assembleReadProposal,
+  pageReadFailedMessage,
   runGlobalReadStage,
   serializeReadProposal,
   type PageReadCache,
   type PageReadCacheEntry,
-  type ReadBudget,
   type ReadProposal,
 } from './globalRead';
+import type { SpineBudget } from './classify';
+
+/** #41: meta + repair keep their small bounded spine budget. The Global Read owns its own per-exam allowance. */
+const SPINE_META_REPAIR_MAX_CALLS = 30;
+const SPINE_META_REPAIR_MAX_UNITS = 200;
 import { imageAsMetaInput, runMetaRead, type MetaReadResult } from './metaRead';
 import { computeDefects, type Defect } from './defects';
 import { runRepairLoop, serializeRepairLoopResult } from './repairLoop';
@@ -149,7 +154,8 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const cloudProvider = providerFor(settings, 'cloud'); const cloudReadProvider = cloudProvider ? forcedOff(cloudProvider) : undefined;
   const repairProvider = providerFor(settings, 'repair'); const metaProviderRaw = providerFor(settings, 'meta'); const metaProvider = metaProviderRaw ? forcedOff(metaProviderRaw) : undefined;
   const visionProvider = providerFor(settings, 'vision');
-  const budget: ReadBudget = { calls: 0, units: 0, maxCalls: settings.agentLimits?.maxModelCalls || 30, maxUnits: settings.agentLimits?.maxToolExecutions || 200 };
+  // #41: `agentLimits` governs only the Assistant executor. Meta + repair draw from this spine budget; Global Read does not.
+  const budget: SpineBudget = { calls: 0, units: 0, maxCalls: SPINE_META_REPAIR_MAX_CALLS, maxUnits: SPINE_META_REPAIR_MAX_UNITS };
   const journalKey = `wing:${fileHash}:${linesHash}`;
   const journal = async (label: string, rawText: string, requestText?: string) => { if (settings.thrift.cacheEnabled) await appendJournalCall(journalKey, { ts: new Date().toISOString(), label, rawText, requestText, complete: true }); };
 
@@ -198,7 +204,6 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
     images: updatedImages,
     model: readProvider?.model,
     pageCache,
-    budget,
     guidance: job?.playbook.block,
     onJournal: e => journal(e.label, e.rawText, e.requestText),
     onPageUpdate: (pageReport: SpinePageReadRecord, completed: number, total: number) => {
@@ -245,7 +250,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
           ? 'cached'
           : 'completed',
     message: proposal
-      ? `${proposal.questions.length} proposed questions · ${proposal.sections.length} proposed sections · ${readResult.pages.length - readResult.failedPages.length}/${readResult.pages.length} page(s) read${cloudOkCount ? ` (${cloudOkCount} via cloud)` : ''}${readResult.failedPages.length ? ` · ${readResult.failedPages.length} failed` : ''}.`
+      ? `${proposal.questions.length} proposed questions · ${proposal.sections.length} proposed sections · ${readResult.pages.length - readResult.failedPages.length}/${readResult.pages.length} page(s) read${cloudOkCount ? ` (${cloudOkCount} via cloud)` : ''}${readResult.failedPages.length ? ` · ${readResult.failedPages.length} failed` : ''} · read calls ${readResult.calls + readResult.cloudCalls} of ${readResult.readAllowance}.`
       : `Global Read failed on all ${readResult.pages.length || extracted.pages} page(s); no code-first fallback was used. ${readResult.complaints.join('; ')}`,
   });
 
@@ -332,7 +337,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
         code: 'PAGE_READ_FAILED',
         severity: 'error',
         rootCauseId: `page_read_failed_${failedPage}`,
-        message: `Page ${failedPage} couldn't be read — its questions are missing.`,
+        message: pageReadFailedMessage(failedPage, readResult.pages.find(p => p.page === failedPage)?.reason),
       });
     }
   }
@@ -385,6 +390,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
         model: readProvider?.model,
         calls: readResult.calls,
         cloudCalls: readResult.cloudCalls,
+        readAllowance: readResult.readAllowance,
         labelledLines: proposal?.labels.size,
         pages: readResult.pages,
         pageProposals: readResult.pageProposals,

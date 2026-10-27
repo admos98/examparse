@@ -605,11 +605,14 @@ test('#40 Acceptance #3, #5, B2, B3, C1, C2: failing page 2 of 3 ships pages 1+3
     assert.match(p2Clouds[0].text, /Illustrated vocabulary item 5/, 'cloud page 2 read also receives page 2 captions');
     assert.doesNotMatch(p2Clouds[0].text, /\[L0011 /, 'cloud page 2 read never receives page 3 lines');
 
-    // 3. `image-unplaced` stayed a defect through Repair → Cloud escalation!
-    assert.ok(doc.spine?.repairLoop.remainingKinds.includes('image-unplaced'), 'image-unplaced survived repair -> cloud');
-    assert.ok(
+    // 3. `image-unplaced` is still reported — but #42 keeps it out of Repair: every line it cites is on the
+    //    read-failed page, so the page-retry path owns it and the repair loop spends no calls proposing it.
+    assert.ok(doc.spine?.repairLoop.remainingKinds.includes('image-unplaced'), 'image-unplaced survives as a reported defect');
+    assert.ok((doc.spine?.repairLoop.droppedReadFailedDefects || 0) > 0, 'read-failed-page defects are dropped before repair batching');
+    assert.equal(
       callLog.some(c => c.role === 'cloud' && c.label.includes('Repair image-unplaced') && c.label.includes('escalation')),
-      'image-unplaced escalated to cloud during Repair',
+      false,
+      '#42: repair never proposes operations for defects whose lines are wholly on a read-failed page',
     );
 
     // 4. Page 2's lines stayed in the document as unaccounted (dropAsFurniture on failed page was rejected!).

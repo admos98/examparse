@@ -296,6 +296,10 @@ export interface SpinePageReadRecord {
   calls: number;
   /** Cloud rescue calls among `calls` (#41). */
   cloudCalls?: number;
+  /** #42: cloud attempts spent on this page's rescue (1, or 2 after one transient-failure retry). */
+  cloudAttempts?: number;
+  /** #42: the provider/transport error (e.g. "503 Service Unavailable") — weather, distinguished from refusal. */
+  cloudError?: string;
   /** Running total of read calls across the exam up to and including this page (#41). */
   runningCalls?: number;
   /** Validator complaint / error from EACH local attempt, kept even when cloud rescued the page (#41). */
@@ -326,8 +330,16 @@ export interface SpineRepairRecord {
   status: 'completed' | 'cached' | 'skipped' | 'no-defects';
   rounds: number;
   calls: number;
+  /** #42: every well-formed operation the model proposed; equals accepted + rejected + deduped. */
+  opsProposed?: number;
   opsAccepted: number;
   opsRejected: number;
+  /** #42: identical operations (kind + targets) not re-validated or re-counted as fresh proposals. */
+  opsDeduped?: number;
+  /** #42: operation kinds abandoned for a round after 10 rejections of that kind. */
+  abandonedKinds?: string[];
+  /** #42: checked defects dropped before repair because they lie wholly on read-failed pages. */
+  droppedReadFailedDefects?: number;
   escalations: number;
   defectsRemaining: number;
   remainingKinds: string[];

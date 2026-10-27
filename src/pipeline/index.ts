@@ -319,7 +319,12 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   if (loop.status === 'completed') await cacheWrite(repairCache, { serialized: serializeRepairLoopResult(loop) });
   if (loop.usage.inputTokens || loop.usage.outputTokens) record(usageRecord('repair', repairProvider, loop.usage, 'Local defect repair'));
   if (loop.escalationUsage.inputTokens || loop.escalationUsage.outputTokens) record(usageRecord('cloud', cloudProvider, loop.escalationUsage, 'Cloud defect repair'));
-  stage({ id: 'repair', name: 'Repair', status: defects.length ? 'completed-with-problems' : loop.status === 'cached' ? 'cached' : 'completed', message: `${loop.opsAccepted} fix(es) accepted · ${loop.escalations} cloud escalation(s) · ${defects.length} survivor(s) for the teacher.` });
+  stage({
+    id: 'repair',
+    name: 'Repair',
+    status: defects.length ? 'completed-with-problems' : loop.status === 'cached' ? 'cached' : 'completed',
+    message: `${loop.opsAccepted} fix(es) accepted · ${loop.opsRejected} rejected · ${loop.opsDeduped} duplicate(s) skipped${loop.abandonedKinds.length ? ` · ${loop.abandonedKinds.length} kind(s) abandoned` : ''} · ${loop.escalations} cloud escalation(s) · ${defects.length} survivor(s) for the teacher.${loop.droppedReadFailedDefects ? ` ${loop.droppedReadFailedDefects} item(s) on unread pages wait for [Retry page].` : ''}`,
+  });
 
   // Final image bijection/I13 pass after repair.
   try {
@@ -400,8 +405,13 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
         status: loop.status,
         rounds: loop.rounds.length,
         calls: loop.calls,
+        // #42: the summary reconciles — proposed = accepted + rejected + deduped.
+        opsProposed: loop.opsProposed,
         opsAccepted: loop.opsAccepted,
         opsRejected: loop.opsRejected,
+        opsDeduped: loop.opsDeduped,
+        ...(loop.abandonedKinds.length ? { abandonedKinds: loop.abandonedKinds } : {}),
+        ...(loop.droppedReadFailedDefects ? { droppedReadFailedDefects: loop.droppedReadFailedDefects } : {}),
         escalations: loop.escalations,
         defectsRemaining: defects.length + metaRead.defects.length,
         remainingKinds: [...new Set([...defects.map(d => d.kind), ...metaRead.defects.map(d => `meta-${d.field}`)])],

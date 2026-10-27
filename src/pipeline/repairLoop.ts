@@ -29,7 +29,22 @@ export type RepairOp =
 
 export const REPAIR_OP_NAMES = ['mergeQuestions', 'dropAsFurniture', 'assignLines', 'setSection', 'breakQuestionAt', 'setPointsFrom', 'noFix'] as const;
 
-export interface ParsedOps { ops: RepairOp[]; rejected: number }
+export interface ParsedOps {
+  ops: RepairOp[];
+  /** Entries the parser could not read (wrong type, unknown op, missing targets). */
+  rejected: number;
+  /** #42: one plain-language complaint per rejected entry, named by position. */
+  complaints: string[];
+}
+
+/** #42 — malformed repair output is data, never an exception. */
+function shapeOfOp(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'missing';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'object') return 'an object';
+  return typeof value === 'string' ? 'text' : typeof value === 'number' ? 'a number' : typeof value === 'boolean' ? 'a boolean' : typeof value;
+}
 
 function asLinePair(value: unknown): [number, number] | undefined {
   if (Array.isArray(value) && value.length >= 2) {
@@ -41,66 +56,110 @@ function asLinePair(value: unknown): [number, number] | undefined {
   return Number.isInteger(single) && single > 0 ? [single, single] : undefined;
 }
 
-/** Strict vocabulary parse: anything outside the closed op set (or malformed) is rejected and counted. */
+/**
+ * Strict vocabulary parse: anything outside the closed op set (or malformed) is rejected and counted.
+ * #42: it never throws — every malformed entry becomes one complaint that says exactly what to return.
+ */
 export function parseRepairOps(rawText: string, json?: unknown): ParsedOps {
   const ops: RepairOp[] = [];
+  const complaints: string[] = [];
   let rejected = 0;
+  const reject = (message: string) => { rejected++; complaints.push(message); };
   const consume = (value: any): boolean => {
-    const list = Array.isArray(value) ? value : Array.isArray(value?.ops) ? value.ops : Array.isArray(value?.operations) ? value.operations : null;
+    const list = Array.isArray(value) ? value : value && typeof value === 'object' && Array.isArray(value.ops) ? value.ops : value && typeof value === 'object' && Array.isArray(value.operations) ? value.operations : null;
     if (!list) return false;
-    for (const item of list) {
-      if (!item || typeof item !== 'object') { rejected++; continue; }
+    list.forEach((item: any, index: number) => {
+      const at = `ops entry ${index + 1}`;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        reject(`${at} is ${shapeOfOp(item)} — every entry must be an object like {"op":"assignLines","defect":"…","lines":[116,124],"questionId":"q_12"}`);
+        return;
+      }
       const name = String(item.op || item.type || '');
       const defect = String(item.defect || item.id || '');
       const num = (v: unknown) => Number(String(v ?? '').replace(/\D/g, ''));
       switch (name) {
         case 'mergeQuestions': {
           if (item.a && item.b && item.a !== item.b) ops.push({ op: name, defect, a: String(item.a), b: String(item.b) });
-          else rejected++;
+          else reject(`${at} (mergeQuestions) needs two different question ids in "a" and "b"`);
           break;
         }
         case 'dropAsFurniture': {
           const lines = asLinePair(item.lines ?? item.range);
-          if (lines) ops.push({ op: name, defect, lines }); else rejected++;
+          if (lines) ops.push({ op: name, defect, lines });
+          else reject(`${at} (dropAsFurniture) needs "lines": [startLine, endLine] with real line numbers`);
           break;
         }
         case 'assignLines': {
           const lines = asLinePair(item.lines ?? item.range);
           const qid = String(item.questionId || item.to || '');
-          if (lines && qid) ops.push({ op: name, defect, lines, questionId: qid }); else rejected++;
+          if (lines && qid) ops.push({ op: name, defect, lines, questionId: qid });
+          else reject(`${at} (assignLines) needs "lines": [startLine, endLine] and the target question id in "questionId"`);
           break;
         }
         case 'setSection': {
           const line = num(item.line);
           const title = String(item.title || '').trim().slice(0, 120);
-          if (Number.isInteger(line) && line > 0 && title) ops.push({ op: name, defect, line, title }); else rejected++;
+          if (Number.isInteger(line) && line > 0 && title) ops.push({ op: name, defect, line, title });
+          else reject(`${at} (setSection) needs a printed "line" and a non-empty "title"`);
           break;
         }
         case 'breakQuestionAt': {
           const line = num(item.line);
-          if (Number.isInteger(line) && line > 0) ops.push({ op: name, defect, line }); else rejected++;
+          if (Number.isInteger(line) && line > 0) ops.push({ op: name, defect, line });
+          else reject(`${at} (breakQuestionAt) needs the printed "line" where the next question starts`);
           break;
         }
         case 'setPointsFrom': {
           const lines = asLinePair(item.lines ?? item.range);
-          if (lines) ops.push({ op: name, defect, lines, ...(item.questionId ? { questionId: String(item.questionId) } : {}) }); else rejected++;
+          if (lines) ops.push({ op: name, defect, lines, ...(item.questionId ? { questionId: String(item.questionId) } : {}) });
+          else reject(`${at} (setPointsFrom) needs "lines": [startLine, endLine] holding the printed marks`);
           break;
         }
         case 'noFix':
           ops.push({ op: name, defect, ...(item.reason ? { reason: String(item.reason).slice(0, 200) } : {}) });
           break;
         default:
-          rejected++;
+          reject(`${at} has op "${name}" — use exactly one of ${REPAIR_OP_NAMES.join(', ')}`);
       }
-    }
+    });
     return true;
   };
-  if (json && consume(json)) return { ops, rejected };
-  const candidate = String(rawText || '').match(/\{[\s\S]*\}/)?.[0];
-  if (candidate) {
-    try { if (consume(JSON.parse(candidate))) return { ops, rejected }; } catch { /* no salvage for ops: strictness is the point */ }
+  const finish = (): ParsedOps => {
+    // An empty (but well-formed) envelope fixes nothing: say so instead of scoring a silent zero.
+    if (!ops.length && !complaints.length) {
+      complaints.push('the operations payload contained no operations — return one operation per defect id, or a noFix entry with a reason');
+    }
+    return { ops, rejected, complaints };
+  };
+  try {
+    if (json !== undefined && json !== null && consume(json)) return finish();
+    const text = String(rawText || '');
+    // Accept the whole reply, an embedded object {"ops":[…]} or a bare array of operations — first readable wins.
+    const candidates = [text.trim(), text.match(/\{[\s\S]*\}/)?.[0], text.match(/\[[\s\S]*\]/)?.[0]]
+      .filter((candidate, index, all): candidate is string => Boolean(candidate) && all.indexOf(candidate) === index);
+    for (const candidate of candidates) {
+      try {
+        if (consume(JSON.parse(candidate))) return finish();
+      } catch { /* try the next candidate extraction */ }
+    }
+    reject('the output contains no readable JSON operations object — return {"ops":[…]}, one operation per defect id');
+  } catch (err: any) {
+    reject(`the operations payload could not be read (${String(err?.message || err)}) — return one JSON object {"ops":[…]}`);
   }
-  return { ops, rejected };
+  return { ops, rejected, complaints };
+}
+
+/** #42 — an operation's identity is its kind plus its targets; the defect id is deliberately NOT part of it. */
+export function repairOpSignature(op: RepairOp): string {
+  switch (op.op) {
+    case 'mergeQuestions': return `mergeQuestions|${[op.a, op.b].sort().join('+')}`;
+    case 'dropAsFurniture': return `dropAsFurniture|${op.lines[0]}-${op.lines[1]}`;
+    case 'assignLines': return `assignLines|${op.questionId}|${op.lines[0]}-${op.lines[1]}`;
+    case 'setSection': return `setSection|${op.line}|${op.title.trim().toLowerCase()}`;
+    case 'breakQuestionAt': return `breakQuestionAt|${op.line}`;
+    case 'setPointsFrom': return `setPointsFrom|${op.questionId || ''}|${op.lines[0]}-${op.lines[1]}`;
+    case 'noFix': return `noFix|${op.defect}`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,11 +424,20 @@ export interface RepairRoundRecord {
   defectsBefore: number;
   byKind: Partial<Record<DefectKind, number>>;
   calls: number;
+  /** Every well-formed operation proposed this round; equals accepted + rejected + deduped (#42). */
   proposed: number;
   accepted: number;
   rejected: number;
+  /** #42: identical operations (kind + targets) suppressed instead of re-validated. */
+  deduped: number;
   noFix: number;
+  /** #42: entries the model emitted that could not be read as operations. */
+  malformed: number;
   escalatedKinds: DefectKind[];
+  /** #42: kinds abandoned for the round after 10 rejections. */
+  abandonedKinds: DefectKind[];
+  /** #42: checked defects skipped because they lie wholly on read-failed pages. */
+  droppedReadFailed: number;
   defectsAfter: number;
   receipts: string[];
 }
@@ -379,9 +447,17 @@ export interface RepairLoopResult {
   state: RepairState;
   rounds: RepairRoundRecord[];
   calls: number;
+  /** #42: proposed == accepted + rejected + deduped. */
+  opsProposed: number;
   opsAccepted: number;
   opsRejected: number;
+  opsDeduped: number;
+  opsMalformed: number;
   escalations: number;
+  /** #42: kinds abandoned for a round after 10 rejections of the same kind. */
+  abandonedKinds: DefectKind[];
+  /** #42: checked defects never shown to repair because they belong to read-failed pages. */
+  droppedReadFailedDefects: number;
   remainingDefects: Defect[];
   usage: { inputTokens: number; outputTokens: number };
   escalationUsage: { inputTokens: number; outputTokens: number };
@@ -390,6 +466,22 @@ export interface RepairLoopResult {
 
 export const REPAIR_BATCH_SIZE = 15;
 export const REPAIR_MAX_ROUNDS = 3;
+/** #42 — after this many rejections of one kind inside one round, that kind is abandoned for the round. */
+export const REPAIR_KIND_REJECTION_CAP = 10;
+
+/** Every printed line that lives on a read-failed page (owned by the page-retry path, not by repair). */
+export function readFailedLineNos(lines: SourceLine[], failedPages?: ReadonlySet<number> | number[]): Set<number> {
+  const pages = failedPages instanceof Set ? failedPages : new Set<number>(failedPages || []);
+  const out = new Set<number>();
+  if (!pages.size) return out;
+  for (const line of lines) if (pages.has(line.page)) out.add(lineNo(line));
+  return out;
+}
+
+/** #42 — a defect whose every cited line sits on a read-failed page is not repair's to fix. */
+export function isReadFailedDefect(defect: Defect, failedLineNos: ReadonlySet<number>): boolean {
+  return defect.lineIds.length > 0 && defect.lineIds.every(n => failedLineNos.has(n));
+}
 
 export function renderDefectEvidenceOnly(defect: Defect): string {
   const evidence = defect.evidence.map(e => `[L${String(e.line).padStart(4, '0')}] ${e.text}`).join('\n');
@@ -431,7 +523,8 @@ export async function runRepairLoop(params: {
   const usage = { inputTokens: 0, outputTokens: 0 };
   const escalationUsage = { inputTokens: 0, outputTokens: 0 };
   const base = (status: RepairLoopResult['status'], state: RepairState, remaining: Defect[], extra?: Partial<RepairLoopResult>): RepairLoopResult => ({
-    status, state, rounds: [], calls: 0, opsAccepted: 0, opsRejected: 0, escalations: 0,
+    status, state, rounds: [], calls: 0, opsProposed: 0, opsAccepted: 0, opsRejected: 0, opsDeduped: 0, opsMalformed: 0,
+    escalations: 0, abandonedKinds: [], droppedReadFailedDefects: 0,
     remainingDefects: remaining, usage, escalationUsage, furnitureDropped: [], ...extra,
   });
 
@@ -440,8 +533,10 @@ export async function runRepairLoop(params: {
       const cached = JSON.parse(params.cachedResult);
       if (Array.isArray(cached.questions) && Array.isArray(cached.sections)) {
         return base('cached', { questions: cached.questions, sections: cached.sections }, Array.isArray(cached.remainingDefects) ? cached.remainingDefects : [], {
-          rounds: cached.rounds || [], opsAccepted: cached.opsAccepted || 0, opsRejected: cached.opsRejected || 0,
-          escalations: cached.escalations || 0, furnitureDropped: cached.furnitureDropped || [],
+          rounds: cached.rounds || [], opsProposed: cached.opsProposed || 0, opsAccepted: cached.opsAccepted || 0,
+          opsRejected: cached.opsRejected || 0, opsDeduped: cached.opsDeduped || 0, opsMalformed: cached.opsMalformed || 0,
+          escalations: cached.escalations || 0, abandonedKinds: cached.abandonedKinds || [],
+          droppedReadFailedDefects: cached.droppedReadFailedDefects || 0, furnitureDropped: cached.furnitureDropped || [],
         });
       }
     } catch { /* fall through to a live loop */ }
@@ -459,6 +554,9 @@ export async function runRepairLoop(params: {
 
   const state: RepairState = structuredClone(params.state);
   const furnitureDropped: number[] = [];
+  // #42 — defects that live wholly on read-failed pages are owned by the page-retry path: never batch them.
+  const failedLineNos = readFailedLineNos(params.lines, params.failedPages);
+  const repairable = (list: Defect[]) => list.filter(d => !isReadFailedDefect(d, failedLineNos));
   let defects: Defect[];
   try {
     defects = computeNow(state);
@@ -467,8 +565,11 @@ export async function runRepairLoop(params: {
     await params.onJournal?.({ label: 'Repair loop skipped (verifier error)', rawText: String(err?.message || err) });
     return base('skipped', state, []);
   }
-  if (!params.caller && !params.escalationCaller) return base('skipped', state, defects);
+  const droppedAtStart = defects.length - repairable(defects).length;
+  if (!params.caller && !params.escalationCaller) return base('skipped', state, defects, { droppedReadFailedDefects: droppedAtStart });
   if (!defects.length) return base('no-defects', state, []);
+  // Nothing repair is allowed to touch: the pages themselves have to be retried, so spend zero calls.
+  if (!repairable(defects).length) return base('no-defects', state, defects, { droppedReadFailedDefects: droppedAtStart });
 
   const maxRounds = Math.max(1, Math.min(params.maxRounds ?? REPAIR_MAX_ROUNDS, REPAIR_MAX_ROUNDS));
   const survival = new Map<DefectKind, number>();
@@ -476,22 +577,46 @@ export async function runRepairLoop(params: {
   const escalatedOnce = new Set<DefectKind>();
   const rounds: RepairRoundRecord[] = [];
   let calls = 0;
+  let opsProposed = 0;
   let opsAccepted = 0;
   let opsRejected = 0;
+  let opsDeduped = 0;
+  let opsMalformed = 0;
   let escalations = 0;
+  const abandonedKinds = new Set<DefectKind>();
+  /** Operations already rejected this parse: never re-sent to the validator, never re-counted. */
+  const rejectedSigs = new Set<string>();
 
   for (let round = 1; round <= maxRounds; round++) {
     const before = defects.length;
-    const byKind = defectsByKind(defects);
+    const byKindAll = defectsByKind(defects);
+    const byKind = new Map<DefectKind, Defect[]>();
+    let droppedThisRound = 0;
+    for (const [kind, list] of byKindAll) {
+      const keep = repairable(list);
+      droppedThisRound += list.length - keep.length;
+      if (keep.length) byKind.set(kind, keep);
+    }
     const record: RepairRoundRecord = {
       round,
       defectsBefore: before,
-      byKind: Object.fromEntries([...byKind.entries()].map(([k, v]) => [k, v.length])),
-      calls: 0, proposed: 0, accepted: 0, rejected: 0, noFix: 0,
-      escalatedKinds: [], defectsAfter: before, receipts: [],
+      byKind: Object.fromEntries([...byKindAll.entries()].map(([k, v]) => [k, v.length])),
+      calls: 0, proposed: 0, accepted: 0, rejected: 0, deduped: 0, noFix: 0, malformed: 0,
+      escalatedKinds: [], abandonedKinds: [], droppedReadFailed: droppedThisRound, defectsAfter: before, receipts: [],
     };
     const ctx = makeRepairContext(state, params.lines, params.keyLineNos, defects, params.failedPages);
     ctx.furnitureDropped = new Set(furnitureDropped);
+    // Every kind's defects are impossible to fix right now (read-failed pages): make no calls at all.
+    if (!byKind.size) {
+      rounds.push(record);
+      await params.onJournal?.({
+        label: `Repair loop round ${round} skipped`,
+        rawText: JSON.stringify({ round, defectsBefore: before, droppedReadFailed: droppedThisRound, reason: 'all remaining defects lie on read-failed pages; retry those pages instead' }),
+      });
+      break;
+    }
+    const rejectionsByKind = new Map<DefectKind, number>();
+    const seenSigs = new Set<string>();
 
     for (const [kind, kindDefects] of byKind) {
       const shouldEscalate = !!params.escalationCaller && !escalatedOnce.has(kind)
@@ -517,28 +642,70 @@ export async function runRepairLoop(params: {
         const bucket = shouldEscalate ? escalationUsage : usage;
         if (response.usage) { bucket.inputTokens += response.usage.inputTokens || 0; bucket.outputTokens += response.usage.outputTokens || 0; }
         await params.onJournal?.({ label, rawText: response.rawText.slice(0, 200000), requestText });
-        const { ops, rejected } = parseRepairOps(response.rawText, response.json);
-        record.rejected += rejected;
-        opsRejected += rejected;
-        params.budget.units += rejected;
+        const parsedOps = parseRepairOps(response.rawText, response.json);
+        const { ops } = parsedOps;
+        // #42: unreadable entries are their own bucket — they were never well-formed operations.
+        record.malformed += parsedOps.rejected;
+        opsMalformed += parsedOps.rejected;
+        params.budget.units += parsedOps.rejected;
+        if (parsedOps.complaints.length) {
+          await params.onJournal?.({ label: `${label} — unreadable operations`, rawText: parsedOps.complaints.join('\n') });
+        }
         const seenDefects = new Set<string>();
+        const rejectKind = (reason?: string) => {
+          record.rejected++;
+          opsRejected++;
+          rejectionsByKind.set(kind, (rejectionsByKind.get(kind) || 0) + 1);
+          if (reason) record.receipts.push(`rejected ${kind}: ${reason}`);
+        };
         for (const op of ops) {
+          if (op.op === 'noFix') {
+            record.noFix++;
+            noFixCounts.set(kind, (noFixCounts.get(kind) || 0) + 1);
+            continue;
+          }
           record.proposed++;
+          opsProposed++;
           params.budget.units++;
-          if (op.defect && seenDefects.has(op.defect)) { record.rejected++; opsRejected++; continue; }
+          const signature = repairOpSignature(op);
+          // Identical to an already-rejected op this parse (or a duplicate in this batch): cost-free dedupe.
+          if (rejectedSigs.has(signature) || seenSigs.has(signature)) {
+            record.deduped++;
+            opsDeduped++;
+            continue;
+          }
+          seenSigs.add(signature);
+          if (op.defect && seenDefects.has(op.defect)) {
+            rejectedSigs.add(signature);
+            rejectKind('two operations for one defect id');
+            continue;
+          }
           if (op.defect) seenDefects.add(op.defect);
           const verdict = validateRepairOp(op, ctx);
-          if (!verdict.ok) { record.rejected++; opsRejected++; continue; }
-          if (op.op === 'noFix') { record.noFix++; noFixCounts.set(kind, (noFixCounts.get(kind) || 0) + 1); continue; }
+          if (!verdict.ok) {
+            rejectedSigs.add(signature);
+            rejectKind(verdict.reason);
+            continue;
+          }
           try {
             const receipt = applyRepairOp(op, ctx);
             record.accepted++;
             opsAccepted++;
             record.receipts.push(receipt);
           } catch {
-            record.rejected++;
-            opsRejected++;
+            rejectedSigs.add(signature);
+            rejectKind('the operation could not be applied');
           }
+        }
+        // #42: a kind the model keeps failing on stops burning calls for the rest of the round.
+        if ((rejectionsByKind.get(kind) || 0) >= REPAIR_KIND_REJECTION_CAP) {
+          if (!record.abandonedKinds.includes(kind)) record.abandonedKinds.push(kind);
+          abandonedKinds.add(kind);
+          await params.onJournal?.({
+            label: `Repair ${kind} abandoned (round ${round})`,
+            rawText: JSON.stringify({ kind, rejections: rejectionsByKind.get(kind), cap: REPAIR_KIND_REJECTION_CAP }),
+          });
+          break;
         }
       }
     }
@@ -562,7 +729,7 @@ export async function runRepairLoop(params: {
     rounds.push(record);
     await params.onJournal?.({
       label: `Repair loop round ${round} summary`,
-      rawText: JSON.stringify({ round, defectsBefore: before, accepted: record.accepted, rejected: record.rejected, noFix: record.noFix, escalatedKinds: record.escalatedKinds, defectsAfter: defects.length, receipts: record.receipts }),
+      rawText: JSON.stringify({ round, defectsBefore: before, proposed: record.proposed, accepted: record.accepted, rejected: record.rejected, deduped: record.deduped, malformed: record.malformed, noFix: record.noFix, abandonedKinds: record.abandonedKinds, droppedReadFailed: record.droppedReadFailed, escalatedKinds: record.escalatedKinds, defectsAfter: defects.length, receipts: record.receipts }),
     });
     // Survival bookkeeping: kinds still present after this round survived it.
     const survivingKinds = new Set(defects.map(d => d.kind));
@@ -578,7 +745,9 @@ export async function runRepairLoop(params: {
   }
 
   return base('completed', state, defects, {
-    rounds, calls, opsAccepted, opsRejected, escalations,
+    rounds, calls, opsProposed, opsAccepted, opsRejected, opsDeduped, opsMalformed, escalations,
+    abandonedKinds: [...abandonedKinds],
+    droppedReadFailedDefects: defects.length - repairable(defects).length,
     furnitureDropped: [...furnitureDropped].sort((a, b) => a - b),
   });
 }
@@ -589,9 +758,14 @@ export function serializeRepairLoopResult(result: RepairLoopResult): string {
     questions: result.state.questions,
     sections: result.state.sections,
     rounds: result.rounds,
+    opsProposed: result.opsProposed,
     opsAccepted: result.opsAccepted,
     opsRejected: result.opsRejected,
+    opsDeduped: result.opsDeduped,
+    opsMalformed: result.opsMalformed,
     escalations: result.escalations,
+    abandonedKinds: result.abandonedKinds,
+    droppedReadFailedDefects: result.droppedReadFailedDefects,
     remainingDefects: result.remainingDefects,
     furnitureDropped: result.furnitureDropped,
   });

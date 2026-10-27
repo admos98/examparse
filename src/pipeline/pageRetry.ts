@@ -213,6 +213,8 @@ export async function retryFailedPage(
     status: readRes.status,
     calls: readRes.localCalls + readRes.cloudCalls,
     cloudCalls: readRes.cloudCalls,
+    ...(readRes.cloudCalls ? { cloudAttempts: readRes.cloudAttempts } : {}),
+    ...(readRes.cloudError ? { cloudError: readRes.cloudError } : {}),
     runningCalls: (doc.spine?.classify?.calls || 0) + (doc.spine?.classify?.cloudCalls || 0) + readRes.localCalls + readRes.cloudCalls,
     localComplaints: readRes.localComplaints,
     questions: readRes.proposal?.questions.length || 0,

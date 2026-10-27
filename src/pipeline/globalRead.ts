@@ -28,6 +28,8 @@ export interface ReadProposal {
   sections: ReadSection[];
   meta: { subject?: MetaProposalField<string>; grade?: MetaProposalField<string | number>; total?: MetaProposalField<number>; date?: MetaProposalField<string> };
   answerKey: Record<string, { value?: string; spans?: Array<[number, number]> }>;
+  /** #42: structural complaints produced while parsing model output (never thrown, always actionable). */
+  parseComplaints?: string[];
 }
 export interface ReadValidation { ok: boolean; complaints: string[] }
 export interface ReadCaller {
@@ -114,36 +116,208 @@ function candidate(rawText: string, json?: unknown): any {
   try { return JSON.parse(rawText.match(/\{[\s\S]*\}/)?.[0] || 'null'); } catch { return null; }
 }
 
-export function parseReadProposal(rawText: string, json?: unknown): ReadProposal {
-  const value = candidate(rawText, json) || {};
+export const UNPARSEABLE_COMPLAINT = 'output is not a JSON object';
+
+/** Plain-language name for a malformed JSON value — every parse complaint uses it. */
+function shapeOf(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'missing';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'object') return 'an object';
+  if (typeof value === 'string') return 'text';
+  if (typeof value === 'number') return 'a number';
+  if (typeof value === 'boolean') return 'a boolean';
+  return `a ${typeof value}`;
+}
+const clip = (value: unknown, max = 24): string => {
+  if (value === undefined) return 'nothing';
+  const text = typeof value === 'string' ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+};
+/** `116–124, 130` — contiguous printed lines as ranges, never a bare number soup. */
+export function formatLineRanges(nos: number[], max = 6): string {
+  const sorted = [...new Set(nos.filter(n => Number.isFinite(n)))].sort((a, b) => a - b);
+  const out: string[] = [];
+  let i = 0;
+  while (i < sorted.length && out.length < max) {
+    const start = sorted[i];
+    let end = start;
+    while (i + 1 < sorted.length && sorted[i + 1] === end + 1) end = sorted[++i];
+    out.push(end === start ? String(start) : `${start}–${end}`);
+    i++;
+  }
+  return out.join(', ');
+}
+/** A model field that must be a list; a wrong type becomes an actionable complaint, never a throw. */
+function asList(value: unknown, path: string, complaints: string[]): any[] {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) return value;
+  complaints.push(`${path} must be a list, but it is ${shapeOf(value)} — return it as a JSON array`);
+  return [];
+}
+
+export interface ReadParseResult { proposal: ReadProposal; complaints: string[] }
+
+/**
+ * #42 — the proposal parser NEVER throws. Malformed model output is data: a null entry, a missing key,
+ * a wrong type or a non-array field each becomes one plain-language complaint the model can act on
+ * (named by position, e.g. "q entry 4 is null — every question entry must be an object …").
+ */
+export function parseReadProposalChecked(rawText: string, json?: unknown): ReadParseResult {
+  const complaints: string[] = [];
   const ranges: ReadRange[] = [];
   const labels = new Map<number, ReadLabel>();
-  for (const row of value.r || value.ranges || []) {
-    const a = no(Array.isArray(row) ? row[0] : row.start ?? row.line);
-    const b = no(Array.isArray(row) ? row[1] : row.end ?? row.start ?? row.line);
-    const label = labelOf(Array.isArray(row) ? row[2] : row.label);
-    if (!label || !Number.isInteger(a) || a < 1 || !Number.isInteger(b) || b < a || b - a > 10000) continue;
-    ranges.push([a, b, label]);
-    for (let n = a; n <= b; n++) if (!labels.has(n)) labels.set(n, label);
-  }
   const questions: ReadQuestion[] = [];
-  for (const row of value.q || value.questions || []) {
-    const printed = no(row.n ?? row.no ?? row.number);
-    const spans = spanList(row.p ?? row.spans);
-    if (!Number.isInteger(printed) || printed < 1 || !spans.length) continue;
-    const options = (row.o || row.options || []).map((o: any) => ({ key: String(Array.isArray(o) ? o[0] : o.key || ''), spans: spanList(Array.isArray(o) ? o[1] : o.spans) })).filter((o: any) => o.key && o.spans.length);
-    questions.push({ no: printed, spans, section: row.s ?? row.section, type: typeOf(row.t ?? row.type), ...(options.length ? { optionSpans: options } : {}), ...(spanList(row.v ?? row.marksEvidence).length ? { marksEvidence: spanList(row.v ?? row.marksEvidence) } : {}), ...(spanList(row.a ?? row.answerSpans).length ? { answerSpans: spanList(row.a ?? row.answerSpans) } : {}), ...(Array.isArray(row.i ?? row.imageIds) ? { imageIds: (row.i ?? row.imageIds).map(String) } : {}), ...(no(row.g ?? row.parentNo) > 0 ? { parentNo: no(row.g ?? row.parentNo) } : {}) });
-  }
-  const sections: ReadSection[] = (value.s || value.sections || []).filter((s: any) => s && !Array.isArray(s)).map((s: any, i: number) => ({ id: String(s.id || `section_${i + 1}`), title: String(s.title ?? s.kind ?? '').trim(), spans: spanList(s.p ?? s.spans), ...(no(s.h ?? s.headerLine) > 0 ? { headerLine: no(s.h ?? s.headerLine) } : {}) })).filter((s: ReadSection) => s.spans.length);
+  const sections: ReadSection[] = [];
   const meta: ReadProposal['meta'] = {};
-  const rawMeta = value.m || value.meta || {};
-  for (const key of ['subject', 'grade', 'total', 'date'] as const) {
-    const field = rawMeta[key] ?? (key === 'total' ? rawMeta.totalPoints : undefined);
-    if (field && typeof field === 'object' && no(field.line ?? field.evidenceLine) > 0) (meta as any)[key] = { value: field.value, evidenceLine: no(field.line ?? field.evidenceLine) };
-  }
   const answerKey: ReadProposal['answerKey'] = {};
-  for (const [key, entry] of Object.entries(value.k || value.answerKey || {})) answerKey[key] = typeof entry === 'object' && entry ? { value: String((entry as any).value ?? ''), spans: spanList((entry as any).p ?? (entry as any).spans) } : { value: String(entry) };
-  return { labels, ranges, questions, sections, meta, answerKey };
+  const result = (): ReadParseResult => ({ proposal: { labels, ranges, questions, sections, meta, answerKey, parseComplaints: complaints }, complaints });
+  try {
+    const value = candidate(rawText, json);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      complaints.push(`${UNPARSEABLE_COMPLAINT} — return one JSON object with the keys r, q, s, m and k and nothing else`);
+      return result();
+    }
+
+    asList(value.r ?? value.ranges, 'r (line labels)', complaints).forEach((row, index) => {
+      const at = `r entry ${index + 1}`;
+      if (!row || typeof row !== 'object') {
+        complaints.push(`${at} is ${shapeOf(row)} — every line-label entry must be [startLine, endLine, label]`);
+        return;
+      }
+      const a = no(Array.isArray(row) ? row[0] : row.start ?? row.line);
+      const b = no(Array.isArray(row) ? row[1] : row.end ?? row.start ?? row.line);
+      const rawLabel = Array.isArray(row) ? row[2] : row.label;
+      const label = labelOf(rawLabel);
+      if (!label) {
+        complaints.push(`${at} has label ${clip(rawLabel, 20)} — use exactly one of ${READ_LABELS.join('|')}`);
+        return;
+      }
+      if (!Number.isInteger(a) || a < 1 || !Number.isInteger(b) || b < a || b - a > 10000) {
+        complaints.push(`${at} (${label}) has unusable lines — each entry must be [startLine, endLine, label] with real line numbers and start ≤ end`);
+        return;
+      }
+      ranges.push([a, b, label]);
+      for (let n = a; n <= b; n++) if (!labels.has(n)) labels.set(n, label);
+    });
+
+    asList(value.q ?? value.questions, 'q (questions)', complaints).forEach((row, index) => {
+      const at = `q entry ${index + 1}`;
+      if (!row || typeof row !== 'object' || Array.isArray(row)) {
+        complaints.push(`${at} is ${shapeOf(row)} — every question entry must be an object with the printed number "n" and line spans "p"`);
+        return;
+      }
+      const printed = no(row.n ?? row.no ?? row.number);
+      const spans = spanList(row.p ?? row.spans);
+      if (!Number.isInteger(printed) || printed < 1) {
+        complaints.push(`${at} has no printed question number — set "n" to the number printed on the sheet`);
+        return;
+      }
+      if (!spans.length) {
+        complaints.push(`q entry ${index + 1} (question ${printed}) has no usable line spans — set "p" to [[startLine, endLine]] on this page`);
+        return;
+      }
+      const optionSpans: Array<{ key: string; spans: Array<[number, number]> }> = [];
+      asList(row.o ?? row.options, `q entry ${index + 1} (question ${printed}) options`, complaints).forEach((option, optionIndex) => {
+        const key = String((Array.isArray(option) ? option[0] : option && typeof option === 'object' ? (option as any).key : '') ?? '').trim();
+        const spansOfOption = spanList(Array.isArray(option) ? option[1] : option && typeof option === 'object' ? (option as any).spans : undefined);
+        if (!key || !spansOfOption.length) {
+          complaints.push(`q entry ${index + 1} (question ${printed}) option ${optionIndex + 1} is ${shapeOf(option)} without a usable key and line span — every option must be ["a", [[line, line]]]`);
+          return;
+        }
+        optionSpans.push({ key: key.slice(0, 8), spans: spansOfOption });
+      });
+      const section = typeof (row.s ?? row.section) === 'string' ? String(row.s ?? row.section) : undefined;
+      const marksEvidence = spanList(row.v ?? row.marksEvidence);
+      const answerSpans = spanList(row.a ?? row.answerSpans);
+      const imageIds = Array.isArray(row.i ?? row.imageIds) ? (row.i ?? row.imageIds).map(String) : [];
+      const parentNo = no(row.g ?? row.parentNo);
+      questions.push({
+        no: printed,
+        spans,
+        ...(section ? { section } : {}),
+        type: typeOf(row.t ?? row.type),
+        ...(optionSpans.length ? { optionSpans } : {}),
+        ...(marksEvidence.length ? { marksEvidence } : {}),
+        ...(answerSpans.length ? { answerSpans } : {}),
+        ...(imageIds.length ? { imageIds } : {}),
+        ...(parentNo > 0 ? { parentNo } : {}),
+      });
+    });
+
+    asList(value.s ?? value.sections, 's (sections)', complaints).forEach((row, index) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) {
+        complaints.push(`s entry ${index + 1} is ${shapeOf(row)} — every section entry must be an object with a "title" and line spans "p"`);
+        return;
+      }
+      const spans = spanList(row.p ?? row.spans);
+      if (!spans.length) {
+        const title = String(row.title ?? row.kind ?? '').trim();
+        complaints.push(`s entry ${index + 1}${title ? ` ("${clip(title, 40)}")` : ''} has no usable line spans — set "p" to [[startLine, endLine]]`);
+        return;
+      }
+      const headerLine = no(row.h ?? row.headerLine);
+      sections.push({
+        id: String(row.id || `section_${index + 1}`),
+        title: String(row.title ?? row.kind ?? '').trim(),
+        spans,
+        ...(headerLine > 0 ? { headerLine } : {}),
+      });
+    });
+
+    const rawMeta = value.m ?? value.meta;
+    if (rawMeta !== undefined && rawMeta !== null && (typeof rawMeta !== 'object' || Array.isArray(rawMeta))) {
+      complaints.push(`m (metadata) is ${shapeOf(rawMeta)} — it must be an object such as {"subject":{"value":"English","line":2}}`);
+    } else if (rawMeta && typeof rawMeta === 'object') {
+      for (const key of ['subject', 'grade', 'total', 'date'] as const) {
+        const field = (rawMeta as any)[key] ?? (key === 'total' ? (rawMeta as any).totalPoints : undefined);
+        if (field === undefined || field === null) continue;
+        if (typeof field !== 'object' || Array.isArray(field)) {
+          complaints.push(`meta.${key} is ${shapeOf(field)} — every metadata field must be {"value": …, "line": <printed evidence line>}`);
+          continue;
+        }
+        const evidenceLine = no(field.line ?? field.evidenceLine);
+        if (!(evidenceLine > 0)) {
+          complaints.push(`meta.${key} has no evidence line — set "line" to the printed line the ${key} was read from`);
+          continue;
+        }
+        (meta as any)[key] = { value: field.value, evidenceLine };
+      }
+    }
+
+    const rawKey = value.k ?? value.answerKey;
+    if (rawKey !== undefined && rawKey !== null && (typeof rawKey !== 'object' || Array.isArray(rawKey))) {
+      complaints.push(`k (answer key) is ${shapeOf(rawKey)} — it must be an object keyed by printed question number, e.g. {"3":{"value":"b","p":[[90,90]]}}`);
+    } else if (rawKey && typeof rawKey === 'object') {
+      for (const [key, entry] of Object.entries(rawKey)) {
+        if (entry === null || entry === undefined) {
+          complaints.push(`k["${key}"] is ${shapeOf(entry)} — every answer-key entry must be "b" or {"value":"b","p":[[line,line]]}`);
+          continue;
+        }
+        if (typeof entry === 'object') {
+          const entryValue = String((entry as any).value ?? '');
+          const entrySpans = spanList((entry as any).p ?? (entry as any).spans);
+          if (!entryValue.trim() && !entrySpans.length) {
+            complaints.push(`k["${key}"] has neither a value nor line spans — give the printed answer text in "value" or the answer line in "p"`);
+            continue;
+          }
+          answerKey[key] = { value: entryValue, spans: entrySpans };
+          continue;
+        }
+        answerKey[key] = { value: String(entry) };
+      }
+    }
+    return result();
+  } catch (err: any) {
+    // Last resort: a thrown exception during parse is itself the bug; it becomes one complaint.
+    complaints.push(`the proposal could not be read (${String(err?.message || err)}) — return one JSON object with the keys r, q, s, m and k`);
+    return result();
+  }
+}
+
+export function parseReadProposal(rawText: string, json?: unknown): ReadProposal {
+  return parseReadProposalChecked(rawText, json).proposal;
 }
 
 export function validateReadProposal(proposal: ReadProposal, lines: SourceLine[]): ReadValidation {
@@ -151,7 +325,6 @@ export function validateReadProposal(proposal: ReadProposal, lines: SourceLine[]
 }
 
 export const NO_QUESTIONS_COMPLAINT = 'the proposal contains no questions';
-const UNPARSEABLE_COMPLAINT = 'output is not a JSON object';
 
 /** True when the model returned a JSON object at all (format), independent of what it labelled (content). */
 export function readOutputParses(rawText: string, json?: unknown): boolean {
@@ -184,53 +357,169 @@ export function pageReadFailedMessage(page: number, reason?: string): string {
   return `Page ${page} couldn't be read — its questions are missing.`;
 }
 
+/** Contiguous ranges inside one question's spans (used to name a question in a complaint). */
+function questionSpanText(q: ReadQuestion): string {
+  const nos: number[] = [];
+  for (const [a, b] of q.spans) for (let n = a; n <= b; n++) nos.push(n);
+  return formatLineRanges(nos, 3) || 'no lines';
+}
+
+/**
+ * Arithmetic page validation. #42: every complaint names the questions (or labels) involved — a bare
+ * line list forces the model to re-derive the conflict, and it never does.
+ */
 export function validatePageProposal(
   proposal: ReadProposal,
   ownedLines: SourceLine[],
   opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean } = {},
 ): ReadValidation {
-  const expected = new Set(ownedLines.map(l => no(l.id)));
+  try {
+    return validatePageProposalUnsafe(proposal, ownedLines, opts);
+  } catch (err: any) {
+    return {
+      ok: false,
+      complaints: [`the page proposal could not be checked (${String(err?.message || err)}) — return the JSON shape from the instructions, with one label per owned line`],
+    };
+  }
+}
+
+function validatePageProposalUnsafe(
+  proposal: ReadProposal,
+  ownedLines: SourceLine[],
+  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean },
+): ReadValidation {
+  const expected = new Set((ownedLines || []).map(l => no(l.id)));
+  const ranges: ReadRange[] = (Array.isArray(proposal?.ranges) ? proposal.ranges : [])
+    .filter((row): row is ReadRange => Array.isArray(row) && row.length >= 3);
+  const questions: ReadQuestion[] = (Array.isArray(proposal?.questions) ? proposal.questions : [])
+    .filter((q): q is ReadQuestion => Boolean(q) && typeof q === 'object' && Array.isArray(q.spans));
+  const labels = proposal?.labels instanceof Map ? proposal.labels : new Map<number, ReadLabel>();
   const counts = new Map<number, number>();
+  const claims = new Map<number, string[]>();
   const complaints: string[] = [];
-  for (const [a, b] of proposal.ranges) for (let n = a; n <= b; n++) counts.set(n, (counts.get(n) || 0) + 1);
+  for (const [a, b, label] of ranges) {
+    for (let n = a; n <= b; n++) {
+      counts.set(n, (counts.get(n) || 0) + 1);
+      const list = claims.get(n);
+      const text = `${label} ${a}–${b}`;
+      if (list) { if (list.length < 3) list.push(text); } else claims.set(n, [text]);
+    }
+  }
   const missing = [...expected].filter(n => !counts.has(n));
   const duplicate = [...counts].filter(([n, c]) => expected.has(n) && c !== 1).map(([n]) => n);
   const outside = [...counts.keys()].filter(n => !expected.has(n));
-  if (missing.length) complaints.push(`every line must be accounted for exactly once; unlabelled lines: ${missing.slice(0, 30).join(', ')}`);
-  if (duplicate.length) complaints.push(`line labels overlap; multiply-labelled lines: ${duplicate.slice(0, 30).join(', ')}`);
+  if (missing.length) complaints.push(`every line must be accounted for exactly once; unlabelled lines: ${missing.slice(0, 30).join(', ')} — label every owned line and never label ctx lines`);
+  if (duplicate.length) {
+    const detail = duplicate.slice(0, 4).map(n => `line ${n} is claimed by ${(claims.get(n) || []).join(' and ')}`).join('; ');
+    complaints.push(`line labels overlap; multiply-labelled lines: ${duplicate.slice(0, 30).join(', ')} — ${detail}; each line belongs to exactly one label`);
+  }
   if (outside.length) complaints.push(`label ranges cite lines outside the document: ${outside.slice(0, 30).join(', ')}`);
 
   const outsideQuestionLines: number[] = [];
-  for (const q of proposal.questions) {
-    for (const [a, b] of q.spans) for (let n = a; n <= b; n++) if (!expected.has(n)) outsideQuestionLines.push(n);
-    for (const opt of q.optionSpans || []) for (const [a, b] of opt.spans) for (let n = a; n <= b; n++) if (!expected.has(n)) outsideQuestionLines.push(n);
+  const outsideByQuestion = new Map<number, number[]>();
+  for (const q of questions) {
+    const cited: number[] = [];
+    for (const [a, b] of q.spans) for (let n = a; n <= b; n++) if (!expected.has(n)) cited.push(n);
+    for (const opt of q.optionSpans || []) for (const [a, b] of opt.spans) for (let n = a; n <= b; n++) if (!expected.has(n)) cited.push(n);
+    if (cited.length) {
+      outsideQuestionLines.push(...cited);
+      outsideByQuestion.set(no(q.no), cited);
+    }
   }
   if (outsideQuestionLines.length) {
-    complaints.push(`question spans cite lines outside this page: ${[...new Set(outsideQuestionLines)].slice(0, 30).join(', ')}`);
+    const detail = [...outsideByQuestion.entries()].slice(0, 4)
+      .map(([no, nos]) => `question ${no} cites ${formatLineRanges(nos, 3)}`)
+      .join('; ');
+    complaints.push(`question spans cite lines outside this page: ${[...new Set(outsideQuestionLines)].slice(0, 30).join(', ')} — ${detail}; this page owns only lines ${formatLineRanges([...expected], 3)}`);
   }
 
-  if (!proposal.questions.length) {
-    const ownedLabels = [...proposal.labels.entries()].filter(([n]) => expected.has(n)).map(([, l]) => l);
+  if (!questions.length) {
+    const ownedLabels = [...labels.entries()].filter(([n]) => expected.has(n)).map(([, l]) => l);
     const hasQuestionLabel = ownedLabels.includes('question');
     const hasValidContinuation = Boolean(opts.hasOpenQuestion) && ownedLabels.some(l => l === 'continuation' || l === 'option');
-    const hasKey = opts.allowKeyOnlyPage !== false && Object.keys(proposal.answerKey).length > 0 && ownedLabels.includes('key');
+    // #42 — an answer-key page is a real page: key/marks content (plus furniture) with 0 questions is fine.
+    const keyOnlyContent = ownedLabels.some(l => l === 'key' || l === 'marks')
+      && ownedLabels.every(l => l === 'key' || l === 'marks' || l === 'furniture');
+    const hasKeyedAnswerMap = Object.keys(proposal?.answerKey || {}).length > 0 && ownedLabels.includes('key');
+    const hasKey = opts.allowKeyOnlyPage !== false && (keyOnlyContent || hasKeyedAnswerMap);
     if (hasQuestionLabel || (!hasValidContinuation && !hasKey)) {
       complaints.push(NO_QUESTIONS_COMPLAINT);
     }
   }
 
-  const nums = proposal.questions.map(q => q.no);
+  const nums = questions.map(q => q.no);
   const dupNos = [...new Set(nums.filter((n, i) => nums.indexOf(n) !== i))];
-  if (dupNos.length) complaints.push(`printed question numbers must be unique; duplicates: ${dupNos.join(', ')}`);
-  const claimed = new Map<number, number>();
-  const parentNos = new Set(proposal.questions.map(q => q.parentNo).filter((n): n is number => typeof n === 'number' && n > 0));
-  for (const q of proposal.questions) {
-    if (q.parentNo && parentNos.has(q.parentNo)) continue;
-    for (const [a, b] of q.spans) for (let n = a; n <= b; n++) claimed.set(n, (claimed.get(n) || 0) + 1);
+  if (dupNos.length) {
+    const detail = dupNos.slice(0, 4).map(no => {
+      const spans = questions.filter(q => q.no === no).map(questionSpanText).join(' and ');
+      return `question number ${no} is opened at ${spans}`;
+    }).join('; ');
+    complaints.push(`printed question numbers must be unique; duplicates: ${dupNos.slice(0, 12).join(', ')} — ${detail}; keep one question per printed number and label continued lines continuation`);
   }
-  const overlaps = [...claimed].filter(([, c]) => c > 1).map(([n]) => n);
-  if (overlaps.length) complaints.push(`question spans overlap on lines: ${overlaps.slice(0, 30).join(', ')}`);
+  const claimed = new Map<number, number[]>();
+  const parentNos = new Set(questions.map(q => q.parentNo).filter((n): n is number => typeof n === 'number' && n > 0));
+  for (const q of questions) {
+    if (q.parentNo && parentNos.has(q.parentNo)) continue;
+    for (const [a, b] of q.spans) for (let n = a; n <= b; n++) claimed.set(n, [...(claimed.get(n) || []), no(q.no)]);
+  }
+  const overlaps = [...claimed].filter(([, owners]) => owners.length > 1).map(([n]) => n);
+  if (overlaps.length) {
+    const linesByPair = new Map<string, number[]>();
+    for (const [n, owners] of claimed) {
+      if (owners.length < 2) continue;
+      for (let i = 0; i < owners.length; i++) for (let j = i + 1; j < owners.length; j++) {
+        const key = [owners[i], owners[j]].sort((x, y) => x - y).join('|');
+        linesByPair.set(key, [...(linesByPair.get(key) || []), n]);
+      }
+    }
+    const detail = [...linesByPair.entries()].slice(0, 4)
+      .map(([key, nos]) => {
+        const [a, b] = key.split('|');
+        return `questions ${a} and ${b} both claim line(s) ${formatLineRanges(nos, 4)}`;
+      })
+      .join('; ');
+    complaints.push(`question spans overlap on lines: ${overlaps.slice(0, 30).join(', ')} — ${detail}; each line belongs to exactly one question`);
+  }
   return { ok: complaints.length === 0, complaints };
+}
+
+export interface ReadCheck extends ReadValidation {
+  proposal: ReadProposal;
+  /** Did the model return a JSON object at all (format), independent of what it labelled? */
+  parses: boolean;
+  /** Structural parse complaints (wrong shape), separate from content validation complaints. */
+  parseComplaints: string[];
+}
+
+/**
+ * #42 — the single seam where model output becomes a verdict. It never throws: parse problems,
+ * validation problems and even an unexpected exception all come back as plain-language complaints.
+ */
+export function checkReadOutput(
+  rawText: string,
+  json: unknown,
+  ownedLines: SourceLine[],
+  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean } = {},
+): ReadCheck {
+  const parses = readOutputParses(rawText, json);
+  let parsed: ReadProposal;
+  let parseComplaints: string[];
+  try {
+    const result = parseReadProposalChecked(rawText, json);
+    parsed = result.proposal;
+    parseComplaints = result.complaints;
+  } catch (err: any) {
+    parsed = parseReadProposal('', undefined);
+    parseComplaints = [`the proposal could not be read (${String(err?.message || err)}) — return one JSON object with the keys r, q, s, m and k`];
+  }
+  let checked: ReadValidation;
+  try {
+    checked = validatePageProposal(parsed, ownedLines, opts);
+  } catch (err: any) {
+    checked = { ok: false, complaints: [`the page proposal could not be checked (${String(err?.message || err)}) — return the JSON shape from the instructions`] };
+  }
+  const complaints = [...new Set([...parseComplaints, ...checked.complaints].filter(Boolean))];
+  return { proposal: parsed, parses, ok: checked.ok && parseComplaints.length === 0, complaints, parseComplaints };
 }
 
 export function serializeReadProposal(proposal: ReadProposal): string {
@@ -552,9 +841,38 @@ export function mergePageProposals(
   return { proposal: merged, pageProposals };
 }
 
+/** #42 — how long a cloud rescue waits before its single transient-failure retry. */
+export const CLOUD_RETRY_DELAY_MS = 5000;
+
+/**
+ * #42 — is a thrown provider error weather or refusal? A 5xx / timeout / network failure is transient
+ * and earns the one retry; a 4xx (bad key, bad request) is not. Validation complaints never reach here.
+ */
+export function isTransientProviderError(message: unknown): boolean {
+  const text = String((message as any)?.message ?? message ?? '');
+  if (!text) return false;
+  if (/\b(429|408|425|5\d\d)\b/.test(text)) return true;
+  return /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EAI_AGAIN|ENOTFOUND|ESOCKETTIMEDOUT|socket hang up|fetch failed|network|timed?\s?out|timeout|bad gateway|service unavailable|gateway timeout|temporarily unavailable|overloaded|rate.?limit|too many requests|upstream)/i.test(text);
+}
+
+export interface CloudPageReadResult {
+  ok: boolean;
+  proposal?: ReadProposal;
+  complaints: string[];
+  usage: { inputTokens: number; outputTokens: number };
+  requestText: string;
+  /** #42: how many cloud calls this page actually spent (1, or 2 after a transient retry). */
+  calls: number;
+  attempts: number;
+  /** #42: the provider/transport error text when the cloud route failed for weather reasons, not content. */
+  error?: string;
+}
+
 /**
  * Re-read a single failed page via the canonical `cloud` role (`cloudPageRead`, same schema).
  * Locality boundary: ONLY that page's lines + at most 30 `ctx` lines from the previous page are sent.
+ * #42: a provider/transport failure (5xx, timeout, network) waits ~5s and retries exactly once;
+ * a validation failure gets zero content retries (the page is simply not good enough).
  */
 export async function cloudPageRead(params: {
   page: number;
@@ -567,14 +885,13 @@ export async function cloudPageRead(params: {
   guidance?: string;
   allowKeyOnlyPage?: boolean;
   caller: ReadCaller;
+  budget?: ReadBudget;
+  /** Test seam: retry delay in ms (defaults to CLOUD_RETRY_DELAY_MS). */
+  retryDelayMs?: number;
+  /** Test seam: the wait function (defaults to a real timer). */
+  wait?: (ms: number) => Promise<void>;
   onJournal?: (e: { label: string; rawText: string; requestText: string }) => void | Promise<void>;
-}): Promise<{
-  ok: boolean;
-  proposal?: ReadProposal;
-  complaints: string[];
-  usage: { inputTokens: number; outputTokens: number };
-  requestText: string;
-}> {
+}): Promise<CloudPageReadResult> {
   const usage = { inputTokens: 0, outputTokens: 0 };
   const context = params.context.slice(-READ_OVERLAP_LINES);
   const requestText = buildPageReadPrompt({
@@ -588,39 +905,72 @@ export async function cloudPageRead(params: {
     complaints: params.complaints,
   });
   const label = `Cloud · Page ${params.page} Read`;
-  try {
-    const response = await params.caller({
-      system: GLOBAL_READ_SYSTEM,
-      text: requestText,
-      label,
-      maxOutputTokens: 32000,
-      reasoningOff: true,
-    });
-    if (response.usage) {
-      usage.inputTokens += response.usage.inputTokens || 0;
-      usage.outputTokens += response.usage.outputTokens || 0;
+  const delay = params.retryDelayMs ?? CLOUD_RETRY_DELAY_MS;
+  const wait = params.wait ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const allowanceOpen = () => !params.budget || params.budget.calls < params.budget.maxCalls;
+  let calls = 0;
+  let error: string | undefined;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (!allowanceOpen()) break;
+    // Charged before the call: a request that throws is never free.
+    calls++;
+    if (params.budget) params.budget.calls++;
+    try {
+      const response = await params.caller({
+        system: GLOBAL_READ_SYSTEM,
+        text: requestText,
+        label,
+        maxOutputTokens: 32000,
+        reasoningOff: true,
+      });
+      if (response.usage) {
+        usage.inputTokens += response.usage.inputTokens || 0;
+        usage.outputTokens += response.usage.outputTokens || 0;
+      }
+      await params.onJournal?.({ label, rawText: response.rawText, requestText });
+      const checked = checkReadOutput(response.rawText, response.json, params.owned, {
+        hasOpenQuestion: Boolean(params.openQuestion),
+        allowKeyOnlyPage: params.allowKeyOnlyPage,
+      });
+      return {
+        ok: checked.ok,
+        proposal: checked.ok ? checked.proposal : undefined,
+        complaints: checked.complaints,
+        usage,
+        requestText,
+        calls,
+        attempts: attempt,
+        // The retry succeeded, but the page record still reports the weather it flew through.
+        ...(error ? { error } : {}),
+      };
+    } catch (err: any) {
+      error = String(err?.message || err);
+      if (attempt === 1 && isTransientProviderError(error)) {
+        await wait(delay);
+        continue;
+      }
+      return {
+        ok: false,
+        complaints: [error],
+        usage,
+        requestText,
+        calls,
+        attempts: attempt,
+        error,
+      };
     }
-    await params.onJournal?.({ label, rawText: response.rawText, requestText });
-    const parsed = parseReadProposal(response.rawText, response.json);
-    const checked = validatePageProposal(parsed, params.owned, {
-      hasOpenQuestion: Boolean(params.openQuestion),
-      allowKeyOnlyPage: params.allowKeyOnlyPage,
-    });
-    return {
-      ok: checked.ok,
-      proposal: checked.ok ? parsed : undefined,
-      complaints: checked.complaints,
-      usage,
-      requestText,
-    };
-  } catch (err: any) {
-    return {
-      ok: false,
-      complaints: [String(err?.message || err)],
-      usage,
-      requestText,
-    };
   }
+
+  return {
+    ok: false,
+    complaints: [error || readAllowanceExhaustedReason(params.budget?.maxCalls ?? 0)],
+    usage,
+    requestText,
+    calls,
+    attempts: calls,
+    ...(error ? { error } : {}),
+  };
 }
 
 /**
@@ -640,6 +990,10 @@ export async function readSinglePageWithFallback(params: {
   budget?: ReadBudget;
   guidance?: string;
   allowKeyOnlyPage?: boolean;
+  /** #42 test seam: delay before the single cloud transient-failure retry (defaults to 5s). */
+  cloudRetryDelayMs?: number;
+  /** #42 test seam: the wait function used by the cloud retry. */
+  wait?: (ms: number) => Promise<void>;
   onJournal?: (e: { label: string; rawText: string; requestText: string }) => void | Promise<void>;
 }): Promise<{
   proposal?: ReadProposal;
@@ -647,6 +1001,10 @@ export async function readSinglePageWithFallback(params: {
   cached: boolean;
   localCalls: number;
   cloudCalls: number;
+  /** #42: cloud calls spent on this page's rescue (1, or 2 after a transient retry). */
+  cloudAttempts: number;
+  /** #42: the provider/transport error text when the cloud route failed for weather, not content. */
+  cloudError?: string;
   usage: { inputTokens: number; outputTokens: number };
   cloudUsage: { inputTokens: number; outputTokens: number };
   complaints: string[];
@@ -672,14 +1030,19 @@ export async function readSinglePageWithFallback(params: {
       const serialized = typeof cachedEntry === 'string' ? cachedEntry : cachedEntry?.serialized;
       const source = typeof cachedEntry === 'object' && cachedEntry?.source === 'cloud' ? 'cloud ok' : 'local ok';
       if (serialized) {
-        const parsed = deserializeReadProposal(serialized);
-        if (parsed && validatePageProposal(parsed, chunk.owned, { hasOpenQuestion: Boolean(params.openQuestion), allowKeyOnlyPage: params.allowKeyOnlyPage }).ok) {
+        // Re-validate the cached wire payload with the same never-throwing seam used for live output.
+        let wire: unknown;
+        try { wire = JSON.parse(serialized); } catch { wire = undefined; }
+        const recheck = wire ? checkReadOutput('', wire, chunk.owned, { hasOpenQuestion: Boolean(params.openQuestion), allowKeyOnlyPage: params.allowKeyOnlyPage }) : undefined;
+        if (recheck?.ok) {
+          const parsed = recheck.proposal;
           return {
             proposal: parsed,
             status: source,
             cached: true,
             localCalls: 0,
             cloudCalls: 0,
+            cloudAttempts: 0,
             usage,
             cloudUsage,
             complaints: [],
@@ -694,6 +1057,8 @@ export async function readSinglePageWithFallback(params: {
   const localComplaints: string[] = [];
   let localCalls = 0;
   let cloudCalls = 0;
+  let cloudAttempts = 0;
+  let cloudError: string | undefined;
   const allowanceOpen = () => !params.budget || params.budget.calls < params.budget.maxCalls;
   const exhausted = () => [readAllowanceExhaustedReason(params.budget?.maxCalls ?? 0)];
 
@@ -732,12 +1097,12 @@ export async function readSinglePageWithFallback(params: {
           usage.outputTokens += response.usage.outputTokens || 0;
         }
         await params.onJournal?.({ label, rawText: response.rawText, requestText: text });
-        const parsed = parseReadProposal(response.rawText, response.json);
-        const parses = readOutputParses(response.rawText, response.json);
-        const checked = validatePageProposal(parsed, chunk.owned, {
+        const checked = checkReadOutput(response.rawText, response.json, chunk.owned, {
           hasOpenQuestion: Boolean(params.openQuestion),
           allowKeyOnlyPage: params.allowKeyOnlyPage,
         });
+        const parsed = checked.proposal;
+        const parses = checked.parses;
         if (checked.ok) {
           if (params.pageCache && cacheKey) {
             await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(parsed), source: 'local' });
@@ -748,6 +1113,7 @@ export async function readSinglePageWithFallback(params: {
             cached: false,
             localCalls,
             cloudCalls,
+            cloudAttempts,
             usage,
             cloudUsage,
             complaints: [],
@@ -755,7 +1121,7 @@ export async function readSinglePageWithFallback(params: {
           };
         }
         complaints = checked.complaints;
-        localComplaints.push(`attempt ${attempt}: ${(parses ? checked.complaints : [UNPARSEABLE_COMPLAINT, ...checked.complaints]).join('; ')}`);
+        localComplaints.push(`attempt ${attempt}: ${(parses ? checked.complaints : [UNPARSEABLE_COMPLAINT, ...checked.complaints.filter(c => c !== UNPARSEABLE_COMPLAINT)]).join('; ')}`);
         // #41 fast-path: a model that cannot speak the schema gains nothing from the complaint read back.
         // Spend the call on the cloud rescue instead (only when a rescue exists; otherwise retry locally).
         if (attempt === 1 && params.cloudCaller && isFormatFailure({ parses, complaints, owned: chunk.owned, proposal: parsed })) break;
@@ -772,8 +1138,7 @@ export async function readSinglePageWithFallback(params: {
     if (!allowanceOpen()) {
       complaints = exhausted();
     } else {
-      cloudCalls++;
-      if (params.budget) params.budget.calls++;
+      // #42: cloudPageRead charges the allowance per attempt (it may retry a transient failure once).
       const cloud = await cloudPageRead({
         page: chunk.page,
         totalPages,
@@ -785,8 +1150,14 @@ export async function readSinglePageWithFallback(params: {
         guidance: params.guidance,
         allowKeyOnlyPage: params.allowKeyOnlyPage,
         caller: params.cloudCaller,
+        budget: params.budget,
+        retryDelayMs: params.cloudRetryDelayMs,
+        wait: params.wait,
         onJournal: params.onJournal,
       });
+      cloudCalls += cloud.calls;
+      cloudAttempts = cloud.attempts;
+      cloudError = cloud.error;
       cloudUsage.inputTokens += cloud.usage.inputTokens;
       cloudUsage.outputTokens += cloud.usage.outputTokens;
       if (cloud.ok && cloud.proposal) {
@@ -799,6 +1170,8 @@ export async function readSinglePageWithFallback(params: {
           cached: false,
           localCalls,
           cloudCalls,
+          cloudAttempts,
+          cloudError,
           usage,
           cloudUsage,
           complaints: [],
@@ -815,6 +1188,8 @@ export async function readSinglePageWithFallback(params: {
     cached: false,
     localCalls,
     cloudCalls,
+    cloudAttempts,
+    ...(cloudError ? { cloudError } : {}),
     usage,
     cloudUsage,
     complaints,
@@ -839,6 +1214,10 @@ export async function runGlobalReadStage(params: {
   cached?: string;
   budget?: ReadBudget;
   guidance?: string;
+  /** #42 test seam: delay before the single cloud transient-failure retry (defaults to 5s). */
+  cloudRetryDelayMs?: number;
+  /** #42 test seam: the wait function used by the cloud retry. */
+  wait?: (ms: number) => Promise<void>;
   onJournal?: (e: { label: string; rawText: string; requestText: string }) => void | Promise<void>;
   onPageUpdate?: (pageReport: SpinePageReadRecord, completedPages: number, totalPages: number) => void | Promise<void>;
 }): Promise<GlobalReadResult> {
@@ -935,6 +1314,8 @@ export async function runGlobalReadStage(params: {
       budget: readBudget,
       guidance: params.guidance,
       allowKeyOnlyPage: chunks.length > 1 && questionsSeenSoFar > 0,
+      cloudRetryDelayMs: params.cloudRetryDelayMs,
+      wait: params.wait,
       onJournal: params.onJournal,
     });
 
@@ -957,6 +1338,8 @@ export async function runGlobalReadStage(params: {
       ...(result.cached ? { cached: true } : {}),
       calls: result.localCalls + result.cloudCalls,
       cloudCalls: result.cloudCalls,
+      ...(result.cloudCalls ? { cloudAttempts: result.cloudAttempts } : {}),
+      ...(result.cloudError ? { cloudError: result.cloudError } : {}),
       runningCalls: calls + cloudCalls,
       localComplaints: result.localComplaints,
       questions: qCount,

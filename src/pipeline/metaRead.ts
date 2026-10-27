@@ -42,8 +42,26 @@ function durationNumbers(lines: SourceLine[]): Set<number> {
   }
   return out;
 }
+/**
+ * #42 — the metadata reader is a sibling parser of the read proposal: malformed model output is data.
+ * A shape it cannot even inspect becomes a complaint the model can act on, never an exception.
+ */
 export function validateMetaCandidate(raw: any, lines: SourceLine[]): ValidatedMeta {
-  const value: MetaCandidate = {}; const defects: MetaDefect[] = []; const lineSet = new Set(lines.map(l => Number(l.id.replace(/\D/g, ''))));
+  try {
+    return validateMetaCandidateUnsafe(raw, lines);
+  } catch (err: any) {
+    return {
+      value: {},
+      defects: [{
+        field: 'subject',
+        complaint: `the metadata could not be checked (${String(err?.message || err)}) — return subject, grade, total and date as {"value": …, "line": <printed header line>}`,
+      }],
+    };
+  }
+}
+
+function validateMetaCandidateUnsafe(raw: any, lines: SourceLine[]): ValidatedMeta {
+  const value: MetaCandidate = {}; const defects: MetaDefect[] = []; const lineSet = new Set((lines || []).map(l => Number(String(l?.id ?? '').replace(/\D/g, ''))));
   const field = (name: string) => raw?.[name];
   const evidence = (f: any): number | undefined => { const n = Number(f?.evidenceLine ?? f?.line); return Number.isInteger(n) && lineSet.has(n) ? n : undefined; };
   const subjectField = field('subject');

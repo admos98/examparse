@@ -23,6 +23,7 @@ import { PARSER_VERSION } from '../pipeline/prompts';
 import { estimateCleanupCall, cleanupKeySignature } from '../pipeline/cleanup';
 import { enumerateExpectedQuestionNos } from '../pipeline/quality';
 import { collectTextRepairCandidates, estimateTextRepairCall, textRepairCacheKey } from '../pipeline/textRepair';
+import { ReadFormatControl } from '../components/ReadFormatControl';
 
 interface Props {
   extractedDoc: ExtractedDocument;
@@ -36,6 +37,7 @@ interface Props {
   setIsAnalyzing: (val: boolean) => void;
   fileHash?: string;
   onOpenSavedExam?: (examDoc: ExamDoc) => void;
+  onSettingsUpdate?: (settings: AppSettings) => void;
 }
 
 export const Step3Analyze: React.FC<Props> = ({
@@ -50,6 +52,7 @@ export const Step3Analyze: React.FC<Props> = ({
   setIsAnalyzing,
   fileHash: fileHashProp,
   onOpenSavedExam,
+  onSettingsUpdate,
 }) => {
   const [forceRerun, setForceRerun] = useState(false);
   const [live, setLive] = useState({ stage: '', label: '', output: '', reasoning: '', info: '', attempts: [] as Array<{ stage: string; label: string; output: string; reasoning: string; ts?: string; finishReason?: string }> });
@@ -482,10 +485,14 @@ export const Step3Analyze: React.FC<Props> = ({
 
           <div className="flex items-center gap-2">
             <span className="text-[length:var(--type-12)] text-[var(--ink-2)] font-mono">
-              Provider: {activeProvider.name} ({activeRole.model})
+              Read: {(settings.providers.find(p => p.id === (settings.roleMapping.read || settings.roleMapping.fast).providerId) || settings.providers[0])?.name} ({(settings.roleMapping.read || settings.roleMapping.fast).model})
             </span>
           </div>
         </div>
+        <ReadFormatControl
+          settings={settings}
+          onChange={readFormat => onSettingsUpdate?.({ ...settings, readFormat })}
+        />
 
         {/* Metric Cards Grid */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">

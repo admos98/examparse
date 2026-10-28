@@ -6,6 +6,7 @@ import { sliceSourceSpans } from './spans';
 export const READ_VERSION = 'global-read-v2';
 export const READ_LABELS = ['furniture', 'section', 'instruction', 'question', 'continuation', 'option', 'passage', 'key', 'marks'] as const;
 export type ReadLabel = typeof READ_LABELS[number];
+export type ReadFormat = 'compact' | 'verbose';
 export type ReadRange = [number, number, ReadLabel];
 
 export interface ReadQuestion {
@@ -65,6 +66,7 @@ export interface OpenQuestionCarryOver {
 export interface PageReadCacheEntry {
   serialized: string;
   source: 'local' | 'cloud';
+  format?: ReadFormat;
 }
 
 export interface PageReadCache {
@@ -92,6 +94,12 @@ export interface GlobalReadResult {
 export const GLOBAL_READ_SYSTEM = `You are ExamRead. Read ONE printed exam page (sheet) and propose its line spans and questions. Reasoning is OFF. Return JSON only and never copy or author question text: code slices text from your line spans.
 Output {"r":[[start,end,label]],"q":[{"n":1,"p":[[10,12]],"s":"sec1","t":"mcq","o":[["a",[[11,11]]]],"v":[[12,12]],"a":[[90,90]],"i":["img1"]}],"s":[{"id":"sec1","title":"Vocabulary","p":[[8,40]],"h":8}],"m":{"subject":{"value":"English","line":2},"grade":{"value":"12","line":3},"total":{"value":40,"line":95}},"k":{"1":{"value":"b","p":[[90,90]]}}}.
 Labels are exactly furniture|section|instruction|question|continuation|option|passage|key|marks. Label ONLY this page's non-ctx lines, each line exactly once; lines marked ctx are read-only context from the previous page and must never be labelled or owned. If OPEN QUESTION FROM PREVIOUS PAGE is not "none" and top lines of this page continue that question before the next printed question number, label those top lines continuation (or option/marks) and do NOT re-open that question number in q. Give every printed question number starting on this page and its complete boundary on this page. Type is mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay|unknown. v is ONLY line spans that explicitly print that question's marks; omit it when marks are not printed. Never infer/distribute points. Use PAGE IMAGES (caption + address) to attach matching page image ids in i:[id]; captions are context only. Meta fields require one evidence line each. A repeated header, footer, page number, or “continued” line is furniture, never a section or question. Use ranges economically. /no_think`;
+
+export const GLOBAL_READ_VERBOSE_SYSTEM = `You are ExamRead. Read ONE printed exam page and describe its real structure. Reasoning is OFF. Return one JSON object only. Do not copy or author question text; code slices text from the line numbers you cite.
+Use full, self-descriptive English keys. Every question is a separate object and must include its printed number, type, stemLines, optionLines, continuationLines, marksLine, answerLine, and imageIds. Line lists are explicit arrays of printed line numbers, never ranges encoded as [start,count], and no field has positional meaning. Use null when marksLine or answerLine is absent and [] for empty lists.
+A page object has this shape: {"page":1,"furnitureLines":[1,2],"sections":[{"title":"Listening","headerLine":5}],"questions":[{"number":1,"type":"truefalse","stemLines":[8],"optionLines":[],"continuationLines":[],"marksLine":null,"answerLine":null,"imageIds":[]},{"number":2,"type":"mcq","stemLines":[12],"optionLines":[13,14,15,16],"options":[{"key":"a","lines":[13]},{"key":"b","lines":[14]},{"key":"c","lines":[15]},{"key":"d","lines":[16]}],"continuationLines":[],"marksLine":17,"answerLine":null,"imageIds":["img1"]}],"answerKey":[{"number":1,"answer":"true","line":90}]}. This is a fully-worked example: question 1 is true/false and question 2 is multiple choice.
+Questions occur where the printed numbers are. If you are producing questions at regular line intervals, you have stopped reading — go back to the printed numbers.
+List only lines you can confidently claim: furnitureLines for repeated headers/footers/page numbers; sections use their printed title and headerLine; each question's stemLines, optionLines, continuationLines, marksLine and answerLine describe its evidence. Do not make a line-by-line label table. Unclaimed lines are okay; code reconciles them. Never infer or distribute marks. Use type names mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay|unknown. Answer-key entries give printed number, answer, and evidence line. Add image ids only when that page image belongs to the question. Meta may be supplied as metadata with evidence lines. Lines marked ctx are read-only and must never be claimed. If OPEN QUESTION FROM PREVIOUS PAGE names a question, top lines may continue it; do not re-open its printed number. A repeated header, footer, or page number is furniture. /no_think`;
 
 const no = (value: unknown): number => Number(String(value ?? '').replace(/[^0-9۰-۹٠-٩]/g, '').replace(/[۰-۹]/g, d => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))).replace(/[٠-٩]/g, d => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))));
 const lineNo = (l: SourceLine) => no(l.id);
@@ -159,12 +167,73 @@ function asList(value: unknown, path: string, complaints: string[]): any[] {
 
 export interface ReadParseResult { proposal: ReadProposal; complaints: string[] }
 
+/** Convert the self-descriptive verbose wire shape to the canonical compact-shaped parser input. */
+function normalizeVerboseProposal(raw: any, ownedLines: SourceLine[]): any {
+  const lineNumbers = ownedLines.map(lineNo).sort((a, b) => a - b);
+  const mark = (line: unknown, label: ReadLabel) => {
+    const n = no(line);
+    return n > 0 ? [n, n, label] : undefined;
+  };
+  const rows: any[] = [];
+  const furniture = Array.isArray(raw.furnitureLines) ? raw.furnitureLines : [];
+  for (const n of furniture) { const r = mark(n, 'furniture'); if (r) rows.push(r); }
+  const sections = (Array.isArray(raw.sections) ? raw.sections : []).map((sec: any, i: number) => {
+    const headerLine = no(sec?.headerLine);
+    if (headerLine) rows.push([headerLine, headerLine, 'section']);
+    const next = (raw.sections || []).map((x: any) => no(x?.headerLine)).filter((n: number) => n > headerLine).sort((a: number, b: number) => a - b)[0];
+    const answerLines = (Array.isArray(raw.answerKey) ? raw.answerKey : []).map((entry: any) => no(entry?.line)).filter(Boolean);
+    const sectionLines = lineNumbers.filter(n => n >= headerLine && (!next || n < next) && !answerLines.includes(n));
+    const end = sectionLines.at(-1) || headerLine;
+    return { id: `sec${i + 1}`, title: String(sec?.title || ''), p: headerLine ? [[headerLine, Math.max(headerLine, end)]] : [], h: headerLine };
+  });
+  const questions = (Array.isArray(raw.questions) ? raw.questions : []).map((q: any) => {
+    const stemLines = Array.isArray(q?.stemLines) ? q.stemLines : [];
+    const optionLines = Array.isArray(q?.optionLines) ? q.optionLines : [];
+    const continuationLines = Array.isArray(q?.continuationLines) ? q.continuationLines : [];
+    const options = Array.isArray(q?.options) ? q.options.map((o: any, i: number) => [String(o?.key || String.fromCharCode(97 + i)), (Array.isArray(o?.lines) ? o.lines : []).map((n: number) => [no(n), no(n)])])
+      : optionLines.map((n: number, i: number) => [parseLeadingOptionKey(ownedLines.find(l => lineNo(l) === no(n))?.text || '') || String.fromCharCode(97 + i), [[no(n), no(n)]]]);
+    for (const n of stemLines) { const r = mark(n, 'question'); if (r) rows.push(r); }
+    for (const n of optionLines) { const r = mark(n, 'option'); if (r) rows.push(r); }
+    for (const n of continuationLines) { const r = mark(n, 'continuation'); if (r) rows.push(r); }
+    for (const n of (Array.isArray(q?.options) ? q.options.flatMap((o: any) => o?.lines || []) : [])) { const r = mark(n, 'option'); if (r) rows.push(r); }
+    const marksLine = q?.marksLine; if (marksLine != null) { const r = mark(marksLine, 'marks'); if (r) rows.push(r); }
+    const answerLine = q?.answerLine; if (answerLine != null) { const r = mark(answerLine, 'key'); if (r) rows.push(r); }
+    const firstQuestionLine = [...stemLines, ...optionLines, ...continuationLines].map(no).filter(Boolean).sort((a: number, b: number) => a - b)[0] || 0;
+    const headerSection = sections.filter((sec: any) => no(sec.h) <= firstQuestionLine).sort((a: any, b: any) => no(b.h) - no(a.h))[0] || sections[0];
+    return {
+      n: q?.number, t: q?.type,
+      p: [...stemLines, ...continuationLines].map((n: number) => [no(n), no(n)]),
+      o: options,
+      ...(headerSection ? { s: headerSection.id } : q?.section ? { s: String(q.section) } : {}),
+      ...(marksLine != null ? { v: [[no(marksLine), no(marksLine)]] } : {}),
+      ...(answerLine != null ? { a: [[no(answerLine), no(answerLine)]] } : {}),
+      i: Array.isArray(q?.imageIds) ? q.imageIds : [],
+      ...(q?.parentNumber ? { g: q.parentNumber } : {}),
+    };
+  });
+  const answerKey: Record<string, any> = {};
+  for (const entry of Array.isArray(raw.answerKey) ? raw.answerKey : []) {
+    if (entry?.number != null) answerKey[String(entry.number)] = { value: String(entry.answer ?? ''), p: entry.line != null ? [[no(entry.line), no(entry.line)]] : [] };
+    if (entry?.line != null) { const r = mark(entry.line, 'key'); if (r) rows.push(r); }
+  }
+  // Deterministically keep one label per line, preferring the most specific structural claim.
+  const priority: ReadLabel[] = ['question', 'option', 'continuation', 'marks', 'key', 'section', 'furniture'];
+  const byLine = new Map<number, ReadLabel>();
+  for (const [a, b, label] of rows) for (let n = a; n <= b; n++) {
+    const prior = byLine.get(n);
+    if (!prior || priority.indexOf(label) < priority.indexOf(prior)) byLine.set(n, label);
+  }
+  const ranges = [...byLine].sort((a, b) => a[0] - b[0]).map(([n, label]) => [n, n, label]);
+  return { r: ranges, q: questions, s: sections, k: answerKey, ...(raw.metadata ? { m: raw.metadata } : {}) };
+}
+
+
 /**
  * #42 — the proposal parser NEVER throws. Malformed model output is data: a null entry, a missing key,
  * a wrong type or a non-array field each becomes one plain-language complaint the model can act on
  * (named by position, e.g. "q entry 4 is null — every question entry must be an object …").
  */
-export function parseReadProposalChecked(rawText: string, json?: unknown): ReadParseResult {
+export function parseReadProposalChecked(rawText: string, json?: unknown, format: ReadFormat = 'compact', ownedLines: SourceLine[] = []): ReadParseResult {
   const complaints: string[] = [];
   const ranges: ReadRange[] = [];
   const labels = new Map<number, ReadLabel>();
@@ -174,7 +243,8 @@ export function parseReadProposalChecked(rawText: string, json?: unknown): ReadP
   const answerKey: ReadProposal['answerKey'] = {};
   const result = (): ReadParseResult => ({ proposal: { labels, ranges, questions, sections, meta, answerKey, parseComplaints: complaints }, complaints });
   try {
-    const value = candidate(rawText, json);
+    let value = candidate(rawText, json);
+    if (format === 'verbose' && value && typeof value === 'object' && !Array.isArray(value)) value = normalizeVerboseProposal(value, ownedLines);
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       complaints.push(`${UNPARSEABLE_COMPLAINT} — return one JSON object with the keys r, q, s, m and k and nothing else`);
       return result();
@@ -316,8 +386,8 @@ export function parseReadProposalChecked(rawText: string, json?: unknown): ReadP
   }
 }
 
-export function parseReadProposal(rawText: string, json?: unknown): ReadProposal {
-  return parseReadProposalChecked(rawText, json).proposal;
+export function parseReadProposal(rawText: string, json?: unknown, format: ReadFormat = 'compact', ownedLines: SourceLine[] = []): ReadProposal {
+  return parseReadProposalChecked(rawText, json, format, ownedLines).proposal;
 }
 
 export function validateReadProposal(proposal: ReadProposal, lines: SourceLine[]): ReadValidation {
@@ -371,7 +441,7 @@ function questionSpanText(q: ReadQuestion): string {
 export function validatePageProposal(
   proposal: ReadProposal,
   ownedLines: SourceLine[],
-  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean } = {},
+  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean; allowUnclaimed?: boolean } = {},
 ): ReadValidation {
   try {
     return validatePageProposalUnsafe(proposal, ownedLines, opts);
@@ -386,7 +456,7 @@ export function validatePageProposal(
 function validatePageProposalUnsafe(
   proposal: ReadProposal,
   ownedLines: SourceLine[],
-  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean },
+  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean; allowUnclaimed?: boolean },
 ): ReadValidation {
   const expected = new Set((ownedLines || []).map(l => no(l.id)));
   const ranges: ReadRange[] = (Array.isArray(proposal?.ranges) ? proposal.ranges : [])
@@ -405,7 +475,7 @@ function validatePageProposalUnsafe(
       if (list) { if (list.length < 3) list.push(text); } else claims.set(n, [text]);
     }
   }
-  const missing = [...expected].filter(n => !counts.has(n));
+  const missing = opts.allowUnclaimed ? [] : [...expected].filter(n => !counts.has(n));
   const duplicate = [...counts].filter(([n, c]) => expected.has(n) && c !== 1).map(([n]) => n);
   const outside = [...counts.keys()].filter(n => !expected.has(n));
   if (missing.length) complaints.push(`every line must be accounted for exactly once; unlabelled lines: ${missing.slice(0, 30).join(', ')} — label every owned line and never label ctx lines`);
@@ -499,13 +569,13 @@ export function checkReadOutput(
   rawText: string,
   json: unknown,
   ownedLines: SourceLine[],
-  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean } = {},
+  opts: { hasOpenQuestion?: boolean; allowKeyOnlyPage?: boolean; format?: ReadFormat; allowUnclaimed?: boolean } = {},
 ): ReadCheck {
   const parses = readOutputParses(rawText, json);
   let parsed: ReadProposal;
   let parseComplaints: string[];
   try {
-    const result = parseReadProposalChecked(rawText, json);
+    const result = parseReadProposalChecked(rawText, json, opts.format || 'compact', ownedLines);
     parsed = result.proposal;
     parseComplaints = result.complaints;
   } catch (err: any) {
@@ -514,7 +584,7 @@ export function checkReadOutput(
   }
   let checked: ReadValidation;
   try {
-    checked = validatePageProposal(parsed, ownedLines, opts);
+    checked = validatePageProposal(parsed, ownedLines, { ...opts, allowUnclaimed: opts.allowUnclaimed || opts.format === 'verbose' });
   } catch (err: any) {
     checked = { ok: false, complaints: [`the page proposal could not be checked (${String(err?.message || err)}) — return the JSON shape from the instructions`] };
   }
@@ -585,21 +655,26 @@ export function buildPageReadPrompt(params: {
   images?: ImageAsset[];
   guidance?: string;
   complaints?: string[];
+  format?: ReadFormat;
 }): string {
   const firstId = params.owned[0]?.id || 'L0001';
   const lastId = params.owned.at(-1)?.id || firstId;
   const guidanceBlock = params.guidance ? `LEARNED GUIDANCE (advisory):\n${params.guidance}\n\n` : '';
-  const pageHeader = `Page ${params.page}/${params.totalPages}. Label ONLY page ${params.page}'s non-ctx lines (${firstId}..${lastId}).${params.context.length ? ' Lines marked ctx are read-only overlap from the previous page; do not label or own them.' : ''}\n`;
+  const pageHeader = params.format === 'verbose'
+    ? `Page ${params.page}/${params.totalPages}. Read this page's printed structure; cite only its own line numbers (${firstId}..${lastId}).${params.context.length ? ' Lines marked ctx are read-only overlap from the previous page and must not be claimed.' : ''}\n`
+    : `Page ${params.page}/${params.totalPages}. Label ONLY page ${params.page}'s non-ctx lines (${firstId}..${lastId}).${params.context.length ? ' Lines marked ctx are read-only overlap from the previous page; do not label or own them.' : ''}\n`;
   const carryOver = `OPEN QUESTION FROM PREVIOUS PAGE: ${formatOpenQuestionState(params.openQuestion)}\n`;
   const imageBlock = renderPageImagesBlock(params.images, params.page);
   const complaintBlock = params.complaints?.length ? `\n\nVALIDATOR COMPLAINT (fix this exactly):\n${params.complaints.join('\n')}` : '';
-  return `${guidanceBlock}${pageHeader}${carryOver}${imageBlock}${renderLines(params.owned, params.context)}${complaintBlock}`;
+  const instructions = params.format === 'verbose' ? `${GLOBAL_READ_VERBOSE_SYSTEM}\n\n` : '';
+  return `${instructions}${guidanceBlock}${pageHeader}${carryOver}${imageBlock}${renderLines(params.owned, params.context)}${complaintBlock}`;
 }
 
 export async function pageReadCacheKey(params: {
   owned: SourceLine[];
   context: SourceLine[];
   model?: string;
+  format?: ReadFormat;
   guidance?: string;
   images?: ImageAsset[];
 }): Promise<string> {
@@ -608,7 +683,7 @@ export async function pageReadCacheKey(params: {
   const guidanceHash = (await sha256(params.guidance || '')).slice(0, 16);
   const page = params.owned[0]?.page ?? 0;
   const imgSig = renderPageImagesBlock(params.images, page);
-  const full = await sha256(`${READ_VERSION}\nmodel:${params.model || 'default'}\nguidance:${guidanceHash}\nimages:${imgSig}\nctx:\n${ctxSig}\nowned:\n${ownedSig}`);
+  const full = await sha256(`${READ_VERSION}\nformat:${params.format || 'compact'}\nmodel:${params.model || 'default'}\nguidance:${guidanceHash}\nimages:${imgSig}\nctx:\n${ctxSig}\nowned:\n${ownedSig}`);
   return `page-read-${READ_VERSION}-${full.slice(0, 32)}`;
 }
 
@@ -883,6 +958,7 @@ export async function cloudPageRead(params: {
   images?: ImageAsset[];
   complaints?: string[];
   guidance?: string;
+  format?: ReadFormat;
   allowKeyOnlyPage?: boolean;
   caller: ReadCaller;
   budget?: ReadBudget;
@@ -903,6 +979,7 @@ export async function cloudPageRead(params: {
     images: params.images,
     guidance: params.guidance,
     complaints: params.complaints,
+    format: params.format,
   });
   const label = `Cloud · Page ${params.page} Read`;
   const delay = params.retryDelayMs ?? CLOUD_RETRY_DELAY_MS;
@@ -918,7 +995,7 @@ export async function cloudPageRead(params: {
     if (params.budget) params.budget.calls++;
     try {
       const response = await params.caller({
-        system: GLOBAL_READ_SYSTEM,
+        system: params.format === 'verbose' ? GLOBAL_READ_VERBOSE_SYSTEM : GLOBAL_READ_SYSTEM,
         text: requestText,
         label,
         maxOutputTokens: 32000,
@@ -930,6 +1007,7 @@ export async function cloudPageRead(params: {
       }
       await params.onJournal?.({ label, rawText: response.rawText, requestText });
       const checked = checkReadOutput(response.rawText, response.json, params.owned, {
+        format: params.format,
         hasOpenQuestion: Boolean(params.openQuestion),
         allowKeyOnlyPage: params.allowKeyOnlyPage,
       });
@@ -986,6 +1064,7 @@ export async function readSinglePageWithFallback(params: {
   caller?: ReadCaller;
   cloudCaller?: ReadCaller;
   model?: string;
+  format?: ReadFormat;
   pageCache?: PageReadCache;
   budget?: ReadBudget;
   guidance?: string;
@@ -1019,6 +1098,7 @@ export async function readSinglePageWithFallback(params: {
         owned: chunk.owned,
         context: chunk.context,
         model: params.model,
+        format: params.format,
         guidance: params.guidance,
         images: params.images,
       })
@@ -1033,7 +1113,7 @@ export async function readSinglePageWithFallback(params: {
         // Re-validate the cached wire payload with the same never-throwing seam used for live output.
         let wire: unknown;
         try { wire = JSON.parse(serialized); } catch { wire = undefined; }
-        const recheck = wire ? checkReadOutput('', wire, chunk.owned, { hasOpenQuestion: Boolean(params.openQuestion), allowKeyOnlyPage: params.allowKeyOnlyPage }) : undefined;
+        const recheck = wire ? checkReadOutput('', wire, chunk.owned, { format: 'compact', allowUnclaimed: typeof cachedEntry === 'object' && cachedEntry?.format === 'verbose', hasOpenQuestion: Boolean(params.openQuestion), allowKeyOnlyPage: params.allowKeyOnlyPage }) : undefined;
         if (recheck?.ok) {
           const parsed = recheck.proposal;
           return {
@@ -1080,13 +1160,14 @@ export async function readSinglePageWithFallback(params: {
         images: params.images,
         guidance: params.guidance,
         complaints: attempt > 1 ? complaints : undefined,
+        format: params.format,
       });
       // Every attempt is charged to the allowance before it is made, so a call that throws is never free.
       localCalls++;
       if (params.budget) params.budget.calls++;
       try {
         const response = await params.caller({
-          system: GLOBAL_READ_SYSTEM,
+          system: params.format === 'verbose' ? GLOBAL_READ_VERBOSE_SYSTEM : GLOBAL_READ_SYSTEM,
           text,
           label,
           maxOutputTokens: 32000,
@@ -1098,6 +1179,7 @@ export async function readSinglePageWithFallback(params: {
         }
         await params.onJournal?.({ label, rawText: response.rawText, requestText: text });
         const checked = checkReadOutput(response.rawText, response.json, chunk.owned, {
+          format: params.format,
           hasOpenQuestion: Boolean(params.openQuestion),
           allowKeyOnlyPage: params.allowKeyOnlyPage,
         });
@@ -1105,7 +1187,7 @@ export async function readSinglePageWithFallback(params: {
         const parses = checked.parses;
         if (checked.ok) {
           if (params.pageCache && cacheKey) {
-            await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(parsed), source: 'local' });
+            await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(parsed), source: 'local', format: params.format || 'compact' });
           }
           return {
             proposal: parsed,
@@ -1162,7 +1244,7 @@ export async function readSinglePageWithFallback(params: {
       cloudUsage.outputTokens += cloud.usage.outputTokens;
       if (cloud.ok && cloud.proposal) {
         if (params.pageCache && cacheKey) {
-          await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(cloud.proposal), source: 'cloud' });
+          await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(cloud.proposal), source: 'cloud', format: params.format || 'compact' });
         }
         return {
           proposal: cloud.proposal,
@@ -1210,6 +1292,7 @@ export async function runGlobalReadStage(params: {
   caller?: ReadCaller;
   cloudCaller?: ReadCaller;
   model?: string;
+  format?: ReadFormat;
   pageCache?: PageReadCache;
   cached?: string;
   budget?: ReadBudget;
@@ -1223,6 +1306,7 @@ export async function runGlobalReadStage(params: {
 }): Promise<GlobalReadResult> {
   const usage = { inputTokens: 0, outputTokens: 0 };
   const cloudUsage = { inputTokens: 0, outputTokens: 0 };
+  const format = params.format || 'compact';
 
   if (params.cached) {
     const p = deserializeReadProposal(params.cached);
@@ -1231,6 +1315,8 @@ export async function runGlobalReadStage(params: {
       const pages: SpinePageReadRecord[] = chunks.map(c => ({
         page: c.page,
         status: 'local ok',
+        format,
+        outputTokens: 0,
         cached: true,
         calls: 0,
         questions: p.questions.filter(q => q.spans.some(([a]) => c.owned.some(l => lineNo(l) === a))).length,
@@ -1310,6 +1396,7 @@ export async function runGlobalReadStage(params: {
       caller: params.caller,
       cloudCaller: params.cloudCaller,
       model: params.model,
+      format,
       pageCache: params.pageCache,
       budget: readBudget,
       guidance: params.guidance,
@@ -1335,6 +1422,8 @@ export async function runGlobalReadStage(params: {
     const pageRecord: SpinePageReadRecord = {
       page: chunk.page,
       status: result.status,
+      format,
+      outputTokens: result.usage.outputTokens + result.cloudUsage.outputTokens,
       ...(result.cached ? { cached: true } : {}),
       calls: result.localCalls + result.cloudCalls,
       cloudCalls: result.cloudCalls,

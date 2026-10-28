@@ -197,6 +197,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
       <div className="font-semibold">{t('Parse report', 'گزارش استخراج')} — <span className="ep-mono">{doc.id}</span></div>
       <div>{t('Models', 'مدل‌ها')}: {Object.entries(report.models).map(([key, value]) => `${key}: ${value}`).join(' · ') || '—'}</div>
       <div>{t('Calls', 'فراخوانی')}: {report.calls} · {t('Input tokens', 'توکن ورودی')}: {report.tokens.input} · {t('Output tokens', 'توکن خروجی')}: {report.tokens.output} · ${report.cost.toFixed(4)}</div>
+      {report.readOutputTokensByFormat && <div>Read output by format: {Object.entries(report.readOutputTokensByFormat).map(([format, tokens]) => `${format}: ${tokens} tokens`).join(' · ') || '—'}</div>}
       <div>{t('Coverage after', 'پوشش پس از اجرا')}: {report.coverageAfter ?? '—'}% · {t('Consensus sections', 'بخش‌های اجماع')}: {report.consensusSections.length} · {t('Critic', 'ممیز')}: {report.critic.calls} {t('calls', 'فراخوانی')}, {report.critic.defects} {t('defects', 'ایراد')}, {report.critic.ok} {t('ok', 'مورد تأیید')}</div>
       <div>{t('Memory injected', 'حافظه تزریق‌شده')}: {t('playbook', 'راهنمای پایه')} [{report.memory.playbookIds.join(', ') || t('none', 'هیچ')}] · {t('skills', 'مهارت‌ها')} [{report.memory.skillIds.join(', ') || t('none', 'هیچ')}] · {report.memory.guidanceTokens} {t('tokens', 'توکن')}</div>
       {report.classify && <div>{t('Line sorting', 'مرتب‌سازی خط‌ها')}: {report.classify.status === 'fallback' || report.classify.status === 'unavailable' || report.classify.status === 'skipped'
@@ -208,7 +209,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
             // #42: cloud attempts + the provider error make weather (503 / timeout) distinguishable from refusal.
             const attempts = p.cloudAttempts && p.cloudAttempts > 1 ? ` ×${p.cloudAttempts}` : '';
             const weather = p.cloudError ? ` — ${String(p.cloudError).replace(/\s+/g, ' ').slice(0, 80)}` : '';
-            return `page ${p.page}: ${p.status}${attempts}${weather}`;
+            return `page ${p.page}: ${p.status}${p.format ? ` · ${p.format}, ${p.outputTokens || 0} output tokens` : ''}${attempts}${weather}`;
           }).join(' · ')}
         </div>
       ) : null}

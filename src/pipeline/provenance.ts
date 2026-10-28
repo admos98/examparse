@@ -101,6 +101,8 @@ export interface ParseReport {
   classify?: SpineClassifyRecord;
   /** #40: per-page Global Read status (`local ok` / `cloud ok` / `failed`) for every sheet. */
   pages?: SpinePageReadRecord[];
+  /** Read output-token totals grouped by the actual page wire format. */
+  readOutputTokensByFormat?: Partial<Record<'compact' | 'verbose', number>>;
   /** #38: automatic fix loop summary (rounds, fixes applied/rejected, second opinions). */
   repairLoop?: SpineRepairRecord;
   /** #43: deterministic reconciliation counts for page proposals. */

@@ -94,6 +94,7 @@ const providerSchema = z.object({
   }
 });
 export const AppSettingsSchema = z.object({
+  readFormat: z.enum(['auto', 'compact', 'verbose']).optional(),
   providers: z.array(providerSchema).min(1).max(50),
   roleMapping: z.object({ fast: selection, standard: selection, escalation: selection, vision: selection, agent: selection.optional(), critic: selection.optional(), consensus: selection.optional(), cleanup: selection.optional(), classify: selection.optional(), read: selection.optional(), meta: selection.optional(), cloud: selection.optional(), repair: selection.optional(), decide: selection.optional() }),
   costTable: z.record(z.string(), z.object({ inputCostPerMillion: z.number().finite().nonnegative(), outputCostPerMillion: z.number().finite().nonnegative() })),

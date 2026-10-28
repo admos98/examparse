@@ -296,6 +296,10 @@ export interface SpinePageReadRecord {
   cached?: boolean;
   /** Total read calls for this page (local attempts + retries + cloud rescue). */
   calls: number;
+  /** Actual Global Read wire format used for this page. */
+  format?: 'compact' | 'verbose';
+  /** Output tokens spent on this page, including retries and any cloud rescue. */
+  outputTokens?: number;
   /** Cloud rescue calls among `calls` (#41). */
   cloudCalls?: number;
   /** #42: cloud attempts spent on this page's rescue (1, or 2 after one transient-failure retry). */
@@ -511,7 +515,11 @@ export interface DocSettings {
   fontSize: 'small' | 'medium' | 'large';
 }
 
+export type ReadFormat = 'auto' | 'compact' | 'verbose';
+
 export interface AppSettings {
+  /** Global Read wire format; auto selects verbose for local endpoints and compact otherwise. */
+  readFormat?: ReadFormat;
   providers: ProviderConfig[];
   roleMapping: RoleMapping;
   costTable: CostTable;

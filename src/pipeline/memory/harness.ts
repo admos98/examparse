@@ -133,6 +133,7 @@ export interface EndJobParams {
   answerAccuracy?: { checked: number; agreed: number; corrected: number; conflicts: number };
   /** #43: decision-audit statistics for this job (scoreboard, per decide model). */
   audit?: { decisions: number; catches: number; uncertain: number };
+  readPageOutcomes?: Array<{ format: 'compact' | 'verbose'; outcome: 'ok' | 'ok-reconciled' | 'partial' | 'failed' }>;
   calls: number;
   tokens: { input: number; output: number; cached?: number };
   costUsd: number;
@@ -188,6 +189,7 @@ export async function endJob(handle: JobHandle, params: EndJobParams): Promise<E
   if (params.defectFixRates) entry.defectFixRates = { ...params.defectFixRates };
   if (params.answerAccuracy && params.answerAccuracy.checked > 0) entry.answerAccuracy = { ...params.answerAccuracy };
   if (params.audit) entry.audit = { ...params.audit };
+  if (params.readPageOutcomes) entry.readPageOutcomes = params.readPageOutcomes.map(item => ({ ...item }));
   if (params.baselineRevision) { entry.baselineRevision = params.baselineRevision; entry.baselineTs = new Date().toISOString(); }
   // B2/D3 — the ids credited/blamed for this job ride in the journal line itself so the
   // server's delayed correction sweep can blame them after the 10-minute window closes.

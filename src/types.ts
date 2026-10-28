@@ -284,8 +284,10 @@ export interface ExamDoc {
   guidanceTokens?: number;
   verdicts?: Record<string, any[]>;
   traces?: any[];
-  /** #38 AI-first spine receipt: classification provenance + defect-repair loop summary (parse report source). */
+  /** Legacy receipts remain readable; never produced by the #46 default path. */
   spine?: SpineRecord;
+  /** #46 raw authored working document, six-step receipt, and comment-only verdicts. */
+  loop?: import('./pipeline/localLoop').LoopReceipt;
 }
 
 export type SpinePageReadStatus = 'local ok' | 'cloud ok' | 'failed';
@@ -450,6 +452,8 @@ export interface ProviderConfig {
   apiKey: string; // stored locally
   /** #43: the decisions endpoint path on baseURL (e.g. /v1/decisions or /v1/systemone). Defaults to /v1/decisions. */
   decisionsPath?: string;
+  /** #46 mmproj-capable decisions build. Off means image decisions are caption-only. */
+  multimodalDecisions?: boolean;
   defaultHeaders?: Record<string, string>;
   /** When true (default), reasoning/thinking is disabled (or minimised for the solver) on OpenAI-compatible calls. */
   disableReasoning?: boolean;
@@ -505,7 +509,7 @@ export interface TokenThriftSettings {
 }
 
 export interface BudgetSettings {
-  maxUsdPerRun: number; // hard stop if estimate exceeds
+  maxUsdPerRun: number; // display-only estimate threshold; never a parse/save gate
   maxOutputTokens: number;
 }
 
@@ -547,6 +551,8 @@ export interface AppSettings {
   textRepairEnabled?: boolean;
   /** #43 decision audit mode: shadow (compute + report only, never routes) or active (routes confident-wrong catches to repair/teacher). Default shadow. */
   decideMode?: 'shadow' | 'active';
+  /** Send image pixels to the local decisions endpoint only when its mmproj build is enabled. */
+  decideMultimodal?: boolean;
 }
 
 /**
@@ -599,7 +605,7 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'read' | 'check' | 'compile' | 'audit' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
+export type PipelineStageId = 'extract' | 'read' | 'self-review' | 'check' | 'code-fix' | 'audit' | 'final-fix' | 'compile' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
 
 export interface StageStatus {
   id: PipelineStageId;

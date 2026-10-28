@@ -755,7 +755,7 @@ test('E1: detectSectionHeaders reproduces exact 8 headers [7,46,65,92,151,178,20
 });
 
 test('F1 & F2: acceptance corpus and English — 11_structured (2).json field replay achieve 8 sections and 0/0/0 shape audit', async () => {
-  const corpus = await runCorpus({ strict: true, print: false });
+  const corpus = await runCorpus({ strict: true, print: false, mode: 'legacy' });
   assert.equal(corpus.ok, true);
   const acc = corpus.results.find(r => r.exam === 'english-final-13991009pq89w65173')!;
   assert.equal(acc.recall, '67/67');

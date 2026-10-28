@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { LLM_ROLES } from '../src/types';
-import { validateLlmRequest } from '../server';
+import { validateLlmRequest, validateDecisionsRequest } from '../server';
 
 const quoted = (block: string) => [...block.matchAll(/'([^']+)'/g)].map(match => match[1]);
 
@@ -45,4 +45,18 @@ test('server seam — text-repair and cleanup pass validateLlmRequest; a bogus r
   assert.equal(validateLlmRequest(minimalRequest('not-a-role')), 'Unsupported LLM role.');
   assert.equal(validateLlmRequest(minimalRequest('')), 'Unsupported LLM role.');
   assert.equal(validateLlmRequest({ system: 'system', text: 'text' }), 'Unsupported LLM role.');
+});
+
+
+test('#46 decisions proxy validator accepts typed probability/choice payloads with optional image pixels and rejects malformed ones', () => {
+  const providerConfig = { kind: 'openai-compatible', model: 'decider', baseURL: 'http://127.0.0.1:11434/v1', decisionsPath: '/v1/decisions' };
+  const body = { input: { exam: 'h' }, questions: [
+    { type: 'probability', name: 'Q1::stem-faithful', instructions: 'Is the stem faithful?', input: { question: { number: 1 } } },
+    { type: 'choice', name: 'Image img1 image-belongs', instructions: 'Does it belong?', choices: ['this question', 'another question on the page', 'no question'], input: { caption: 'cat' }, images: [{ id: 'img1', mime: 'image/png', data: 'aGVsbG8=' }] },
+  ] };
+  assert.equal(validateDecisionsRequest({ providerConfig, body }), null);
+  assert.ok(validateDecisionsRequest({ providerConfig: { ...providerConfig, kind: 'gemini' }, body }));
+  assert.ok(validateDecisionsRequest({ providerConfig, body: { ...body, questions: [{ ...body.questions[0], type: 'essay' }] } }));
+  assert.ok(validateDecisionsRequest({ providerConfig, body: { ...body, questions: [{ ...body.questions[1], images: [{ id: 'img1', mime: 'text/html', data: 'aGVsbG8=' }] }] } }));
+  assert.ok(validateDecisionsRequest({ providerConfig: { ...providerConfig, decisionsPath: 'https://evil.example' }, body }));
 });

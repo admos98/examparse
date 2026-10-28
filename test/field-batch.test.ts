@@ -105,7 +105,7 @@ test('field R4: duplicate pre-extracted ids are re-minted sequentially without _
 });
 
 test('field corpus acceptance hard gate: English final passes 67/67, 8/8, 48, 12/12, shape 0/0/0 and both groups pre-assistant', async () => {
-  const { results, ok } = await runCorpus({ strict: true, print: false });
+  const { results, ok } = await runCorpus({ strict: true, print: false, mode: 'legacy' });
   const exam = results.find(result => result.exam === 'english-final-13991009pq89w65173');
   assert.equal(ok, true, JSON.stringify(exam?.failures));
   assert.equal(exam?.recall, '67/67');

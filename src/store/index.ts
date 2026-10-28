@@ -74,12 +74,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
     fast: { providerId: 'google-gemini', model: 'gemini-2.5-flash-lite' },
     standard: { providerId: 'google-gemini', model: 'gemini-2.5-flash' },
     escalation: { providerId: 'google-gemini', model: 'gemini-2.5-pro' },
-    vision: { providerId: 'google-gemini', model: 'gemini-2.5-flash' },
+    vision: { providerId: '9router-local', model: 'qwen2.5vl:7b' },
     read: { providerId: '9router-local', model: 'qwen3:4b' },
     meta: { providerId: '9router-local', model: 'qwen3:4b' },
     cloud: { providerId: 'google-gemini', model: 'gemini-2.5-pro' },
     repair: { providerId: '9router-local', model: 'qwen3:4b' },
-    decide: { providerId: 'google-gemini', model: 'gemini-2.5-flash-lite' },
   },
   costTable: {
     'gemini-2.5-flash-lite': {
@@ -106,7 +105,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     cacheEnabled: true,
   },
   budget: {
-    maxUsdPerRun: 0.25, // default hard cap
+    maxUsdPerRun: 0.25, // display-only estimate threshold; never a parse gate
     maxOutputTokens: 16384,
   },
   // E3: executor budgets — model calls 30 (5–60 configurable), tool executions 200 (reads weigh 0.25).
@@ -114,7 +113,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxModelCalls: 30,
     maxToolExecutions: 200,
   },
-  // Semantic cleanup is not a default-path stage in the five-stage wing.
+  // Legacy optional tools are uncalled by the six-step local loop.
   cleanupEnabled: false,
   consensusEnabled: false,
   criticEnabled: false,
@@ -379,8 +378,12 @@ export async function saveExamDoc(
   // C2/A2 — SOURCE_ONLY drafts (import-time, zero parsed questions) are not exams:
   // invariants describe parsed exams, so drafts skip the gate and only get image-id hygiene.
   const isSourceOnlyDraft = (doc.flags || []).some((flag) => flag.code === 'SOURCE_ONLY');
+  // #46 checkers are comments, not save gates. The loop already owns its closed verdict list.
+  const isLocalLoop = Boolean(doc.loop);
   try {
-    if (isSourceOnlyDraft) {
+    if (isLocalLoop) {
+      // Storage hygiene only; never run legacy semantic invariants or demote a loop document.
+    } else if (isSourceOnlyDraft) {
       const { validateAndFixDuplicateImageIds } = await import('../pipeline/assemble');
       if (Array.isArray(doc.source?.lines)) {
         const fixed = validateAndFixDuplicateImageIds(doc);

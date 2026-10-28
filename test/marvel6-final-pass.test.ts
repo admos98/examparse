@@ -239,7 +239,7 @@ test('T2 phantom: a child numbered as its own parent is dropped by the canonical
 // ============================================================================
 
 test('T3 corpus: malformed-first-pass profile is green (shape audit 0/0/0, 12/12 spot checks)', async () => {
-  const corpus = await runCorpus({ strict: true, print: false });
+  const corpus = await runCorpus({ strict: true, print: false, mode: 'legacy' });
   assert.equal(corpus.ok, true);
   const malformed = corpus.results.find(result => result.malformedProfile === true);
   assert.ok(malformed, 'malformed-first-pass profile ran');

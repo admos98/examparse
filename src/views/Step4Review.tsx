@@ -39,6 +39,7 @@ import { computeSuggestions } from '../pipeline/suggestions';
 import { computeQualityScore } from '../utils/qualityScore';
 import { traceTimeline } from '../pipeline/provenance';
 import { ConfirmCard, Modal } from '../design/primitives';
+import { LoopReceipt } from '../components/LoopReceipt';
 
 interface Props {
   examDoc: ExamDoc;
@@ -739,12 +740,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
         </section>
       )}
 
-      {/* Solver Budget Stop Banner */}
+      {/* Solver request note */}
       {solverError && (
         <div className="p-4 rounded-[10px] border border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]  flex items-start gap-3 text-xs">
           <ShieldAlert className="w-5 h-5 shrink-0 text-[var(--danger)] mt-0.5" />
           <div className="flex-1 space-y-1">
-            <span className="font-bold">Budget / Execution Stop:</span>
+            <span className="font-bold">Solver note:</span>
             <p>{solverError}</p>
           </div>
           <button onClick={() => setSolverError(null)} className="text-[var(--danger)] hover:text-[var(--danger)]">
@@ -753,6 +754,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
         </div>
       )}
 
+      {examDoc.loop && <div className="my-4"><LoopReceipt receipt={examDoc.loop} /></div>}
       <div id="review-issues">{showFlagsPanel && <IntegrityFlags doc={examDoc} onOpenItem={openAttentionItem} onSecondaryAction={openAttentionSecondary} />}</div>
 
       {/* 2F Provenance — per-question Trace disclosure + 2B critic verdict badges */}

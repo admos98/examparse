@@ -635,33 +635,32 @@ export const SettingsModal: React.FC<Props> = ({
               <div className="space-y-6">
                 <div>
                   <h3 className="font-semibold text-[var(--ink)]  text-sm">Pipeline Role Mapping</h3>
-                  <p className="text-xs text-[var(--ink-2)]">Assign specific models to fast structure parsing, vision, and escalation repairs</p>
+                  <p className="text-xs text-[var(--ink-2)]">The default parse uses only local endpoints: read, optional decide, and vision. Legacy cloud roles are Assistant-only.</p>
                 </div>
 
-                <div className="p-3.5 rounded-[10px] border border-[var(--rule)] bg-[var(--paper)]">
-                  <ReadFormatControl settings={current} compact onChange={readFormat => setCurrent(prev => ({ ...prev, readFormat }))} />
-                </div>
 
                 <div className="space-y-4">
-                  {(['read', 'meta', 'repair', 'cloud', 'vision', 'standard', 'agent', 'critic', 'consensus'] as const).map(role => {
-                    const sel = current.roleMapping[role] || (role === 'cloud' ? current.roleMapping.escalation : current.roleMapping.fast);
+                  {(['read', 'decide', 'vision', 'agent'] as const).map(role => {
+                    const sel = current.roleMapping[role] || (role === 'decide' ? { providerId: current.providers.find(p => p.id === '9router-local')?.id || current.providers[0]?.id || '', model: '' } : role === 'agent' ? current.roleMapping.cloud || current.roleMapping.fast : current.roleMapping.read || current.roleMapping.fast);
                     const labelMap: Record<string, string> = {
-                      read: 'Read (one whole-paper proposal · reasoning always off)',
-                      meta: 'Meta (two tiny header reads · defaults to Read)',
-                      repair: 'Repair (local fixes from a closed operation list)',
-                      cloud: 'Cloud (one surviving defect and its evidence only)',
-                      standard: 'Standard (General questions)',
-                      vision: 'Vision (image captions, OCR, and metadata tie-break)',
-                      agent: 'Assistant (defaults to Read until configured)',
-                      critic: 'Critic (optional report only · off by default)',
-                      consensus: 'Consensus (optional report only · off by default)',
+                      read: 'Read (local generative model · READ, reviews, and fixes)',
+                      decide: 'Decide (optional local Lightning/Jev-class decisions endpoint)',
+                      vision: 'Vision (local OCR + bundled image captions)',
+                      agent: 'Assistant (legacy/cloud settings tolerated; never called by the parse loop)',
                     };
+
 
                     return (
                       <div key={role} className="p-3.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)]  space-y-2">
                         <div className="font-medium text-xs text-[var(--ink)] ">
                           {labelMap[role]}
                         </div>
+                        {role === 'decide' && <div className="space-y-2 rounded-[6px] border border-[var(--rule)] p-3">
+                          <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">Leave the model empty to skip the audit. The endpoint is never replaced by a cloud fallback.</p>
+                          <label className="block text-[length:var(--type-12)]">Decisions path<input value={current.providers.find(p => p.id === sel.providerId)?.decisionsPath || '/v1/decisions'} onChange={event => handleUpdateProvider(sel.providerId, { decisionsPath: event.target.value })} className="mt-1 w-full rounded-[6px] border bg-[var(--paper-raised)] p-2 font-mono" /></label>
+                          <label className="flex items-center gap-2"><input type="checkbox" checked={current.decideMultimodal === true} onChange={event => setCurrent(prev => ({ ...prev, decideMultimodal: event.target.checked }))} />Multimodal build (mmproj): send image pixels for image-belongs</label>
+                          <label className="flex items-center gap-2">Mode<select value={current.decideMode || 'shadow'} onChange={event => setCurrent(prev => ({ ...prev, decideMode: event.target.value as 'shadow' | 'active' }))} className="rounded-[6px] border bg-[var(--paper-raised)] p-1"><option value="shadow">Shadow — report only</option><option value="active">Active — route confident-wrong items to Final fix</option></select></label>
+                        </div>}
                         {(() => {
                           const sbRole = role === 'agent' ? 'fast' : role;
                           const leader = sbBucket ? leaderFor(sbRows as any, sbRole, sbBucket) : null;
@@ -722,30 +721,13 @@ export const SettingsModal: React.FC<Props> = ({
                   })}
                 </div>
 
-                {/* 2E/2C pipeline controls + 2G live bench */}
-                <div className="p-3.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)]  space-y-3 text-xs">
-                  <div className="font-medium text-[var(--ink)] ">Pipeline concurrency & consensus</div>
-                  <label className="flex items-center gap-2">Parallel sections (1–6)
-                    <input type="number" min={1} max={6} value={current.parallelSections ?? 3} onChange={e => setCurrent(prev => ({ ...prev, parallelSections: Math.max(1, Math.min(6, Number(e.target.value) || 3)) }))} className="w-16 px-2 py-1 rounded-[6px] border bg-[var(--paper-raised)] " />
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input type="checkbox" checked={current.consensusEnabled !== false} onChange={e => setCurrent(prev => ({ ...prev, consensusEnabled: e.target.checked }))} />
-                    Consensus on hard sections (default ON only when a distinct consensus model exists — never surprise spend)
-                  </label>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button onClick={runLiveBench} className="px-3 py-1.5 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)]">Benchmark this change</button>
-                    <span className="text-[var(--ink-2)]">Runs golden sources through the real configured provider after you confirm the estimate. Never auto-runs.</span>
-                  </div>
-                  {benchConfirmOpen && <ConfirmCard
-                    title={current.uiLanguage === 'fa' ? 'اجرای بنچ زنده؟' : 'Run live benchmark?'}
-                    description={current.uiLanguage === 'fa' ? `آزمون‌های منبع english-mcq و scanned-noisy با ارائه‌دهنده واقعی برای مدل ${current.roleMapping.fast.model} اجرا می‌شوند؛ حدود ${estimateLiveBenchCost().calls} فراخوانی و هزینهٔ برآوردی $${estimateLiveBenchCost().estCostUsd.toFixed(4)}. لغو هیچ فراخوانی‌ای انجام نمی‌دهد.` : `Run golden SOURCE docs (english-mcq, scanned-noisy) through the configured provider for ${current.roleMapping.fast.model}; about ${estimateLiveBenchCost().calls} calls and $${estimateLiveBenchCost().estCostUsd.toFixed(4)} estimated. Cancel makes 0 calls.`}
-                    confirmLabel={current.uiLanguage === 'fa' ? 'اجرای بنچ' : 'Run benchmark'}
-                    cancelLabel={current.uiLanguage === 'fa' ? 'لغو' : 'Cancel'}
-                    onConfirm={() => void confirmLiveBench()}
-                    onCancel={() => { setBenchConfirmOpen(false); setBenchMsg(current.uiLanguage === 'fa' ? 'بنچ زنده لغو شد؛ ۰ فراخوانی انجام شد.' : 'Live bench declined — 0 calls made.'); }}
-                  />}
-                  {benchMsg && <div role="status" className="p-2 rounded-[6px] bg-[var(--paper-raised)]  border">{benchMsg}</div>}
-                </div>
+                <details className="rounded-[10px] border border-[var(--rule)] p-3 text-xs">
+                  <summary className="cursor-pointer font-semibold">Assistant / proving-ground settings (not used by the local loop)</summary>
+                  <p className="my-2 text-[var(--ink-2)]">Legacy repair, cloud, classify, meta, critic, consensus, cleanup, and read-format settings remain in saved profiles for compatibility. The default pipeline does not call them.</p>
+                  <div className="flex flex-wrap items-center gap-2"><button onClick={runLiveBench} className="rounded-[6px] border px-3 py-1.5">Run explicit live benchmark</button><span className="text-[var(--ink-2)]">Separate, confirmed provider test; never part of a parse.</span></div>
+                  {benchConfirmOpen && <ConfirmCard title="Run live benchmark?" description={`Explicit external benchmark: about ${estimateLiveBenchCost().calls} calls, estimated $${estimateLiveBenchCost().estCostUsd.toFixed(4)}. Cancel makes zero calls.`} confirmLabel="Run benchmark" cancelLabel="Cancel" onConfirm={() => void confirmLiveBench()} onCancel={() => { setBenchConfirmOpen(false); setBenchMsg('Live benchmark cancelled — zero calls.'); }} />}
+                  {benchMsg && <div role="status" className="mt-2">{benchMsg}</div>}
+                </details>
               </div>
             )}
 
@@ -847,12 +829,12 @@ export const SettingsModal: React.FC<Props> = ({
 
                   <div className="flex items-center justify-between p-3.5 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)] ">
                     <div>
-                      <div className="font-medium text-[var(--ink)] ">Cleanup Judgment (Stage 2.5)</div>
+                      <div className="font-medium text-[var(--ink)] ">Legacy cleanup judgment (Assistant/proving-ground only)</div>
                       <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">One cheap AI call tags junk/header lines before structure (fewer prompt tokens). Off = local regex tags only; never deletes or edits lines.</div>
                     </div>
                     <input
                       type="checkbox"
-                      checked={current.cleanupEnabled !== false}
+                      checked={current.cleanupEnabled === true}
                       onChange={e => setCurrent(prev => ({ ...prev, cleanupEnabled: e.target.checked }))}
                       className="w-4 h-4 rounded-[6px] text-[var(--accent-ink)]"
                     />
@@ -930,17 +912,17 @@ export const SettingsModal: React.FC<Props> = ({
             {activeTab === 'budget' && (
               <div className="space-y-6">
                 <div>
-                  <h3 className="font-semibold text-[var(--ink)]  text-sm">Budget & Stop-Loss Protection</h3>
-                  <p className="text-xs text-[var(--ink-2)]">Prevent accidental runaway API spend</p>
+                  <h3 className="font-semibold text-[var(--ink)]  text-sm">Usage estimates (display only)</h3>
+                  <p className="text-xs text-[var(--ink-2)]">The local loop never stops or discards a document because of a budget counter.</p>
                 </div>
 
                 <div className="space-y-4 text-xs">
                   <div className="p-4 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)]  space-y-2">
                     <label className="block font-medium text-[var(--ink)] ">
-                      Hard Budget Cap per Document Run ($ USD)
+                      Display threshold per document run ($ USD)
                     </label>
                     <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">
-                      If pre-flight estimated cost exceeds this cap, analysis will be hard-stopped before making any API call.
+                      Shown as a warning when the pre-flight estimate is higher. It never blocks a parse or a save.
                     </p>
                     <input
                       type="number"
@@ -958,9 +940,9 @@ export const SettingsModal: React.FC<Props> = ({
 
                   <div className="p-4 rounded-[10px] border border-[var(--rule)]  bg-[var(--paper)]  space-y-2">
                     <label className="block font-medium text-[var(--ink)] ">
-                      Max Output Tokens Limit
+                      Preferred output allowance
                     </label>
-                    <p className="text-xs text-[var(--ink-2)]">Ceiling only — you pay for tokens generated. Large or question-dense exams may need 16384–32768.</p>
+                    <p className="text-xs text-[var(--ink-2)]">The loop requests at least 16384 tokens and grows with the page so full authored questions fit. This setting cannot shrink that floor.</p>
                     <input
                       type="number"
                       step="1024"

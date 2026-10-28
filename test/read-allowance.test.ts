@@ -56,59 +56,28 @@ function parsePromptPage(text: string): { page: number; owned: [number, number] 
 
 const formatFailure = (): LLMResponse => ({ rawText: 'Sure! Here is the exam: it has questions.', json: undefined, usage: { inputTokens: 10, outputTokens: 5 } });
 
-test('#41 starvation regression: 7-page exam, local always fails format, cloud rescues — all 7 pages land via cloud, within allowance, never budget-exhausted', async () => {
-  const limitsCases: Array<{ maxModelCalls: number; maxToolExecutions: number }> = [{ maxModelCalls: 30, maxToolExecutions: 200 }, { maxModelCalls: 6, maxToolExecutions: 200 }];
-  for (const agentLimits of limitsCases) {
-    const storage = mockFolderStorage();
-    const originalExecute = LLMAdapter.execute;
-    const lines = examLines();
-    const preExtracted: ExtractedDocument = { fileName: 'field.pdf', lines, pages: PAGES, ocrUsed: false, scannedPageIndices: [], pageImages: [], pageThumbKeys: [], images: [] };
-    const readCalls: string[] = [];
-    const cloudCalls: string[] = [];
-
-    LLMAdapter.execute = (async (req: LLMRequest): Promise<LLMResponse> => {
-      if (req.role === 'meta') return { rawText: '{}', json: { subject: { value: 'English', line: 1 }, grade: { value: '12', line: 1 } }, usage: { inputTokens: 1, outputTokens: 1 } };
-      if (req.role === 'read') {
-        readCalls.push(req.label);
-        return formatFailure();
-      }
-      if (req.role === 'cloud' && req.label.startsWith('Cloud · Page ')) {
-        const { owned } = parsePromptPage(req.text);
-        cloudCalls.push(req.label);
-        return { rawText: JSON.stringify(validPageJson(owned)), json: validPageJson(owned), usage: { inputTokens: 20, outputTokens: 10 } } as LLMResponse;
-      }
-      return { rawText: '{}', json: {}, usage: { inputTokens: 1, outputTokens: 1 } };
-    }) as typeof LLMAdapter.execute;
-
-    try {
-      const file = new File([`starvation-${agentLimits.maxModelCalls}`], 'field.pdf', { type: 'application/pdf' });
-      const fileHash = await sha256(await file.arrayBuffer());
-      const settings = { ...DEFAULT_SETTINGS, agentLimits, thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false } };
-      const doc = await runFullPipeline(file, settings, { onStageUpdate: () => undefined }, { preExtracted, fileHash });
-
-      const classify = doc.spine?.classify;
-      assert.ok(classify, 'classify record present');
-      assert.equal(classify.pages?.length, PAGES);
-      assert.deepEqual(classify.pages?.map(p => p.status), Array(PAGES).fill('cloud ok'), `agentLimits.maxModelCalls=${agentLimits.maxModelCalls}: every page lands via cloud`);
-      assert.equal(classify.readAllowance, readAllowanceForPages(PAGES));
-      assert.equal(classify.readAllowance, 27);
-      const total = (classify.calls || 0) + (classify.cloudCalls || 0);
-      assert.equal(total, 2 * PAGES, 'one local format attempt + one cloud rescue per page');
-      assert.ok(total <= (classify.readAllowance || 0));
-      assert.ok(!classify.pages?.some(p => (p.reason || '').includes('exhausted')), 'NO page reports budget exhaustion');
-      assert.equal(readCalls.length, PAGES, 'format failure fast-path: exactly one local call per page');
-      assert.equal(cloudCalls.length, PAGES);
-      assert.deepEqual(doc.questions.map(q => q.no), [1, 2, 3, 4, 5, 6, 7]);
-      assert.equal(doc.flags.some(f => f.code === 'PAGE_READ_FAILED'), false);
-      for (const p of classify.pages || []) {
-        assert.equal(p.localComplaints?.length, 1, `page ${p.page} keeps its local complaint after cloud rescue`);
-        assert.match(p.localComplaints?.[0] || '', /^attempt 1: output is not a JSON object/);
-      }
-    } finally {
-      LLMAdapter.execute = originalExecute;
-      storage.restore();
-    }
-  }
+test('#46 local loop: a 7-page format failure never calls cloud, never exhausts a budget, and saves a shell with per-page notes', async () => {
+  const storage = mockFolderStorage();
+  const originalExecute = LLMAdapter.execute;
+  const preExtracted: ExtractedDocument = { fileName: 'field.pdf', lines: examLines(), pages: PAGES, ocrUsed: false, scannedPageIndices: [], pageImages: [], pageThumbKeys: [], images: [] };
+  const roles: string[] = [];
+  LLMAdapter.execute = (async (req: LLMRequest) => {
+    roles.push(req.role);
+    return { rawText: 'Sure! Here is the exam: it has questions.', json: undefined, usage: { inputTokens: 10, outputTokens: 5 } };
+  }) as typeof LLMAdapter.execute;
+  try {
+    const file = new File(['local-loop-starvation'], 'field.pdf', { type: 'application/pdf' });
+    const fileHash = await sha256(await file.arrayBuffer());
+    const settings = { ...DEFAULT_SETTINGS, agentLimits: { maxModelCalls: 1, maxToolExecutions: 1 }, thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false } } as any;
+    const doc = await runFullPipeline(file, settings, { onStageUpdate: () => undefined }, { preExtracted, fileHash });
+    assert.ok(doc.loop, 'loop receipt present');
+    assert.equal(doc.loop!.pages.length, PAGES);
+    assert.ok(doc.loop!.notes.length >= PAGES, 'every unreadable page is a note');
+    assert.ok(roles.every(role => role === 'read' || role === 'vision'), 'no cloud/repair/classify/meta role in the default path');
+    assert.equal(doc.spine, undefined, 'legacy spine is not written by the loop');
+    assert.ok(computeAttention(doc).some(item => item.kind === 'read-failed' && item.action.target === 'page-retry'));
+    assert.equal(parseReportForDoc(doc).loop?.steps.length, 6);
+  } finally { LLMAdapter.execute = originalExecute; storage.restore(); }
 });
 
 test('#41 fast-path: a format failure on page 1 costs exactly ONE local call, then cloud', async () => {

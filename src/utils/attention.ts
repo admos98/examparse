@@ -9,7 +9,7 @@
  */
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 
-export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed' | 'audit-catch';
+export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed' | 'audit-catch' | 'loop-verdict' | 'loop-note';
 
 export interface AttentionAction {
   /** 'question' scrolls to + expands that card; 'image-tray' opens the tray; 'page-retry' re-reads one failed page; 'source-page' opens that page in Source. */
@@ -122,6 +122,34 @@ function budgetExhaustedReadPages(doc: ExamDoc): Set<number> {
 export function computeAttention(doc: ExamDoc): AttentionItem[] {
   const items: AttentionItem[] = [];
   const questions = doc.questions || [];
+  // #46: the loop's surviving comments are the attention list. Do not run the old spine's
+  // inferred answer/coverage nag machinery on top of the same findings a second time.
+  if (doc.loop) {
+    const items: AttentionItem[] = doc.loop.survivingVerdicts.map(verdict => {
+      const affected = questions.filter(q => verdict.questionNumbers.includes(q.no));
+      const kind: AttentionKind = verdict.kind === 'empty-stem' ? 'stem-hollow'
+        : verdict.kind === 'options-missing-for-type' ? 'options-missing'
+        : verdict.kind === 'image-unassigned' ? 'image-unplaced'
+        : verdict.kind === 'image-double-assigned' ? 'image-suspect'
+        : verdict.kind === 'meta-field-implausible' ? 'metadata-missing'
+        : verdict.source === 'decision' ? 'audit-catch' : 'loop-verdict';
+      const action: AttentionAction = verdict.imageId ? { target: 'image-tray', imageIds: [verdict.imageId], label: 'Review image' }
+        : { target: 'question', questionId: affected[0]?.id, label: affected.length ? 'Review' : 'Review exam' };
+      return { id: verdict.id, kind, rootCauseId: verdict.id, plainSentence: `${verdict.message} [${action.label}]`, action,
+        questionIds: affected.map(q => q.id), imageIds: verdict.imageId ? [verdict.imageId] : [], count: 1, severity: 'warn' };
+    });
+    for (const page of doc.loop.pages.filter(p => p.status === 'failed' || p.status === 'empty')) items.push({
+      id: `loop-page-${page.page}`, kind: 'read-failed', rootCauseId: `loop-page-${page.page}`,
+      plainSentence: `Page ${page.page} was not fully read. Retry it with the local model; the rest of the document is saved. [Retry page]`,
+      action: { target: 'page-retry', page: page.page, label: 'Retry page' }, questionIds: [], imageIds: [], count: 1, severity: 'warn',
+    });
+    for (const [index, message] of doc.loop.notes.entries()) items.push({
+      id: `loop-note-${index}`, kind: 'loop-note', rootCauseId: `loop-note-${index}`,
+      plainSentence: `${message} [Review]`, action: { target: 'question', label: 'Review' },
+      questionIds: [], imageIds: [], count: 1, severity: 'warn',
+    });
+    return items;
+  }
   const flags: Flag[] = doc.flags || [];
   const readFailure = flags.find(flag => flag.code === 'GLOBAL_READ_FAILED');
 

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Printer, Download, Upload, Copy, FileSpreadsheet } from 'lucide-react';
 import { ExamDoc, ImageAsset, getDisplayName, sanitizeFileName } from '../types';
+import { LoopReceipt } from '../components/LoopReceipt';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
 import { saveExamDoc, getImageBlob } from '../store';
 import { duplicateExamDoc, exportExamJson, partialExportIssues, parseReportForDoc } from '../utils/examExport';
@@ -218,6 +219,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
           ? t(`nothing repair could fix — ${report.repairLoop.droppedReadFailedDefects} checked item(s) sit on unread pages and need [Retry page]`, `چیزی برای اصلاح خودکار نبود؛ ${report.repairLoop.droppedReadFailedDefects} مورد روی صفحه‌های خوانده‌نشده است و به «تلاش دوباره صفحه» نیاز دارد`)
           : t('none needed — the paper\'s numbers and marks already add up', 'نیازی نبود؛ شماره‌ها و نمره‌های برگه از پیش درست بودند'))
         : t(`${report.repairLoop.rounds} round(s) · ${report.repairLoop.opsProposed ?? ((report.repairLoop.opsAccepted || 0) + (report.repairLoop.opsRejected || 0) + (report.repairLoop.opsDeduped || 0))} suggested · ${report.repairLoop.opsAccepted} fix(es) applied · ${report.repairLoop.opsRejected} suggestion(s) rejected · ${report.repairLoop.opsDeduped || 0} duplicate(s) skipped${report.repairLoop.abandonedKinds?.length ? ` · ${report.repairLoop.abandonedKinds.join(', ')} abandoned` : ''} · ${report.repairLoop.escalations} second opinion(s) · ${report.repairLoop.defectsRemaining} thing(s) still open`, `${report.repairLoop.rounds} دور · ${report.repairLoop.opsProposed ?? ((report.repairLoop.opsAccepted || 0) + (report.repairLoop.opsRejected || 0) + (report.repairLoop.opsDeduped || 0))} پیشنهاد · ${report.repairLoop.opsAccepted} اصلاح اعمال شد · ${report.repairLoop.opsRejected} پیشنهاد رد شد · ${report.repairLoop.opsDeduped || 0} تکراری نادیده · ${report.repairLoop.escalations} نظر دوم · ${report.repairLoop.defectsRemaining} مورد باز`)}</div>}
+      {doc.loop && <div className="my-3"><LoopReceipt receipt={doc.loop} /></div>}
       <div>{t('Config hash', 'هش پیکربندی')}: <span className="ep-mono">{report.configHash}</span> · {t('Generated', 'ساخته‌شده')}: {report.generatedAt}</div>
       <p className="ep-caption m-0">{t('The JSON export embeds this report as a receipt; no keys are included.', 'فایل JSON خروجی این گزارش را به‌عنوان رسید دارد و هیچ کلیدی در آن نیست.')}</p>
     </section>}

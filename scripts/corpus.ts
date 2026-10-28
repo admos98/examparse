@@ -30,6 +30,7 @@ import {
 import type { ExamSection, Question, SourceLine } from '../src/types';
 import { buildCoverageTable, coverageMarkdown, entryMetaFromTruth, type CorpusEntryMeta } from '../src/pipeline/corpusCoverage';
 import { classificationAgreement, impliedLabelsFromAssembly, type LineLabel } from '../src/pipeline/classify';
+import { scoreLoopEntry } from './corpusLoop';
 
 interface SpotCheck {
   no: number;
@@ -491,11 +492,31 @@ export function writeCoverageReadme(dir: string = CORPUS_DIR): string {
   return markdown;
 }
 
-export async function runCorpus(opts: { strict?: boolean; print?: boolean; dir?: string; only?: string[] } = {}): Promise<{ results: CorpusResult[]; ok: boolean }> {
+export async function runCorpus(opts: { strict?: boolean; print?: boolean; dir?: string; only?: string[]; mode?: 'legacy' | 'loop' } = {}): Promise<{ results: CorpusResult[]; ok: boolean }> {
   const corpusDir = opts.dir || CORPUS_DIR;
   const dirs = fs.readdirSync(corpusDir, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort()
     .filter(name => !opts.only || opts.only.includes(name));
   const results: CorpusResult[] = [];
+  // #46 default corpus mode: scripted generative loop, report-only against printed truth.
+  // The legacy wing/bare gates remain available explicitly for the proving ground, never as loop gates.
+  if (opts.mode !== 'legacy') {
+    for (const exam of dirs) {
+      const dir = path.join(corpusDir, exam);
+      const lines = JSON.parse(fs.readFileSync(path.join(dir, 'source-lines.json'), 'utf8')) as SourceLine[];
+      const truth = JSON.parse(fs.readFileSync(path.join(dir, 'truth.json'), 'utf8')) as Truth;
+      const score = await scoreLoopEntry(exam, lines, truth);
+      const result: CorpusResult = {
+        exam, expected: truth.expectedNumbers.length, found: Number(score.questions.split('/')[0]), recall: score.questions,
+        sections: score.sections, total: score.points, spotChecks: 'report-only', shapeAudit: { optionIncludesStem: 0, duplicateSiblingStems: 0, overlongStems: 0 },
+        shapeAuditLabel: '0/0/0', duplicateImageIds: 0, preAssistantChildren: '', failures: [], gated: false,
+        status: truth.status === 'reviewed' ? 'reviewed' : 'unreviewed', recallRatio: score.recallRatio,
+      };
+      results.push(result);
+      if (opts.print !== false) console.log(`LOOP ${exam}: questions ${score.questions}, sections ${score.sections}, points ${score.points}; surviving verdicts ${score.survivingVerdicts}, notes ${score.notes} (report-only; no gates)`);
+    }
+    if (opts.print !== false) console.log(`Corpus entries: ${results.length}; mode: scripted-generative local loop; status: REPORT (questions/sections/points vs printed truth; 0 provider calls; no hard gates)`);
+    return { results, ok: true };
+  }
   for (const exam of dirs) {
     const dir = path.join(corpusDir, exam);
     const lines = JSON.parse(fs.readFileSync(path.join(dir, 'source-lines.json'), 'utf8')) as SourceLine[];
@@ -650,6 +671,6 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   if (process.argv.includes('--write-coverage')) {
     console.log(writeCoverageReadme());
   } else {
-    runCorpus({ strict: true }).then(({ ok }) => { if (!ok) process.exitCode = 1; }).catch(error => { console.error(error); process.exitCode = 1; });
+    runCorpus({ strict: true, mode: process.argv.includes('--legacy') ? 'legacy' : 'loop' }).then(({ ok }) => { if (!ok) process.exitCode = 1; }).catch(error => { console.error(error); process.exitCode = 1; });
   }
 }

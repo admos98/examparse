@@ -175,7 +175,10 @@ test('stream breaker stops a counting generation before the read cap without tra
     }), { headers: { 'Content-Type': 'text/event-stream' } });
   }) as typeof fetch;
   try {
-    await assert.rejects(LLMAdapter.execute({ role: 'read', system: '', text: '', label: 'page', maxOutputTokens: 2000 }, { onDelta: () => {}, detectCountingLoop: true, salvagePartial: true }), CountingLoopError);
+    // #46: the breaker is a pathology guard, not an abort class. With salvagePartial it returns the partial stream.
+    const partial = await LLMAdapter.execute({ role: 'read', system: '', text: '', label: 'page', maxOutputTokens: 2000 }, { onDelta: () => {}, detectCountingLoop: true, salvagePartial: true });
+    assert.equal(partial.finishReason, 'counting-loop');
+    assert.ok(partial.rawText.length > 0);
     assert.equal(fetches, 1);
     assert.ok(sent < 100);
     // Aborting the underlying fetch stops generation even though there is no done event.

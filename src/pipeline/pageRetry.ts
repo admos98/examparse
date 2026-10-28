@@ -24,6 +24,9 @@ import {
 import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership';
 import { prepareReviewDocument } from './reviewIntegrity';
 import { effectiveReadFormat } from './readFormat';
+import { localProviderFor } from './localProvider';
+import { applyCorrections, buildLoopPagePrompt, buildLoopPages, errorMessage, pageFromResponse, projectAuthoredDocument, LOOP_READ_SYSTEM } from './localLoop';
+import { loopFlags } from './loopFlags';
 
 const lineNo = (id: string) => Number(String(id || '').replace(/\D/g, ''));
 
@@ -101,6 +104,42 @@ export async function retryFailedPage(
   questionsAdded: number;
   message: string;
 }> {
+  // #46 loop documents retry with the local generative reader only. No cloud fallback exists here.
+  if (doc.loop) {
+    const lines = doc.source?.lines || [];
+    const chunk = buildLoopPages(lines).find(c => c.page === page);
+    if (!chunk) return { doc, status: 'failed', questionsAdded: 0, message: `Page ${page} has no extracted lines.` };
+    const provider = localProviderFor(settings, 'read');
+    const before = doc.questions.length;
+    try {
+      options?.onProgress?.(`Reading page ${page} with the local model…`);
+      const response = options?.caller
+        ? await options.caller({ system: LOOP_READ_SYSTEM, text: buildLoopPagePrompt(chunk, doc.images), label: `Retry page ${page}`, maxOutputTokens: Math.max(16384, settings.budget.maxOutputTokens || 0) } as any)
+        : provider ? await LLMAdapter.execute({ role: 'read', system: LOOP_READ_SYSTEM, text: buildLoopPagePrompt(chunk, doc.images), label: `Retry page ${page}`, maxOutputTokens: Math.max(16384, settings.budget.maxOutputTokens || 0), providerConfig: { ...provider, disableReasoning: true } }, { detectCountingLoop: true, salvagePartial: true })
+        : undefined;
+      if (!response) throw new Error('no local read model configured');
+      const parsed = pageFromResponse({ rawText: response.rawText, json: (response as any).json, usage: response.usage }, page);
+      const corrections = parsed.document.questions.map(q => ({ action: (doc.loop!.document.questions.some(old => old.number === q.number) ? 'replace' : 'insert') as 'replace' | 'insert', questionNumber: q.number, question: q }));
+      const applied = applyCorrections(doc.loop!.document, corrections);
+      const loop = structuredClone(doc.loop!);
+      loop.document = applied.document;
+      loop.notes.push(`Page ${page} retried locally: ${applied.applied} correction(s) applied. ${parsed.receipt.notes.join(' ')}`);
+      const pageRow = loop.pages.find(p => p.page === page);
+      if (pageRow) Object.assign(pageRow, parsed.receipt, { status: parsed.receipt.status === 'empty' ? 'failed' : parsed.receipt.status });
+      else loop.pages.push(parsed.receipt);
+      const projected = projectAuthoredDocument(loop.document);
+      const next: ExamDoc = { ...doc, questions: projected.questions, sections: projected.sections, meta: { ...doc.meta, ...projected.meta }, loop };
+      next.flags = loopFlags(loop, next);
+      if (options?.persist !== false) await saveExamDoc(next);
+      return { doc: next, status: parsed.receipt.status === 'empty' ? 'failed' : 'local ok', questionsAdded: Math.max(0, next.questions.length - before), message: `Page ${page} retried locally; ${applied.applied} correction(s) applied.` };
+    } catch (error) {
+      const message = `Page ${page} local retry skipped — ${errorMessage(error)}. The saved document is unchanged.`;
+      const loop = structuredClone(doc.loop); loop.notes.push(message);
+      const next = { ...doc, loop, flags: loopFlags(loop, doc) };
+      if (options?.persist !== false) try { await saveExamDoc(next); } catch { /* keep in memory */ }
+      return { doc: next, status: 'failed', questionsAdded: 0, message };
+    }
+  }
   const lines = doc.source?.lines || [];
   const chunks = buildReadChunks(lines);
   const targetIdx = chunks.findIndex(c => c.page === page);

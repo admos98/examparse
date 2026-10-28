@@ -307,7 +307,7 @@ test('T2/B2: promote round trip — unreviewed runs report-only; flipped to revi
     // Day one after promotion, with a deliberately WRONG prefilled total: still safe.
     const wrongFiles = { ...entry.files, 'truth.json': JSON.stringify({ ...entry.truth, totalPoints: 999 }, null, 1) };
     writeEntry(tmp, entry.slug, wrongFiles);
-    const reportOnly = await runCorpus({ dir: tmp, print: false });
+    const reportOnly = await runCorpus({ dir: tmp, print: false, mode: 'legacy' });
     assert.equal(reportOnly.results.length, 1, 'promoted entry appears and executes');
     assert.equal(reportOnly.results[0].status, 'unreviewed');
     assert.equal(reportOnly.results[0].gated, false);
@@ -317,14 +317,14 @@ test('T2/B2: promote round trip — unreviewed runs report-only; flipped to revi
     // Human flips status to reviewed (test operation on the temp copy): now it gates.
     const reviewedWrong = { ...entry.files, 'truth.json': JSON.stringify({ ...entry.truth, totalPoints: 999, status: 'reviewed' }, null, 1) };
     writeEntry(tmp, entry.slug, reviewedWrong);
-    const gatedWrong = await runCorpus({ dir: tmp, print: false });
+    const gatedWrong = await runCorpus({ dir: tmp, print: false, mode: 'legacy' });
     assert.equal(gatedWrong.results[0].gated, true);
     assert.equal(gatedWrong.ok, false, 'reviewed entry with wrong truth fails the gate');
 
     // Reviewed with correct totals and the checked-subset discipline: gates and passes.
     const reviewedFiles = { ...entry.files, 'truth.json': JSON.stringify({ ...entry.truth, status: 'reviewed', types: {} }, null, 1) };
     writeEntry(tmp, entry.slug, reviewedFiles);
-    const gatedOk = await runCorpus({ dir: tmp, print: false });
+    const gatedOk = await runCorpus({ dir: tmp, print: false, mode: 'legacy' });
     assert.equal(gatedOk.results[0].recall, '67/67');
     assert.equal(gatedOk.ok, true, JSON.stringify(gatedOk.results[0].failures));
   } finally {
@@ -383,7 +383,7 @@ test('T4/D1: probe fixtures are byte-reproducible from the acceptance lines and 
     assert.equal(truth.status, 'unreviewed', `${slug} is report-only until reviewed`);
     assert.deepEqual(truth.expectedNumbers, JSON.parse(fs.readFileSync(path.join(ACCEPTANCE_DIR, 'truth.json'), 'utf8')).expectedNumbers, 'truth unchanged');
   }
-  const { results, ok } = await runCorpus({ only: ['probe-two-column', 'probe-scanned-noise'], print: false });
+  const { results, ok } = await runCorpus({ only: ['probe-two-column', 'probe-scanned-noise'], print: false, mode: 'legacy' });
   assert.equal(ok, true, 'probes never gate');
   const bySlug = new Map(results.map(result => [result.exam, result]));
   // Honest measured scores on today's parser (pinned so regressions/improvements are seen).

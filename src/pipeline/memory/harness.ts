@@ -62,6 +62,8 @@ export interface BeginJobParams {
   openIssueCodes?: string[];
   capTokens?: number;
   skillsCapTokens?: number;
+  /** #46: the local read loop receives matching read skills as well as its playbook. */
+  includeSkills?: boolean;
 }
 
 /** Assemble guidance for a job. Empty memory ⇒ empty blocks ⇒ prompts unchanged (D4). */
@@ -91,10 +93,10 @@ export async function beginJob(params: BeginJobParams): Promise<JobHandle> {
     const file = await loadPlaybook().catch(() => ({ version: 1 as const, entries: [] }));
     matchedPlaybookIds = matchedEntryIds(file, ctx);
     playbook = selectPlaybookEntries(file, ctx);
-    if (params.kind === 'assistant') {
+    if (params.kind === 'assistant' || params.includeSkills) {
       const skillCtx: SkillSelectionCtx = {
         userMessage: params.userMessage, health: params.health, docTraits,
-        openIssueCodes: params.openIssueCodes, roles: ['agent'],
+        openIssueCodes: params.openIssueCodes, roles: [params.kind === 'assistant' ? 'agent' : params.role || 'read'],
       };
       const pool: ParsedSkill[] = await loadSkills().catch(() => []);
       const selection = selectSkillsFromPool(pool, skillCtx, params.skillsCapTokens);

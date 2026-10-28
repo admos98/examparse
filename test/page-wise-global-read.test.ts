@@ -25,6 +25,7 @@ import { computeAttention } from '../src/utils/attention';
 import { IntegrityFlags } from '../src/components/IntegrityFlags';
 import { buildExportDoc, parseReportForDoc } from '../src/utils/examExport';
 import { Step5Exam } from '../src/views/Step5Exam';
+import { LoopReceipt } from '../src/components/LoopReceipt';
 
 const mkLine = (no: number, page: number, text: string, y = 100): SourceLine => ({
   id: `L${String(no).padStart(4, '0')}`,
@@ -426,354 +427,64 @@ test('#40 Part B1 / Acceptance #4: cloud locality — cloud receives ONLY failed
 //   and [Retry page] recovers Page 2 + places its 5 pictures without re-reading Pages 1/3!
 // ============================================================================
 
-test('#40 Acceptance #3, #5, B2, B3, C1, C2: failing page 2 of 3 ships pages 1+3 questions (never 0), emits B2 + C2 attention items, streams per-page progress, and [Retry page] recovers page 2 alone', async () => {
+test('#46 page-wise loop: failing page 2 ships pages 1+3, notes page 2, streams progress, and Retry page stays local', async () => {
   const storage = mockFolderStorage();
   const originalExecute = LLMAdapter.execute;
-
-  // 3-page exam mirroring the reported field failure:
-  // Page 1: Q1..Q3 (lines 1..4)
-  // Page 2: Q4..Q8 with 5 pictures (lines 5..10) -> FAILS local x2 + cloud x1!
-  // Page 3: Q9..Q11 (lines 11..14)
   const lines: SourceLine[] = [
-    mkLine(1, 1, 'English Exam — Grade 12 — Date: 2026-10-25 — Total: 22 marks', 40),
-    mkLine(2, 1, '1. Complete the sentence with the correct verb form. (2 marks)', 100),
-    mkLine(3, 1, '2. Complete the sentence with the correct preposition. (2 marks)', 200),
-    mkLine(4, 1, '3. Explain the meaning of "persevere". (2 marks)', 300),
-
-    mkLine(5, 2, 'Picture Matching — Match each picture to its word:', 50),
-    mkLine(6, 2, '4. Look at picture one and write the word. (2 marks)', 120),
-    mkLine(7, 2, '5. Look at picture two and write the word. (2 marks)', 220),
-    mkLine(8, 2, '6. Look at picture three and write the word. (2 marks)', 320),
-    mkLine(9, 2, '7. Look at picture four and write the word. (2 marks)', 420),
-    mkLine(10, 2, '8. Look at picture five and write the word. (2 marks)', 520),
-
-    mkLine(11, 3, 'Reading Comprehension', 50),
-    mkLine(12, 3, '9. Why did the traveler return early? (2 marks)', 120),
-    mkLine(13, 3, '10. What lesson did the villagers learn? (2 marks)', 220),
-    mkLine(14, 3, '11. Summarize the ending in one sentence. (2 marks)', 320),
+    mkLine(1, 1, 'English Exam — Grade 12 — Total: 22 marks'),
+    ...[1, 2, 3].map(n => mkLine(n + 1, 1, `${n}. Question ${n} (2 marks)`)),
+    mkLine(5, 2, 'Picture Matching'),
+    ...[4, 5, 6, 7, 8].map(n => mkLine(n + 1, 2, `${n}. Look at picture ${n - 3}. (2 marks)`)),
+    mkLine(11, 3, 'Reading Comprehension'),
+    ...[9, 10, 11].map(n => mkLine(n + 2, 3, `${n}. Question ${n} (2 marks)`)),
   ];
-
-  const page2Images: ImageAsset[] = Array.from({ length: 5 }, (_, idx) => {
-    const n = idx + 1;
-    const anchorLine = 5 + n;
-    return {
-      id: `img_p2_${n}`,
-      page: 2,
-      bbox: { x: 40, y: 100 * n, w: 120, h: 80 },
-      mime: 'image/jpeg',
-      sha: `sha_p2_${n}`,
-      width: 120,
-      height: 80,
-      anchorLine,
-      blobKey: `blob_p2_${n}`,
-      dataUrl: `/api/images/blob_p2_${n}`,
-      label: { role: 'stem', kind: 'photo', caption: `Illustrated vocabulary item ${n}` },
-    };
-  });
-
-  const preExtracted: ExtractedDocument = {
-    fileName: 'starvation.pdf',
-    lines,
-    pages: 3,
-    ocrUsed: false,
-    scannedPageIndices: [],
-    pageImages: [],
-    pageThumbKeys: [],
-    images: page2Images,
-  };
-
+  const preExtracted: ExtractedDocument = { fileName: 'starvation.pdf', lines, pages: 3, ocrUsed: false, scannedPageIndices: [], pageImages: [], pageThumbKeys: [], images: [] };
   const callLog: Array<{ role: string; label: string; text: string }> = [];
-  const stageUpdates: Array<{ id: string; status: string; message?: string }> = [];
-  const liveReadInfo: string[] = [];
-
+  const stageUpdates: string[] = [];
+  const pageDoc = (page: number) => ({ meta: { totalPoints: 22 }, sections: [{ title: page === 3 ? 'Reading Comprehension' : 'Questions' }], questions: (page === 1 ? [1, 2, 3] : page === 2 ? [4, 5, 6, 7, 8] : [9, 10, 11]).map(number => ({ number, sectionTitle: page === 3 ? 'Reading Comprehension' : 'Questions', type: 'short', stem: `Question ${number}`, options: [], points: 2, imageIds: [] })) });
   LLMAdapter.execute = (async (req: LLMRequest): Promise<LLMResponse> => {
     callLog.push({ role: req.role, label: req.label, text: req.text });
-
-    if (req.role === 'meta') {
-      return {
-        rawText: '{}',
-        json: {
-          subject: { value: 'English', line: 1 },
-          grade: { value: '12', line: 1 },
-          total: { value: 22, line: 1 },
-          date: { value: '2026-10-25', line: 1 },
-        },
-        usage: { inputTokens: 20, outputTokens: 15 },
-      };
-    }
-
-    if (req.role === 'read') {
-      if (req.text.startsWith('Page 1/3.')) {
-        return {
-          rawText: '{}',
-          json: {
-            r: [[1, 1, 'furniture'], [2, 4, 'question']],
-            q: [
-              { n: 1, p: [[2, 2]], s: 's1', t: 'short', v: [[2, 2]] },
-              { n: 2, p: [[3, 3]], s: 's1', t: 'short', v: [[3, 3]] },
-              { n: 3, p: [[4, 4]], s: 's1', t: 'short', v: [[4, 4]] },
-            ],
-            s: [{ id: 's1', title: 'Part 1', p: [[1, 4]] }],
-          },
-          usage: { inputTokens: 50, outputTokens: 40 },
-        };
-      }
-      if (req.text.startsWith('Page 2/3.')) {
-        return { rawText: 'not valid json {{{', json: null, usage: { inputTokens: 60, outputTokens: 10 } };
-      }
-      if (req.text.startsWith('Page 3/3.')) {
-        return {
-          rawText: '{}',
-          json: {
-            r: [[11, 11, 'section'], [12, 14, 'question']],
-            q: [
-              { n: 9, p: [[12, 12]], s: 's3', t: 'short', v: [[12, 12]] },
-              { n: 10, p: [[13, 13]], s: 's3', t: 'short', v: [[13, 13]] },
-              { n: 11, p: [[14, 14]], s: 's3', t: 'short', v: [[14, 14]] },
-            ],
-            s: [{ id: 's3', title: 'Reading Comprehension', p: [[11, 14]], h: 11 }],
-          },
-          usage: { inputTokens: 50, outputTokens: 40 },
-        };
-      }
-    }
-
-    if (req.role === 'cloud') {
-      if (req.label === 'Cloud · Page 2 Read') {
-        return { rawText: '{"r":[],"q":[]}', json: { r: [], q: [] }, usage: { inputTokens: 60, outputTokens: 10 } };
-      }
-      // Cloud defect escalation during Stage 4 Repair (including `image-unplaced`!)
-      return { rawText: '{"ops":[{"op":"noFix","defect":"escalated"}]}', json: { ops: [{ op: 'noFix', defect: 'escalated' }] }, usage: { inputTokens: 20, outputTokens: 10 } };
-    }
-
-    if (req.role === 'repair') {
-      // Even if local repair tries to drop Page 2's unread lines as furniture, validateRepairOp rejects it!
-      if (req.text.includes('unaccounted-lines')) {
-        return {
-          rawText: '{}',
-          json: { ops: [{ op: 'dropAsFurniture', defect: 'unaccounted-lines:5-10', lines: [5, 10] }] },
-          usage: { inputTokens: 30, outputTokens: 15 },
-        };
-      }
-      return { rawText: '{"ops":[]}', json: { ops: [] }, usage: { inputTokens: 20, outputTokens: 10 } };
-    }
-
-    return { rawText: '{"items":[]}', json: { items: [] }, usage: { inputTokens: 10, outputTokens: 10 } };
+    if (req.role !== 'read') return { rawText: '{"items":[]}', json: { items: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
+    const page = Number(/PAGE (\d+) SOURCE:/.exec(req.text)?.[1] || 0);
+    if (page === 2 && !req.label.startsWith('Retry')) return { rawText: 'broken response', json: null, usage: { inputTokens: 10, outputTokens: 5 } };
+    const doc = pageDoc(page);
+    return { rawText: JSON.stringify(doc), json: doc, usage: { inputTokens: 20, outputTokens: 10 } };
   }) as typeof LLMAdapter.execute;
-
   try {
-    const content = 'starvation-test-pdf';
-    const file = new File([content], 'starvation.pdf', { type: 'application/pdf' });
+    const file = new File(['page-wise-loop'], 'starvation.pdf', { type: 'application/pdf' });
     const fileHash = await sha256(await file.arrayBuffer());
-    const settings = {
-      ...DEFAULT_SETTINGS,
-      readFormat: 'compact' as const, // scripted fixture speaks the legacy compact wire format
-      thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false },
-    };
-
-    const doc = await runFullPipeline(
-      file,
-      settings,
-      {
-        onStageUpdate: s => stageUpdates.push({ id: s.id, status: s.status, message: s.message }),
-        onLiveText: (stageId, _label, channel, fullText) => {
-          if (stageId === 'read' && channel === 'info') liveReadInfo.push(fullText);
-        },
-      },
-      { preExtracted, fileHash },
-    );
-
-    // 1. NEVER 0 questions: Pages 1 + 3 shipped intact (6 questions: 1, 2, 3, 9, 10, 11)!
-    assert.equal(doc.questions.length, 6, 'shipped doc contains pages 1+3 questions, NEVER 0');
+    const settings = { ...DEFAULT_SETTINGS, thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false } };
+    const doc = await runFullPipeline(file, settings, { onStageUpdate: s => stageUpdates.push(s.id), onLiveText: () => undefined }, { preExtracted, fileHash });
     assert.deepEqual(doc.questions.map(q => q.no), [1, 2, 3, 9, 10, 11]);
-
-    // 2. Page 2 was tried twice locally and once via cloudPageRead, with Part C1 image captions + addresses ONLY on Page 2!
-    const p1Reads = callLog.filter(c => c.role === 'read' && c.text.startsWith('Page 1/3.'));
-    const p2Reads = callLog.filter(c => c.role === 'read' && c.text.startsWith('Page 2/3.'));
-    const p3Reads = callLog.filter(c => c.role === 'read' && c.text.startsWith('Page 3/3.'));
-    const p2Clouds = callLog.filter(c => c.role === 'cloud' && c.label === 'Cloud · Page 2 Read');
-    assert.equal(p1Reads.length, 1);
-    assert.equal(p2Reads.length, 1, '#41: format failure on page 2 is not complaint-retried locally');
-    assert.equal(p3Reads.length, 1);
-    assert.equal(p2Clouds.length, 1);
-
-    assert.doesNotMatch(p1Reads[0].text, /PAGE IMAGES/, 'page 1 has no images');
-    assert.match(p2Reads[0].text, /PAGE IMAGES \(picture content on page 2/);
-    assert.match(p2Reads[0].text, /\[img_p2_1 p2 near L0006 y100\] caption: "Illustrated vocabulary item 1"/);
-    assert.match(p2Reads[0].text, /\[img_p2_5 p2 near L0010 y500\] caption: "Illustrated vocabulary item 5"/);
-    assert.match(p2Clouds[0].text, /VALIDATOR COMPLAINT \(fix this exactly\):/, 'cloud rescue receives the local complaint verbatim');
-    assert.doesNotMatch(p3Reads[0].text, /img_p2_1/, 'page 3 does not receive page 2 images');
-    assert.match(p2Clouds[0].text, /Illustrated vocabulary item 5/, 'cloud page 2 read also receives page 2 captions');
-    assert.doesNotMatch(p2Clouds[0].text, /\[L0011 /, 'cloud page 2 read never receives page 3 lines');
-
-    // 3. `image-unplaced` is still reported — but #42 keeps it out of Repair: every line it cites is on the
-    //    read-failed page, so the page-retry path owns it and the repair loop spends no calls proposing it.
-    assert.ok(doc.spine?.repairLoop.remainingKinds.includes('image-unplaced'), 'image-unplaced survives as a reported defect');
-    assert.ok((doc.spine?.repairLoop.droppedReadFailedDefects || 0) > 0, 'read-failed-page defects are dropped before repair batching');
-    assert.equal(
-      callLog.some(c => c.role === 'cloud' && c.label.includes('Repair image-unplaced') && c.label.includes('escalation')),
-      false,
-      '#42: repair never proposes operations for defects whose lines are wholly on a read-failed page',
-    );
-
-    // 4. Page 2's lines stayed in the document as unaccounted (dropAsFurniture on failed page was rejected!).
-    assert.deepEqual(doc.source.orphanLineNos, [5, 6, 7, 8, 9, 10]);
-
-    // 5. Attention items:
-    //    - ONE `read-failed` item for Page 2: "Page 2 couldn't be read — its questions are missing [Retry page] [Open page]"
-    //    - Explanatory C2 `image-unplaced` item: "5 pictures couldn't be placed because page 2 couldn't be read — retry the page to place them [Retry page]"
-    const attention = computeAttention(doc);
-    const readFailedItems = attention.filter(i => i.kind === 'read-failed');
-    assert.equal(readFailedItems.length, 1);
-    assert.equal(
-      readFailedItems[0].plainSentence,
-      "Page 2 couldn't be read — its questions are missing [Retry page] [Open page]",
-    );
-    assert.equal(readFailedItems[0].action.target, 'page-retry');
-    assert.equal(readFailedItems[0].action.page, 2);
-    assert.equal(readFailedItems[0].secondaryAction?.target, 'source-page');
-    assert.equal(readFailedItems[0].secondaryAction?.lineNo, 5);
-
-    const imageItems = attention.filter(i => i.kind === 'image-unplaced');
-    assert.equal(imageItems.length, 1);
-    assert.equal(
-      imageItems[0].plainSentence,
-      "5 pictures couldn't be placed because page 2 couldn't be read — retry the page to place them [Retry page]",
-    );
-    assert.equal(imageItems[0].action.target, 'page-retry');
-    assert.equal(imageItems[0].action.page, 2);
-
-    // IntegrityFlags renders exact count and interactive [Retry page] + [Open page] buttons with 1 data-attention-kind per item.
-    const flagsHtml = renderToStaticMarkup(React.createElement(IntegrityFlags, { doc }));
-    assert.equal((flagsHtml.match(/data-attention-kind="/g) || []).length, attention.length);
-    assert.match(flagsHtml, /Page 2 couldn&#x27;t be read — its questions are missing \[Retry page\]/);
-    assert.match(flagsHtml, /\[Open page\]/);
-    assert.match(flagsHtml, /5 pictures couldn&#x27;t be placed because page 2 couldn&#x27;t be read — retry the page to place them \[Retry page\]/);
-
-    // 6. Acceptance #5: Step 3 live stream received pages completing one by one, and Parse Report has per-page status!
-    assert.deepEqual(liveReadInfo, [
-      'Page 1/3: local ok — 3 question(s)',
-      'Page 2/3: failed — 0 question(s)',
-      'Page 3/3: local ok — 3 question(s)',
-    ]);
-    assert.ok(stageUpdates.some(s => s.id === 'read' && s.message?.includes('Sheet 1/3')));
-    assert.ok(stageUpdates.some(s => s.id === 'read' && s.message?.includes('Sheet 2/3')));
-    assert.ok(stageUpdates.some(s => s.id === 'read' && s.message?.includes('Sheet 3/3')));
-
-    const report = parseReportForDoc(doc);
-    assert.deepEqual(
-      report.pages?.map(p => ({ page: p.page, status: p.status })),
-      [
-        { page: 1, status: 'local ok' },
-        { page: 2, status: 'failed' },
-        { page: 3, status: 'local ok' },
-      ],
-    );
-    assert.equal((buildExportDoc(doc).parseReport.classify as any).pageProposals, undefined, 'raw pageProposals stripped from export');
-
-    // 7. On-demand [Retry page] re-runs ONLY Page 2 (never Pages 1 or 3), recovers Q4..Q8, and places all 5 pictures!
-    const retryReadCalls: LLMRequest[] = [];
-    LLMAdapter.execute = (async (req: LLMRequest): Promise<LLMResponse> => {
-      if (req.role === 'read' || req.role === 'cloud') {
-        retryReadCalls.push(req);
-        assert.match(req.text, /^Page 2\/3\./m, 'retryFailedPage ONLY reads page 2');
-        return {
-          rawText: '{}',
-          json: {
-            r: [[5, 5, 'instruction'], [6, 10, 'question']],
-            q: [
-              { n: 4, p: [[6, 6]], s: 's2', t: 'short', v: [[6, 6]], i: ['img_p2_1'] },
-              { n: 5, p: [[7, 7]], s: 's2', t: 'short', v: [[7, 7]], i: ['img_p2_2'] },
-              { n: 6, p: [[8, 8]], s: 's2', t: 'short', v: [[8, 8]], i: ['img_p2_3'] },
-              { n: 7, p: [[9, 9]], s: 's2', t: 'short', v: [[9, 9]], i: ['img_p2_4'] },
-              { n: 8, p: [[10, 10]], s: 's2', t: 'short', v: [[10, 10]], i: ['img_p2_5'] },
-            ],
-            s: [{ id: 's2', title: 'Picture Matching', p: [[5, 10]], h: 5 }],
-          },
-          usage: { inputTokens: 60, outputTokens: 50 },
-        };
-      }
-      return { rawText: '{}', json: {}, usage: { inputTokens: 5, outputTokens: 5 } };
-    }) as typeof LLMAdapter.execute;
-
-    const retried = await retryFailedPage(doc, 2, settings);
-    assert.equal(retryReadCalls.length, 1, 'exactly 1 read call made for page 2 retry; pages 1 & 3 untouched');
-    assert.match(retryReadCalls[0].text, /^Page 2\/3\./m, 'retryFailedPage ONLY reads page 2');
+    assert.equal(callLog.filter(c => c.role === 'cloud').length, 0, 'no cloud anywhere');
+    assert.equal(callLog.filter(c => c.role === 'read' && /PAGE 2 SOURCE:/.test(c.text)).length, 1, 'one local read per page, no retry allowance');
+    assert.ok(stageUpdates.includes('read') && stageUpdates.includes('self-review') && stageUpdates.includes('present'));
+    assert.ok(doc.loop!.pages.find(p => p.page === 2)?.status === 'empty');
+    assert.ok(computeAttention(doc).some(item => item.action.target === 'page-retry' && item.action.page === 2));
+    const retried = await retryFailedPage(doc, 2, settings, { persist: false });
     assert.equal(retried.status, 'local ok');
-    assert.equal(retried.doc.questions.length, 11);
     assert.deepEqual(retried.doc.questions.map(q => q.no), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-    assert.equal(computeAttention(retried.doc).length, 0, 'all failed-page and unplaced-picture attention items cleared');
-  } finally {
-    LLMAdapter.execute = originalExecute;
-    storage.restore();
-  }
+    assert.equal(callLog.filter(c => c.role === 'cloud').length, 0);
+    const report = parseReportForDoc(retried.doc);
+    assert.equal(report.loop?.pages.length, 3);
+    assert.ok(renderToStaticMarkup(React.createElement(LoopReceipt, { receipt: retried.doc.loop! })).includes('Loop receipt'));
+  } finally { LLMAdapter.execute = originalExecute; storage.restore(); }
 });
 
-// ============================================================================
-// Part B3 — All pages fail: ships empty document with the read-failure attention
-//           item as today, and parse report states per-page status for every page.
-// ============================================================================
-
-test('#40 Part B3: when ALL pages fail, ships empty doc with read-failure attention item and per-page failed status in Parse Report', async () => {
+test('#46 all pages unreadable: the extraction shell is saved with six step receipts and attention notes, never Analysis failed', async () => {
   const storage = mockFolderStorage();
   const originalExecute = LLMAdapter.execute;
-
-  const lines: SourceLine[] = [
-    mkLine(1, 1, '1. Question on page 1'),
-    mkLine(2, 2, '2. Question on page 2'),
-  ];
-  const preExtracted: ExtractedDocument = {
-    fileName: 'all-fail.pdf',
-    lines,
-    pages: 2,
-    ocrUsed: false,
-    scannedPageIndices: [],
-    pageImages: [],
-    pageThumbKeys: [],
-    images: [],
-  };
-
-  LLMAdapter.execute = (async (req: LLMRequest): Promise<LLMResponse> => {
-    if (req.role === 'meta') {
-      return { rawText: '{}', json: { subject: { value: 'Math', line: 1 }, grade: { value: '10', line: 1 } }, usage: { inputTokens: 5, outputTokens: 5 } };
-    }
-    return { rawText: 'broken response', json: null, usage: { inputTokens: 10, outputTokens: 5 } };
-  }) as typeof LLMAdapter.execute;
-
+  const preExtracted: ExtractedDocument = { fileName: 'all-fail.pdf', lines: [mkLine(1, 1, '1. Question on page 1'), mkLine(2, 2, '2. Question on page 2')], pages: 2, ocrUsed: false, scannedPageIndices: [], pageImages: [], pageThumbKeys: [], images: [] };
+  LLMAdapter.execute = (async () => ({ rawText: 'broken response', json: null, usage: { inputTokens: 10, outputTokens: 5 } })) as typeof LLMAdapter.execute;
   try {
     const file = new File(['all-fail'], 'all-fail.pdf', { type: 'application/pdf' });
     const fileHash = await sha256(await file.arrayBuffer());
-    const doc = await runFullPipeline(
-      file,
-      { ...DEFAULT_SETTINGS, thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false } },
-      { onStageUpdate: () => undefined },
-      { preExtracted, fileHash },
-    );
-
+    const doc = await runFullPipeline(file, { ...DEFAULT_SETTINGS, thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false } }, { onStageUpdate: () => undefined }, { preExtracted, fileHash });
     assert.equal(doc.questions.length, 0);
-    const items = computeAttention(doc);
-    assert.equal(items.length, 1);
-    assert.equal(items[0].kind, 'read-failed');
-    assert.match(items[0].plainSentence, /whole-paper read failed/i);
-
-    const report = parseReportForDoc(doc);
-    assert.deepEqual(
-      report.pages?.map(p => ({ page: p.page, status: p.status })),
-      [
-        { page: 1, status: 'failed' },
-        { page: 2, status: 'failed' },
-      ],
-    );
-
-    const step5Html = renderToStaticMarkup(
-      React.createElement(Step5Exam, {
-        doc,
-        onUpdateDoc: () => undefined,
-      }),
-    );
-    assert.ok(step5Html.length > 0);
-  } finally {
-    LLMAdapter.execute = originalExecute;
-    storage.restore();
-  }
+    assert.equal(doc.loop!.steps.length, 6);
+    assert.ok(doc.loop!.notes.length >= 2);
+    assert.ok(computeAttention(doc).some(item => item.kind === 'read-failed'));
+    assert.deepEqual(parseReportForDoc(doc).loop?.pages.map(p => p.status), ['empty', 'empty']);
+    assert.ok(renderToStaticMarkup(React.createElement(Step5Exam, { doc, onUpdateDoc: () => undefined })).length > 0);
+  } finally { LLMAdapter.execute = originalExecute; storage.restore(); }
 });

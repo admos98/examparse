@@ -155,6 +155,30 @@ export function validateLlmRequest(value: any): string | null {
   return null;
 }
 
+export function validateDecisionsRequest(value: any): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'Decisions request object required.';
+  const config = value.providerConfig;
+  if (!config || config.kind !== 'openai-compatible' || typeof config.model !== 'string' || !config.model || !validateProviderBaseUrl(config.baseURL)) return 'Decisions provider must be an openai-compatible endpoint with a model.';
+  if (config.decisionsPath !== undefined && (typeof config.decisionsPath !== 'string' || !config.decisionsPath.startsWith('/') || config.decisionsPath.length > 300 || /[?#]/.test(config.decisionsPath))) return 'Decisions path must be a relative path.';
+  const body = value.body;
+  if (!body || typeof body !== 'object' || !Array.isArray(body.questions) || body.questions.length > 64) return 'Decisions request requires 1–64 typed questions.';
+  let imageBytes = 0;
+  for (const question of body.questions) {
+    if (!question || !['probability', 'choice'].includes(question.type) || typeof question.name !== 'string' || question.name.length > 300 || typeof question.instructions !== 'string' || question.instructions.length > 20000) return 'Decisions question is invalid.';
+    if (question.type === 'choice' && (!Array.isArray(question.choices) || question.choices.length < 2 || question.choices.length > 8 || question.choices.some((choice: any) => typeof choice !== 'string' || choice.length > 200))) return 'Choice decisions require 2–8 choices.';
+    if (question.images !== undefined) {
+      if (!Array.isArray(question.images) || question.images.length > 8) return 'Decisions image batch exceeds the 8-image limit.';
+      for (const image of question.images) {
+        if (!image || !['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'].includes(image.mime) || typeof image.data !== 'string' || image.data.length > MAX_IMAGE_BYTES * 4 / 3 || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)) return 'Decisions image payload is invalid.';
+        imageBytes += image.data.length * 0.75;
+      }
+    }
+  }
+  if (imageBytes > MAX_IMAGE_BYTES) return 'Decisions image payload exceeds the 32 MiB limit.';
+  if (!validateJsonSize(body, 25_000_000)) return 'Decisions request is too large.';
+  return null;
+}
+
 function readJsonFile<T>(file: string, fallback: T): T {
   try {
     if (!fs.existsSync(file) || fs.lstatSync(file).isSymbolicLink()) return fallback;
@@ -1217,6 +1241,29 @@ function parseExtraBody(extraBodyJson: unknown): Record<string, any> {
     return {};
   }
 }
+
+/** #46 comment-only decisions proxy. It never authors text and never edits a document. */
+app.post('/api/decisions', async (req: Request, res: Response) => {
+  const validationError = validateDecisionsRequest(req.body);
+  if (validationError) return res.status(400).json({ error: validationError });
+  const { providerConfig, body } = req.body;
+  const base = String(providerConfig.baseURL).replace(/\/+$/, '');
+  const url = `${base}${providerConfig.decisionsPath || '/v1/decisions'}`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (providerConfig.apiKey) headers['Authorization'] = `Bearer ${providerConfig.apiKey}`;
+  if (providerConfig.defaultHeaders && validateHeaders(providerConfig.defaultHeaders)) Object.assign(headers, providerConfig.defaultHeaders);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const upstream = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal });
+    if (!upstream.ok) return res.status(502).json({ error: `Decisions endpoint HTTP ${upstream.status}` });
+    const data: any = await upstream.json();
+    if (!data || !Array.isArray(data.results)) return res.status(502).json({ error: 'Decisions endpoint returned no results array' });
+    return res.json({ results: data.results.map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability) || 0)), ...(result.choice === undefined ? {} : { choice: String(result.choice) }) })) });
+  } catch (error: any) {
+    return res.status(502).json({ error: `Decisions endpoint unavailable: ${error?.message || error}` });
+  } finally { clearTimeout(timer); }
+});
 
 /**
  * Single thin proxy route POST /api/llm (§7)

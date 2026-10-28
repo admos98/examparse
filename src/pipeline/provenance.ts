@@ -110,6 +110,8 @@ export interface ParseReport {
   /** #43: decision audit summary, or the skip line when no decide role is configured. */
   audit?: AuditSummary;
   memory: { playbookIds: string[]; skillIds: string[]; guidanceTokens: number };
+  /** #46 complete six-step receipt, including the raw authored working document. */
+  loop?: import('./localLoop').LoopReceipt;
   generatedAt: string;
 }
 

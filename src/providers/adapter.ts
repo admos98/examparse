@@ -81,7 +81,10 @@ export class LLMAdapter {
       }
       throw new Error('Stream ended before done event');
     } catch (err: any) {
-      if (err instanceof CountingLoopError) throw err;
+      if (err instanceof CountingLoopError) {
+        if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'counting-loop', usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil(output.length / 3) } };
+        throw err;
+      }
       if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'stream-died', usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil((output.length + reasoning.length) / 3) } };
       opts.onInfo?.('stream-fallback');
       return this.execute(request);
@@ -160,29 +163,24 @@ export class LLMAdapter {
   }
 
   /**
-   * #43 Decision audit transport. POSTs the OpenAI-shaped decisions request
-   * ({ input, questions: [{ type, name, instructions, choices?} ]}) directly to the
-   * provider's decisions path (baseURL + decisionsPath, default /v1/decisions).
+   * #43/#46 Decision audit transport. POSTs the OpenAI-shaped decisions request
+   * ({ input, questions: [{ type, name, instructions, choices?, input?, images?} ]}) to the
+   * thin /api/decisions proxy, which forwards to the provider's decisions path.
    * No streaming, no reasoning fields, 30s timeout. The model never authors text;
    * it returns calibrated probabilities for typed questions.
    */
   static async executeDecisions(params: {
     providerConfig: ProviderConfig & { model: string };
-    body: { input: unknown; questions: Array<{ type: string; name: string; instructions: string; choices?: string[] }> };
+    body: { input: unknown; questions: Array<{ type: string; name: string; instructions: string; choices?: string[]; input?: unknown; images?: Array<{ id: string; mime: string; data: string }> }> };
     timeoutMs?: number;
   }): Promise<{ results: Array<{ name: string; probability: number; choice?: string }> }> {
     const { providerConfig, body, timeoutMs = 30000 } = params;
-    const base = providerConfig.baseURL.replace(/\/+$/, '');
-    const path = providerConfig.decisionsPath || '/v1/decisions';
-    const url = `${base}${path}`;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (providerConfig.apiKey) headers['Authorization'] = `Bearer ${providerConfig.apiKey}`;
-    if (providerConfig.defaultHeaders) Object.assign(headers, providerConfig.defaultHeaders);
-
+    // #46: the browser never calls a local provider directly (CORS/credentials). The thin server
+    // proxy validates the typed decisions payload, including optional image pixels, and forwards it.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal });
+      const response = await fetch('/api/decisions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providerConfig, body }), signal: controller.signal });
       if (!response.ok) throw new Error(`Decisions endpoint HTTP ${response.status}`);
       const data = await response.json();
       if (!data || !Array.isArray(data.results)) throw new Error('Decisions endpoint returned no results array');

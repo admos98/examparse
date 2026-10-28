@@ -4,7 +4,7 @@ import { sha256 } from '../utils/hash';
 import { getPipelineCache, setPipelineCache } from '../store';
 import {
   LOOP_VERSION, LOOP_FIX_SYSTEM, LOOP_READ_SYSTEM, LOOP_REVIEW_SYSTEM, applyCorrections, applyMetaCorrection,
-  buildLoopPagePrompt, buildLoopPages, buildReviewChunks, checkAuthoredDocument, errorMessage, flaggedFixInput,
+  buildLoopPagePrompt, buildLoopPages, buildReviewChunks, checkAuthoredDocument, assignAuthoredImages, errorMessage, flaggedFixInput,
   mergePageReads, newLoopReceipt, pageFromResponse, parseCorrections,
   type LoopModelCaller, type LoopReceipt, type LoopStepId, type LoopVerdict,
 } from './localLoop';
@@ -91,6 +91,15 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     if (row.status === 'running') row.status = 'completed';
   });
 
+  // Code image assignment follows READ and precedes SELF-REVIEW.
+  assignAuthoredImages(receipt.document, images, lines);
+
+  const patchTeacherVerdicts: LoopVerdict[] = [];
+  const recordPatchNotes=(messages:string[])=>messages.forEach((message,index)=>{
+    const no=Number(message.match(/(?:question|numbered) (\\d+)/i)?.[1]);
+    patchTeacherVerdicts.push({id:`code:patch-unapplied:${receipt.steps[3].calls}:${index}`,kind:'patch-unapplied',questionNumbers:Number.isFinite(no)&&no>0?[no]:[],source:'code',message:`Teacher review required: ${message}`});
+  });
+
   // 2. SELF-REVIEW — fresh call(s), whole exam when it fits, otherwise section/page chunks.
   await safe('self-review', async () => {
     const row = receipt.steps[1];
@@ -105,6 +114,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
         const applied = applyCorrections(receipt.document, corrections);
         receipt.document = applied.document; row.correctionsApplied += applied.applied;
         for (const message of applied.notes) note(receipt, 'self-review', message);
+        recordPatchNotes(applied.notes);
         if (applied.applied) await notify(params, receipt, 'self-review', true);
       } catch (error) { note(receipt, 'self-review', `${label} skipped — ${errorMessage(error)}.`); }
     }
@@ -132,12 +142,14 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
         const corrections = parseCorrections(response);
         if (!corrections) { note(receipt, 'code-fix', `${label}: unparseable correction output — patch skipped.`); continue; }
         const before = checkAuthoredDocument(receipt.document, images, remnants);
+        receipt.pointsWithdrawn = (receipt.pointsWithdrawn || 0) + corrections.filter(c=>c.pointsWithdrawn).length;
         let applied = applyCorrections(receipt.document, corrections);
         applied.document = applyMetaCorrection(response, applied.document, group);
         receipt.document = applied.document; row.correctionsApplied += applied.applied;
         const after = checkAuthoredDocument(receipt.document, images, remnants);
         row.verdictsClosed += closedVerdictIds(before, after).length;
         for (const message of applied.notes) note(receipt, 'code-fix', message);
+        recordPatchNotes(applied.notes);
         if (applied.applied) await notify(params, receipt, 'code-fix', true);
       } catch (error) { note(receipt, 'code-fix', `${label} skipped — ${errorMessage(error)}.`); }
     }
@@ -149,6 +161,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     const audit = await runLoopDecisionAudit({ document: receipt.document, lines, images, settings, fileHash,
       decisionCaller: params.decisionCaller, imagePayload: params.imagePayload, onJournal: params.onJournal });
     receipt.auditMode = audit.mode; receipt.auditVerdicts = audit.verdicts;
+    if(audit.dialect && audit.endpointHost) receipt.decisionProvenance={dialect:audit.dialect,host:audit.endpointHost};
     receipt.steps[4].calls = audit.calls; receipt.steps[4].inputTokens = audit.usage.inputTokens; receipt.steps[4].outputTokens = audit.usage.outputTokens;
     receipt.steps[4].verdictsRaised = audit.verdicts.filter(v => (v.probability ?? 1) < 0.8).length;
     if (audit.calls) params.onUsage?.('decision-audit', audit.usage, `Decision audit · ${audit.calls} request(s)`);
@@ -179,10 +192,11 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
           await notify(params, receipt, 'final-fix', true);
         }
         for (const message of applied.notes) note(receipt, 'final-fix', message);
+        recordPatchNotes(applied.notes);
       } catch (error) { note(receipt, 'final-fix', `${label} skipped — ${errorMessage(error)}.`); }
     }
   });
-  receipt.codeVerdicts = checkAuthoredDocument(receipt.document, images, remnants);
+  receipt.codeVerdicts = [...checkAuthoredDocument(receipt.document, images, remnants), ...patchTeacherVerdicts];
   receipt.survivingVerdicts = [...receipt.codeVerdicts, ...receipt.auditVerdicts.filter(v => !v.closed && (v.probability ?? 1) < 0.8)];
   return receipt;
 }

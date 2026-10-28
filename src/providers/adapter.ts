@@ -183,14 +183,23 @@ export class LLMAdapter {
       const response = await fetch('/api/decisions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providerConfig, body }), signal: controller.signal });
       if (!response.ok) throw new Error(`Decisions endpoint HTTP ${response.status}`);
       const data = await response.json();
+      if (providerConfig.decideDialect === 'thx') {
+        const item = Array.isArray(body.questions) ? body.questions[0] : (() => { const [name, value] = Object.entries(body.questions as any)[0] || ['', {}]; return { name, ...(value as any) }; })();
+        const itemName = item.name || Object.keys(body.questions as any)[0];
+        const raw = data?.results?.[itemName] ?? data?.[itemName] ?? data?.probabilities ?? data;
+        const choices = item.choices || Object.keys(item.criteria || {});
+        const map = raw && typeof raw === 'object' ? raw : {};
+        if (choices.length) {
+          const values = map.probabilities || map;
+          const choice = choices.reduce((best: string, c: string) => Number(values[c] ?? 0) > Number(values[best] ?? 0) ? c : best, choices[0] as string);
+          return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, Number(values[choice]) || 0)), choice }] };
+        }
+        const yes = Number(map.yes ?? map.Yes ?? map.probabilities?.yes);
+        if (!Number.isFinite(yes)) throw new Error('THX decision response malformed');
+        return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, yes)) }] };
+      }
       if (!data || !Array.isArray(data.results)) throw new Error('Decisions endpoint returned no results array');
-      return {
-        results: data.results.map((result: any) => ({
-          name: String(result.name ?? ''),
-          probability: Math.min(1, Math.max(0, Number(result.probability) || 0)),
-          ...(result.choice === undefined ? {} : { choice: String(result.choice) }),
-        })),
-      };
+      return { results: data.results.map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability) || 0)), ...(result.choice === undefined ? {} : { choice: String(result.choice) }) })) };
     } finally {
       clearTimeout(timer);
     }

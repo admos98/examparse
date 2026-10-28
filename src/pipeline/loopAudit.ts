@@ -1,7 +1,6 @@
 /** #46 decision audit: typed probability comments only. It has no document-writing API. */
 import type { AppSettings, ImageAsset, ProviderConfig, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
-import { isLocalEndpoint } from './localProvider';
 import { getPipelineCache, setPipelineCache } from '../store';
 import { sha256 } from '../utils/hash';
 import { estimateTokens } from './memory/tokens';
@@ -14,22 +13,19 @@ export interface LoopDecisionItem {
   choices?: string[]; imageId?: string;
   images?: Array<{ id: string; mime: string; data: string }>;
 }
-export interface DecisionRequestBody {
-  input: Record<string, unknown>;
-  questions: Array<{ type: string; name: string; instructions: string; choices?: string[]; input: Record<string, unknown>; images?: LoopDecisionItem['images'] }>;
-}
+export type DecisionRequestBody = any;
 export type LoopDecisionCaller = (body: DecisionRequestBody) => Promise<{ results: Array<{ name: string; probability: number; choice?: string }> }>;
 export interface LoopAuditResult {
   verdicts: LoopVerdict[]; routed: LoopVerdict[]; calls: number; mode: 'shadow' | 'active' | 'skipped';
-  notes: string[]; usage: { inputTokens: number; outputTokens: number }; catches: number; uncertain: number;
+  notes: string[]; usage: { inputTokens: number; outputTokens: number }; catches: number; uncertain: number; dialect?: 'jev'|'thx'; endpointHost?: string;
 }
 export function resolveDecisionProvider(settings: AppSettings): (ProviderConfig & { model: string }) | undefined {
   const selection = settings.roleMapping.decide;
   if (!selection?.model) return undefined;
   // Optional means optional: never fall back to read, cloud, or the first (possibly remote) provider.
   const provider = settings.providers.find(p => p.id === selection.providerId);
-  // #46: the default loop is local-only. A legacy/cloud decide mapping is tolerated but never called.
-  if (!provider || provider.kind !== 'openai-compatible' || !isLocalEndpoint(provider.baseURL)) return undefined;
+  // Generative roles remain local-only; decide is an explicitly user-configured referee and may be hosted.
+  if (!provider || provider.kind !== 'openai-compatible') return undefined;
   return { ...provider, model: selection.model };
 }
 export function buildLoopDecisionCatalogue(params: {
@@ -84,6 +80,7 @@ export async function runLoopDecisionAudit(params: {
   const provider = resolveDecisionProvider(settings);
   if (!provider) return emptyResult('skipped', ['decision audit skipped — no decide endpoint configured']);
   const result = emptyResult(mode);
+  try { result.dialect = provider.decideDialect || 'jev'; result.endpointHost = new URL(provider.baseURL).host; } catch { result.endpointHost = provider.baseURL; }
   const multimodal = settings.decideMultimodal === true;
   const payloads: Record<string, { id: string; mime: string; data: string }> = {};
   if (multimodal && params.imagePayload) {
@@ -105,29 +102,41 @@ export async function runLoopDecisionAudit(params: {
       if (cached && clamp(cached.probability) !== undefined) votes.set(item.id, cached); else unresolved.push(item);
     } catch { unresolved.push(item); }
   }
-  // One request per small batch. A failed image/payload batch does not suppress other decisions.
-  for (let start = 0; start < unresolved.length; start += 16) {
-    const batch = unresolved.slice(start, start + 16);
-    const body: DecisionRequestBody = {
-      input: { exam: fileHash.slice(0, 12), purpose: 'comment-only exam audit' },
-      questions: batch.map(item => ({ type: item.choices ? 'choice' : 'probability', name: item.id, instructions: item.instructions,
-        input: item.input, ...(item.choices ? { choices: item.choices } : {}), ...(item.images ? { images: item.images } : {}) })),
-    };
-    result.calls++;
-    result.usage.inputTokens += estimateTokens(JSON.stringify(body.input) + JSON.stringify(body.questions.map(({ images, ...q }) => q)));
-    try {
-      const caller = params.decisionCaller || ((request: DecisionRequestBody) => LLMAdapter.executeDecisions({ providerConfig: provider, body: request, timeoutMs: DECIDE_TIMEOUT_MS }));
-      const response = await caller(body);
-      const byName = new Map(response.results.map(r => [r.name, r]));
-      for (const item of batch) {
-        const row = byName.get(item.id); const p = clamp(row?.probability);
-        if (p === undefined) { result.notes.push(`Decision audit returned no usable verdict for ${item.id}.`); continue; }
-        const vote = { probability: p, ...(row?.choice !== undefined ? { choice: row.choice } : {}) };
-        votes.set(item.id, vote);
-        if (cacheEnabled) try { await setPipelineCache(await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`), vote); } catch { /* best effort */ }
-      }
-      try { await params.onJournal?.({ label: 'Decision audit · comments only', rawText: JSON.stringify(response.results), requestText: JSON.stringify(body) }); } catch { /* journal is optional */ }
-    } catch (error) { result.notes.push(`decision audit skipped for ${batch.length} item(s) — ${errorMessage(error)}`); }
+  // THX items are independent; cap concurrent single-item requests at four. JEV keeps its existing batches.
+  const thx = provider.decideDialect === 'thx';
+  const width = thx ? 4 : 16;
+  for (let start = 0; start < unresolved.length; start += width) {
+    const window = unresolved.slice(start, start + width);
+    const caller = params.decisionCaller || ((request: DecisionRequestBody) => LLMAdapter.executeDecisions({ providerConfig: provider, body: request, timeoutMs: DECIDE_TIMEOUT_MS }));
+    const jobs = thx ? window.map(item => [item]) : [window];
+    await Promise.all(jobs.map(async batch => {
+      const item0=batch[0];
+      const questionObject=item0?.input?.question || item0?.input || {};
+      const qText=`Question: ${JSON.stringify(questionObject)}`;
+      const sourceText=String(item0?.input?.sourcePageText || item0?.input?.caption || '');
+      let tail=sourceText;
+      while(tail && estimateTokens(`${qText}\nSource: ${tail}`)>850) tail=tail.slice(0,Math.max(0,Math.floor(tail.length*0.85)));
+      const state=`${qText}\nSource: ${tail}`;
+      const body: DecisionRequestBody = thx ? {
+        model: provider.model, state, questions: { [item0.name]: { type: item0.type === 'points-plausible' ? 'score' : item0.choices ? 'choice' : 'noul', instructions: item0.instructions, ...(item0.choices ? { criteria: Object.fromEntries(item0.choices.map(c=>[c,c])) } : {}) } },
+      } : {
+        input: { exam: fileHash.slice(0, 12), purpose: 'comment-only exam audit' },
+        questions: batch.map(item => ({ type: item.choices ? 'choice' : 'probability', name: item.id, instructions: item.instructions, input: item.input, ...(item.choices ? { choices: item.choices } : {}), ...(item.images ? { images: item.images } : {}) })),
+      };
+      result.calls++; result.usage.inputTokens += estimateTokens(JSON.stringify(body));
+      try {
+        const response = await caller(body);
+        const byName = new Map(response.results.map(r => [r.name, r]));
+        for (const item of batch) {
+          const row = byName.get(item.id); const p = clamp(row?.probability);
+          if (p === undefined) { result.notes.push(`Decision audit returned no usable verdict for ${item.id}.`); continue; }
+          const vote = { probability: p, ...(row?.choice !== undefined ? { choice: row.choice } : {}) };
+          votes.set(item.id, vote);
+          if (cacheEnabled) try { await setPipelineCache(await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`), vote); } catch { /* best effort */ }
+        }
+        try { await params.onJournal?.({ label: 'Decision audit · comments only', rawText: JSON.stringify(response.results), requestText: JSON.stringify(body) }); } catch { /* journal is optional */ }
+      } catch (error) { result.notes.push(`decision audit skipped for ${batch.length} item(s) — ${errorMessage(error)}`); }
+    }));
   }
   for (const item of catalogue) {
     const vote = votes.get(item.id); if (!vote) continue;

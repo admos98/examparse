@@ -146,7 +146,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const applyReceipt = (receipt: LoopReceipt) => {
     const projected = projectAuthoredDocument(receipt.document);
     const meta = { ...doc.meta, ...projected.meta };
-    doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, images,
+    doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, images, partial: receipt.survivingVerdicts.length > 0,
       displayName: nameSource === 'manual' ? displayName : computeDisplayName(meta, file.name),
       usage: [...usageRecords], loop: structuredClone(receipt), guidanceTokens: job?.guidanceTokens || 0 };
     doc.flags = loopFlags(receipt, doc);

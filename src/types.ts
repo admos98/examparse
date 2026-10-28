@@ -452,6 +452,8 @@ export interface ProviderConfig {
   apiKey: string; // stored locally
   /** #43: the decisions endpoint path on baseURL (e.g. /v1/decisions or /v1/systemone). Defaults to /v1/decisions. */
   decisionsPath?: string;
+  /** Decision request dialect. Defaults to the existing JEV/OpenAI-shaped array protocol. */
+  decideDialect?: 'jev' | 'thx';
   /** #46 mmproj-capable decisions build. Off means image decisions are caption-only. */
   multimodalDecisions?: boolean;
   defaultHeaders?: Record<string, string>;

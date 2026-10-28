@@ -13,7 +13,7 @@ export const LOOP_STEP_NAMES: Record<LoopStepId, string> = {
   read: 'Read', 'self-review': 'Self-review', 'code-check': 'Code check',
   'code-fix': 'Code-verdict fix', 'decision-audit': 'Decision audit', 'final-fix': 'Final fix',
 };
-export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'duplicate-number', 'missing-number', 'empty-stem',
+export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'empty-stem',
   'options-missing-for-type', 'points-sum-mismatch', 'image-unassigned', 'image-double-assigned', 'meta-field-implausible'] as const;
 export type CodeVerdictKind = typeof CODE_VERDICT_KINDS[number];
 export type LoopDecisionKind = 'stem-faithful' | 'complete' | 'uncontaminated' | 'type-correct' | 'answer-correct'
@@ -40,6 +40,8 @@ export interface AuthoredQuestion {
   answer?: string;
   points?: number;
   imageIds: string[];
+  passageId?: string;
+  imageAssignmentReasons?: Record<string, 'order'|'model-claim'|'vision-ref'>;
   subQuestions?: AuthoredQuestion[];
   sourcePages?: number[];
   /** Model-authored extensions and advisory stemFrom/stemTo are retained, never used to slice text. */
@@ -49,6 +51,8 @@ export interface AuthoredDocument {
   meta: Record<string, unknown>;
   sections: Array<{ title: string; [key: string]: unknown }>;
   questions: AuthoredQuestion[];
+  passages?: Array<{ id: string; sectionTitle: string; text: string }>;
+  pointsWithdrawn?: number;
 }
 export interface LoopPageReceipt {
   page: number; status: 'ok' | 'salvaged' | 'empty' | 'failed' | 'cached';
@@ -70,6 +74,8 @@ export interface LoopReceipt {
   survivingVerdicts: LoopVerdict[];
   notes: string[];
   auditMode: 'shadow' | 'active' | 'skipped';
+  pointsWithdrawn?: number;
+  decisionProvenance?: { dialect: 'jev'|'thx'; host: string };
 }
 export interface LoopModelRequest {
   step: Exclude<LoopStepId, 'code-check' | 'decision-audit'>;
@@ -143,6 +149,7 @@ export function normalizeAuthoredDocument(raw: unknown): AuthoredDocument {
   if (meta.totalPoints === undefined && meta.total !== undefined) meta.totalPoints = meta.total;
   return {
     meta,
+    passages: Array.isArray(value.passages) ? value.passages.filter((p:any)=>p && p.text).map((p:any,i:number)=>({id:text(p.id)||`passage_${i+1}`,sectionTitle:sectionTitle(p.sectionTitle),text:text(p.text)})) : [],
     sections: (Array.isArray(value.sections) ? value.sections : []).map((s: any) => typeof s === 'string' ? { title: s } : { ...object(s), title: sectionTitle(s?.title ?? s?.sectionTitle) }).filter((s: any) => s.title),
     questions: (Array.isArray(value.questions) ? value.questions : Array.isArray(raw) ? raw : []).map((q: unknown) => normalizeAuthoredQuestion(q)).filter(Boolean) as AuthoredQuestion[],
   };
@@ -196,6 +203,8 @@ export function mergePageReads(pages: AuthoredDocument[]): AuthoredDocument {
   const result = emptyAuthoredDocument();
   for (const page of pages) {
     for (const [key, value] of Object.entries(page.meta)) if (result.meta[key] === undefined && value !== undefined && value !== null && value !== '') result.meta[key] = value;
+    result.passages ||= [];
+    for (const passage of page.passages || []) { if (!result.passages.some(p=>p.id===passage.id)) result.passages.push({...passage}); }
     for (const section of page.sections) {
       const old = result.sections.find(s => sectionKey(s.title) === sectionKey(section.title));
       if (old) Object.assign(old, { ...section, ...Object.fromEntries(Object.entries(old).filter(([, v]) => v !== undefined)) });
@@ -221,7 +230,7 @@ export function mergePageReads(pages: AuthoredDocument[]): AuthoredDocument {
   return result;
 }
 
-export type Correction = { action: 'replace' | 'insert' | 'delete'; questionNumber: number; question?: AuthoredQuestion; sectionTitle?: string };
+export type Correction = { action: 'replace' | 'insert' | 'delete' | 'mergeDuplicates'; questionNumber: number; question?: AuthoredQuestion; sectionTitle?: string; pointsWithdrawn?: boolean; passages?: Array<{id:string;sectionTitle:string;text:string}> };
 export function parseCorrections(response: LoopModelResponse): Correction[] | undefined {
   // Patch output is all-or-nothing when unparseable. Unlike READ, never apply a guessed partial patch.
   let value: unknown = response.json;
@@ -231,13 +240,14 @@ export function parseCorrections(response: LoopModelResponse): Correction[] | un
   const rows = object(value).corrections;
   if (!Array.isArray(rows)) return undefined;
   const result: Correction[] = [];
+  const passages = Array.isArray(object(value).passages) ? object(value).passages.filter((p:any)=>p?.text).map((p:any,i:number)=>({id:text(p.id)||`passage_${i+1}`,sectionTitle:sectionTitle(p.sectionTitle),text:text(p.text)})) : [];
   for (const row of rows) {
     const r = object(row); const no = questionNumber(r.questionNumber ?? r.number ?? r.no);
     const action = r.action ?? r.op ?? (r.delete ? 'delete' : 'replace');
-    if (no === undefined || !['replace', 'insert', 'delete'].includes(action)) continue;
+    if (no === undefined || !['replace', 'insert', 'delete', 'mergeDuplicates'].includes(action)) continue;
     const question = action === 'delete' ? undefined : normalizeAuthoredQuestion(r.question ?? r.correctedQuestion ?? r.object);
     if (action !== 'delete' && !question) continue;
-    result.push({ action, questionNumber: no, question, sectionTitle: r.sectionTitle === undefined ? undefined : sectionTitle(r.sectionTitle) });
+    result.push({ action, questionNumber: no, question, pointsWithdrawn: (r.question ?? r.correctedQuestion ?? r.object)?.points === null, passages, sectionTitle: r.sectionTitle === undefined ? undefined : sectionTitle(r.sectionTitle) });
   }
   return result;
 }
@@ -267,10 +277,20 @@ function deleteInTree(questions: AuthoredQuestion[], correction: Correction): { 
 export function applyCorrections(doc: AuthoredDocument, corrections: Correction[]): { document: AuthoredDocument; applied: number; notes: string[] } {
   let next = structuredClone(doc); let applied = 0; const notes: string[] = [];
   for (const correction of corrections) {
+    if(correction.passages?.length){ next.passages ||= []; for(const p of correction.passages) if(!next.passages.some(x=>x.id===p.id)) next.passages.push(p); }
     const matches = flatAuthoredQuestions(next).filter(q => q.number === correction.questionNumber && (correction.sectionTitle === undefined || sectionKey(q.sectionTitle) === sectionKey(correction.sectionTitle)));
+    if (correction.action === 'mergeDuplicates') {
+      const sameNo=flatAuthoredQuestions(next).filter(q=>q.number===correction.questionNumber);
+      const keep=correction.question;
+      if(sameNo.length>=2 && keep){ const first=sameNo[0]; const replacement={...structuredClone(keep),number:correction.questionNumber,sectionTitle:keep.sectionTitle||first.sectionTitle}; const dropped=new Set(sameNo.slice(1)); const prune=(rows:AuthoredQuestion[]):AuthoredQuestion[]=>rows.filter(q=>!dropped.has(q)).map(q=>({...q,subQuestions:prune(q.subQuestions||[])})); next.questions=prune(next.questions); const old=flatAuthoredQuestions(next).find(q=>q.number===correction.questionNumber); if(old) Object.assign(old,replacement); applied++; } else notes.push(`Could not merge duplicate question ${correction.questionNumber}; teacher review required.`); continue;
+    }
     if (correction.action === 'insert' && matches.length) { notes.push(`Insert for existing question ${correction.questionNumber} ignored; use replace.`); continue; }
     if (correction.action !== 'insert' && !matches.length) { notes.push(`Correction ignored: question ${correction.questionNumber} does not exist.`); continue; }
-    if (matches.length > 1 && correction.sectionTitle === undefined) { notes.push(`Correction for duplicate question ${correction.questionNumber} ignored; sectionTitle is needed to choose its record.`); continue; }
+    if (matches.length > 1 && correction.sectionTitle === undefined) {
+      const tokens=(v:string)=>new Set(v.toLowerCase().match(/[\p{L}\p{N}]+/gu)||[]); const target=tokens(correction.question?.stem||''); const score=(q:AuthoredQuestion)=>{const t=tokens(q.stem);let n=0;for(const x of target)if(t.has(x))n++;return n/Math.max(1,target.size+t.size-n)}; const ranked=[...matches].sort((a,b)=>score(b)-score(a));
+      if(target.size && (ranked.length===1 || score(ranked[0])-score(ranked[1])>=0.12)) { correction.sectionTitle=ranked[0].sectionTitle; }
+      else { notes.push(`Two questions numbered ${correction.questionNumber} disagree — pick the right one (records: ${matches.map(q=>`${q.sectionTitle||'untitled'}: ${q.stem.slice(0,80)}`).join(' | ')}).`); continue; }
+    }
     if (correction.action === 'delete') {
       const removed = deleteInTree(next.questions, correction); next.questions = removed.questions;
       if (removed.changed) applied++;
@@ -280,7 +300,7 @@ export function applyCorrections(doc: AuthoredDocument, corrections: Correction[
       if (title && !next.sections.some(s => sectionKey(s.title) === sectionKey(title))) next.sections.push({ title });
     } else {
       const old = matches[0];
-      const replacement = { ...structuredClone(correction.question!), sourcePages: correction.question!.sourcePages || old.sourcePages };
+      const replacement = { ...structuredClone(correction.question!), sectionTitle: correction.question!.sectionTitle || old.sectionTitle, sourcePages: correction.question!.sourcePages || old.sourcePages };
       const replaced = replaceInTree(next.questions, { ...correction, question: replacement });
       next.questions = replaced.questions; if (replaced.changed) applied++;
       const title = replacement.sectionTitle;
@@ -292,19 +312,42 @@ export function applyCorrections(doc: AuthoredDocument, corrections: Correction[
   return { document: next, applied, notes };
 }
 
+/** Deterministic image bookkeeping: page + document order are primary; model claims only break ties. */
+export function assignAuthoredImages(doc: AuthoredDocument, images: ImageAsset[], lines: SourceLine[]): void {
+  const qs=flatAuthoredQuestions(doc), oldClaims=new Map(qs.map(q=>[q.number,[...q.imageIds]]));
+  for(const q of qs) { q.imageIds=[]; q.imageAssignmentReasons={}; }
+  const used=new Set<string>();
+  const orderedImages=images.map((image,index)=>({image,index})).filter(x=>!x.image.duplicateOf).sort((a,b)=>a.image.page-b.image.page||a.index-b.index).map(x=>x.image);
+  for(const image of orderedImages){
+    const eligible=(page:number)=>qs.filter(q=>{const pages=questionSourcePages(q,lines);const content=`${q.stem} ${q.options.map(o=>o.text).join(' ')}`;return (pages.includes(page)||q.sourcePages?.includes(page)) && (/\b(picture|image|diagram|figure|photo|illustration)\b/i.test(content)||oldClaims.get(q.number)?.length||Number(image.label?.questionRef?.replace(/^Q/i,''))===q.number);});
+    let candidates=eligible(image.page); if(!candidates.length)candidates=eligible(image.page-1).concat(eligible(image.page+1));
+    const available=candidates.filter(q=>q.imageIds.length===0);
+    const owner=available.find(q=>oldClaims.get(q.number)?.includes(image.id))||available[0];
+    if(owner&&!used.has(image.id)){owner.imageIds.push(image.id);const ref=Number(image.label?.questionRef?.replace(/^Q/i,''));owner.imageAssignmentReasons![image.id]=oldClaims.get(owner.number)?.includes(image.id)?'model-claim':ref===owner.number?'vision-ref':'order';used.add(image.id);}
+  }
+}
+
 export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[], remnants: LoopVerdict[] = []): LoopVerdict[] {
   const verdicts: LoopVerdict[] = [...remnants];
   const questions = flatAuthoredQuestions(doc);
   const add = (kind: CodeVerdictKind, numbers: number[], message: string, extra: Partial<LoopVerdict> = {}) => verdicts.push({ id: `code:${kind}:${numbers.join(',') || extra.imageId || 'exam'}`, kind, questionNumbers: numbers, message, source: 'code', ...extra });
   const byNumber = new Map<number, AuthoredQuestion[]>();
   for (const q of questions) byNumber.set(q.number, [...(byNumber.get(q.number) || []), q]);
-  for (const [no, matches] of byNumber) if (matches.length > 1) add('duplicate-number', [no], `Question ${no} appears ${matches.length} times. Check whether these are duplicates or separate sections.`);
+  for (const [no, matches] of byNumber) if (matches.length > 1) {
+    const norm=(v:string)=>v.toLocaleLowerCase().replace(/[^\\p{L}\\p{N}]+/gu,' ').trim();
+    const conflict=matches.length===2 && norm(matches[0].stem)===norm(matches[1].stem) && (matches[0].type!==matches[1].type || matches[0].answer!==matches[1].answer);
+    if(conflict) add('duplicate-conflict',[no],`Question ${no} has stem-identical records with conflicting type or answer; merge into one corrected question. Both records: ${JSON.stringify(matches)}.`);
+    else add('duplicate-number', [no], `Question ${no} appears ${matches.length} times. Check whether these are duplicates or separate sections.`);
+  }
   const max = Math.max(0, ...questions.map(q => q.number));
   // Pathology guard: a malformed absurd number must not allocate an unbounded gap list.
   const scanMax = Math.min(max, 1000);
   for (let no = 1; no <= scanMax; no++) if (!byNumber.has(no)) add('missing-number', [no], `Question ${no} is missing between 1 and the document's highest number (${max}).`);
   if (max > scanMax) add('missing-number', [], `The highest authored number (${max}) is implausibly large; gap checking was bounded at ${scanMax}.`);
   for (const q of questions) {
+    const passage=(doc.passages||[]).find(p=>(p.id===q.passageId || sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle)) && sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle));
+    if (passage && q.stem.length>300 && passage.text.length>100 && q.stem.includes(passage.text.slice(0,100))) add('passage-in-stem',[q.number],`Question ${q.number} duplicates passage text in its stem.`);
+    if (!q.passageId && (/\b(passage|paragraph|text above|second line)\b/i.test(q.stem) || /reading/i.test(q.sectionTitle||'')) && !(doc.passages||[]).some(p=>sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle))) add('passage-missing',[q.number],`Question ${q.number} refers to a passage but no passage is attached.`,{page:q.sourcePages?.[0]});
     if (!q.stem.trim() && !q.subQuestions?.length) add('empty-stem', [q.number], `Question ${q.number} has no question text.`);
     if (['mcq', 'multi', 'truefalse', 'matching'].includes(q.type) && q.options.length < 2 && !q.subQuestions?.length) add('options-missing-for-type', [q.number], `Question ${q.number} is ${q.type} but its answer choices are missing or incomplete.`);
   }
@@ -315,7 +358,7 @@ export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[
   const owners = new Map<string, number[]>();
   for (const q of questions) for (const id of q.imageIds) owners.set(id, [...(owners.get(id) || []), q.number]);
   for (const image of images) {
-    if (image.duplicateOf || image.label?.role === 'decoration' || image.label?.kind === 'decoration') continue;
+    if (image.duplicateOf) continue;
     const assigned = owners.get(image.id) || [];
     if (!assigned.length) add('image-unassigned', [], `Image ${image.id} on page ${image.page} has not been assigned to a question.`, { imageId: image.id, page: image.page });
     if (new Set(assigned).size > 1) add('image-double-assigned', assigned, `Image ${image.id} is assigned to more than one question (${assigned.join(', ')}).`, { imageId: image.id, page: image.page });
@@ -334,7 +377,7 @@ export function projectAuthoredDocument(doc: AuthoredDocument): { questions: Que
   const titles = [...new Set([...doc.sections.map(s => s.title), ...flatAuthoredQuestions(doc).map(q => q.sectionTitle || '').filter(Boolean)])];
   const sections = titles.map((title, index) => {
     const authored = doc.sections.find(s => sectionKey(s.title) === sectionKey(title));
-    return { id: `loop_section_${index + 1}`, index: index + 1, title, spans: [], ...(authored?.instructions ? { instructions: text(authored.instructions) } : {}), ...(number(authored?.points) !== undefined ? { points: number(authored?.points) } : {}) };
+    return { id: `loop_section_${index + 1}`, index: index + 1, title, spans: [], ...(authored?.instructions ? { instructions: text(authored.instructions) } : {}), ...((doc.passages||[]).find(p=>sectionKey(p.sectionTitle)===sectionKey(title)) ? {passage:(doc.passages||[]).find(p=>sectionKey(p.sectionTitle)===sectionKey(title))!.text} : {}), ...(number(authored?.points) !== undefined ? { points: number(authored?.points) } : {}) };
   });
   const questions: Question[] = [];
   const visit = (q: AuthoredQuestion, parentId?: string) => {
@@ -381,10 +424,10 @@ export function questionSourcePages(q: AuthoredQuestion, lines: SourceLine[]): n
 }
 export const LOOP_READ_SYSTEM = `You are ExamParse's local reader. Read this one exam page and author its questions as full JSON objects. Return JSON only.
 Use {"meta":{"subject":"...","grade":"...","totalPoints":40,"durationMinutes":90,"pages":6},"sections":[{"title":"Vocabulary","instructions":"..."}],"questions":[{"number":1,"sectionTitle":"Vocabulary","type":"mcq","stem":"full printed question text","options":[{"key":"a","text":"full choice"}],"answer":"only if a printed key supplies it","points":0.5,"imageIds":["img_1"]}]}.
-Use self-descriptive keys. Include the full stem, every option, shared instructions/passages needed to understand the question, printed points only when printed, and a printed answer only when present. Never infer or distribute marks. Include every question on this page, including continuations and subQuestions. Same number + same section on a later page means continuation. The previous-page context is read-only; do not duplicate its questions. Use only supplied image ids when the picture belongs to a question. Do not enumerate source lines. Optional stemFrom/stemTo are advisory only, never a substitute for text. Do not invent questions to fill gaps. Reasoning off. /no_think`;
+Use self-descriptive keys. Include the full stem, every option, shared instructions/passages needed to understand the question, printed points only when printed, and a printed answer only when present. Never infer or distribute marks. Include every question on this page, including continuations and subQuestions. Same number + same section on a later page means continuation. The previous-page context is read-only; do not duplicate its questions. Use only supplied image ids when the picture belongs to a question. Return shared passages once in top-level passages [{id,sectionTitle,text}], link dependent questions with passageId, and never copy passage text into stems. Do not enumerate source lines. Optional stemFrom/stemTo are advisory only, never a substitute for text. Do not invent questions to fill gaps. Reasoning off. /no_think`;
 export const LOOP_REVIEW_SYSTEM = `Here is your parse and the original text. Find questions that are wrong, incomplete, duplicated, missing, or containing another question's material. Return ONLY corrections: for each problem, the question number and the fully corrected question object; for missing questions, the complete new object; for duplicates, which number to delete. If a question is fine, say nothing about it.
 JSON: {"corrections":[{"action":"replace","questionNumber":1,"question":{full corrected object}},{"action":"insert","questionNumber":2,"question":{complete new object}},{"action":"delete","questionNumber":3,"sectionTitle":"optional when number is duplicated"}]}. Never return spans or patches to individual fields. No corrections means {"corrections":[]}. Reasoning off. /no_think`;
-export const LOOP_FIX_SYSTEM = `Fix only the questions and verdicts supplied. Use the source text, not guesswork. Return corrected FULL question objects by number, as {"corrections":[{"action":"replace","questionNumber":1,"question":{full object}}]}. You may insert a missing question or delete a duplicate using the same envelope. Do not change unflagged questions. If metadata is flagged, re-read the supplied first-page header and include corrected "meta" alongside corrections. Never infer points or answers. Reasoning off. /no_think`;
+export const LOOP_FIX_SYSTEM = `Fix only the questions and verdicts supplied. Use the source text, not guesswork. Return corrected FULL question objects by number, as {"corrections":[{"action":"replace","questionNumber":1,"question":{full object}}]}. For duplicate-conflict verdicts, include both records and source in your reasoning and return a single merged corrected object with action mergeDuplicates. You may insert a missing question or delete a duplicate using the same envelope. Do not change unflagged questions. If metadata is flagged, re-read the supplied first-page header and include corrected "meta" alongside corrections. Never infer points or answers. If printed per-question marks are absent, return points: null. For passage-missing, re-read source and return {passages:[{id,sectionTitle,text}], corrections:[{action:'replace',questionNumber,question:{...,passageId}}]}; extract passage verbatim once and link all dependent questions. Never copy passage into stem. Reasoning off. /no_think`;
 export function buildLoopPagePrompt(chunk: LoopPageChunk, images: ImageAsset[], guidance?: string): string {
   const context = chunk.context.length ? `PREVIOUS PAGE CONTEXT (read only; last ${LOOP_OVERLAP_LINES} lines):\n${sourceText(chunk.context)}\n\n` : '';
   const captions = images.filter(i => i.page === chunk.page && !i.duplicateOf).map(i => ({ id: i.id, caption: i.label?.caption || null, role: i.label?.role || null }));

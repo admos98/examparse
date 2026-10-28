@@ -161,7 +161,9 @@ export function validateDecisionsRequest(value: any): string | null {
   if (!config || config.kind !== 'openai-compatible' || typeof config.model !== 'string' || !config.model || !validateProviderBaseUrl(config.baseURL)) return 'Decisions provider must be an openai-compatible endpoint with a model.';
   if (config.decisionsPath !== undefined && (typeof config.decisionsPath !== 'string' || !config.decisionsPath.startsWith('/') || config.decisionsPath.length > 300 || /[?#]/.test(config.decisionsPath))) return 'Decisions path must be a relative path.';
   const body = value.body;
-  if (!body || typeof body !== 'object' || !Array.isArray(body.questions) || body.questions.length > 64) return 'Decisions request requires 1–64 typed questions.';
+  if (!body || typeof body !== 'object') return 'Decisions request body required.';
+  if (config.decideDialect === 'thx') { if (typeof body.state !== 'string' || body.state.length > 30000 || !body.questions || typeof body.questions !== 'object' || Object.keys(body.questions).length !== 1) return 'THX decisions require state text and exactly one named question.'; return null; }
+  if (!Array.isArray(body.questions) || body.questions.length > 64) return 'Decisions request requires 1–64 typed questions.';
   let imageBytes = 0;
   for (const question of body.questions) {
     if (!question || !['probability', 'choice'].includes(question.type) || typeof question.name !== 'string' || question.name.length > 300 || typeof question.instructions !== 'string' || question.instructions.length > 20000) return 'Decisions question is invalid.';
@@ -1258,6 +1260,7 @@ app.post('/api/decisions', async (req: Request, res: Response) => {
     const upstream = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal });
     if (!upstream.ok) return res.status(502).json({ error: `Decisions endpoint HTTP ${upstream.status}` });
     const data: any = await upstream.json();
+    if (providerConfig.decideDialect === 'thx') return res.json(data);
     if (!data || !Array.isArray(data.results)) return res.status(502).json({ error: 'Decisions endpoint returned no results array' });
     return res.json({ results: data.results.map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability) || 0)), ...(result.choice === undefined ? {} : { choice: String(result.choice) }) })) });
   } catch (error: any) {

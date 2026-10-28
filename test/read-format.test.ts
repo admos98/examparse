@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseReadProposalChecked, buildPageReadPrompt, runGlobalReadStage } from '../src/pipeline/globalRead';
+import { parseReadProposalChecked, buildPageReadPrompt, runGlobalReadStage, GLOBAL_READ_VERBOSE_SYSTEM, hasCountingLoop, pageReadOutputCap, salvageVerbosePage } from '../src/pipeline/globalRead';
 import { effectiveReadFormat, isLocalReadProvider } from '../src/pipeline/readFormat';
 import { assembleReadProposal } from '../src/pipeline/globalRead';
 import { compileDocument } from '../src/pipeline/compile';
@@ -25,9 +25,8 @@ const compact = {
 };
 const verbose = {
   page: 1,
-  furnitureLines: [1],
   sections: [{ title: 'Listening', headerLine: 2 }],
-  questions: [{ number: 1, type: 'truefalse', stemLines: [3], optionLines: [4, 5], options: [{ key: 'a', lines: [4] }, { key: 'b', lines: [5] }], continuationLines: [], marksLine: 6, answerLine: null, imageIds: [] }],
+  questions: [{ number: 1, type: 'truefalse', stemFrom: 3, stemTo: 3, optionsFrom: 4, optionsTo: 5, passageFrom: null, passageTo: null, marksLine: 6, answerLine: null, imageIds: [] }],
   answerKey: [{ number: 1, answer: 'b', line: 20 }],
 };
 
@@ -36,7 +35,7 @@ test('compact and verbose formats normalize the same scripted page to the same p
   const v = parseReadProposalChecked('', verbose, 'verbose', lines).proposal;
   assert.deepEqual(v.questions, c.questions);
   assert.deepEqual(v.sections, c.sections);
-  assert.deepEqual([...v.labels].filter(([, label]) => label === 'furniture'), [...c.labels].filter(([, label]) => label === 'furniture'));
+  assert.equal(v.labels.has(1), false); // unclaimed furniture is derived by code
   assert.deepEqual(v.answerKey, c.answerKey);
 });
 
@@ -50,13 +49,12 @@ test('verbose mode leaves unclaimed lines for compiler reconciliation without a 
     { id: 'L0011', page: 2, y: 1, text: 'Repeated banner' },
   ];
   const proposal = parseReadProposalChecked('', {
-    page: 1, furnitureLines: [], sections: [{ title: 'Listening', headerLine: 1 }],
-    questions: [{ number: 1, type: 'short', stemLines: [2, 4], optionLines: [], continuationLines: [], marksLine: null, answerLine: null, imageIds: [] }], answerKey: [],
+    page: 1, sections: [{ title: 'Listening', headerLine: 1 }],
+    questions: [{ number: 1, type: 'short', stemFrom: 2, stemTo: 4, optionsFrom: null, optionsTo: null, passageFrom: null, passageTo: null, marksLine: null, answerLine: null, imageIds: [] }], answerKey: [],
   }, 'verbose', source).proposal;
-  assert.deepEqual(proposal.questions[0].spans, [[2, 2], [4, 4]]);
+  assert.deepEqual(proposal.questions[0].spans, [[2, 4]]);
   const assembled = assembleReadProposal(proposal, source);
   const compiled = await compileDocument({ questions: assembled.questions, sections: assembled.sections, lines: source, keyLineNos: assembled.keyLineNos, accountedLineNos: [...proposal.labels.keys()] });
-  assert.ok(compiled.reconciliations.some(r => r.kind === 'orphan-absorbed' && r.lines.includes(3)));
   assert.ok(compiled.defects.some(d => d.kind === 'unaccounted-lines' && d.lineIds.includes(5)));
 });
 
@@ -73,7 +71,7 @@ test('auto selects verbose for local endpoints, compact for remote, and explicit
 
 test('verbose prompt includes explicit anti-template instruction', () => {
   const prompt = buildPageReadPrompt({ page: 1, totalPages: 1, owned: lines, context: [], format: 'verbose' });
-  assert.match(prompt, /If you are producing questions at regular line intervals, you have stopped reading — go back to the printed numbers\./);
+  assert.match(prompt, /Never list line numbers one by one/);
 });
 
 test('page report records the actual verbose format and its output-token receipt', async () => {
@@ -81,7 +79,7 @@ test('page report records the actual verbose format and its output-token receipt
     lines,
     format: 'verbose',
     caller: async request => {
-      assert.match(request.text, /"furnitureLines"/);
+      assert.match(request.text, /"stemFrom"/);
       return { rawText: JSON.stringify(verbose), json: verbose, usage: { inputTokens: 100, outputTokens: 321 } };
     },
   });
@@ -103,4 +101,95 @@ test('read-model scoreboard keeps page outcomes split by format', () => {
     verbose: { ok: 1, okReconciled: 0, partial: 1, failed: 0 },
     compact: { ok: 0, okReconciled: 0, partial: 0, failed: 1 },
   });
+});
+
+
+test('verbose v2 schema contains no enumerated line-number array', () => {
+  const prompt = buildPageReadPrompt({ page: 1, totalPages: 1, owned: lines, context: [], format: 'verbose' });
+  const example = JSON.parse(GLOBAL_READ_VERBOSE_SYSTEM.match(/Use this example: (\{[^\n]+\})\./)![1]);
+  const visit = (value: any, key = '') => {
+    if (Array.isArray(value)) { assert.ok(!/line|span|range/i.test(key)); value.forEach(x => visit(x)); }
+    else if (value && typeof value === 'object') Object.entries(value).forEach(([k, v]) => visit(v, k));
+  };
+  visit(example);
+  assert.doesNotMatch(prompt, /furnitureLines|stemLines|optionLines|continuationLines/);
+  assert.match(prompt, /Never list line numbers one by one/);
+});
+
+test('page cap uses owned lines, both formats', async () => {
+  assert.equal(pageReadOutputCap(40), 2000);
+  for (const format of ['compact', 'verbose'] as const) {
+    const source = Array.from({ length: 40 }, (_, i) => ({ id: `L${String(i + 1).padStart(4, '0')}`, page: 1, y: i, text: `${i + 1}. test` }));
+    await runGlobalReadStage({ lines: source, format, caller: async req => {
+      assert.equal(req.maxOutputTokens, 2000);
+      return { rawText: JSON.stringify(format === 'verbose' ? verbose : compact), json: format === 'verbose' ? verbose : compact };
+    } });
+  }
+});
+
+test('counting loop detection reaches cloud without local retry', async () => {
+  assert.equal(hasCountingLoop(Array.from({ length: 40 }, (_, i) => String(1600 + i)).join(',')), true);
+  let local = 0, cloud = 0;
+  const result = await runGlobalReadStage({ lines, format: 'verbose', caller: async () => {
+    local++;
+    throw Object.assign(new Error('counting loop in read stream'), { outputTokens: 120 });
+  }, cloudCaller: async () => {
+    cloud++;
+    return { rawText: JSON.stringify(compact), json: compact, usage: { inputTokens: 10, outputTokens: 50 } };
+  } });
+  assert.equal(local, 1); assert.equal(cloud, 1);
+  assert.equal(result.calls, 1); assert.equal(result.cloudCalls, 1);
+  assert.equal(result.usage.outputTokens, 120);
+  assert.equal(result.pages[0].status, 'cloud ok');
+});
+
+test('truncated question four salvages complete questions and leaves a compiler defect', async () => {
+  const source = Array.from({ length: 9 }, (_, i) => ({ id: `L${String(i + 1).padStart(4, '0')}`, page: 1, y: i, text: i % 2 === 0 ? `${Math.floor(i / 2) + 1}. Question` : 'body' }));
+  const q = (n: number) => ({ number: n, type: 'short', stemFrom: n * 2 - 1, stemTo: n * 2, optionsFrom: null, optionsTo: null, passageFrom: null, passageTo: null, marksLine: null, answerLine: null, imageIds: [] });
+  const raw = `{"page":1,"sections":[],"questions":[${[1, 2, 3].map(n => JSON.stringify(q(n))).join(',')},{"number":4,"stemFrom":7`;
+  assert.equal(salvageVerbosePage(raw)?.questions.length, 3);
+  const result = await runGlobalReadStage({ lines: source, format: 'verbose', caller: async () => ({ rawText: raw, usage: { inputTokens: 50, outputTokens: 180 } }) });
+  assert.equal(result.calls, 1);
+  assert.equal(result.failedPages.length, 0);
+  assert.equal(result.proposal?.questions.length, 3);
+  const assembled = assembleReadProposal(result.proposal!, source);
+  const compiled = await compileDocument({ questions: assembled.questions, sections: assembled.sections, lines: source, keyLineNos: [], accountedLineNos: [...result.proposal!.labels.keys()] });
+  assert.ok(compiled.defects.length > 0);
+  assert.equal(compiled.pageStatus.get(1), 'partial');
+});
+
+test('stream breaker stops a counting generation before the read cap without transport retry', async () => {
+  const { LLMAdapter, CountingLoopError } = await import('../src/providers/adapter');
+  const original = globalThis.fetch;
+  let fetches = 0, sent = 0, cancelled = false;
+  globalThis.fetch = (async () => {
+    fetches++;
+    const encoder = new TextEncoder();
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        sent++;
+        controller.enqueue(encoder.encode(`event: delta\ndata: ${JSON.stringify({ text: `${sent},` })}\n\n`));
+        if (sent > 100) controller.close();
+      },
+      cancel() { cancelled = true; },
+    }), { headers: { 'Content-Type': 'text/event-stream' } });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(LLMAdapter.execute({ role: 'read', system: '', text: '', label: 'page', maxOutputTokens: 2000 }, { onDelta: () => {}, detectCountingLoop: true, salvagePartial: true }), CountingLoopError);
+    assert.equal(fetches, 1);
+    assert.ok(sent < 100);
+    // Aborting the underlying fetch stops generation even though there is no done event.
+    assert.ok(cancelled || sent < 100);
+  } finally { globalThis.fetch = original; }
+});
+
+test('pure enumeration with no complete question fast-paths to cloud', async () => {
+  let local = 0;
+  const result = await runGlobalReadStage({ lines, format: 'verbose', caller: async () => {
+    local++;
+    return { rawText: `{"questions":[${Array.from({ length: 60 }, (_, i) => i + 1).join(',')}` };
+  }, cloudCaller: async () => ({ rawText: JSON.stringify(compact), json: compact }) });
+  assert.equal(local, 1);
+  assert.equal(result.cloudCalls, 1);
+  assert.equal(result.pages[0].status, 'cloud ok');
 });

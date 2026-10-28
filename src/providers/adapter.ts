@@ -1,12 +1,18 @@
 /**
  * Unified Provider Abstraction & Adapter (§7)
  */
+import { hasCountingLoop } from '../pipeline/globalRead';
 import { LLMRequest, LLMResponse, ProviderConfig } from '../types';
 
 export interface ExecuteOptions {
   onDelta?: (channel: 'output' | 'reasoning', fullText: string, chunk: string) => void;
   onInfo?: (note: string) => void;
   salvagePartial?: boolean;
+  detectCountingLoop?: boolean;
+}
+
+export class CountingLoopError extends Error {
+  constructor(public outputTokens: number) { super('counting loop in read stream'); }
 }
 
 export class LLMAdapter {
@@ -48,8 +54,9 @@ export class LLMAdapter {
 
   private static async executeStreaming(request: LLMRequest, opts: ExecuteOptions): Promise<LLMResponse> {
     let output = '', reasoning = '';
+    const controller = new AbortController();
     try {
-      const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...request, stream: true }) });
+      const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...request, stream: true }), signal: controller.signal });
       if (!response.ok) throw new Error((await response.text()).slice(0, 500) || `HTTP ${response.status}`);
       const reader = response.body?.getReader();
       if (!reader) throw new Error('Streaming response body unavailable');
@@ -66,7 +73,7 @@ export class LLMAdapter {
           if (!data) continue;
           const payload = JSON.parse(data);
           if (event === 'info') opts.onInfo?.(payload.note || '');
-          else if (event === 'delta') { output += payload.text || ''; opts.onDelta?.('output', output, payload.text || ''); }
+          else if (event === 'delta') { output += payload.text || ''; if (opts.detectCountingLoop && hasCountingLoop(output)) { controller.abort(); throw new CountingLoopError(Math.ceil(output.length / 3)); } opts.onDelta?.('output', output, payload.text || ''); }
           else if (event === 'reasoning') { reasoning += payload.text || ''; opts.onDelta?.('reasoning', reasoning, payload.text || ''); }
           else if (event === 'error') throw new Error(payload.message || 'Stream error');
           else if (event === 'done') return payload as LLMResponse;
@@ -74,6 +81,7 @@ export class LLMAdapter {
       }
       throw new Error('Stream ended before done event');
     } catch (err: any) {
+      if (err instanceof CountingLoopError) throw err;
       if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'stream-died', usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil((output.length + reasoning.length) / 3) } };
       opts.onInfo?.('stream-fallback');
       return this.execute(request);

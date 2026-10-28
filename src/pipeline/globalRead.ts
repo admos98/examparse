@@ -95,11 +95,50 @@ export const GLOBAL_READ_SYSTEM = `You are ExamRead. Read ONE printed exam page 
 Output {"r":[[start,end,label]],"q":[{"n":1,"p":[[10,12]],"s":"sec1","t":"mcq","o":[["a",[[11,11]]]],"v":[[12,12]],"a":[[90,90]],"i":["img1"]}],"s":[{"id":"sec1","title":"Vocabulary","p":[[8,40]],"h":8}],"m":{"subject":{"value":"English","line":2},"grade":{"value":"12","line":3},"total":{"value":40,"line":95}},"k":{"1":{"value":"b","p":[[90,90]]}}}.
 Labels are exactly furniture|section|instruction|question|continuation|option|passage|key|marks. Label ONLY this page's non-ctx lines, each line exactly once; lines marked ctx are read-only context from the previous page and must never be labelled or owned. If OPEN QUESTION FROM PREVIOUS PAGE is not "none" and top lines of this page continue that question before the next printed question number, label those top lines continuation (or option/marks) and do NOT re-open that question number in q. Give every printed question number starting on this page and its complete boundary on this page. Type is mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay|unknown. v is ONLY line spans that explicitly print that question's marks; omit it when marks are not printed. Never infer/distribute points. Use PAGE IMAGES (caption + address) to attach matching page image ids in i:[id]; captions are context only. Meta fields require one evidence line each. A repeated header, footer, page number, or “continued” line is furniture, never a section or question. Use ranges economically. /no_think`;
 
-export const GLOBAL_READ_VERBOSE_SYSTEM = `You are ExamRead. Read ONE printed exam page and describe its real structure. Reasoning is OFF. Return one JSON object only. Do not copy or author question text; code slices text from the line numbers you cite.
-Use full, self-descriptive English keys. Every question is a separate object and must include its printed number, type, stemLines, optionLines, continuationLines, marksLine, answerLine, and imageIds. Line lists are explicit arrays of printed line numbers, never ranges encoded as [start,count], and no field has positional meaning. Use null when marksLine or answerLine is absent and [] for empty lists.
-A page object has this shape: {"page":1,"furnitureLines":[1,2],"sections":[{"title":"Listening","headerLine":5}],"questions":[{"number":1,"type":"truefalse","stemLines":[8],"optionLines":[],"continuationLines":[],"marksLine":null,"answerLine":null,"imageIds":[]},{"number":2,"type":"mcq","stemLines":[12],"optionLines":[13,14,15,16],"options":[{"key":"a","lines":[13]},{"key":"b","lines":[14]},{"key":"c","lines":[15]},{"key":"d","lines":[16]}],"continuationLines":[],"marksLine":17,"answerLine":null,"imageIds":["img1"]}],"answerKey":[{"number":1,"answer":"true","line":90}]}. This is a fully-worked example: question 1 is true/false and question 2 is multiple choice.
-Questions occur where the printed numbers are. If you are producing questions at regular line intervals, you have stopped reading — go back to the printed numbers.
-List only lines you can confidently claim: furnitureLines for repeated headers/footers/page numbers; sections use their printed title and headerLine; each question's stemLines, optionLines, continuationLines, marksLine and answerLine describe its evidence. Do not make a line-by-line label table. Unclaimed lines are okay; code reconciles them. Never infer or distribute marks. Use type names mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay|unknown. Answer-key entries give printed number, answer, and evidence line. Add image ids only when that page image belongs to the question. Meta may be supplied as metadata with evidence lines. Lines marked ctx are read-only and must never be claimed. If OPEN QUESTION FROM PREVIOUS PAGE names a question, top lines may continue it; do not re-open its printed number. A repeated header, footer, or page number is furniture. /no_think`;
+export const GLOBAL_READ_VERBOSE_SYSTEM = `You are ExamRead. Read ONE printed exam page. Return one JSON object only. Do not copy question text; the app slices it from your boundaries. Reasoning is OFF.
+Use this example: {"page":1,"sections":[{"title":"Listening","headerLine":5}],"questions":[{"number":1,"type":"truefalse","stemFrom":8,"stemTo":8,"optionsFrom":8,"optionsTo":8,"passageFrom":null,"passageTo":null,"marksLine":null,"answerLine":null,"imageIds":[]}],"answerKey":[{"number":1,"answer":"b","line":90}]}.
+Never list line numbers one by one. For each question give only the first and last line of its stem and options. If a line belongs to no question, say nothing about it — the app will handle it.
+For absent options or passages use null for both endpoints. Sections give printed title and headerLine. Include every printed question that starts on this page, with its number and type: mcq|truefalse|short|long|fillblank|matching|multi|numeric|diagram|essay|unknown. Give marksLine only for explicitly printed marks; do not infer points. Answer-key entries give printed number, answer, and evidence line. Add imageIds only when an image belongs to the question. Lines marked ctx belong to the previous page; never cite them. If OPEN QUESTION FROM PREVIOUS PAGE names a question, do not reopen its number. Never invent questions at regular intervals; follow printed numbers. /no_think`;
+
+/** The read cap is page-local, for both wire formats. */
+export const pageReadOutputCap = (ownedLines: number): number => Math.min(8192, 800 + ownedLines * 30);
+
+/** A counting loop is not an exam proposal. Match delimited integers, across streaming chunks. */
+export function hasCountingLoop(text: string): boolean {
+  let previous = -1, run = 0;
+  for (const match of text.matchAll(/\b\d+\b/g)) {
+    const n = Number(match[0]);
+    run = n === previous + 1 ? run + 1 : 1;
+    if (run >= 40) return true;
+    previous = n;
+  }
+  return false;
+}
+
+/** Scan only complete top-level objects inside a named array, respecting JSON strings. */
+function completeArrayObjects(text: string, key: string): unknown[] {
+  const start = new RegExp(`"${key}"\\s*:\\s*\\[`).exec(text);
+  if (!start || start.index === undefined) return [];
+  const out: unknown[] = [];
+  let depth = 0, begin = -1, quoted = false, escape = false;
+  for (let i = start.index + start[0].length; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) { if (escape) escape = false; else if (ch === '\\') escape = true; else if (ch === '"') quoted = false; continue; }
+    if (ch === '"') { quoted = true; continue; }
+    if (ch === ']' && depth === 0) break;
+    if (ch === '{') { if (depth++ === 0) begin = i; }
+    if (ch === '}' && depth > 0 && --depth === 0) {
+      try { out.push(JSON.parse(text.slice(begin, i + 1))); } catch { /* incomplete object */ }
+    }
+  }
+  return out;
+}
+
+export function salvageVerbosePage(text: string): any | undefined {
+  const questions = completeArrayObjects(text, 'questions');
+  if (!questions.length) return undefined;
+  return { sections: completeArrayObjects(text, 'sections'), questions, answerKey: completeArrayObjects(text, 'answerKey') };
+}
 
 const no = (value: unknown): number => Number(String(value ?? '').replace(/[^0-9۰-۹٠-٩]/g, '').replace(/[۰-۹]/g, d => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))).replace(/[٠-٩]/g, d => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))));
 const lineNo = (l: SourceLine) => no(l.id);
@@ -175,8 +214,6 @@ function normalizeVerboseProposal(raw: any, ownedLines: SourceLine[]): any {
     return n > 0 ? [n, n, label] : undefined;
   };
   const rows: any[] = [];
-  const furniture = Array.isArray(raw.furnitureLines) ? raw.furnitureLines : [];
-  for (const n of furniture) { const r = mark(n, 'furniture'); if (r) rows.push(r); }
   const sections = (Array.isArray(raw.sections) ? raw.sections : []).map((sec: any, i: number) => {
     const headerLine = no(sec?.headerLine);
     if (headerLine) rows.push([headerLine, headerLine, 'section']);
@@ -187,28 +224,39 @@ function normalizeVerboseProposal(raw: any, ownedLines: SourceLine[]): any {
     return { id: `sec${i + 1}`, title: String(sec?.title || ''), p: headerLine ? [[headerLine, Math.max(headerLine, end)]] : [], h: headerLine };
   });
   const questions = (Array.isArray(raw.questions) ? raw.questions : []).map((q: any) => {
-    const stemLines = Array.isArray(q?.stemLines) ? q.stemLines : [];
-    const optionLines = Array.isArray(q?.optionLines) ? q.optionLines : [];
-    const continuationLines = Array.isArray(q?.continuationLines) ? q.continuationLines : [];
-    const options = Array.isArray(q?.options) ? q.options.map((o: any, i: number) => [String(o?.key || String.fromCharCode(97 + i)), (Array.isArray(o?.lines) ? o.lines : []).map((n: number) => [no(n), no(n)])])
-      : optionLines.map((n: number, i: number) => [parseLeadingOptionKey(ownedLines.find(l => lineNo(l) === no(n))?.text || '') || String.fromCharCode(97 + i), [[no(n), no(n)]]]);
-    for (const n of stemLines) { const r = mark(n, 'question'); if (r) rows.push(r); }
-    for (const n of optionLines) { const r = mark(n, 'option'); if (r) rows.push(r); }
-    for (const n of continuationLines) { const r = mark(n, 'continuation'); if (r) rows.push(r); }
-    for (const n of (Array.isArray(q?.options) ? q.options.flatMap((o: any) => o?.lines || []) : [])) { const r = mark(n, 'option'); if (r) rows.push(r); }
-    const marksLine = q?.marksLine; if (marksLine != null) { const r = mark(marksLine, 'marks'); if (r) rows.push(r); }
-    const answerLine = q?.answerLine; if (answerLine != null) { const r = mark(answerLine, 'key'); if (r) rows.push(r); }
-    const firstQuestionLine = [...stemLines, ...optionLines, ...continuationLines].map(no).filter(Boolean).sort((a: number, b: number) => a - b)[0] || 0;
+    const range = (from: unknown, to: unknown): [number, number] | undefined => {
+      if (from == null || to == null) return undefined;
+      const a = no(from), b = no(to);
+      return a > 0 && b >= a && b - a < 10000 ? [a, b] : undefined;
+    };
+    const stem = range(q?.stemFrom, q?.stemTo);
+    const options = range(q?.optionsFrom, q?.optionsTo);
+    const passage = range(q?.passageFrom, q?.passageTo);
+    const markRange = (r: [number, number] | undefined, label: ReadLabel) => { if (r) for (let n = r[0]; n <= r[1]; n++) rows.push([n, n, label]); };
+    markRange(stem, 'question'); markRange(options, 'option'); markRange(passage, 'passage');
+    if (q?.marksLine != null) { const r = mark(q.marksLine, 'marks'); if (r) rows.push(r); }
+    if (q?.answerLine != null) { const r = mark(q.answerLine, 'key'); if (r) rows.push(r); }
+    const firstQuestionLine = stem?.[0] || options?.[0] || passage?.[0] || 0;
     const headerSection = sections.filter((sec: any) => no(sec.h) <= firstQuestionLine).sort((a: any, b: any) => no(b.h) - no(a.h))[0] || sections[0];
+    // Infer option boundaries from printed keys. Wrapped option lines extend the preceding option;
+    // if there are no keys, retain the whole options range as one evidence span.
+    const optionSpans: Array<{ key: string; span: [number, number] }> = [];
+    if (options) {
+      for (const n of lineNumbers.filter(n => n >= options[0] && n <= options[1])) {
+        const key = parseLeadingOptionKey(ownedLines.find(l => lineNo(l) === n)?.text || '');
+        const last = optionSpans.at(-1);
+        if (key || !last) optionSpans.push({ key: key || String.fromCharCode(97 + optionSpans.length), span: [n, n] });
+        else last.span[1] = n;
+      }
+    }
     return {
       n: q?.number, t: q?.type,
-      p: [...stemLines, ...continuationLines].map((n: number) => [no(n), no(n)]),
-      o: options,
-      ...(headerSection ? { s: headerSection.id } : q?.section ? { s: String(q.section) } : {}),
-      ...(marksLine != null ? { v: [[no(marksLine), no(marksLine)]] } : {}),
-      ...(answerLine != null ? { a: [[no(answerLine), no(answerLine)]] } : {}),
+      p: [stem, passage].filter(Boolean),
+      o: optionSpans.map(x => [x.key, [x.span]]),
+      ...(headerSection ? { s: headerSection.id } : {}),
+      ...(q?.marksLine != null ? { v: [[no(q.marksLine), no(q.marksLine)]] } : {}),
+      ...(q?.answerLine != null ? { a: [[no(q.answerLine), no(q.answerLine)]] } : {}),
       i: Array.isArray(q?.imageIds) ? q.imageIds : [],
-      ...(q?.parentNumber ? { g: q.parentNumber } : {}),
     };
   });
   const answerKey: Record<string, any> = {};
@@ -664,7 +712,9 @@ export function buildPageReadPrompt(params: {
     ? `Page ${params.page}/${params.totalPages}. Read this page's printed structure; cite only its own line numbers (${firstId}..${lastId}).${params.context.length ? ' Lines marked ctx are read-only overlap from the previous page and must not be claimed.' : ''}\n`
     : `Page ${params.page}/${params.totalPages}. Label ONLY page ${params.page}'s non-ctx lines (${firstId}..${lastId}).${params.context.length ? ' Lines marked ctx are read-only overlap from the previous page; do not label or own them.' : ''}\n`;
   const carryOver = `OPEN QUESTION FROM PREVIOUS PAGE: ${formatOpenQuestionState(params.openQuestion)}\n`;
-  const imageBlock = renderPageImagesBlock(params.images, params.page);
+  const imageBlock = params.format === 'verbose'
+    ? renderPageImagesBlock(params.images, params.page).replace('question "i":[...]', 'question imageIds:[]')
+    : renderPageImagesBlock(params.images, params.page);
   const complaintBlock = params.complaints?.length ? `\n\nVALIDATOR COMPLAINT (fix this exactly):\n${params.complaints.join('\n')}` : '';
   const instructions = params.format === 'verbose' ? `${GLOBAL_READ_VERBOSE_SYSTEM}\n\n` : '';
   return `${instructions}${guidanceBlock}${pageHeader}${carryOver}${imageBlock}${renderLines(params.owned, params.context)}${complaintBlock}`;
@@ -683,8 +733,9 @@ export async function pageReadCacheKey(params: {
   const guidanceHash = (await sha256(params.guidance || '')).slice(0, 16);
   const page = params.owned[0]?.page ?? 0;
   const imgSig = renderPageImagesBlock(params.images, page);
-  const full = await sha256(`${READ_VERSION}\nformat:${params.format || 'compact'}\nmodel:${params.model || 'default'}\nguidance:${guidanceHash}\nimages:${imgSig}\nctx:\n${ctxSig}\nowned:\n${ownedSig}`);
-  return `page-read-${READ_VERSION}-${full.slice(0, 32)}`;
+  const wireVersion = params.format === 'verbose' ? 'verbose-v2' : READ_VERSION;
+  const full = await sha256(`${wireVersion}\nformat:${params.format || 'compact'}\nmodel:${params.model || 'default'}\nguidance:${guidanceHash}\nimages:${imgSig}\nctx:\n${ctxSig}\nowned:\n${ownedSig}`);
+  return `page-read-${wireVersion}-${full.slice(0, 32)}`;
 }
 
 function maxQuestionLineOnPage(q: ReadQuestion): number {
@@ -998,7 +1049,7 @@ export async function cloudPageRead(params: {
         system: params.format === 'verbose' ? GLOBAL_READ_VERBOSE_SYSTEM : GLOBAL_READ_SYSTEM,
         text: requestText,
         label,
-        maxOutputTokens: 32000,
+        maxOutputTokens: pageReadOutputCap(params.owned.length),
         reasoningOff: true,
       });
       if (response.usage) {
@@ -1170,7 +1221,7 @@ export async function readSinglePageWithFallback(params: {
           system: params.format === 'verbose' ? GLOBAL_READ_VERBOSE_SYSTEM : GLOBAL_READ_SYSTEM,
           text,
           label,
-          maxOutputTokens: 32000,
+          maxOutputTokens: pageReadOutputCap(chunk.owned.length),
           reasoningOff: true,
         });
         if (response.usage) {
@@ -1185,6 +1236,19 @@ export async function readSinglePageWithFallback(params: {
         });
         const parsed = checked.proposal;
         const parses = checked.parses;
+        // A cut-off tail is not grounds to discard complete earlier questions.
+        // Unclaimed tail lines flow into compiler reconciliation / scoped defects.
+        if (!parses && params.format === 'verbose') {
+          const salvaged = salvageVerbosePage(response.rawText);
+          if (salvaged) {
+            const partial = checkReadOutput('', salvaged, chunk.owned, { format: 'verbose', hasOpenQuestion: Boolean(params.openQuestion), allowKeyOnlyPage: params.allowKeyOnlyPage });
+            if (partial.ok) return {
+              proposal: partial.proposal, status: 'local ok', cached: false, localCalls, cloudCalls,
+              cloudAttempts, usage, cloudUsage,
+              complaints: ['read output truncated; complete questions salvaged; remaining lines require reconciliation'], localComplaints,
+            };
+          }
+        }
         if (checked.ok) {
           if (params.pageCache && cacheKey) {
             await params.pageCache.set(cacheKey, { serialized: serializeReadProposal(parsed), source: 'local', format: params.format || 'compact' });
@@ -1209,7 +1273,9 @@ export async function readSinglePageWithFallback(params: {
         if (attempt === 1 && params.cloudCaller && isFormatFailure({ parses, complaints, owned: chunk.owned, proposal: parsed })) break;
       } catch (err: any) {
         complaints = [String(err?.message || err)];
+        if (err?.outputTokens) usage.outputTokens += err.outputTokens;
         localComplaints.push(`attempt ${attempt}: ${complaints[0]}`);
+        if (attempt === 1 && params.cloudCaller && /counting loop in read stream/.test(complaints[0])) break;
       }
     }
   } else {

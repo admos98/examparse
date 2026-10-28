@@ -37,6 +37,8 @@ export interface RunJournalEntry {
   defectFixRates?: { localFixed: number; cloudFixed: number; teacherLeft: number };
   /** #43 decision-audit statistics for this job (scoreboard, per decide model). */
   audit?: { decisions: number; catches: number; uncertain: number };
+  /** Per-page Global Read results grouped by actual format for model/format comparisons. */
+  readPageOutcomes?: Array<{ format: 'compact' | 'verbose'; outcome: 'ok' | 'ok-reconciled' | 'partial' | 'failed' }>;
   /** Godlike-1 C3: key-table answer agreement on this run (scoreboard answer-accuracy). */
   answerAccuracy?: { checked: number; agreed: number; corrected: number; conflicts: number };
   baselineRevision?: string;

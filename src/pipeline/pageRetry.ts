@@ -23,6 +23,7 @@ import {
 } from './globalRead';
 import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership';
 import { prepareReviewDocument } from './reviewIntegrity';
+import { effectiveReadFormat } from './readFormat';
 
 const lineNo = (id: string) => Number(String(id || '').replace(/\D/g, ''));
 
@@ -184,6 +185,7 @@ export async function retryFailedPage(
     caller,
     cloudCaller,
     model: readProvider?.model,
+    format: effectiveReadFormat(settings),
     pageCache: writeOnlyCache,
     budget: retryBudget,
     allowKeyOnlyPage: chunks.length > 1 && (doc.questions?.length || 0) > 0,
@@ -211,6 +213,8 @@ export async function retryFailedPage(
   const updatedPageRecord: SpinePageReadRecord = {
     page,
     status: readRes.status,
+    format: effectiveReadFormat(settings),
+    outputTokens: readRes.usage.outputTokens + readRes.cloudUsage.outputTokens,
     calls: readRes.localCalls + readRes.cloudCalls,
     cloudCalls: readRes.cloudCalls,
     ...(readRes.cloudCalls ? { cloudAttempts: readRes.cloudAttempts } : {}),

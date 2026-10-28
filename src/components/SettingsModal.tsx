@@ -27,6 +27,7 @@ import { buildScoreboard, leaderFor, docTraitBucket, bucketKey } from '../pipeli
 import { estimateLiveBench, liveBenchGate, diffScorecards } from '../pipeline/liveBench';
 import { ConfirmCard, Modal } from '../design/primitives';
 import { uiText } from '../design/i18n';
+import { ReadFormatControl } from './ReadFormatControl';
 
 interface Props {
   isOpen: boolean;
@@ -637,6 +638,10 @@ export const SettingsModal: React.FC<Props> = ({
                   <p className="text-xs text-[var(--ink-2)]">Assign specific models to fast structure parsing, vision, and escalation repairs</p>
                 </div>
 
+                <div className="p-3.5 rounded-[10px] border border-[var(--rule)] bg-[var(--paper)]">
+                  <ReadFormatControl settings={current} compact onChange={readFormat => setCurrent(prev => ({ ...prev, readFormat }))} />
+                </div>
+
                 <div className="space-y-4">
                   {(['read', 'meta', 'repair', 'cloud', 'vision', 'standard', 'agent', 'critic', 'consensus'] as const).map(role => {
                     const sel = current.roleMapping[role] || (role === 'cloud' ? current.roleMapping.escalation : current.roleMapping.fast);
@@ -660,12 +665,13 @@ export const SettingsModal: React.FC<Props> = ({
                         {(() => {
                           const sbRole = role === 'agent' ? 'fast' : role;
                           const leader = sbBucket ? leaderFor(sbRows as any, sbRole, sbBucket) : null;
-                          const row = sbRows.find(r => r.role === sbRole && r.bucket === sbBucket);
+                          const row = sbRows.find(r => r.role === sbRole && r.bucket === sbBucket && (role !== 'read' || r.modelId === sel.model));
                           if (!sbRows.length) return null;
-                          if (!leader) return <div className="text-[length:var(--type-12)] text-[var(--ink-2)]">Scoreboard ({sbBucket}): insufficient data (n&lt;3) — no leader claimed.</div>;
+                          if (!leader) return <div className="text-[length:var(--type-12)] text-[var(--ink-2)] space-y-1"><div>Scoreboard ({sbBucket}): insufficient data (n&lt;3) — no leader claimed.</div>{role === 'read' && Object.entries(row?.readPageOutcomes || {}).map(([format, counts]: [string, any]) => <div key={format}>Read model {row?.modelId} · {format}: {counts.ok} ok / {counts.okReconciled} reconciled / {counts.partial} partial / {counts.failed} failed pages</div>)}</div>;
                           return (
                             <div className="flex flex-wrap items-center gap-2 text-[length:var(--type-12)] text-[var(--ink-2)] ">
                               <span>Bucket leader for the latest doc ({sbBucket}): <b>{leader.modelId}</b> — clean-rate {(leader.cleanCoverageRate * 100).toFixed(0)}%, {leader.meanDefectsPerExam} defects/exam, ${leader.meanCostPerCleanQuestion}/clean Q (n={leader.jobs})</span>
+                              {role === 'read' && Object.entries(row?.readPageOutcomes || {}).map(([format, counts]: [string, any]) => <span key={format}>· current read model {row?.modelId}, {format}: {counts.ok} ok / {counts.okReconciled} reconciled / {counts.partial} partial / {counts.failed} failed pages</span>)}
                               <button className="px-2 py-0.5 rounded-[6px] border" onClick={() => setCurrent(prev => ({ ...prev, roleMapping: { ...prev.roleMapping, [role]: { providerId: prev.providers.find(p => p.name) ? (prev.providers.find(p => (Object.values(prev.roleMapping) as any[]).some((m: any) => m?.model === leader.modelId))?.id || prev.providers[0]?.id || sel.providerId) : sel.providerId, model: leader.modelId } } }))}>Use</button>
                             </div>
                           );

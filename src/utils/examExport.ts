@@ -30,7 +30,13 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
     critic: { calls: (doc.usage || []).filter(u => (u as any).role === 'critic').length, defects: verdicts.filter(v => v.verdict === 'defect').length, ok: verdicts.filter(v => v.verdict === 'ok').length },
     memory: { playbookIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.playbookIds || []))], skillIds: [...new Set<string>(((doc as any).traces || []).flatMap((t: any) => t.guidance?.skillIds || []))], guidanceTokens: Number((doc as any).guidanceTokens) || 0 },
     classify: cleanClassify,
-    ...(cleanClassify?.pages ? { pages: cleanClassify.pages } : {}),
+    ...(cleanClassify?.pages ? {
+      pages: cleanClassify.pages,
+      readOutputTokensByFormat: cleanClassify.pages.reduce((totals: Record<string, number>, page: any) => {
+        if (page.format) totals[page.format] = (totals[page.format] || 0) + (Number(page.outputTokens) || 0);
+        return totals;
+      }, {}),
+    } : {}),
     repairLoop: doc.spine?.repairLoop,
     ...(doc.spine?.compile ? { reconcile: { total: doc.spine.compile.reconciliations, byKind: doc.spine.compile.byKind } } : {}),
     audit: doc.spine?.audit,

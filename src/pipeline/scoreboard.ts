@@ -36,19 +36,21 @@ export interface ScoreboardRow {
   auditDecisions: number;
   auditCatches: number;
   auditUncertain: number;
+  /** Global Read page results by actual wire format; populated on the Read role row. */
+  readPageOutcomes: Partial<Record<'compact' | 'verbose', { ok: number; okReconciled: number; partial: number; failed: number }>>;
   insufficientData: boolean;      // n<3 — never fake a %
 }
 
 type RunLike = RunJournalEntry & { verifierDefects?: number };
 
 export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
-  const acc = new Map<string, { role: string; modelId: string; bucket: string; jobs: number; cov: number; defects: number; recoveries: number; cost: number; cleanQs: number; trunc: number; ansChecked: number; ansAgreed: number; localFixed: number; cloudFixed: number; teacherLeft: number; auditDecisions: number; auditCatches: number; auditUncertain: number }>();
+  const acc = new Map<string, { role: string; modelId: string; bucket: string; jobs: number; cov: number; defects: number; recoveries: number; cost: number; cleanQs: number; trunc: number; ansChecked: number; ansAgreed: number; localFixed: number; cloudFixed: number; teacherLeft: number; auditDecisions: number; auditCatches: number; auditUncertain: number; readPageOutcomes: Partial<Record<'compact' | 'verbose', { ok: number; okReconciled: number; partial: number; failed: number }>> }>();
   for (const run of runs || []) {
     const bucket = bucketKey(docTraitBucket(run.docTraits as any));
     const defects = typeof run.verifierDefects === 'number' ? run.verifierDefects : (run.flagsRaised?.length || 0);
     for (const [role, modelId] of Object.entries(run.models || {})) {
       const key = `${role}|${modelId}|${bucket}`;
-      const row = acc.get(key) || { role, modelId, bucket, jobs: 0, cov: 0, defects: 0, recoveries: 0, cost: 0, cleanQs: 0, trunc: 0, ansChecked: 0, ansAgreed: 0, localFixed: 0, cloudFixed: 0, teacherLeft: 0, auditDecisions: 0, auditCatches: 0, auditUncertain: 0 };
+      const row = acc.get(key) || { role, modelId, bucket, jobs: 0, cov: 0, defects: 0, recoveries: 0, cost: 0, cleanQs: 0, trunc: 0, ansChecked: 0, ansAgreed: 0, localFixed: 0, cloudFixed: 0, teacherLeft: 0, auditDecisions: 0, auditCatches: 0, auditUncertain: 0, readPageOutcomes: {} };
       row.jobs++;
       row.cov += (run.outcome?.health?.coveragePercent || 0) / 100;
       row.defects += defects;
@@ -66,6 +68,14 @@ export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
       row.auditDecisions += Math.max(0, Number(run.audit?.decisions) || 0);
       row.auditCatches += Math.max(0, Number(run.audit?.catches) || 0);
       row.auditUncertain += Math.max(0, Number(run.audit?.uncertain) || 0);
+      if (role === 'read') for (const page of run.readPageOutcomes || []) {
+        const counts = row.readPageOutcomes[page.format] || { ok: 0, okReconciled: 0, partial: 0, failed: 0 };
+        if (page.outcome === 'ok') counts.ok++;
+        else if (page.outcome === 'ok-reconciled') counts.okReconciled++;
+        else if (page.outcome === 'partial') counts.partial++;
+        else counts.failed++;
+        row.readPageOutcomes[page.format] = counts;
+      }
       acc.set(key, row);
     }
   }
@@ -84,6 +94,7 @@ export function buildScoreboard(runs: RunLike[]): ScoreboardRow[] {
     auditDecisions: r.auditDecisions,
     auditCatches: r.auditCatches,
     auditUncertain: r.auditUncertain,
+    readPageOutcomes: r.readPageOutcomes,
     insufficientData: r.jobs < 3,
   })).sort((a, b) => a.role.localeCompare(b.role) || b.cleanCoverageRate - a.cleanCoverageRate);
 }

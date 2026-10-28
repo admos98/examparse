@@ -27,6 +27,7 @@ const ALLOWED_IMAGE_MIMES = new Set([
 ]);
 
 export const DEFAULT_SETTINGS: AppSettings = {
+  readFormat: 'auto',
   providers: [
     {
       id: 'google-gemini',

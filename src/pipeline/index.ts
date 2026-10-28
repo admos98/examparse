@@ -40,6 +40,7 @@ import { assignImagesExact, enforceSingleImageOwnership } from './imageOwnership
 import { validateAndFixDuplicateImageIds } from './assemble';
 import { prepareReviewDocument } from './reviewIntegrity';
 import { beginJob, endJob, guidanceSummary, type JobHandle } from './memory/harness';
+import { effectiveReadFormat } from './readFormat';
 
 export interface PipelineCallbacks {
   onStageUpdate: (stage: StageStatus) => void;
@@ -154,6 +155,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   stage({ id: 'extract', name: 'Extract', status: 'completed', message: `${lines.length} addressed lines · ${extracted.images.length} images · ${extracted.pages} pages${ocrUsed ? ' · OCR used' : ''}.` });
 
   const readProviderRaw = providerFor(settings, 'read'); const readProvider = readProviderRaw ? forcedOff(readProviderRaw) : undefined;
+  const readFormat = effectiveReadFormat(settings);
   const cloudProvider = providerFor(settings, 'cloud'); const cloudReadProvider = cloudProvider ? forcedOff(cloudProvider) : undefined;
   const repairProvider = providerFor(settings, 'repair'); const metaProviderRaw = providerFor(settings, 'meta'); const metaProvider = metaProviderRaw ? forcedOff(metaProviderRaw) : undefined;
   const visionProvider = providerFor(settings, 'vision');
@@ -215,6 +217,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
     lines,
     images: updatedImages,
     model: readProvider?.model,
+    format: readFormat,
     pageCache,
     guidance: job?.playbook.block,
     onJournal: e => journal(e.label, e.rawText, e.requestText),
@@ -499,7 +502,14 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   if (job) try {
     const localFixed = loop.rounds.filter(round => !round.escalatedKinds.length).reduce((sum, round) => sum + round.accepted, 0);
     const cloudFixed = loop.rounds.filter(round => round.escalatedKinds.length).reduce((sum, round) => sum + round.accepted, 0);
-    await endJob(job, { health: { expected: expectedNumbers.length, parsed: questions.length, missing: defects.filter(d => d.kind === 'missing-number').length, duplicates: defects.filter(d => d.kind === 'duplicate-number').length, coveragePercent: expectedNumbers.length ? questions.length / expectedNumbers.length * 100 : 0, state: flags.length ? 'partial' : 'complete', complete: flags.length === 0, pointsParsed: questions.reduce((s, q) => s + (q.points || 0), 0), pointsExpected: totalPoints, audit: { decisions: auditSummary.decisions, catches: auditSummary.catches, uncertain: auditSummary.uncertain } }, verifierDefects: defects.length, defectFixRates: { localFixed, cloudFixed, teacherLeft: defects.length + metaRead.defects.length }, audit: { decisions: auditSummary.decisions, catches: auditSummary.catches, uncertain: auditSummary.uncertain }, calls: usageRecords.filter(r => !r.isCachedHit).length, tokens: { input: usageRecords.reduce((s, r) => s + r.inputTokens, 0), output: usageRecords.reduce((s, r) => s + r.outputTokens, 0), cached: 0 }, costUsd: usageRecords.reduce((s, r) => s + (r.costUsd || 0), 0), isCacheHit: readResult.status === 'cached' && loop.status === 'cached', settings, baselineRevision: `${questions.length}:${sections.length}:${totalPoints ?? 'null'}`, sourceLines: lines.slice(0, 500).map(l => l.text) }); callbacks.onLiveText?.('present', 'Memory', 'info', guidanceSummary(job)); } catch { /* memory is report-only */ }
+    const readPageOutcomes = readResult.pages.map(page => {
+      const compileStatus = compiled.pageStatus.get(page.page);
+      const outcome = page.status === 'failed' ? 'failed' as const
+        : compileStatus === 'partial' || compileStatus === 'read-failed' ? 'partial' as const
+          : compileStatus === 'ok-reconciled' || compiled.reconciliations.some(item => item.page === page.page) ? 'ok-reconciled' as const : 'ok' as const;
+      return { format: page.format || readFormat, outcome };
+    });
+    await endJob(job, { readPageOutcomes, health: { expected: expectedNumbers.length, parsed: questions.length, missing: defects.filter(d => d.kind === 'missing-number').length, duplicates: defects.filter(d => d.kind === 'duplicate-number').length, coveragePercent: expectedNumbers.length ? questions.length / expectedNumbers.length * 100 : 0, state: flags.length ? 'partial' : 'complete', complete: flags.length === 0, pointsParsed: questions.reduce((s, q) => s + (q.points || 0), 0), pointsExpected: totalPoints, audit: { decisions: auditSummary.decisions, catches: auditSummary.catches, uncertain: auditSummary.uncertain } }, verifierDefects: defects.length, defectFixRates: { localFixed, cloudFixed, teacherLeft: defects.length + metaRead.defects.length }, audit: { decisions: auditSummary.decisions, catches: auditSummary.catches, uncertain: auditSummary.uncertain }, calls: usageRecords.filter(r => !r.isCachedHit).length, tokens: { input: usageRecords.reduce((s, r) => s + r.inputTokens, 0), output: usageRecords.reduce((s, r) => s + r.outputTokens, 0), cached: 0 }, costUsd: usageRecords.reduce((s, r) => s + (r.costUsd || 0), 0), isCacheHit: readResult.status === 'cached' && loop.status === 'cached', settings, baselineRevision: `${questions.length}:${sections.length}:${totalPoints ?? 'null'}`, sourceLines: lines.slice(0, 500).map(l => l.text) }); callbacks.onLiveText?.('present', 'Memory', 'info', guidanceSummary(job)); } catch { /* memory is report-only */ }
   return doc;
 }
 

@@ -567,6 +567,7 @@ test('#40 Acceptance #3, #5, B2, B3, C1, C2: failing page 2 of 3 ships pages 1+3
     const fileHash = await sha256(await file.arrayBuffer());
     const settings = {
       ...DEFAULT_SETTINGS,
+      readFormat: 'compact' as const, // scripted fixture speaks the legacy compact wire format
       thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false },
     };
 

@@ -231,7 +231,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
     caller: readProvider ? async req => {
       const response = await LLMAdapter.execute(
         { role: 'read', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens, providerConfig: readProvider },
-        { onDelta: (channel, full) => channel === 'output' && callbacks.onLiveText?.('read', req.label, channel, full) },
+        { detectCountingLoop: readFormat === 'verbose', salvagePartial: true, onDelta: (channel, full) => channel === 'output' && callbacks.onLiveText?.('read', req.label, channel, full) },
       );
       return { rawText: response.rawText, json: response.json, usage: response.usage };
     } : undefined,

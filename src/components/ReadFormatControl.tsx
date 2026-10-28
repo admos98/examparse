@@ -32,6 +32,6 @@ export const ReadFormatControl: React.FC<Props> = ({ settings, value = settings.
       </div>
       <span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{readFormatDescription({ ...settings, readFormat: value })}</span>
     </div>
-    {!compact && <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">Verbose uses ~2–3× more output tokens but small local models read far more accurately in it. Compact suits large/cloud models.</p>}
+    {!compact && <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">Verbose asks each question’s start/end lines only; leftover lines are the app’s job. Compact suits large/cloud models.</p>}
   </div>
 );

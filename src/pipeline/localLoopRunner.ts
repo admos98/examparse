@@ -6,11 +6,13 @@ import {
   LOOP_VERSION, LOOP_FIX_SYSTEM, LOOP_READ_SYSTEM, LOOP_REVIEW_SYSTEM, applyCorrections, applyMetaCorrection,
   buildLoopPagePrompt, buildLoopPages, buildReviewChunks, checkAuthoredDocument, assignAuthoredImages, errorMessage, flaggedFixInput,
   mergePageReads, newLoopReceipt, pageFromResponse, parseCorrections,
-  type LoopModelCaller, type LoopReceipt, type LoopStepId, type LoopVerdict,
+  callWithOneRetry, fixOutputCap, pathologyNote, responsePathology, flatAuthoredQuestions,
+  type LoopModelCaller, type LoopPathologyRecord, type LoopReceipt, type LoopStepId, type LoopVerdict,
 } from './localLoop';
 import { runLoopDecisionAudit, type LoopDecisionCaller } from './loopAudit';
 import { runMapFirstRead, sectionReadVerdicts, type LoopMapReceipt } from './mapFirst';
 import type { AppSettings } from '../types';
+import { modelFacingLines } from './lineNormalize';
 
 export interface LocalLoopParams {
   lines: SourceLine[]; images: ImageAsset[]; settings: AppSettings; fileHash: string;
@@ -36,17 +38,20 @@ async function notify(params: LocalLoopParams, receipt: LoopReceipt, step: LoopS
 }
 export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt> {
   const receipt = newLoopReceipt();
-  const { lines, images, settings, fileHash } = params;
+  const { images, settings, fileHash } = params;
+  // #50 Part C: every model prompt and code count reads the normalized twin; watermark lines are furniture.
+  const lines = modelFacingLines(params.lines);
   const cacheEnabled = settings.thrift.cacheEnabled && !params.force;
   const cacheGet = async <T>(key: string): Promise<T | undefined> => { if (!cacheEnabled) return undefined; try { return await getPipelineCache<T>(key); } catch { return undefined; } };
   const cacheSet = async (key: string, value: unknown) => { if (!settings.thrift.cacheEnabled) return; try { await setPipelineCache(key, value); } catch { /* optional */ } };
   const guidanceHash = await sha256(params.guidance || '');
-  const call = async (step: LoopStepId, label: string, system: string, text: string) => {
+  const call = async (step: LoopStepId, label: string, system: string, text: string, cap?: number) => {
     const row = receipt.steps.find(s => s.step === step)!;
     if (!params.caller) throw new Error('no local read model configured');
     row.calls++;
-    // Generous authored-output allowance, never the old 800+30/line cap and never a run budget.
-    const maxOutputTokens = Math.min(65536, Math.max(16384, settings.budget.maxOutputTokens || 0, Math.ceil(text.length / 2)));
+    // #50 Part A: proportional caps for map / section / fix calls (a loop can't burn the whole window).
+    // The page-READ fallback keeps the generous authored-output allowance, never a run budget.
+    const maxOutputTokens = cap ?? Math.min(65536, Math.max(16384, settings.budget.maxOutputTokens || 0, Math.ceil(text.length / 2)));
     const response = await params.caller({ step: step as any, system, text, label, maxOutputTokens });
     row.inputTokens += response.usage?.inputTokens || 0; row.outputTokens += response.usage?.outputTokens || 0;
     params.onUsage?.(step, response.usage || { inputTokens: 0, outputTokens: 0 }, label);
@@ -54,14 +59,28 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     try { await params.onJournal?.({ label, rawText: response.rawText, requestText: text }); } catch { /* optional */ }
     return response;
   };
-  const parseWithRetry = async (step: 'self-review' | 'code-fix' | 'final-fix', label: string, system: string, text: string) => {
-    let response = await call(step, label, system, text);
+  const recordPathology = (record: LoopPathologyRecord) => { (receipt.pathologies ||= []).push(record); };
+  const parseWithRetry = async (step: 'self-review' | 'code-fix' | 'final-fix', label: string, system: string, text: string, cap?: number) => {
+    let response = await call(step, label, system, text, cap);
+    const salvage = (r: typeof response) => parseCorrections(r, { salvage: Boolean(responsePathology(r)) });
+    if (responsePathology(response)) {
+      // A breaker/cap cut: complete correction objects are salvaged and the target gets its ONE retry
+      // (shared with the unparseable-output retry below — never a third call).
+      const result = await callWithOneRetry({ label, text, cap, first: response, call: (l, t) => call(step, l, system, t, cap),
+        parse: salvage, count: c => c ? c.length : -1, onNote: m => note(receipt, step, m), onPathology: recordPathology });
+      return { response: result.response, corrections: result.value };
+    }
     let corrections = parseCorrections(response);
     if (!corrections) {
       note(receipt, step, `${label}: unparseable correction output — retried: true (once).`);
       const example = 'Return only JSON, for example: {"corrections":[{"action":"replace","questionNumber":1,"question":{"number":1,"type":"short","stem":"Example question?","options":[],"imageIds":[]}}]}. Include complete corrected objects and any passages. No invented answers or points.';
-      response = await call(step, `${label} · retry`, example, text);
-      corrections = parseCorrections(response);
+      response = await call(step, `${label} · retry`, example, text, cap);
+      corrections = salvage(response);
+      const kind = responsePathology(response);
+      if (kind) {
+        note(receipt, step, `${pathologyNote(`${label} · retry`, kind, response.breaker?.completedItems, corrections?.length ?? 0, cap)} Second failure on the same target — marked partial; no third attempt.`);
+        recordPathology({ label, kind, cutAtItem: response.breaker?.completedItems, salvaged: corrections?.length ?? 0, retried: true, outcome: 'partial' });
+      }
     }
     return { response, corrections };
   };
@@ -79,7 +98,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     if (lines.length && params.caller) {
       try {
         const mapped = await runMapFirstRead({ lines, images, settings, fileHash, guidance: params.guidance, decisionCaller: params.decisionCaller,
-          call: (label, system, text) => call('read', label, system, text), cacheGet, cacheSet,
+          call: (label, system, text, cap) => call('read', label, system, text, cap), cacheGet, cacheSet, onPathology: recordPathology,
           cacheKey: text => sha256(`${LOOP_VERSION}:map-read:${params.modelId || 'scripted'}:${guidanceHash}:${text}`),
           onNote: message => note(receipt, 'read', message),
           onAuditUsage: (usage, label) => params.onUsage?.('decision-audit', usage, label),
@@ -91,6 +110,8 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
         });
         if (mapped) {
           receipt.map = mapped.map; receipt.document = mapped.document;
+          receipt.reconciled = { ...(mapped.map.reconciled || { truncated: 0, deduped: 0 }) };
+          receipt.sectionReReads = mapped.map.sectionReReads || 0;
           for (const message of mapped.map.notes) note(receipt, 'read', message);
           return;
         }
@@ -107,7 +128,9 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
         let response = cached;
         if (response) { row.status = 'cached'; params.onUsage?.('read', { inputTokens: 0, outputTokens: 0 }, `${label} (cache hit)`, true); }
         else response = await call('read', label, LOOP_READ_SYSTEM, text);
+        const pageKind = responsePathology(response as any);
         const parsed = pageFromResponse(response, chunk.page, Boolean(cached));
+        if (pageKind) { const salvaged = parsed.document.questions.length; note(receipt, 'read', pathologyNote(label, pageKind, (response as any).breaker?.completedItems, salvaged)); recordPathology({ label, kind: pageKind, cutAtItem: (response as any).breaker?.completedItems, salvaged, retried: false, outcome: 'partial' }); }
         reads.push(parsed.document);
         Object.assign(pageRow, parsed.receipt);
         for (const message of parsed.receipt.notes) note(receipt, 'read', message);
@@ -142,7 +165,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
       const mapDisputes = receipt.map ? [...receipt.map.codeVerdicts.map(v => v.message), ...receipt.map.remaps.filter(r => !r.applied).map(r => `${r.entryId}: ${r.reason}`)] : [];
       const text = `YOUR PARSE:\n${JSON.stringify(chunk.document)}${mapDisputes.length ? `\n\nMAP FINDINGS (proposals, not facts):\n${mapDisputes.join('\n')}` : ''}\n\nORIGINAL TEXT:\n${chunk.source}`;
       try {
-        const { corrections } = await parseWithRetry('self-review', label, LOOP_REVIEW_SYSTEM, text);
+        const { corrections } = await parseWithRetry('self-review', label, LOOP_REVIEW_SYSTEM, text, fixOutputCap(flatAuthoredQuestions(chunk.document).length));
         if (!corrections) { note(receipt, 'self-review', `${label}: unparseable correction output — step chunk skipped.`); continue; }
         const applied = applyCorrections(receipt.document, corrections);
         receipt.document = applied.document; row.correctionsApplied += applied.applied;
@@ -158,7 +181,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     id: `code:invalid-json-remnant:page-${p.page}`, kind: 'invalid-json-remnant' as const, questionNumbers: [], source: 'code' as const, page: p.page,
     message: `Page ${p.page} contained an invalid JSON remnant; only complete question objects were kept.`,
   })) ];
-  const check = () => [...checkAuthoredDocument(receipt.document, images, remnants), ...sectionReadVerdicts(receipt.map, receipt.document)];
+  const check = () => [...checkAuthoredDocument(receipt.document, images, remnants), ...sectionReadVerdicts(receipt.map, receipt.document, lines)];
   await safe('code-check', async () => {
     receipt.codeVerdicts = check();
     receipt.steps[2].verdictsRaised = receipt.codeVerdicts.length;
@@ -172,9 +195,13 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     for (const [index, group] of groups.entries()) {
       const label = `Code-verdict fix · ${index + 1}`;
       try {
-        const proposedPassages = receipt.map?.passages.filter(p => group.some(v => v.kind === 'passage-link-missing' && v.questionNumbers.some(n => n >= p.appliesToFirst && n <= p.appliesToLast))) || [];
-        const fixInput = flaggedFixInput(receipt.document, group, lines) + (proposedPassages.length ? `\n\nPROPOSED MAP PASSAGES (verify against source):\n${JSON.stringify(proposedPassages)}` : '');
-        const { response, corrections } = await parseWithRetry('code-fix', label, LOOP_FIX_SYSTEM, fixInput);
+        const proposedPassages = receipt.map?.passages.filter(p => group.some(v => (v.kind === 'passage-link-missing' || v.kind === 'blank-missing') && v.questionNumbers.some(n => n >= p.appliesToFirst && n <= p.appliesToLast))) || [];
+        // #50 Part B: a missing cloze blank is a section-scoped re-ask — quote the owning section contract.
+        const blankSections = receipt.map?.sections.filter(s => group.some(v => v.kind === 'blank-missing' && v.questionNumbers.some(n => n >= s.firstQuestion && n <= s.lastQuestion))) || [];
+        const fixInput = flaggedFixInput(receipt.document, group, lines) + (proposedPassages.length ? `\n\nPROPOSED MAP PASSAGES (verify against source):\n${JSON.stringify(proposedPassages)}` : '')
+          + (blankSections.length ? `\n\nSECTION SCOPE (insert each missing blank as a fillblank question linked to its passage):\n${JSON.stringify(blankSections)}` : '');
+        const flagged = new Set(group.flatMap(v => v.questionNumbers)).size + (group.some(v => !v.questionNumbers.length) ? 1 : 0);
+        const { response, corrections } = await parseWithRetry('code-fix', label, LOOP_FIX_SYSTEM, fixInput, fixOutputCap(flagged));
         if (!corrections) { note(receipt, 'code-fix', `${label}: unparseable correction output — patch skipped.`); continue; }
         const before = check();
         receipt.pointsWithdrawn = (receipt.pointsWithdrawn || 0) + corrections.filter(c=>c.pointsWithdrawn).length;
@@ -220,7 +247,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     for (const [index, group] of chunkVerdicts(routed).entries()) {
       const label = `Final fix · ${index + 1}`;
       try {
-        const { corrections } = await parseWithRetry('final-fix', label, LOOP_FIX_SYSTEM, flaggedFixInput(receipt.document, group, lines, true));
+        const { corrections } = await parseWithRetry('final-fix', label, LOOP_FIX_SYSTEM, flaggedFixInput(receipt.document, group, lines, true), fixOutputCap(new Set(group.flatMap(v => v.questionNumbers)).size || 1));
         if (!corrections) { note(receipt, 'final-fix', `${label}: unparseable correction output — patch skipped.`); continue; }
         const before = check();
         const applied = applyCorrections(receipt.document, corrections);

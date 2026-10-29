@@ -204,6 +204,10 @@ export interface ExtractionDiagnostics {
   suspectStripCount: number;
   emptyPages: number[];
   ambiguousLayouts: number;
+  /** #50 Part C: ids of lines whose digit run contained a corrupt glyph. Present only when non-empty. */
+  digitSuspectLines?: string[];
+  /** #50 Part C: ids of watermark-shaped lines (furniture, excluded from prompts). Present only when non-empty. */
+  watermarkLines?: string[];
 }
 export function extractionDiagnostics(
   lines: SourceLine[],
@@ -229,5 +233,8 @@ export function extractionDiagnostics(
     ).length,
     emptyPages: linesPerPage.flatMap((n, i) => (n === 0 ? [i + 1] : [])),
     ambiguousLayouts: lines.filter((l) => l.layoutWarning).length,
+    // #50 Part C: input hygiene is visible in diagnostics (line ids; text is never rewritten).
+    ...(lines.some((l) => l.digitSuspect) ? { digitSuspectLines: lines.filter((l) => l.digitSuspect).map((l) => l.id) } : {}),
+    ...(lines.some((l) => l.watermark) ? { watermarkLines: lines.filter((l) => l.watermark).map((l) => l.id) } : {}),
   };
 }

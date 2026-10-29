@@ -15,7 +15,22 @@ export interface LoopDecisionItem {
   images?: Array<{ id: string; mime: string; data: string }>;
 }
 export type DecisionRequestBody = any;
-export type LoopDecisionCaller = (body: DecisionRequestBody) => Promise<{ results: Array<{ name: string; probability: number; choice?: string }> }>;
+export type LoopDecisionCaller = (body: DecisionRequestBody) => Promise<{ results: Array<{ name: string; probability: number; choice?: string; distribution?: Record<string, number> }> }>;
+/** #50 Part D: ordinal difficulty levels sent as llama.cpp's native score criteria (array, index 0 = level 1). */
+export const DIFFICULTY_LEVELS = ['1: trivial recall', '2: easy', '3: medium', '4: hard', '5: very hard multi-step'] as const;
+export const DIFFICULTY_INSTRUCTIONS = 'Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard), considering the stem, options and section.';
+/** A flat level distribution is an uncertain difficulty estimate. */
+export const DIFFICULTY_UNCERTAIN_BELOW = 0.4;
+/** THX (/v1/systemone) single-question body. Score items use the shape the llama.cpp implementation accepts:
+ * { type: 'score', criteria: [level descriptions] } — the old { levels } shape is rejected with HTTP 400. */
+export function buildThxDecisionBody(item: LoopDecisionItem, model: string, state: string): DecisionRequestBody {
+  const question = item.type === 'difficulty'
+    ? { type: 'score', instructions: item.instructions, criteria: [...DIFFICULTY_LEVELS] }
+    : item.choices
+      ? { type: 'choice', instructions: item.instructions, criteria: item.choiceDescriptions || Object.fromEntries(item.choices.map(c => [c, c])) }
+      : { type: 'noul', instructions: item.instructions };
+  return { model, state, questions: { [item.name]: question } };
+}
 export interface LoopAuditResult {
   verdicts: LoopVerdict[]; routed: LoopVerdict[]; calls: number; mode: 'shadow' | 'active' | 'skipped';
   notes: string[]; usage: { inputTokens: number; outputTokens: number }; catches: number; uncertain: number; endpointErrors: number; difficultyUncertain: number; dialect?: 'jev'|'thx'; endpointHost?: string;
@@ -51,7 +66,7 @@ export function buildLoopDecisionCatalogue(params: {
     add(q, 'belongs-in-section', 'Does this question belong in its assigned printed section?', { sectionTitle: q.sectionTitle });
     const difficultyChoices = ['1', '2', '3', '4', '5'];
     items.push({ id: `Q${q.number}::difficulty`, type: 'difficulty', name: `Q${q.number} difficulty`,
-      instructions: 'Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard), considering the stem, options and section.',
+      instructions: DIFFICULTY_INSTRUCTIONS,
       questionNumbers: [q.number], input: { question: q }, choices: difficultyChoices });
     const lessons = curriculumLessons(document.meta.grade, document.meta.subject);
     const hint = keywordCurriculumHint(lessons, `${q.stem} ${q.options.map(o => o.text).join(' ')}`);
@@ -124,7 +139,7 @@ export async function runLoopDecisionAudit(params: {
     if (endpointError) progress.endpointErrors++;
     const p = vote && soundProbability(item, vote);
     const tagging = item.type === 'difficulty' || item.type === 'curriculum-hint';
-    const tagUncertain = p !== undefined && (p < 0.5 || (item.type === 'difficulty' && vote?.choice === '3'));
+    const tagUncertain = p !== undefined && (item.type === 'difficulty' ? p < DIFFICULTY_UNCERTAIN_BELOW : p < 0.5);
     if (p === undefined || (tagging ? tagUncertain : p > DECIDE_CATCH && p < DECIDE_PASS)) progress.uncertain++;
     else if (!tagging && p <= DECIDE_CATCH) progress.catches++;
     progress.recent.push(`${item.name.replace(' ', ' · ')} · ${p === undefined ? 'uncertain' : `p=${p.toFixed(2)} ${tagging ? (tagUncertain ? '?' : '✓') : p <= DECIDE_CATCH ? '⚠' : p >= DECIDE_PASS ? '✓' : '?'}`}${endpointError ? ' · endpoint error' : ''}`);
@@ -133,7 +148,7 @@ export async function runLoopDecisionAudit(params: {
   emit();
   const cacheEnabled = settings.thrift.cacheEnabled;
   const unresolved: LoopDecisionItem[] = [];
-  const votes = new Map<string, { probability: number; choice?: string }>();
+  const votes = new Map<string, { probability: number; choice?: string; distribution?: Record<string, number> }>();
   for (const item of catalogue) {
     if (!cacheEnabled) { unresolved.push(item); continue; }
     const key = await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`);
@@ -162,9 +177,7 @@ export async function runLoopDecisionAudit(params: {
       let tail=sourceText;
       while(tail && estimateTokens(`${qText}\nSource: ${tail}`)>850) tail=tail.slice(0,Math.max(0,Math.floor(tail.length*0.85)));
       const state=`${qText}\nSource: ${tail}`;
-      const body: DecisionRequestBody = thx ? {
-        model: provider.model, state, questions: { [item0.name]: { type: item0.type === 'difficulty' ? 'score' : item0.choices ? 'choice' : 'noul', instructions: item0.instructions, ...(item0.type === 'difficulty' ? { levels: item0.choices } : item0.choices ? { criteria: item0.choiceDescriptions || Object.fromEntries(item0.choices.map(c=>[c,c])) } : {}) } },
-      } : {
+      const body: DecisionRequestBody = thx ? buildThxDecisionBody(item0, provider.model, state) : {
         input: { exam: fileHash.slice(0, 12), purpose: 'comment-only exam audit' },
         questions: batch.map(item => ({ type: item.choices ? 'choice' : 'probability', name: item.id, instructions: item.instructions, input: item.input, ...(item.choices ? { choices: item.choices } : {}), ...(item.images ? { images: item.images } : {}) })),
       };
@@ -175,7 +188,7 @@ export async function runLoopDecisionAudit(params: {
         for (const item of batch) {
           const row = byName.get(item.id) ?? byName.get(item.name); const p = clamp(row?.probability);
           if (p === undefined || (item.type === 'difficulty' && !['1', '2', '3', '4', '5'].includes(row?.choice || '')) || (item.type === 'curriculum-hint' && !item.choices?.includes(row?.choice || ''))) { result.notes.push(`Decision audit returned no usable verdict for ${item.id}.`); completed(item); continue; }
-          const vote = { probability: p, ...(row?.choice !== undefined ? { choice: row.choice } : {}) };
+          const vote = { probability: p, ...(row?.choice !== undefined ? { choice: row.choice } : {}), ...(row?.distribution ? { distribution: row.distribution } : {}) };
           votes.set(item.id, vote); completed(item, vote);
           if (cacheEnabled) try { await setPipelineCache(await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`), vote); } catch { /* best effort */ }
         }
@@ -202,8 +215,10 @@ export async function runLoopDecisionAudit(params: {
       const value = Number(vote.choice);
       if (Number.isInteger(value) && value >= 1 && value <= 5) {
         const q = item.input.question as import('./localLoop').AuthoredQuestion;
-        q.difficulty = { value, source: 'model' }; q.difficultyMode = mode;
-        if (probability < 0.5 || value === 3) result.difficultyUncertain++;
+        // Argmax level from the returned distribution; flat (top level < 0.4) is flagged uncertain.
+        const uncertain = probability < DIFFICULTY_UNCERTAIN_BELOW;
+        q.difficulty = { value, source: 'model', ...(uncertain ? { uncertain: true } : {}) }; q.difficultyMode = mode;
+        if (uncertain) result.difficultyUncertain++;
       }
       continue;
     }
@@ -227,7 +242,7 @@ export async function runLoopDecisionAudit(params: {
     } else if (probability < DECIDE_PASS) result.uncertain++;
   }
   result.uncertain = progress.uncertain;
-  if (result.difficultyUncertain) result.notes.push(`difficultyUncertain: ${result.difficultyUncertain} model estimate(s) peak in the middle or have diffuse scores.`);
+  if (result.difficultyUncertain) result.notes.push(`difficultyUncertain: ${result.difficultyUncertain} model estimate(s) have a flat level distribution (top level < ${DIFFICULTY_UNCERTAIN_BELOW}).`);
   if (progress.skipped || (!result.verdicts.length && result.notes.length)) result.mode = 'skipped';
   return result;
 }

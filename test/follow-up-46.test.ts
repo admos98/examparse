@@ -127,7 +127,7 @@ test('#46 never-empty fault injection: every model step throws, including replay
 test('#46 corpus loop mode reports every entry plus the mock against printed truth without hard gates', async () => {
   const { results, ok } = await runCorpus({ mode: 'loop', print: false });
   assert.equal(ok, true);
-  assert.equal(results.length, 14);
+  assert.equal(results.length, 15); // #50 Part B added cloze-passage
   assert.ok(results.some(result => result.exam === 'mock-born-digital'));
   for (const result of results) {
     assert.match(result.recall, /^\d+\/\d+$/);

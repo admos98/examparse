@@ -2,6 +2,7 @@
  * Model-authored JSON is authoritative. Checkers comment; only model patches change question content.
  * Legacy compile/repair/cloud modules remain available to explicit Assistant/proving-ground tools, never called here.
  */
+import { annotateSourceLines } from './lineNormalize';
 import type { AppSettings, ExamDoc, Flag, ImageAsset, PipelineStageId, ProviderConfig, SourceLine, StageStatus, UsageRecord } from '../types';
 import { computeDisplayName } from '../types';
 import { extractDocument, type ExtractedDocument } from './extract';
@@ -90,6 +91,8 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
       }
     } catch (error) { extractionNotes.push(`OCR unavailable — ${errorMessage(error)}; extracted text is retained.`); }
   }
+  // #50 Part C: OCR-merged lines get the same normalized twin / watermark tags as extracted ones.
+  lines = annotateSourceLines(lines);
   const storedLines = lines;
   let lineRepairs: Record<string, string> = {}; let textRepairStats: any;
   if (settings.textRepairEnabled) {
@@ -130,11 +133,12 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const caller = options?.loopCaller || (readProvider ? async (req: import('./localLoop').LoopModelRequest) => {
     const response = await LLMAdapter.execute({ role: 'read', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens,
       providerConfig: { ...readProvider, disableReasoning: true } }, {
-      detectCountingLoop: true, salvagePartial: true,
+      // #50 Part A: generalized circuit-breaker on every generative call (map, section parse, fix passes).
+      detectCountingLoop: true, detectRepetition: true, salvagePartial: true,
       onDelta: (channel, fullText) => callbacks.onLiveText?.(stageId(req.step), req.label, channel, fullText),
       onInfo: message => callbacks.onLiveText?.(stageId(req.step), req.label, 'info', message),
     });
-    return { rawText: response.rawText, json: response.json, usage: response.usage };
+    return { rawText: response.rawText, json: response.json, usage: response.usage, ...(response.finishReason ? { finishReason: response.finishReason } : {}), ...(response.breaker ? { breaker: response.breaker } : {}) };
   } : undefined);
   const journalKey = `local-loop:${fileHash}:${linesHash}`;
   let doc: ExamDoc = {

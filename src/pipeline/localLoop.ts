@@ -3,6 +3,7 @@ import type { ExamDoc, ImageAsset, Question, SourceLine } from '../types';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { normalizeGrade, normalizeSubject, normalizeDigits } from './metaRead';
 import { hasCountingLoop } from './globalRead';
+import { modelText } from './lineNormalize';
 
 export { hasCountingLoop };
 export const LOOP_VERSION = 'local-loop-v1';
@@ -13,7 +14,7 @@ export const LOOP_STEP_NAMES: Record<LoopStepId, string> = {
   read: 'Read', 'self-review': 'Self-review', 'code-check': 'Code check',
   'code-fix': 'Code-verdict fix', 'decision-audit': 'Decision audit', 'final-fix': 'Final fix',
 };
-export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-link-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'section-count-mismatch', 'section-range-mismatch', 'section-missing', 'empty-stem',
+export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-link-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'section-count-mismatch', 'section-range-mismatch', 'section-missing', 'blank-missing', 'empty-stem',
   'options-missing-for-type', 'points-sum-mismatch', 'image-unassigned', 'image-double-assigned', 'meta-field-implausible'] as const;
 export type CodeVerdictKind = typeof CODE_VERDICT_KINDS[number];
 export type LoopDecisionKind = 'stem-faithful' | 'complete' | 'uncontaminated' | 'type-correct' | 'answer-correct'
@@ -78,6 +79,12 @@ export interface LoopReceipt {
   auditMode: 'shadow' | 'active' | 'skipped';
   map?: import('./mapFirst').LoopMapReceipt;
   pointsWithdrawn?: number;
+  /** #50 Part A: list elements dropped at compile (beyond a declared count / exact duplicates). */
+  reconciled?: { truncated: number; deduped: number };
+  /** #50 Part E: automatic section re-reads after an under-count. */
+  sectionReReads?: number;
+  /** #50 Part A: generation pathologies (breaker/cap) and how each target was salvaged. */
+  pathologies?: LoopPathologyRecord[];
   decisionProvenance?: { dialect: 'jev'|'thx'; host: string };
 }
 export interface LoopModelRequest {
@@ -86,7 +93,12 @@ export interface LoopModelRequest {
   /** Deliberately no small page cap: a full page of authored questions must fit. */
   maxOutputTokens?: number;
 }
-export interface LoopModelResponse { rawText: string; json?: unknown; usage?: { inputTokens: number; outputTokens: number } }
+export interface LoopModelResponse {
+  rawText: string; json?: unknown; usage?: { inputTokens: number; outputTokens: number };
+  /** Provider finish reason; 'length'/'max_tokens' = cap, 'repetition-loop'/'counting-loop' = breaker. */
+  finishReason?: string;
+  breaker?: { kind: 'repetition' | 'counting'; completedItems: number };
+}
 export type LoopModelCaller = (request: LoopModelRequest) => Promise<LoopModelResponse>;
 
 export const emptyAuthoredDocument = (): AuthoredDocument => ({ meta: {}, sections: [], questions: [] });
@@ -96,6 +108,85 @@ export const newLoopReceipt = (): LoopReceipt => ({
     correctionsApplied: 0, verdictsRaised: 0, verdictsClosed: 0, notes: [], inputTokens: 0, outputTokens: 0 })),
   pages: [], codeVerdicts: [], auditVerdicts: [], survivingVerdicts: [], notes: [], auditMode: 'skipped',
 });
+// ---------------------------------------------------------------------------------------------
+// #50 Part A — loops can't hurt: proportional caps, pathology classification, one retry, salvage.
+// ---------------------------------------------------------------------------------------------
+/** Map call cap (tokens). */
+export const MAP_OUTPUT_CAP = 3000;
+/** Section parse cap: 800 + expected questions × 220. */
+export const sectionOutputCap = (expectedQuestions: number): number => Math.min(16384, 800 + Math.max(0, Math.ceil(expectedQuestions)) * 220);
+/** Fix-pass cap: 400 + flagged items × 300, floor 800, ceiling 8192. */
+export const fixOutputCap = (flaggedItems: number): number => Math.min(8192, Math.max(800, 400 + Math.max(0, Math.ceil(flaggedItems)) * 300));
+export type LoopPathologyKind = 'repetition' | 'counting' | 'cap';
+export interface LoopPathologyRecord { label: string; kind: LoopPathologyKind; cutAtItem?: number; salvaged: number; retried: boolean; outcome: 'recovered' | 'partial' }
+export function responsePathology(response: LoopModelResponse): LoopPathologyKind | undefined {
+  const reason = String(response.finishReason || '').toLowerCase();
+  if (reason === 'repetition-loop' || response.breaker?.kind === 'repetition') return 'repetition';
+  if (reason === 'counting-loop' || response.breaker?.kind === 'counting') return 'counting';
+  if (reason === 'length' || reason === 'max_tokens' || reason === 'max-tokens') return 'cap';
+  return undefined;
+}
+export function pathologyComplaint(kind: LoopPathologyKind, cap?: number): string {
+  if (kind === 'repetition') return 'your previous output repeated the same item; emit each item once';
+  if (kind === 'counting') return 'your previous output fell into a counting loop; emit each item once and stop';
+  return `your previous output hit the output cap${cap ? ` of ${cap} tokens` : ''} before finishing; emit each item once, compactly`;
+}
+export function pathologyNote(label: string, kind: LoopPathologyKind, cutAtItem: number | undefined, salvaged: number, cap?: number): string {
+  const what = kind === 'repetition' ? 'repetition' : kind === 'counting' ? 'counting loop' : `output cap${cap ? ` ${cap} tokens` : ''}`;
+  return `${label}: generation loop cut at item ${cutAtItem ?? salvaged + 1} — salvaged ${salvaged} item${salvaged === 1 ? '' : 's'} (pathology: ${what}).`;
+}
+/**
+ * ONE retry per target on a generation pathology (breaker/cap), with the complaint quoted, at the same
+ * model. `extraComplaint` lets a caller fold another reason (e.g. a section under-count) into that same
+ * single retry. A second pathology marks the target partial — never a third attempt. The better attempt
+ * (by `count`) wins; the retry replaces the first attempt only if it is strictly better.
+ */
+export async function callWithOneRetry<T>(opts: {
+  label: string; text: string; cap?: number;
+  call: (label: string, text: string) => Promise<LoopModelResponse>;
+  parse: (response: LoopModelResponse) => T; count: (value: T) => number;
+  extraComplaint?: (value: T, response: LoopModelResponse) => string | undefined;
+  onNote: (message: string) => void; onPathology?: (record: LoopPathologyRecord) => void;
+  first?: LoopModelResponse;
+}): Promise<{ value: T; response: LoopModelResponse; attempts: number; retriedFor: Array<'pathology' | 'extra'>; partial: boolean; usedRetry: boolean }> {
+  const firstResponse = opts.first ?? await opts.call(opts.label, opts.text);
+  const firstValue = opts.parse(firstResponse);
+  const firstKind = responsePathology(firstResponse);
+  const complaints: string[] = []; const retriedFor: Array<'pathology' | 'extra'> = [];
+  if (firstKind) { opts.onNote(pathologyNote(opts.label, firstKind, firstResponse.breaker?.completedItems, opts.count(firstValue), opts.cap)); complaints.push(pathologyComplaint(firstKind, opts.cap)); retriedFor.push('pathology'); }
+  const extra = opts.extraComplaint?.(firstValue, firstResponse);
+  if (extra) { complaints.push(extra); retriedFor.push('extra'); }
+  if (!complaints.length) return { value: firstValue, response: firstResponse, attempts: 1, retriedFor, partial: false, usedRetry: false };
+  let second: LoopModelResponse;
+  try { second = await opts.call(`${opts.label} · re-read`, `COMPLAINT ABOUT YOUR PREVIOUS ATTEMPT: ${complaints.join('; ')}.\n\n${opts.text}`); }
+  catch (error) {
+    opts.onNote(`${opts.label} · re-read skipped — ${errorMessage(error)}; first attempt kept.`);
+    if (firstKind) opts.onPathology?.({ label: opts.label, kind: firstKind, cutAtItem: firstResponse.breaker?.completedItems, salvaged: opts.count(firstValue), retried: true, outcome: 'partial' });
+    return { value: firstValue, response: firstResponse, attempts: 2, retriedFor, partial: Boolean(firstKind), usedRetry: false };
+  }
+  const secondValue = opts.parse(second);
+  const secondKind = responsePathology(second);
+  if (secondKind) opts.onNote(`${pathologyNote(`${opts.label} · re-read`, secondKind, second.breaker?.completedItems, opts.count(secondValue), opts.cap)} Second pathology on the same target — marked partial; no third attempt.`);
+  const useSecond = opts.count(secondValue) > opts.count(firstValue) || (!secondKind && opts.count(secondValue) === opts.count(firstValue) && Boolean(firstKind));
+  const partial = Boolean(secondKind) && Boolean(firstKind || useSecond);
+  if (firstKind || secondKind) opts.onPathology?.({ label: opts.label, kind: (firstKind || secondKind)!, cutAtItem: (firstKind ? firstResponse : second).breaker?.completedItems, salvaged: opts.count(useSecond ? secondValue : firstValue), retried: true, outcome: partial ? 'partial' : 'recovered' });
+  return useSecond ? { value: secondValue, response: second, attempts: 2, retriedFor, partial, usedRetry: true } : { value: firstValue, response: firstResponse, attempts: 2, retriedFor, partial, usedRetry: false };
+}
+/** Whitespace/NFKC-normalized text for duplicate detection (never written back). */
+export const dedupeText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value ?? '')).normalize('NFKC').replace(/\s+/g, ' ').trim();
+/** Drop exact duplicates (by key), then truncate beyond a declared count. Stats are accumulated. */
+export function reconcileList<T>(items: T[], declared: unknown, key: (item: T) => string, stats: { truncated: number; deduped: number }, minDeclared = 0): T[] {
+  const seen = new Set<string>(); const out: T[] = [];
+  for (const item of items) { const k = key(item); if (seen.has(k)) { stats.deduped++; continue; } seen.add(k); out.push(item); }
+  const n = declared === null || declared === undefined || declared === '' ? NaN : Number(declared);
+  if (Number.isInteger(n) && n >= minDeclared && out.length > n) { stats.truncated += out.length - n; out.length = n; }
+  return out;
+}
+/** Section-parse compile: same number + same normalized stem is a duplicate; then the declared questionCount. */
+export function reconcileAuthoredQuestions(doc: AuthoredDocument, declaredCount: unknown, stats: { truncated: number; deduped: number }): AuthoredDocument {
+  doc.questions = reconcileList(doc.questions, declaredCount, q => `${q.number}\u0000${dedupeText(q.stem)}`, stats);
+  return doc;
+}
 export const errorMessage = (error: unknown): string => String((error as any)?.message || error || 'unknown error').replace(/\s+/g, ' ').slice(0, 300);
 const object = (value: unknown): Record<string, any> => value && typeof value === 'object' && !Array.isArray(value) ? value as any : {};
 const text = (value: unknown): string => typeof value === 'string' ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : '';
@@ -234,11 +325,19 @@ export function mergePageReads(pages: AuthoredDocument[]): AuthoredDocument {
 }
 
 export type Correction = { action: 'replace' | 'insert' | 'delete' | 'mergeDuplicates'; questionNumber: number; question?: AuthoredQuestion; sectionTitle?: string; pointsWithdrawn?: boolean; passages?: Array<{id:string;sectionTitle:string;text:string}> };
-export function parseCorrections(response: LoopModelResponse): Correction[] | undefined {
+export function parseCorrections(response: LoopModelResponse, options: { salvage?: boolean } = {}): Correction[] | undefined {
   // Patch output is all-or-nothing when unparseable. Unlike READ, never apply a guessed partial patch.
+  // #50: a response explicitly CUT by the breaker/cap salvages its COMPLETE correction objects only.
   let value: unknown = response.json;
   if (response.rawText?.trim()) {
-    try { value = JSON.parse(response.rawText.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '')); } catch { return undefined; }
+    try { value = JSON.parse(response.rawText.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '')); }
+    catch {
+      if (!options.salvage) return undefined;
+      const raw = response.rawText;
+      const seen = new Set<string>();
+      const corrections = completeObjects(raw, 'corrections').filter(row => { const k = dedupeText(row); if (seen.has(k)) return false; seen.add(k); return true; });
+      value = { corrections, passages: completeObjects(raw, 'passages'), ...(object(repairTruncatedJson(raw)).meta ? { meta: object(repairTruncatedJson(raw)).meta } : {}) };
+    }
   }
   const rows = object(value).corrections;
   if (!Array.isArray(rows)) return undefined;
@@ -419,7 +518,8 @@ export function buildLoopPages(lines: SourceLine[]): LoopPageChunk[] {
   }
   return pages;
 }
-export const sourceText = (lines: SourceLine[]): string => lines.map(l => l.text).join('\n');
+/** #50 Part C: prompts carry the normalized twin and never a watermark line. */
+export const sourceText = (lines: SourceLine[]): string => lines.filter(l => !l.watermark).map(modelText).join('\n');
 export function sourcePagesText(lines: SourceLine[], pages: number[]): string {
   const wanted = new Set(pages);
   return [...wanted].sort((a, b) => a - b).map(p => `PAGE ${p}\n${sourceText(lines.filter(l => l.page === p))}`).join('\n\n');
@@ -471,7 +571,7 @@ export function flaggedFixInput(doc: AuthoredDocument, verdicts: LoopVerdict[], 
   const images = [...imageIds];
   return JSON.stringify({ questions, meta: metaVerdicts.length ? doc.meta : undefined, images, verdicts: verdicts.map(v => ({ questionNumbers: v.questionNumbers, kind: v.kind, message: v.message, ...(v.probability !== undefined ? { probability: v.probability, choice: v.choice } : {}) })), ...(audit ? { instruction: 'One final patch pass. Fix only these audit-flagged items.' } : {}) })
     + `\n\nSOURCE PAGES:\n${sourcePagesText(lines, pages)}`
-    + (metaVerdicts.length ? `\n\nFIRST PAGE HEADER LINES (re-read these; no separate metadata model):\n${lines.filter(l => l.page === 1).slice(0, 15).map(l => l.text).join('\n')}` : '');
+    + (metaVerdicts.length ? `\n\nFIRST PAGE HEADER LINES (re-read these; no separate metadata model):\n${lines.filter(l => l.page === 1 && !l.watermark).slice(0, 15).map(modelText).join('\n')}` : '');
 }
 /** Metadata is part of READ's object; only an explicitly flagged meta correction may change it in step 4/6. */
 export function applyMetaCorrection(response: LoopModelResponse, doc: AuthoredDocument, verdicts: LoopVerdict[]): AuthoredDocument {

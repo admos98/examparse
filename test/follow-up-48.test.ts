@@ -28,11 +28,14 @@ test('THX parses the systemone answers envelope and retains existing fallbacks',
 });
 
 test('audit reports progress and defaults localhost THX to one in-flight request', async () => {
-  let running = 0, max = 0, calls = 0; const updates: LoopAuditProgress[] = [];
+  let running = 0, max = 0, calls = 0, binary = 0; const updates: LoopAuditProgress[] = [];
   const result = await runLoopDecisionAudit({ document: doc(), lines: [], images: [], settings, fileHash: 'test', onProgress: p => updates.push(p), decisionCaller: async body => {
     running++; max = Math.max(max, running); await new Promise(r => setTimeout(r, 2)); running--; calls++;
     const name = Object.keys(body.questions)[0];
-    return { results: [{ name, probability: calls === 1 ? .1 : calls === 2 ? .5 : .95, ...(name.endsWith('difficulty') ? { choice: '3' } : {}) }] };
+    // #50 Part D: difficulty is uncertain when its top level is below 0.4 (was: "value 3 is uncertain").
+    if (name.endsWith('difficulty')) return { results: [{ name, probability: .3, choice: '3', distribution: { '1': .1, '2': .25, '3': .3, '4': .25, '5': .1 } }] };
+    binary++;
+    return { results: [{ name, probability: binary === 1 ? .1 : binary === 2 ? .5 : .95 }] };
   } });
   assert.equal(max, 1); assert.equal(calls, 9); assert.equal(result.catches, 1); assert.equal(result.uncertain, 2);
   assert.equal(updates[0].total, 9); assert.equal(updates.at(-1)?.decided, 9); assert.equal(updates.at(-1)?.endpointErrors, 0);
@@ -58,18 +61,21 @@ test('self-review retries malformed output only once and records the attempt', a
 
 test('difficulty score uses argmax and is stored as a shadow proposal', async () => {
   const old = globalThis.fetch;
-  globalThis.fetch = (async () => ({ ok: true, json: async () => ({ answers: { 'Q1 difficulty': { answer: '2', probabilities: { '1': .1, '2': .2, '3': .4, '4': .2, '5': .1 } } } }) })) as any;
+  // #50 Part D: the llama.cpp /v1/systemone score shape (see test/fixtures/systemone-llama-score-response.json):
+  // request criteria = level labels; response probabilities keyed by 0-based level index.
+  globalThis.fetch = (async () => ({ ok: true, json: async () => ({ answers: { 'Q1 difficulty': { type: 'score', score: 2, legend: { '0': '1: trivial recall', '1': '2: easy', '2': '3: medium', '3': '4: hard', '4': '5: very hard multi-step' }, probabilities: { '0': .1, '1': .2, '2': .4, '3': .2, '4': .1 }, confidence: .2 } } }) })) as any;
   try {
-    const parsed = await LLMAdapter.executeDecisions({ providerConfig: provider, body: { state: 'Q', questions: { 'Q1 difficulty': { type: 'score', levels: ['1','2','3','4','5'] } } } as any });
-    assert.deepEqual(parsed.results, [{ name: 'Q1 difficulty', probability: .4, choice: '3' }]);
+    const parsed = await LLMAdapter.executeDecisions({ providerConfig: provider, body: { state: 'Q', questions: { 'Q1 difficulty': { type: 'score', instructions: 'rate', criteria: ['1: trivial recall','2: easy','3: medium','4: hard','5: very hard multi-step'] } } } as any });
+    assert.deepEqual(parsed.results, [{ name: 'Q1 difficulty', probability: .4, choice: '3', distribution: { '1': .1, '2': .2, '3': .4, '4': .2, '5': .1 } }]);
   } finally { globalThis.fetch = old; }
   const document = doc();
   const result = await runLoopDecisionAudit({ document, lines: [], images: [], settings, fileHash: 'score', decisionCaller: async body => {
     const name = Object.keys(body.questions)[0];
     return { results: [{ name, probability: name.endsWith('difficulty') ? .4 : .95, ...(name.endsWith('difficulty') ? { choice: '3' } : {}) }] };
   } });
+  // top level exactly 0.4 is not below the 0.4 uncertainty line
   assert.deepEqual(document.questions[0].difficulty, { value: 3, source: 'model' });
-  assert.equal(document.questions[0].difficultyMode, 'shadow'); assert.equal(result.difficultyUncertain, 1);
+  assert.equal(document.questions[0].difficultyMode, 'shadow'); assert.equal(result.difficultyUncertain, 0);
 });
 
 test('curriculum keywords choose a clear lesson, and ambiguous active questions use grade choices', async () => {

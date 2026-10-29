@@ -274,3 +274,12 @@ Suites after the sweep: tsc clean · **163 tests pass** · bench PASS · `vite b
 - Local-only token savings — a regex-only pass cannot omit lines safely (only AI-confirmed junk conf ≥ 8 is omitted), so the F2 token column is honest about −0.6 %.
 - Rewrites that translate or invent, rewrites on numbered/option/digit lines, or any rewrite outside the `rewrites` channel.
 - Any model call in gap completion, ownership, gates, META_TOTAL or the "Fix it" path — all deterministic by design.
+
+## Follow-up #50 — Fix the input, tame the pathologies
+Full report: [`docs/followup-50-report.md`](docs/followup-50-report.md).
+- **A:** stream breaker on every generative call (3 identical top-level items cut the stream). Declared counts plus compile-time reconciliation (`reconciled{truncated,deduped}`). Proportional caps (map 3000, section 800+n×220, fix 400+n×300 clamped to 800–8192). Salvage plus ONE complaint retry. Read-role `repeat_penalty 1.12` with a `[no-repeat-penalty]` rung.
+- **B:** map passage `blanks`; one `fillblank` per blank; `blank-missing` verdict with a section-scoped fix; `cloze-passage` corpus entry at 15/15.
+- **C:** a normalised digit twin per line (original text untouched); `digitSuspect` for corrupt digit runs; `watermark` lines kept but hidden from every prompt.
+- **D:** difficulty is sent as the native llama.cpp score (`criteria` array), gated on a real captured server response. Stored as argmax, `uncertain` when the top level is below 0.4.
+- **E:** one automatic section re-read when a section returns under 50% of its expected questions; the better attempt is kept; counted in `sectionReReads`.
+- Checks: `npm test` 420/420, `tsc` and build clean; existing corpus entries are byte-identical to before.

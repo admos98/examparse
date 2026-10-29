@@ -27,6 +27,13 @@ export type SourceLine = {
   tagConf?: number;
   /** Local readability signal (D1): ≥30% tokens with mixed-script glue / U+FFFD / watermark residue. */
   garbled?: boolean;
+  /** #50 Part C: model-facing twin (Arabic-Indic/Persian digits → Latin; corrupt digit runs → U+FFFD).
+   * Absent ⇒ identical to `text`. `text` itself is never rewritten by normalization. */
+  normalized?: string;
+  /** #50 Part C: a digit run contained a known-corrupt glyph (rendered as U+FFFD in `normalized`). */
+  digitSuspect?: boolean;
+  /** #50 Part C: watermark shape (one token/domain repeated ≥3×); furniture, excluded from model prompts. */
+  watermark?: boolean;
 };
 
 export interface OffsetSpan {
@@ -111,7 +118,7 @@ export interface Question {
     text: string;
   }[]; // only normalized lines
   confidence: number; // 0..1 from model
-  difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model' };
+  difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model'; /** #50: flat level distribution (top level < 0.4). */ uncertain?: boolean };
   difficultyMode?: 'shadow' | 'active';
   curriculumHints?: import('./pipeline/curriculumHints').CurriculumHints;
   curriculumSource?: 'keyword' | 'decision';
@@ -614,6 +621,8 @@ export interface LLMResponse {
   rawText: string;
   reasoningText?: string;
   finishReason?: string;
+  /** #50 Part A: set when the stream circuit-breaker cut the response. */
+  breaker?: { kind: 'repetition' | 'counting'; completedItems: number };
 }
 
 /**

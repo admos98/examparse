@@ -2,6 +2,7 @@
  * Unified Provider Abstraction & Adapter (§7)
  */
 import { hasCountingLoop } from '../pipeline/globalRead';
+import { RepetitionBreaker, type BreakerTrip } from '../pipeline/streamBreaker';
 import { LLMRequest, LLMResponse, ProviderConfig } from '../types';
 
 export interface ExecuteOptions {
@@ -9,10 +10,15 @@ export interface ExecuteOptions {
   onInfo?: (note: string) => void;
   salvagePartial?: boolean;
   detectCountingLoop?: boolean;
+  /** #50 Part A: abort when the same top-level JSON element completes 3 times. */
+  detectRepetition?: boolean;
 }
 
 export class CountingLoopError extends Error {
   constructor(public outputTokens: number) { super('counting loop in read stream'); }
+}
+export class RepetitionLoopError extends Error {
+  constructor(public trip: BreakerTrip) { super(`repetition loop in read stream (same item ×${trip.repeats} at item ${trip.completedItems})`); }
 }
 
 export class LLMAdapter {
@@ -55,6 +61,7 @@ export class LLMAdapter {
   private static async executeStreaming(request: LLMRequest, opts: ExecuteOptions): Promise<LLMResponse> {
     let output = '', reasoning = '';
     const controller = new AbortController();
+    const breaker = opts.detectRepetition ? new RepetitionBreaker() : undefined;
     try {
       const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...request, stream: true }), signal: controller.signal });
       if (!response.ok) throw new Error((await response.text()).slice(0, 500) || `HTTP ${response.status}`);
@@ -73,7 +80,13 @@ export class LLMAdapter {
           if (!data) continue;
           const payload = JSON.parse(data);
           if (event === 'info') opts.onInfo?.(payload.note || '');
-          else if (event === 'delta') { output += payload.text || ''; if (opts.detectCountingLoop && hasCountingLoop(output)) { controller.abort(); throw new CountingLoopError(Math.ceil(output.length / 3)); } opts.onDelta?.('output', output, payload.text || ''); }
+          else if (event === 'delta') {
+            output += payload.text || '';
+            if (opts.detectCountingLoop && hasCountingLoop(output)) { controller.abort(); throw new CountingLoopError(Math.ceil(output.length / 3)); }
+            const trip = breaker?.push(payload.text || '');
+            if (trip) { controller.abort(); reader.cancel().catch(() => undefined); throw new RepetitionLoopError(trip); }
+            opts.onDelta?.('output', output, payload.text || '');
+          }
           else if (event === 'reasoning') { reasoning += payload.text || ''; opts.onDelta?.('reasoning', reasoning, payload.text || ''); }
           else if (event === 'error') throw new Error(payload.message || 'Stream error');
           else if (event === 'done') return payload as LLMResponse;
@@ -83,6 +96,11 @@ export class LLMAdapter {
     } catch (err: any) {
       if (err instanceof CountingLoopError) {
         if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'counting-loop', usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil(output.length / 3) } };
+        throw err;
+      }
+      if (err instanceof RepetitionLoopError) {
+        opts.onInfo?.(`stream cut — ${err.message}`);
+        if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'repetition-loop', breaker: { kind: 'repetition', completedItems: err.trip.completedItems }, usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil(output.length / 3) } };
         throw err;
       }
       if (opts.salvagePartial && output) return { json: null, rawText: output, reasoningText: reasoning || undefined, finishReason: 'stream-died', usage: { inputTokens: Math.ceil(request.text.length / 3), outputTokens: Math.ceil((output.length + reasoning.length) / 3) } };
@@ -173,7 +191,7 @@ export class LLMAdapter {
     providerConfig: ProviderConfig & { model: string };
     body: { input: unknown; questions: Array<{ type: string; name: string; instructions: string; choices?: string[]; input?: unknown; images?: Array<{ id: string; mime: string; data: string }> }> };
     timeoutMs?: number;
-  }): Promise<{ results: Array<{ name: string; probability: number; choice?: string }> }> {
+  }): Promise<{ results: Array<{ name: string; probability: number; choice?: string; distribution?: Record<string, number> }> }> {
     const { providerConfig, body, timeoutMs = 30000 } = params;
     // #46: the browser never calls a local provider directly (CORS/credentials). The thin server
     // proxy validates the typed decisions payload, including optional image pixels, and forwards it.
@@ -191,6 +209,18 @@ export class LLMAdapter {
         const map = raw && typeof raw === 'object' ? raw : {};
         const validNumber = (value: unknown) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
         const values = map.probabilities && typeof map.probabilities === 'object' ? map.probabilities : map;
+        // #50 Part D: llama.cpp's native score (tools/server/server-decision.cpp, proven by the captured
+        // fixture test/fixtures/systemone-llama-score-response.json): criteria is an ARRAY of level
+        // descriptions and probabilities are keyed by the 0-based level index "0".."n-1". The returned
+        // level is 1-based (index + 1); a missing/partial distribution is malformed, never guessed.
+        if (item.type === 'score' && Array.isArray(item.criteria)) {
+          const n = item.criteria.length;
+          const keys = Array.from({ length: n }, (_, i) => String(i));
+          if (n < 2 || !keys.every(k => validNumber(values[k]))) throw new Error('THX score response malformed');
+          const probs = keys.map(k => Math.min(1, Math.max(0, Number(values[k]))));
+          const best = probs.reduce((b, p, i) => p > probs[b] ? i : b, 0);
+          return { results: [{ name: itemName, probability: probs[best], choice: String(best + 1), distribution: Object.fromEntries(probs.map((p, i) => [String(i + 1), p])) }] };
+        }
         if (choices.length || item.type === 'choice' || item.type === 'score') {
           const candidates = choices.length ? choices : Object.keys(values).filter(c => validNumber(values[c]));
           const available = candidates.filter((c: string) => values[c] !== undefined && validNumber(values[c]));

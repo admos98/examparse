@@ -116,7 +116,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
       <div className="ep-sheet-meta">
         <div className="ep-sheet-meta-side" dir={fallbackDir}>
           {meta.school && <div><strong>{meta.school}</strong></div>}
-          {meta.grade && <div className="ep-muted">{meta.grade}</div>}
+          {meta.grade && <div className="ep-muted">{meta.gradeDisplay || meta.grade}</div>}
         </div>
         <div>
           <h1 className="ep-sheet-title">{meta.title || getDisplayName(doc)}</h1>

@@ -1,3 +1,4 @@
+import { normalizeIdentity } from './identity';
 /** #46/#51 default path: six phases — Extract → Map → Parse → Check → Fix → Present.
  * Model-authored JSON is authoritative. Checkers comment; only model patches change question content.
  * Legacy compile/repair/cloud modules remain available to explicit Assistant/proving-ground tools, never called here.
@@ -157,7 +158,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   };
   const applyReceipt = (receipt: LoopReceipt) => {
     const projected = projectAuthoredDocument(receipt.document);
-    const meta = { ...doc.meta, ...projected.meta };
+    const meta = { ...doc.meta, ...projected.meta, ...normalizeIdentity(projected.meta.grade ?? doc.meta.grade, projected.meta.subject ?? doc.meta.subject) };
     doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, instructionGroups: structuredClone(receipt.document.instructionGroups || []), passages: structuredClone(receipt.document.passages || []), images, partial: receipt.survivingVerdicts.length > 0,
       displayName: nameSource === 'manual' ? displayName : computeDisplayName(meta, file.name),
       usage: [...usageRecords], loop: structuredClone(receipt), guidanceTokens: job?.guidanceTokens || 0 };

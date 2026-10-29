@@ -11,3 +11,6 @@ data/
 
 examparse-data/
 .examparse-storage.json
+# The curriculum digest is a versioned application asset, not runtime storage.
+!src/data/
+!src/data/curriculum-digest-v2.json

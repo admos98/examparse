@@ -86,6 +86,9 @@ export interface Question {
     spans: LineSpan[];
     text?: string;
   }[];
+  /** Map-proposed shared instructions applicable to this question. */
+  instructionGroups?: string[];
+  passageId?: string;
   /** Optional shared or inline word-bank items associated with fill-in-the-blank questions. */
   wordBank?: string[];
   subQuestions?: Question[];
@@ -108,6 +111,10 @@ export interface Question {
     text: string;
   }[]; // only normalized lines
   confidence: number; // 0..1 from model
+  difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model' };
+  difficultyMode?: 'shadow' | 'active';
+  curriculumHints?: import('./pipeline/curriculumHints').CurriculumHints;
+  curriculumSource?: 'keyword' | 'decision';
   /** Optional deterministic provenance; legacy persisted questions need not carry it. */
   receipt?: QuestionReceipt;
   flags?: string[];
@@ -234,6 +241,9 @@ export interface ExamDoc {
   nameSource?: 'ai' | 'manual';
   meta: ExamMeta;
   sections: ExamSection[];
+  /** Map-proposed shared text, with ranges retained for question-level ownership. */
+  instructionGroups?: Array<{ appliesToFirst: number; appliesToLast: number; text: string }>;
+  passages?: Array<{ id: string; sectionTitle: string; text: string; appliesToFirst?: number; appliesToLast?: number }>;
   questions: Question[];
   images: ImageAsset[];
   source: {
@@ -454,6 +464,8 @@ export interface ProviderConfig {
   decisionsPath?: string;
   /** Decision request dialect. Defaults to the existing JEV/OpenAI-shaped array protocol. */
   decideDialect?: 'jev' | 'thx';
+  /** Maximum simultaneous decision requests. Local THX defaults to one. */
+  decideConcurrency?: number;
   /** #46 mmproj-capable decisions build. Off means image decisions are caption-only. */
   multimodalDecisions?: boolean;
   defaultHeaders?: Record<string, string>;

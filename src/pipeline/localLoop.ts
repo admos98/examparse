@@ -13,11 +13,11 @@ export const LOOP_STEP_NAMES: Record<LoopStepId, string> = {
   read: 'Read', 'self-review': 'Self-review', 'code-check': 'Code check',
   'code-fix': 'Code-verdict fix', 'decision-audit': 'Decision audit', 'final-fix': 'Final fix',
 };
-export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'empty-stem',
+export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-link-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'section-count-mismatch', 'section-range-mismatch', 'section-missing', 'empty-stem',
   'options-missing-for-type', 'points-sum-mismatch', 'image-unassigned', 'image-double-assigned', 'meta-field-implausible'] as const;
 export type CodeVerdictKind = typeof CODE_VERDICT_KINDS[number];
 export type LoopDecisionKind = 'stem-faithful' | 'complete' | 'uncontaminated' | 'type-correct' | 'answer-correct'
-  | 'answer-letter' | 'points-plausible' | 'belongs-in-section' | 'image-belongs';
+  | 'answer-letter' | 'points-plausible' | 'belongs-in-section' | 'image-belongs' | 'difficulty' | 'curriculum-hint';
 export interface LoopVerdict {
   id: string;
   questionNumbers: number[];
@@ -51,7 +51,8 @@ export interface AuthoredDocument {
   meta: Record<string, unknown>;
   sections: Array<{ title: string; [key: string]: unknown }>;
   questions: AuthoredQuestion[];
-  passages?: Array<{ id: string; sectionTitle: string; text: string }>;
+  passages?: Array<{ id: string; sectionTitle: string; text: string; appliesToFirst?: number; appliesToLast?: number }>;
+  instructionGroups?: Array<{ appliesToFirst: number; appliesToLast: number; text: string }>;
   pointsWithdrawn?: number;
 }
 export interface LoopPageReceipt {
@@ -63,6 +64,7 @@ export interface LoopStepReceipt {
   status: 'idle' | 'running' | 'completed' | 'skipped' | 'failed' | 'cached';
   calls: number; correctionsApplied: number; verdictsRaised: number; verdictsClosed: number;
   notes: string[]; inputTokens: number; outputTokens: number;
+  auditProgress?: import('./loopAudit').LoopAuditProgress;
 }
 export interface LoopReceipt {
   version: typeof LOOP_VERSION;
@@ -74,6 +76,7 @@ export interface LoopReceipt {
   survivingVerdicts: LoopVerdict[];
   notes: string[];
   auditMode: 'shadow' | 'active' | 'skipped';
+  map?: import('./mapFirst').LoopMapReceipt;
   pointsWithdrawn?: number;
   decisionProvenance?: { dialect: 'jev'|'thx'; host: string };
 }
@@ -313,16 +316,17 @@ export function applyCorrections(doc: AuthoredDocument, corrections: Correction[
 }
 
 /** Deterministic image bookkeeping: page + document order are primary; model claims only break ties. */
-export function assignAuthoredImages(doc: AuthoredDocument, images: ImageAsset[], lines: SourceLine[]): void {
+export function assignAuthoredImages(doc: AuthoredDocument, images: ImageAsset[], lines: SourceLine[], map?: import('./mapFirst').LoopMapReceipt): void {
   const qs=flatAuthoredQuestions(doc), oldClaims=new Map(qs.map(q=>[q.number,[...q.imageIds]]));
   for(const q of qs) { q.imageIds=[]; q.imageAssignmentReasons={}; }
   const used=new Set<string>();
   const orderedImages=images.map((image,index)=>({image,index})).filter(x=>!x.image.duplicateOf).sort((a,b)=>a.image.page-b.image.page||a.index-b.index).map(x=>x.image);
   for(const image of orderedImages){
-    const eligible=(page:number)=>qs.filter(q=>{const pages=questionSourcePages(q,lines);const content=`${q.stem} ${q.options.map(o=>o.text).join(' ')}`;return (pages.includes(page)||q.sourcePages?.includes(page)) && (/\b(picture|image|diagram|figure|photo|illustration)\b/i.test(content)||oldClaims.get(q.number)?.length||Number(image.label?.questionRef?.replace(/^Q/i,''))===q.number);});
+    const hint = map?.images.find(i => i.imageId === image.id && i.status !== 'disputed');
+    const eligible=(page:number)=>qs.filter(q=>{const pages=questionSourcePages(q,lines);const content=`${q.stem} ${q.options.map(o=>o.text).join(' ')}`;return (pages.includes(page)||q.sourcePages?.includes(page)) && (/\b(picture|image|diagram|figure|photo|illustration)\b/i.test(content)||oldClaims.get(q.number)?.length||Number(image.label?.questionRef?.replace(/^Q/i,''))===q.number || hint?.aboutQuestion === q.number);});
     let candidates=eligible(image.page); if(!candidates.length)candidates=eligible(image.page-1).concat(eligible(image.page+1));
     const available=candidates.filter(q=>q.imageIds.length===0);
-    const owner=available.find(q=>oldClaims.get(q.number)?.includes(image.id))||available[0];
+    const owner=available.find(q=>oldClaims.get(q.number)?.includes(image.id)) || available.find(q=>hint?.aboutQuestion === q.number) || available.find(q=>hint?.sectionTitle && sectionKey(q.sectionTitle) === sectionKey(hint.sectionTitle)) || available[0];
     if(owner&&!used.has(image.id)){owner.imageIds.push(image.id);const ref=Number(image.label?.questionRef?.replace(/^Q/i,''));owner.imageAssignmentReasons![image.id]=oldClaims.get(owner.number)?.includes(image.id)?'model-claim':ref===owner.number?'vision-ref':'order';used.add(image.id);}
   }
 }
@@ -346,6 +350,7 @@ export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[
   if (max > scanMax) add('missing-number', [], `The highest authored number (${max}) is implausibly large; gap checking was bounded at ${scanMax}.`);
   for (const q of questions) {
     const passage=(doc.passages||[]).find(p=>(p.id===q.passageId || sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle)) && sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle));
+    if (q.passageId && !(doc.passages || []).some(p => p.id === q.passageId)) add('passage-missing', [q.number], `Question ${q.number} links passage ${q.passageId}, but the passage body is absent.`, { page: q.sourcePages?.[0] });
     if (passage && q.stem.length>300 && passage.text.length>100 && q.stem.includes(passage.text.slice(0,100))) add('passage-in-stem',[q.number],`Question ${q.number} duplicates passage text in its stem.`);
     if (!q.passageId && (/\b(passage|paragraph|text above|second line)\b/i.test(q.stem) || /reading/i.test(q.sectionTitle||'')) && !(doc.passages||[]).some(p=>sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle))) add('passage-missing',[q.number],`Question ${q.number} refers to a passage but no passage is attached.`,{page:q.sourcePages?.[0]});
     if (!q.stem.trim() && !q.subQuestions?.length) add('empty-stem', [q.number], `Question ${q.number} has no question text.`);
@@ -388,6 +393,10 @@ export function projectAuthoredDocument(doc: AuthoredDocument): { questions: Que
       spans: [], options: q.options.map(o => ({ key: o.key, text: o.text, spans: [] })), images: q.imageIds.map(imageId => ({ imageId, role: 'stem' })), confidence: 1,
       ...(section ? { sectionId: section.id } : {}), ...(parentId ? { parentId } : {}),
       ...(q.points !== undefined ? { points: q.points } : {}),
+      ...(q.passageId ? { passageId: q.passageId } : {}),
+      ...((doc.instructionGroups || []).some(g => q.number >= g.appliesToFirst && q.number <= g.appliesToLast) ? { instructionGroups: (doc.instructionGroups || []).filter(g => q.number >= g.appliesToFirst && q.number <= g.appliesToLast).map(g => g.text) } : {}),
+      ...(q.difficulty ? { difficulty: q.difficulty as Question['difficulty'], difficultyMode: q.difficultyMode as Question['difficultyMode'] } : {}),
+      ...(q.curriculumHints ? { curriculumHints: q.curriculumHints as Question['curriculumHints'], curriculumSource: q.curriculumSource as Question['curriculumSource'] } : {}),
       ...(q.answer !== undefined ? { answer: { text: q.answer, source: 'paper' as const } } : {}),
       ...(Array.isArray(q.wordBank) ? { wordBank: q.wordBank.map(text) } : {}),
     };
@@ -427,7 +436,7 @@ Use {"meta":{"subject":"...","grade":"...","totalPoints":40,"durationMinutes":90
 Use self-descriptive keys. Include the full stem, every option, shared instructions/passages needed to understand the question, printed points only when printed, and a printed answer only when present. Never infer or distribute marks. Include every question on this page, including continuations and subQuestions. Same number + same section on a later page means continuation. The previous-page context is read-only; do not duplicate its questions. Use only supplied image ids when the picture belongs to a question. Return shared passages once in top-level passages [{id,sectionTitle,text}], link dependent questions with passageId, and never copy passage text into stems. Do not enumerate source lines. Optional stemFrom/stemTo are advisory only, never a substitute for text. Do not invent questions to fill gaps. Reasoning off. /no_think`;
 export const LOOP_REVIEW_SYSTEM = `Here is your parse and the original text. Find questions that are wrong, incomplete, duplicated, missing, or containing another question's material. Return ONLY corrections: for each problem, the question number and the fully corrected question object; for missing questions, the complete new object; for duplicates, which number to delete. If a question is fine, say nothing about it.
 JSON: {"corrections":[{"action":"replace","questionNumber":1,"question":{full corrected object}},{"action":"insert","questionNumber":2,"question":{complete new object}},{"action":"delete","questionNumber":3,"sectionTitle":"optional when number is duplicated"}]}. Never return spans or patches to individual fields. No corrections means {"corrections":[]}. Reasoning off. /no_think`;
-export const LOOP_FIX_SYSTEM = `Fix only the questions and verdicts supplied. Use the source text, not guesswork. Return corrected FULL question objects by number, as {"corrections":[{"action":"replace","questionNumber":1,"question":{full object}}]}. For duplicate-conflict verdicts, include both records and source in your reasoning and return a single merged corrected object with action mergeDuplicates. You may insert a missing question or delete a duplicate using the same envelope. Do not change unflagged questions. If metadata is flagged, re-read the supplied first-page header and include corrected "meta" alongside corrections. Never infer points or answers. If printed per-question marks are absent, return points: null. For passage-missing, re-read source and return {passages:[{id,sectionTitle,text}], corrections:[{action:'replace',questionNumber,question:{...,passageId}}]}; extract passage verbatim once and link all dependent questions. Never copy passage into stem. Reasoning off. /no_think`;
+export const LOOP_FIX_SYSTEM = `Fix only the questions and verdicts supplied. Use the source text, not guesswork. Return corrected FULL question objects by number, as {"corrections":[{"action":"replace","questionNumber":1,"question":{full object}}]}. For duplicate-conflict verdicts, include both records and source in your reasoning and return a single merged corrected object with action mergeDuplicates. You may insert a missing question or delete a duplicate using the same envelope. Do not change unflagged questions. If metadata is flagged, re-read the supplied first-page header and include corrected "meta" alongside corrections. Never infer points or answers. If printed per-question marks are absent, return points: null. For passage-missing or passage-link-missing, re-read source and return {passages:[{id,sectionTitle,text}], corrections:[{action:'replace',questionNumber,question:{...,passageId}}]}; extract passage verbatim once and link all dependent questions. Never copy passage into stem. Reasoning off. /no_think`;
 export function buildLoopPagePrompt(chunk: LoopPageChunk, images: ImageAsset[], guidance?: string): string {
   const context = chunk.context.length ? `PREVIOUS PAGE CONTEXT (read only; last ${LOOP_OVERLAP_LINES} lines):\n${sourceText(chunk.context)}\n\n` : '';
   const captions = images.filter(i => i.page === chunk.page && !i.duplicateOf).map(i => ({ id: i.id, caption: i.label?.caption || null, role: i.label?.role || null }));

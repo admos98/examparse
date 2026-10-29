@@ -25,6 +25,7 @@ export interface PipelineCallbacks {
   onStageUpdate: (stage: StageStatus) => void;
   onNodeUpdate?: (node: { id: string; label?: string; status: string; tokens?: number; error?: string }) => void;
   onUsageUpdate?: (record: UsageRecord) => void;
+  onMapUpdate?: (map: import('./mapFirst').LoopMapReceipt) => void;
   onLiveText?: (stageId: string, label: string, channel: 'output' | 'reasoning' | 'info', fullText: string) => void;
 }
 export interface PipelineOptions {
@@ -146,7 +147,7 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const applyReceipt = (receipt: LoopReceipt) => {
     const projected = projectAuthoredDocument(receipt.document);
     const meta = { ...doc.meta, ...projected.meta };
-    doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, images, partial: receipt.survivingVerdicts.length > 0,
+    doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, instructionGroups: structuredClone(receipt.document.instructionGroups || []), passages: structuredClone(receipt.document.passages || []), images, partial: receipt.survivingVerdicts.length > 0,
       displayName: nameSource === 'manual' ? displayName : computeDisplayName(meta, file.name),
       usage: [...usageRecords], loop: structuredClone(receipt), guidanceTokens: job?.guidanceTokens || 0 };
     doc.flags = loopFlags(receipt, doc);
@@ -155,12 +156,14 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const loop = await runLocalLoop({ lines, images, settings, fileHash, caller, modelId: readProvider ? `${readProvider.id}:${readProvider.model}` : 'scripted', guidance: [job?.playbook.block, job?.skillsBlock].filter(Boolean).join('\n\n'),
     force: forceStage('read'), decisionCaller: options?.decisionCaller, imagePayload,
     onJournal: async entry => { if (settings.thrift.cacheEnabled) await appendJournalCall(journalKey, { ts: new Date().toISOString(), ...entry, complete: true }); },
+    onMapUpdate: map => callbacks.onMapUpdate?.(map),
     onLiveText: (step, label, channel, text) => callbacks.onLiveText?.(stageId(step), label, channel, text),
     onUsage: (step, usage, label, cached) => record(usageRecord(step === 'decision-audit' ? 'decide' : 'read', step === 'decision-audit' ? decideProvider : readProvider, usage, label, settings.costTable, cached)),
     onStep: (receipt, step) => {
       applyReceipt(receipt); const row = receipt.steps.find(s => s.step === step)!;
       const status = row.status === 'running' ? 'running' : row.status === 'failed' ? 'completed-with-problems' : row.status === 'idle' ? 'idle' : row.status;
-      stage({ id: stageId(step), name: row.name, status, message: `${row.calls} call(s) · ${row.correctionsApplied} correction(s) applied · ${row.verdictsRaised} verdict(s) raised · ${row.verdictsClosed} closed.${row.notes.length ? ` ${row.notes.join(' ')}` : ''}`, inputTokens: row.inputTokens, outputTokens: row.outputTokens });
+      const progress = row.auditProgress;
+      stage({ id: stageId(step), name: row.name, status, message: progress && row.status === 'running' ? `${progress.decided === 0 ? `Auditing ${progress.questions} questions + ${progress.images} images — ${progress.total} decisions · ` : ''}Decision audit · ${progress.decided}/${progress.total} decided · ${progress.catches} catches · ${progress.uncertain} uncertain · ${progress.endpointErrors} endpoint errors · ${progress.rate.toFixed(1)}/s${progress.currentItem ? ` · ${progress.currentItem}` : ''}${progress.skipped ? ' · endpoint unreachable — skipping' : ''}` : `${row.calls} call(s) · ${row.correctionsApplied} correction(s) applied · ${row.verdictsRaised} verdict(s) raised · ${row.verdictsClosed} closed.${row.notes.length ? ` ${row.notes.join(' ')}` : ''}`, inputTokens: row.inputTokens, outputTokens: row.outputTokens });
       callbacks.onNodeUpdate?.({ id: step, label: row.name, status: row.status, tokens: row.inputTokens + row.outputTokens });
     },
     onSave: async receipt => { applyReceipt(receipt); await saveExamDoc(doc); },

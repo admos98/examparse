@@ -1,0 +1,12 @@
+{
+  "model": "[redacted local model path]",
+  "answers": {
+    "answer_ok": { "type": "noul", "noul": 0.6527858416386044 },
+    "correct_letter": {
+      "type": "choice", "choice": "B",
+      "probabilities": { "C": 0.03924170279986747, "D": 0.1631049787978798, "B": 0.6365900484187214, "A": 0.16106326998353146 },
+      "confidence": 0.5154533978916285
+    }
+  },
+  "usage": { "input_tokens": 262, "output_tokens": 0 }
+}

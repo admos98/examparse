@@ -27,7 +27,7 @@ export function scriptedLoopReader(lines: SourceLine[], images: ImageAsset[] = [
   const headers = detectSectionHeaders(lines);
   const keyLines = detectKeyTerritory(lines).lineNos;
   const total = extractDocumentTotals(lines, keyLines).documentTotal;
-  return async req => {
+  const legacyReader: LoopModelCaller = async req => {
     if (req.step !== 'read') return { rawText: JSON.stringify({ corrections: [] }), json: { corrections: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
     const page = Number(/PAGE (\d+) SOURCE:/.exec(req.text)?.[1] || 0);
     const owned = lines.filter(l => l.page === page && !keyLines.has(Number(l.id.replace(/\D/g, ''))));
@@ -53,6 +53,43 @@ export function scriptedLoopReader(lines: SourceLine[], images: ImageAsset[] = [
     }
     const doc = { meta: { ...(total !== undefined ? { totalPoints: total } : {}), pages: Math.max(1, ...lines.map(l => l.page)) }, sections: [...new Set(questions.map(q => q.sectionTitle).filter(Boolean))].map(title => ({ title })), questions };
     return { rawText: JSON.stringify(doc), json: doc, usage: { inputTokens: Math.ceil(req.text.length / 4), outputTokens: Math.ceil(JSON.stringify(doc).length / 4) } };
+  };
+  return async req => {
+    if (req.step === 'read' && req.label.startsWith('Map ·')) {
+      const candidates = lines.filter(l => !keyLines.has(Number(l.id.replace(/\D/g, '')))).flatMap(l => {
+        const n = numberAt(l.text); if (n === undefined) return [];
+        const lineNo = Number(l.id.replace(/\D/g, ''));
+        const header = [...headers].reverse().find(h => h.headerLine <= lineNo);
+        return [{ n, title: header?.title || 'Unsectioned', kind: header?.kind || 'other' }];
+      });
+      const byNumber = new Map<number, { n:number; title:string; kind:string }>();
+      for (const row of candidates) if (!byNumber.has(row.n)) byNumber.set(row.n, row);
+      const sorted = [...byNumber.values()].sort((a,b)=>a.n-b.n);
+      const sections: Array<{ title:string; firstQuestion:number; lastQuestion:number; questionCount:number; kind:string }> = [];
+      for (const row of sorted) {
+        const prior = sections.at(-1);
+        if (prior && prior.title === row.title) { prior.lastQuestion = row.n; prior.questionCount++; }
+        else sections.push({ title:row.title, firstQuestion:row.n, lastQuestion:row.n, questionCount:1, kind:row.kind });
+      }
+      // Scripted map is derived from printed numbering and headings, never truth.json.
+      if (sections.length) {
+        const result = { meta: { ...(total !== undefined ? { totalPoints: total } : {}) }, sections, instructionGroups:[], passages:[], images:[] };
+        return { rawText: JSON.stringify(result), json: result };
+      }
+    }
+    if (req.step === 'read' && req.label.startsWith('Section parse ·')) {
+      const pages = [...new Set(lines.map(l => l.page))];
+      const pieces = await Promise.all(pages.map(page => legacyReader({ ...req, text: `PAGE ${page} SOURCE:` })));
+      const docs = pieces.map(p => p.json as any);
+      let contract: any = {};
+      try { contract = JSON.parse(req.text.split('MAP CONTRACT: ')[1].split('\nSECTION SOURCE')[0]); } catch { /* scripted fallback */ }
+      const range = contract.section;
+      const numbers: number[] | undefined = contract.numberedQuestions;
+      const questions = docs.flatMap(d=>d.questions || []).filter((q:any) => range ? q.number >= range.firstQuestion && q.number <= range.lastQuestion : numbers ? numbers.includes(q.number) : true);
+      const result = { meta: docs[0]?.meta || {}, sections: docs.flatMap(d=>d.sections || []), questions };
+      return { rawText: JSON.stringify(result), json: result };
+    }
+    return legacyReader(req);
   };
 }
 export interface LoopCorpusScore {

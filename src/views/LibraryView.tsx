@@ -33,6 +33,7 @@ import { ConfirmCard, Modal } from '../design/primitives';
 import { loadSettings } from '../store';
 import { answerLibraryQuestion } from '../pipeline/multiExamChat';
 import { createBackup, restoreBackup } from '../utils/backup';
+import { QuestionBankExportDialog } from '../components/QuestionBankExportDialog';
 
 interface Props {
   isOpen: boolean;
@@ -69,6 +70,7 @@ export const LibraryView: React.FC<Props> = ({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [pendingDelete, setPendingDelete] = useState<ExamSummary | null>(null);
+  const [bankExportDoc, setBankExportDoc] = useState<ExamDoc | null>(null);
   const [pendingExport, setPendingExport] = useState<ExamDoc | null>(null);
   const [cacheCleared, setCacheCleared] = useState(false);
   const [storageMode, setStorageMode] = useState<{ mode: string; dir?: string }>({ mode: 'unavailable' });
@@ -572,6 +574,10 @@ export const LibraryView: React.FC<Props> = ({
                         <Download className="w-3 h-3" /> Export JSON
                       </button>
                       <button
+                        onClick={() => { void loadExamDoc(s.id).then(doc => { if (doc) setBankExportDoc(doc); else setErrorMsg('That exam could not be loaded for export.'); }).catch(() => setErrorMsg('That exam could not be loaded for export.')); }}
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)] hover:bg-[var(--paper)] transition"
+                      ><Download className="w-3 h-3" /> Export · Question Bank batch</button>
+                      <button
                         onClick={() => void handlePromoteToCorpus(s)}
                         title="Add this parsed exam to the local test corpus as an unreviewed entry (report-only until truth is reviewed)"
                         className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"
@@ -604,6 +610,7 @@ export const LibraryView: React.FC<Props> = ({
           onCancel={() => setPendingDelete(null)}
         /></div>}
       </Modal>
+      {bankExportDoc && <QuestionBankExportDialog doc={bankExportDoc} settings={loadSettings()} onClose={() => setBankExportDoc(null)} onTagged={async doc => { await saveExamDoc(doc); setBankExportDoc(doc); }} />}
       <Modal open={Boolean(pendingExport)} onClose={() => setPendingExport(null)} title={fa ? 'تأیید خروجی آزمون ناقص' : 'Confirm partial exam export'}>
         {pendingExport && <div className="p-4"><ConfirmCard
           title={fa ? 'آزمون ناقص است' : 'This exam is partial'}

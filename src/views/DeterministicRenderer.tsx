@@ -74,7 +74,21 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
     // Group images (including duplicate child references) render once beneath the parent only.
     const groupRefs = depth === 0 ? [q, ...descendants(q, children)].flatMap(item => item.images || []) : [];
     const groupImages = depth === 0 ? renderImages([...new Map(groupRefs.map(ref => [ref.imageId, ref])).values()]) : null;
+    const section = doc.sections.find(s => s.id === q.sectionId);
+    const instructions = (q.instructionGroups || []).filter(instruction => {
+      if (section?.instructions === instruction) return false;
+      const applicable = (doc.instructionGroups || []).filter(g => g.text === instruction && q.no >= g.appliesToFirst && q.no <= g.appliesToLast);
+      if (applicable.length) return applicable.some(g => {
+        const firstPresent = Math.min(...doc.questions.filter(other => other.sectionId === q.sectionId && other.no >= g.appliesToFirst && other.no <= g.appliesToLast).map(other => other.no));
+        return q.no === firstPresent;
+      });
+      return q.no === Math.min(...doc.questions.filter(other => other.sectionId === q.sectionId && other.instructionGroups?.includes(instruction)).map(other => other.no));
+    });
+    const passage = q.passageId ? doc.passages?.find(p => p.id === q.passageId && p.text !== section?.passage) : undefined;
+    const firstForPassage = passage && q.no === Math.min(...doc.questions.filter(other => other.passageId === passage.id).map(other => other.no));
     return <article key={q.id} data-qid={q.id} data-no={String(q.no)} className={`ep-question ${depth ? 'ep-nested-question' : ''}`}>
+      {instructions.map((instruction, index) => <DirectionalText key={index} text={instruction} fallback={fallbackDir} className="block ep-muted italic text-[length:var(--type-13)]" />)}
+      {passage && firstForPassage && <div className="ep-passage" data-sheet-passage="true"><DirectionalText text={passage.text} fallback={fallbackDir} /></div>}
       <div className="ep-question-row">
         <div className="ep-question-body">
           <span className="ep-question-number">{nestedLabel}</span>

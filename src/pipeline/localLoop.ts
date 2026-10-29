@@ -3,17 +3,25 @@ import type { ExamDoc, ImageAsset, Question, SourceLine } from '../types';
 import { repairTruncatedJson } from '../utils/jsonRepair';
 import { normalizeGrade, normalizeSubject, normalizeDigits } from './metaRead';
 import { hasCountingLoop } from './globalRead';
+import { modelText } from './lineNormalize';
 
 export { hasCountingLoop };
-export const LOOP_VERSION = 'local-loop-v1';
+/** v2 = the #51 six-phase receipt (extract → map → parse → check → fix → present). v1 receipts keep parsing. */
+export const LOOP_VERSION = 'local-loop-v2';
 export const LOOP_OVERLAP_LINES = 30;
-export const LOOP_STEPS = ['read', 'self-review', 'code-check', 'code-fix', 'decision-audit', 'final-fix'] as const;
-export type LoopStepId = typeof LOOP_STEPS[number];
-export const LOOP_STEP_NAMES: Record<LoopStepId, string> = {
-  read: 'Read', 'self-review': 'Self-review', 'code-check': 'Code check',
-  'code-fix': 'Code-verdict fix', 'decision-audit': 'Decision audit', 'final-fix': 'Final fix',
+/** #51: the only order. Check (both checkers, comment-only) always precedes the ONE Fix pass; Present re-checks. */
+export const LOOP_PHASES = ['extract', 'map', 'parse', 'check', 'fix', 'present'] as const;
+export type LoopPhaseId = typeof LOOP_PHASES[number];
+/** Kept as an alias so call sites read naturally; the values are the six phases. */
+export type LoopStepId = LoopPhaseId;
+/** Step ids written by v1 receipts (pre-#51). Legacy exports still parse and render with these. */
+export type LegacyLoopStepId = 'read' | 'self-review' | 'code-check' | 'code-fix' | 'decision-audit' | 'final-fix';
+export const LOOP_PHASE_NAMES: Record<LoopPhaseId, string> = {
+  extract: 'Extract', map: 'Map', parse: 'Parse', check: 'Check', fix: 'Fix', present: 'Present',
 };
-export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-link-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'section-count-mismatch', 'section-range-mismatch', 'section-missing', 'empty-stem',
+/** @deprecated v1 name; same table. */
+export const LOOP_STEP_NAMES = LOOP_PHASE_NAMES;
+export const CODE_VERDICT_KINDS = ['invalid-json-remnant', 'passage-missing', 'passage-link-missing', 'passage-in-stem', 'duplicate-conflict', 'patch-unapplied', 'duplicate-number', 'missing-number', 'section-count-mismatch', 'section-range-mismatch', 'section-missing', 'blank-missing', 'empty-stem',
   'options-missing-for-type', 'points-sum-mismatch', 'image-unassigned', 'image-double-assigned', 'meta-field-implausible'] as const;
 export type CodeVerdictKind = typeof CODE_VERDICT_KINDS[number];
 export type LoopDecisionKind = 'stem-faithful' | 'complete' | 'uncontaminated' | 'type-correct' | 'answer-correct'
@@ -30,6 +38,11 @@ export interface LoopVerdict {
   page?: number;
   routed?: boolean;
   closed?: boolean;
+  /** #51: both checkers flagged the same item for the same concern — ONE verdict, both sources quoted. */
+  sources?: Array<'code' | 'decision'>;
+  merged?: Array<{ id: string; kind: string; source: 'code' | 'decision'; message: string; probability?: number }>;
+  /** #51: an uncertain-band decision verdict shown to the fixer as a hint; it does not by itself require a change. */
+  hint?: boolean;
 }
 export interface AuthoredQuestion {
   number: number;
@@ -60,14 +73,17 @@ export interface LoopPageReceipt {
   calls: number; questions: number; notes: string[];
 }
 export interface LoopStepReceipt {
-  step: LoopStepId; name: string;
+  step: LoopPhaseId | LegacyLoopStepId; name: string;
   status: 'idle' | 'running' | 'completed' | 'skipped' | 'failed' | 'cached';
-  calls: number; correctionsApplied: number; verdictsRaised: number; verdictsClosed: number;
+  /** correctionsApplied = patches applied in this phase. verdictsCarried = raised earlier and still standing. */
+  calls: number; correctionsApplied: number; verdictsRaised: number; verdictsClosed: number; verdictsCarried?: number;
   notes: string[]; inputTokens: number; outputTokens: number;
   auditProgress?: import('./loopAudit').LoopAuditProgress;
 }
+/** #51: collapsed call/check timeline — consecutive identical phase:event pairs are counted, not repeated. */
+export interface LoopTimelineEntry { phase: LoopPhaseId; event: 'generate' | 'decide' | 'code'; count: number }
 export interface LoopReceipt {
-  version: typeof LOOP_VERSION;
+  version: 'local-loop-v1' | typeof LOOP_VERSION;
   document: AuthoredDocument;
   steps: LoopStepReceipt[];
   pages: LoopPageReceipt[];
@@ -78,24 +94,211 @@ export interface LoopReceipt {
   auditMode: 'shadow' | 'active' | 'skipped';
   map?: import('./mapFirst').LoopMapReceipt;
   pointsWithdrawn?: number;
+  /** #50 Part A: list elements dropped at compile (beyond a declared count / exact duplicates). */
+  reconciled?: { truncated: number; deduped: number };
+  /** #50 Part E: automatic section re-reads after an under-count. */
+  sectionReReads?: number;
+  /** #50 Part A: generation pathologies (breaker/cap) and how each target was salvaged. */
+  pathologies?: LoopPathologyRecord[];
   decisionProvenance?: { dialect: 'jev'|'thx'; host: string };
+  /** #51 Check output: code + decision verdicts merged (one verdict per item/concern), before any fix. */
+  mergedVerdicts?: LoopVerdict[];
+  /** #51 Present re-check economy: code is instant; decision re-votes only changed / confidently indicted items. */
+  recheck?: { codeModelCalls: 0; decisionRevoted: number; decisionReused: number; changedQuestions: number[] };
+  timeline?: LoopTimelineEntry[];
 }
 export interface LoopModelRequest {
-  step: Exclude<LoopStepId, 'code-check' | 'decision-audit'>;
+  /** Generative calls happen only in Map (map + scoped re-map), Parse (sections / page fallback) and Fix. */
+  step: 'map' | 'parse' | 'fix';
   system: string; text: string; label: string;
   /** Deliberately no small page cap: a full page of authored questions must fit. */
   maxOutputTokens?: number;
 }
-export interface LoopModelResponse { rawText: string; json?: unknown; usage?: { inputTokens: number; outputTokens: number } }
+export interface LoopModelResponse {
+  rawText: string; json?: unknown; usage?: { inputTokens: number; outputTokens: number };
+  /** Provider finish reason; 'length'/'max_tokens' = cap, 'repetition-loop'/'counting-loop' = breaker. */
+  finishReason?: string;
+  breaker?: { kind: 'repetition' | 'counting'; completedItems: number };
+}
 export type LoopModelCaller = (request: LoopModelRequest) => Promise<LoopModelResponse>;
 
 export const emptyAuthoredDocument = (): AuthoredDocument => ({ meta: {}, sections: [], questions: [] });
 export const newLoopReceipt = (): LoopReceipt => ({
   version: LOOP_VERSION, document: emptyAuthoredDocument(),
-  steps: LOOP_STEPS.map(step => ({ step, name: LOOP_STEP_NAMES[step], status: 'idle', calls: 0,
-    correctionsApplied: 0, verdictsRaised: 0, verdictsClosed: 0, notes: [], inputTokens: 0, outputTokens: 0 })),
-  pages: [], codeVerdicts: [], auditVerdicts: [], survivingVerdicts: [], notes: [], auditMode: 'skipped',
+  steps: LOOP_PHASES.map(step => ({ step, name: LOOP_PHASE_NAMES[step], status: 'idle', calls: 0,
+    correctionsApplied: 0, verdictsRaised: 0, verdictsClosed: 0, verdictsCarried: 0, notes: [], inputTokens: 0, outputTokens: 0 })),
+  pages: [], codeVerdicts: [], auditVerdicts: [], survivingVerdicts: [], mergedVerdicts: [], notes: [], auditMode: 'skipped', timeline: [],
 });
+// ---------------------------------------------------------------------------------------------
+// #51 Part B — one merged verdict list (Check), one fix pass batched by section (Fix).
+// ---------------------------------------------------------------------------------------------
+/** Same-concern equivalence between the code list and the decision catalogue. Not new kinds: it only
+ * decides when "both checkers flag the same item for the same kind" so they count as ONE verdict. */
+export const VERDICT_CONCERN: Partial<Record<CodeVerdictKind | LoopDecisionKind, string>> = {
+  'empty-stem': 'stem', 'stem-faithful': 'stem',
+  'options-missing-for-type': 'complete', 'passage-missing': 'complete', 'passage-link-missing': 'complete', 'complete': 'complete',
+  'passage-in-stem': 'contamination', 'uncontaminated': 'contamination',
+  'section-range-mismatch': 'section', 'belongs-in-section': 'section',
+  'image-unassigned': 'image', 'image-double-assigned': 'image', 'image-belongs': 'image',
+};
+const concernKey = (v: LoopVerdict): string => {
+  const concern = VERDICT_CONCERN[v.kind] || v.kind;
+  return concern === 'image' && v.imageId ? `image:${v.imageId}` : `${concern}:${[...new Set(v.questionNumbers)].sort((a, b) => a - b).join(',')}`;
+};
+/** Merge code verdicts with FLAGGING decision verdicts (p below the pass line). Where both flag the same
+ * item for the same concern the result is one verdict that keeps the decision probability and quotes both. */
+export function mergeVerdicts(code: LoopVerdict[], decision: LoopVerdict[], passAt: number): LoopVerdict[] {
+  const flags = decision.filter(v => (v.probability ?? 1) < passAt);
+  const byKey = new Map<string, LoopVerdict[]>();
+  for (const v of code) { const k = concernKey(v); byKey.set(k, [...(byKey.get(k) || []), v]); }
+  const absorbed = new Set<string>();
+  const merged: LoopVerdict[] = [];
+  for (const d of flags) {
+    const twins = (byKey.get(concernKey(d)) || []).filter(c => !absorbed.has(c.id) && (c.questionNumbers.length || c.imageId));
+    if (!twins.length) { merged.push(d); continue; }
+    twins.forEach(c => absorbed.add(c.id));
+    merged.push({ ...d, sources: ['code', 'decision'],
+      merged: [...twins.map(c => ({ id: c.id, kind: c.kind, source: 'code' as const, message: c.message })), { id: d.id, kind: d.kind, source: 'decision' as const, message: d.message, probability: d.probability }],
+      message: `${twins.map(c => c.message).join(' ')} The decision audit agrees (probability sound ${(d.probability ?? 0).toFixed(2)}).` });
+  }
+  return [...code.filter(c => !absorbed.has(c.id)), ...merged];
+}
+const HINT_PHRASE: Partial<Record<LoopDecisionKind, string>> = {
+  'stem-faithful': 'faithful to the printed stem', complete: 'complete', uncontaminated: "free of another question's material",
+  'type-correct': 'typed correctly', 'answer-correct': 'answered correctly', 'answer-letter': 'naming the right answer option',
+  'points-plausible': 'carrying plausible points', 'belongs-in-section': 'in the right section', 'image-belongs': 'attached to the right image',
+};
+/** Plain-language teacher sentence for a decision verdict (the attention list never shows raw prompts). */
+export function plainDecisionSentence(v: LoopVerdict, catchAt = 0.2): string {
+  const what = HINT_PHRASE[v.kind as LoopDecisionKind] || v.kind;
+  const who = v.imageId ? `Image ${v.imageId}` : v.questionNumbers.map(n => `Q${n}`).join(', ') || 'This item';
+  const p = v.probability ?? 0.5;
+  return p <= catchAt ? `The audit judges ${who} likely not ${what} (sound p=${p.toFixed(2)}).` : `The audit is unsure whether ${who} is ${what} (sound p=${p.toFixed(2)}).`;
+}
+/** "the audit is unsure whether Q14 is complete — check it while you're here" */
+export function hintMessage(v: LoopVerdict): string {
+  const what = HINT_PHRASE[v.kind as LoopDecisionKind] || v.kind;
+  const who = v.imageId ? `image ${v.imageId}` : v.questionNumbers.map(n => `Q${n}`).join(', ') || 'this item';
+  return `Hint: the audit is unsure whether ${who} is ${what} (p=${(v.probability ?? 0.5).toFixed(2)}) — check it while you're here; change it only if the source shows a defect.`;
+}
+/** Fix batches: by section, ≤ maxQuestions flagged numbers each; every verdict travels once with its
+ * questions. Document-level verdicts (no numbers) ride in the first batch. Hints join only batches that
+ * already exist — a hint never causes a call on its own. */
+export function batchVerdictsBySection(doc: AuthoredDocument, scope: LoopVerdict[], hints: LoopVerdict[], sectionOf: (n: number) => string, maxQuestions = 12): Array<{ section: string; verdicts: LoopVerdict[]; hints: LoopVerdict[] }> {
+  const ownerSection = (v: LoopVerdict): string | undefined => v.questionNumbers.length ? sectionOf(v.questionNumbers[0]) : undefined;
+  const order: string[] = []; const bySection = new Map<string, LoopVerdict[]>(); const extras: LoopVerdict[] = [];
+  for (const v of scope) {
+    const section = ownerSection(v);
+    if (section === undefined) { extras.push(v); continue; }
+    if (!bySection.has(section)) { bySection.set(section, []); order.push(section); }
+    bySection.get(section)!.push(v);
+  }
+  const batches: Array<{ section: string; verdicts: LoopVerdict[]; hints: LoopVerdict[]; numbers: Set<number> }> = [];
+  for (const section of order) {
+    let current: { section: string; verdicts: LoopVerdict[]; hints: LoopVerdict[]; numbers: Set<number> } | undefined;
+    for (const v of bySection.get(section)!) {
+      const nums = new Set(v.questionNumbers);
+      if (!current || (current.numbers.size && [...nums].filter(n => !current!.numbers.has(n)).length + current.numbers.size > maxQuestions)) {
+        current = { section, verdicts: [], hints: [], numbers: new Set() }; batches.push(current);
+      }
+      current.verdicts.push(v); nums.forEach(n => current!.numbers.add(n));
+    }
+  }
+  if (extras.length) { if (batches.length) batches[0].verdicts.push(...extras); else batches.push({ section: 'Exam', verdicts: extras, hints: [], numbers: new Set() }); }
+  for (const h of hints) {
+    const section = ownerSection(h); if (section === undefined) continue;
+    const target = batches.find(b => h.questionNumbers.some(n => b.numbers.has(n))) || batches.find(b => b.section === section && b.numbers.size < maxQuestions);
+    if (target) { target.hints.push(h); h.questionNumbers.forEach(n => target.numbers.add(n)); }
+  }
+  void doc;
+  return batches.map(({ section, verdicts, hints }) => ({ section, verdicts, hints }));
+}
+/** Question numbers whose authored content differs (ignoring Check's own tags), plus inserts and deletes. */
+export function changedQuestionNumbers(before: AuthoredDocument, after: AuthoredDocument): number[] {
+  const strip = (q: AuthoredQuestion) => { const { difficulty, difficultyMode, curriculumHints, curriculumSource, sourcePages, imageAssignmentReasons, subQuestions, ...rest } = q as any; void difficulty; void difficultyMode; void curriculumHints; void curriculumSource; void sourcePages; void imageAssignmentReasons; void subQuestions; return JSON.stringify(rest); };
+  const index = (doc: AuthoredDocument) => { const m = new Map<number, string[]>(); for (const q of flatAuthoredQuestions(doc)) m.set(q.number, [...(m.get(q.number) || []), strip(q)]); return m; };
+  const a = index(before), b = index(after);
+  return [...new Set([...a.keys(), ...b.keys()])].filter(n => JSON.stringify(a.get(n) || []) !== JSON.stringify(b.get(n) || [])).sort((x, y) => x - y);
+}
+// ---------------------------------------------------------------------------------------------
+// #50 Part A — loops can't hurt: proportional caps, pathology classification, one retry, salvage.
+// ---------------------------------------------------------------------------------------------
+/** Map call cap (tokens). */
+export const MAP_OUTPUT_CAP = 3000;
+/** Section parse cap: 800 + expected questions × 220. */
+export const sectionOutputCap = (expectedQuestions: number): number => Math.min(16384, 800 + Math.max(0, Math.ceil(expectedQuestions)) * 220);
+/** Fix-pass cap: 400 + flagged items × 300, floor 800, ceiling 8192. */
+export const fixOutputCap = (flaggedItems: number): number => Math.min(8192, Math.max(800, 400 + Math.max(0, Math.ceil(flaggedItems)) * 300));
+export type LoopPathologyKind = 'repetition' | 'counting' | 'cap';
+export interface LoopPathologyRecord { label: string; kind: LoopPathologyKind; cutAtItem?: number; salvaged: number; retried: boolean; outcome: 'recovered' | 'partial' }
+export function responsePathology(response: LoopModelResponse): LoopPathologyKind | undefined {
+  const reason = String(response.finishReason || '').toLowerCase();
+  if (reason === 'repetition-loop' || response.breaker?.kind === 'repetition') return 'repetition';
+  if (reason === 'counting-loop' || response.breaker?.kind === 'counting') return 'counting';
+  if (reason === 'length' || reason === 'max_tokens' || reason === 'max-tokens') return 'cap';
+  return undefined;
+}
+export function pathologyComplaint(kind: LoopPathologyKind, cap?: number): string {
+  if (kind === 'repetition') return 'your previous output repeated the same item; emit each item once';
+  if (kind === 'counting') return 'your previous output fell into a counting loop; emit each item once and stop';
+  return `your previous output hit the output cap${cap ? ` of ${cap} tokens` : ''} before finishing; emit each item once, compactly`;
+}
+export function pathologyNote(label: string, kind: LoopPathologyKind, cutAtItem: number | undefined, salvaged: number, cap?: number): string {
+  const what = kind === 'repetition' ? 'repetition' : kind === 'counting' ? 'counting loop' : `output cap${cap ? ` ${cap} tokens` : ''}`;
+  return `${label}: generation loop cut at item ${cutAtItem ?? salvaged + 1} — salvaged ${salvaged} item${salvaged === 1 ? '' : 's'} (pathology: ${what}).`;
+}
+/**
+ * ONE retry per target on a generation pathology (breaker/cap), with the complaint quoted, at the same
+ * model. `extraComplaint` lets a caller fold another reason (e.g. a section under-count) into that same
+ * single retry. A second pathology marks the target partial — never a third attempt. The better attempt
+ * (by `count`) wins; the retry replaces the first attempt only if it is strictly better.
+ */
+export async function callWithOneRetry<T>(opts: {
+  label: string; text: string; cap?: number;
+  call: (label: string, text: string) => Promise<LoopModelResponse>;
+  parse: (response: LoopModelResponse) => T; count: (value: T) => number;
+  extraComplaint?: (value: T, response: LoopModelResponse) => string | undefined;
+  onNote: (message: string) => void; onPathology?: (record: LoopPathologyRecord) => void;
+  first?: LoopModelResponse;
+}): Promise<{ value: T; response: LoopModelResponse; attempts: number; retriedFor: Array<'pathology' | 'extra'>; partial: boolean; usedRetry: boolean }> {
+  const firstResponse = opts.first ?? await opts.call(opts.label, opts.text);
+  const firstValue = opts.parse(firstResponse);
+  const firstKind = responsePathology(firstResponse);
+  const complaints: string[] = []; const retriedFor: Array<'pathology' | 'extra'> = [];
+  if (firstKind) { opts.onNote(pathologyNote(opts.label, firstKind, firstResponse.breaker?.completedItems, opts.count(firstValue), opts.cap)); complaints.push(pathologyComplaint(firstKind, opts.cap)); retriedFor.push('pathology'); }
+  const extra = opts.extraComplaint?.(firstValue, firstResponse);
+  if (extra) { complaints.push(extra); retriedFor.push('extra'); }
+  if (!complaints.length) return { value: firstValue, response: firstResponse, attempts: 1, retriedFor, partial: false, usedRetry: false };
+  let second: LoopModelResponse;
+  try { second = await opts.call(`${opts.label} · re-read`, `COMPLAINT ABOUT YOUR PREVIOUS ATTEMPT: ${complaints.join('; ')}.\n\n${opts.text}`); }
+  catch (error) {
+    opts.onNote(`${opts.label} · re-read skipped — ${errorMessage(error)}; first attempt kept.`);
+    if (firstKind) opts.onPathology?.({ label: opts.label, kind: firstKind, cutAtItem: firstResponse.breaker?.completedItems, salvaged: opts.count(firstValue), retried: true, outcome: 'partial' });
+    return { value: firstValue, response: firstResponse, attempts: 2, retriedFor, partial: Boolean(firstKind), usedRetry: false };
+  }
+  const secondValue = opts.parse(second);
+  const secondKind = responsePathology(second);
+  if (secondKind) opts.onNote(`${pathologyNote(`${opts.label} · re-read`, secondKind, second.breaker?.completedItems, opts.count(secondValue), opts.cap)} Second pathology on the same target — marked partial; no third attempt.`);
+  const useSecond = opts.count(secondValue) > opts.count(firstValue) || (!secondKind && opts.count(secondValue) === opts.count(firstValue) && Boolean(firstKind));
+  const partial = Boolean(secondKind) && Boolean(firstKind || useSecond);
+  if (firstKind || secondKind) opts.onPathology?.({ label: opts.label, kind: (firstKind || secondKind)!, cutAtItem: (firstKind ? firstResponse : second).breaker?.completedItems, salvaged: opts.count(useSecond ? secondValue : firstValue), retried: true, outcome: partial ? 'partial' : 'recovered' });
+  return useSecond ? { value: secondValue, response: second, attempts: 2, retriedFor, partial, usedRetry: true } : { value: firstValue, response: firstResponse, attempts: 2, retriedFor, partial, usedRetry: false };
+}
+/** Whitespace/NFKC-normalized text for duplicate detection (never written back). */
+export const dedupeText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value ?? '')).normalize('NFKC').replace(/\s+/g, ' ').trim();
+/** Drop exact duplicates (by key), then truncate beyond a declared count. Stats are accumulated. */
+export function reconcileList<T>(items: T[], declared: unknown, key: (item: T) => string, stats: { truncated: number; deduped: number }, minDeclared = 0): T[] {
+  const seen = new Set<string>(); const out: T[] = [];
+  for (const item of items) { const k = key(item); if (seen.has(k)) { stats.deduped++; continue; } seen.add(k); out.push(item); }
+  const n = declared === null || declared === undefined || declared === '' ? NaN : Number(declared);
+  if (Number.isInteger(n) && n >= minDeclared && out.length > n) { stats.truncated += out.length - n; out.length = n; }
+  return out;
+}
+/** Section-parse compile: same number + same normalized stem is a duplicate; then the declared questionCount. */
+export function reconcileAuthoredQuestions(doc: AuthoredDocument, declaredCount: unknown, stats: { truncated: number; deduped: number }): AuthoredDocument {
+  doc.questions = reconcileList(doc.questions, declaredCount, q => `${q.number}\u0000${dedupeText(q.stem)}`, stats);
+  return doc;
+}
 export const errorMessage = (error: unknown): string => String((error as any)?.message || error || 'unknown error').replace(/\s+/g, ' ').slice(0, 300);
 const object = (value: unknown): Record<string, any> => value && typeof value === 'object' && !Array.isArray(value) ? value as any : {};
 const text = (value: unknown): string => typeof value === 'string' ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : '';
@@ -234,11 +437,19 @@ export function mergePageReads(pages: AuthoredDocument[]): AuthoredDocument {
 }
 
 export type Correction = { action: 'replace' | 'insert' | 'delete' | 'mergeDuplicates'; questionNumber: number; question?: AuthoredQuestion; sectionTitle?: string; pointsWithdrawn?: boolean; passages?: Array<{id:string;sectionTitle:string;text:string}> };
-export function parseCorrections(response: LoopModelResponse): Correction[] | undefined {
+export function parseCorrections(response: LoopModelResponse, options: { salvage?: boolean } = {}): Correction[] | undefined {
   // Patch output is all-or-nothing when unparseable. Unlike READ, never apply a guessed partial patch.
+  // #50: a response explicitly CUT by the breaker/cap salvages its COMPLETE correction objects only.
   let value: unknown = response.json;
   if (response.rawText?.trim()) {
-    try { value = JSON.parse(response.rawText.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '')); } catch { return undefined; }
+    try { value = JSON.parse(response.rawText.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '')); }
+    catch {
+      if (!options.salvage) return undefined;
+      const raw = response.rawText;
+      const seen = new Set<string>();
+      const corrections = completeObjects(raw, 'corrections').filter(row => { const k = dedupeText(row); if (seen.has(k)) return false; seen.add(k); return true; });
+      value = { corrections, passages: completeObjects(raw, 'passages'), ...(object(repairTruncatedJson(raw)).meta ? { meta: object(repairTruncatedJson(raw)).meta } : {}) };
+    }
   }
   const rows = object(value).corrections;
   if (!Array.isArray(rows)) return undefined;
@@ -419,7 +630,8 @@ export function buildLoopPages(lines: SourceLine[]): LoopPageChunk[] {
   }
   return pages;
 }
-export const sourceText = (lines: SourceLine[]): string => lines.map(l => l.text).join('\n');
+/** #50 Part C: prompts carry the normalized twin and never a watermark line. */
+export const sourceText = (lines: SourceLine[]): string => lines.filter(l => !l.watermark).map(modelText).join('\n');
 export function sourcePagesText(lines: SourceLine[], pages: number[]): string {
   const wanted = new Set(pages);
   return [...wanted].sort((a, b) => a - b).map(p => `PAGE ${p}\n${sourceText(lines.filter(l => l.page === p))}`).join('\n\n');
@@ -434,31 +646,11 @@ export function questionSourcePages(q: AuthoredQuestion, lines: SourceLine[]): n
 export const LOOP_READ_SYSTEM = `You are ExamParse's local reader. Read this one exam page and author its questions as full JSON objects. Return JSON only.
 Use {"meta":{"subject":"...","grade":"...","totalPoints":40,"durationMinutes":90,"pages":6},"sections":[{"title":"Vocabulary","instructions":"..."}],"questions":[{"number":1,"sectionTitle":"Vocabulary","type":"mcq","stem":"full printed question text","options":[{"key":"a","text":"full choice"}],"answer":"only if a printed key supplies it","points":0.5,"imageIds":["img_1"]}]}.
 Use self-descriptive keys. Include the full stem, every option, shared instructions/passages needed to understand the question, printed points only when printed, and a printed answer only when present. Never infer or distribute marks. Include every question on this page, including continuations and subQuestions. Same number + same section on a later page means continuation. The previous-page context is read-only; do not duplicate its questions. Use only supplied image ids when the picture belongs to a question. Return shared passages once in top-level passages [{id,sectionTitle,text}], link dependent questions with passageId, and never copy passage text into stems. Do not enumerate source lines. Optional stemFrom/stemTo are advisory only, never a substitute for text. Do not invent questions to fill gaps. Reasoning off. /no_think`;
-export const LOOP_REVIEW_SYSTEM = `Here is your parse and the original text. Find questions that are wrong, incomplete, duplicated, missing, or containing another question's material. Return ONLY corrections: for each problem, the question number and the fully corrected question object; for missing questions, the complete new object; for duplicates, which number to delete. If a question is fine, say nothing about it.
-JSON: {"corrections":[{"action":"replace","questionNumber":1,"question":{full corrected object}},{"action":"insert","questionNumber":2,"question":{complete new object}},{"action":"delete","questionNumber":3,"sectionTitle":"optional when number is duplicated"}]}. Never return spans or patches to individual fields. No corrections means {"corrections":[]}. Reasoning off. /no_think`;
-export const LOOP_FIX_SYSTEM = `Fix only the questions and verdicts supplied. Use the source text, not guesswork. Return corrected FULL question objects by number, as {"corrections":[{"action":"replace","questionNumber":1,"question":{full object}}]}. For duplicate-conflict verdicts, include both records and source in your reasoning and return a single merged corrected object with action mergeDuplicates. You may insert a missing question or delete a duplicate using the same envelope. Do not change unflagged questions. If metadata is flagged, re-read the supplied first-page header and include corrected "meta" alongside corrections. Never infer points or answers. If printed per-question marks are absent, return points: null. For passage-missing or passage-link-missing, re-read source and return {passages:[{id,sectionTitle,text}], corrections:[{action:'replace',questionNumber,question:{...,passageId}}]}; extract passage verbatim once and link all dependent questions. Never copy passage into stem. Reasoning off. /no_think`;
+export const LOOP_FIX_SYSTEM = `Fix only the questions and verdicts supplied. Use the source text, not guesswork. Verdicts come from two checkers: code (plain-language complaints) and the decision audit (probability that the item is sound); a verdict with "sources" was raised by both — treat it once. Verdicts marked "hint" are uncertain: check those questions while you are here, but change them only if the source shows a real defect. While reading each supplied question against its source, also catch what checkers can miss: wrong or incomplete text, a duplicated or missing question, or material belonging to another question. Return corrected FULL question objects by number, as {"corrections":[{"action":"replace","questionNumber":1,"question":{full object}}]}. For duplicate-conflict verdicts, include both records and source in your reasoning and return a single merged corrected object with action mergeDuplicates. You may insert a missing question or delete a duplicate using the same envelope. Do not change unflagged questions. If metadata is flagged, re-read the supplied first-page header and include corrected "meta" alongside corrections. Never infer points or answers. If printed per-question marks are absent, return points: null. For passage-missing or passage-link-missing, re-read source and return {passages:[{id,sectionTitle,text}], corrections:[{action:'replace',questionNumber,question:{...,passageId}}]}; extract passage verbatim once and link all dependent questions. Never copy passage into stem. Never return spans or patches to individual fields; nothing to fix means {"corrections":[]}. Reasoning off. /no_think`;
 export function buildLoopPagePrompt(chunk: LoopPageChunk, images: ImageAsset[], guidance?: string): string {
   const context = chunk.context.length ? `PREVIOUS PAGE CONTEXT (read only; last ${LOOP_OVERLAP_LINES} lines):\n${sourceText(chunk.context)}\n\n` : '';
   const captions = images.filter(i => i.page === chunk.page && !i.duplicateOf).map(i => ({ id: i.id, caption: i.label?.caption || null, role: i.label?.role || null }));
   return `${guidance ? `${guidance}\n\n` : ''}${context}PAGE ${chunk.page} SOURCE:\n${sourceText(chunk.owned)}\n\nPAGE IMAGE CAPTIONS:\n${JSON.stringify(captions)}`;
-}
-export function buildReviewChunks(doc: AuthoredDocument, lines: SourceLine[], maxChars = 60000): Array<{ document: AuthoredDocument; source: string }> {
-  const whole = { document: doc, source: sourcePagesText(lines, [...new Set(lines.map(l => l.page))]) };
-  if (JSON.stringify(doc).length + whole.source.length <= maxChars) return [whole];
-  const groups = [...new Set(doc.questions.map(q => sectionKey(q.sectionTitle)))];
-  const chunks: Array<{ document: AuthoredDocument; source: string }> = [];
-  for (const group of groups) {
-    const questions = doc.questions.filter(q => sectionKey(q.sectionTitle) === group);
-    const pages = [...new Set(questions.flatMap(q => questionSourcePages(q, lines)))];
-    const sectionDoc = { ...doc, questions, sections: doc.sections.filter(s => !group || sectionKey(s.title) === group) };
-    const source = sourcePagesText(lines, pages);
-    if (JSON.stringify(sectionDoc).length + source.length <= maxChars) chunks.push({ document: sectionDoc, source });
-    else {
-      // Large sections are split at page boundaries, never by cutting a question object or its stem.
-      for (const page of pages) chunks.push({ document: { ...sectionDoc, questions: questions.filter(q => questionSourcePages(q, lines).includes(page)) }, source: sourcePagesText(lines, [page]) });
-    }
-  }
-  return chunks.length ? chunks : [whole];
 }
 export function flaggedFixInput(doc: AuthoredDocument, verdicts: LoopVerdict[], lines: SourceLine[], audit = false): string {
   const numbers = new Set(verdicts.flatMap(v => v.questionNumbers));
@@ -469,11 +661,11 @@ export function flaggedFixInput(doc: AuthoredDocument, verdicts: LoopVerdict[], 
   if (metaVerdicts.length) pages.push(1);
   const imageIds = new Set(verdicts.map(v => v.imageId).filter(Boolean));
   const images = [...imageIds];
-  return JSON.stringify({ questions, meta: metaVerdicts.length ? doc.meta : undefined, images, verdicts: verdicts.map(v => ({ questionNumbers: v.questionNumbers, kind: v.kind, message: v.message, ...(v.probability !== undefined ? { probability: v.probability, choice: v.choice } : {}) })), ...(audit ? { instruction: 'One final patch pass. Fix only these audit-flagged items.' } : {}) })
+  return JSON.stringify({ questions, meta: metaVerdicts.length ? doc.meta : undefined, images, verdicts: verdicts.map(v => ({ questionNumbers: v.questionNumbers, kind: v.kind, message: v.hint ? hintMessage(v) : v.message, ...(v.probability !== undefined ? { probability: v.probability, choice: v.choice } : {}), ...(v.hint ? { hint: true } : {}), ...(v.merged ? { sources: v.merged.map(m => ({ source: m.source, kind: m.kind, message: m.message, ...(m.probability !== undefined ? { probability: m.probability } : {}) })) } : {}) })), ...(audit ? { instruction: 'One final patch pass. Fix only these audit-flagged items.' } : {}) })
     + `\n\nSOURCE PAGES:\n${sourcePagesText(lines, pages)}`
-    + (metaVerdicts.length ? `\n\nFIRST PAGE HEADER LINES (re-read these; no separate metadata model):\n${lines.filter(l => l.page === 1).slice(0, 15).map(l => l.text).join('\n')}` : '');
+    + (metaVerdicts.length ? `\n\nFIRST PAGE HEADER LINES (re-read these; no separate metadata model):\n${lines.filter(l => l.page === 1 && !l.watermark).slice(0, 15).map(modelText).join('\n')}` : '');
 }
-/** Metadata is part of READ's object; only an explicitly flagged meta correction may change it in step 4/6. */
+/** Metadata is part of the parse object; only an explicitly flagged meta correction may change it in Fix. */
 export function applyMetaCorrection(response: LoopModelResponse, doc: AuthoredDocument, verdicts: LoopVerdict[]): AuthoredDocument {
   if (!verdicts.some(v => v.kind === 'meta-field-implausible')) return doc;
   try {

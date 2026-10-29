@@ -27,6 +27,13 @@ export type SourceLine = {
   tagConf?: number;
   /** Local readability signal (D1): ≥30% tokens with mixed-script glue / U+FFFD / watermark residue. */
   garbled?: boolean;
+  /** #50 Part C: model-facing twin (Arabic-Indic/Persian digits → Latin; corrupt digit runs → U+FFFD).
+   * Absent ⇒ identical to `text`. `text` itself is never rewritten by normalization. */
+  normalized?: string;
+  /** #50 Part C: a digit run contained a known-corrupt glyph (rendered as U+FFFD in `normalized`). */
+  digitSuspect?: boolean;
+  /** #50 Part C: watermark shape (one token/domain repeated ≥3×); furniture, excluded from model prompts. */
+  watermark?: boolean;
 };
 
 export interface OffsetSpan {
@@ -111,7 +118,7 @@ export interface Question {
     text: string;
   }[]; // only normalized lines
   confidence: number; // 0..1 from model
-  difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model' };
+  difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model'; /** #50: flat level distribution (top level < 0.4). */ uncertain?: boolean };
   difficultyMode?: 'shadow' | 'active';
   curriculumHints?: import('./pipeline/curriculumHints').CurriculumHints;
   curriculumSource?: 'keyword' | 'decision';
@@ -296,7 +303,7 @@ export interface ExamDoc {
   traces?: any[];
   /** Legacy receipts remain readable; never produced by the #46 default path. */
   spine?: SpineRecord;
-  /** #46 raw authored working document, six-step receipt, and comment-only verdicts. */
+  /** #46/#51 raw authored working document, six-phase receipt, and comment-only verdicts. */
   loop?: import('./pipeline/localLoop').LoopReceipt;
 }
 
@@ -614,12 +621,16 @@ export interface LLMResponse {
   rawText: string;
   reasoningText?: string;
   finishReason?: string;
+  /** #50 Part A: set when the stream circuit-breaker cut the response. */
+  breaker?: { kind: 'repetition' | 'counting'; completedItems: number };
 }
 
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'read' | 'self-review' | 'check' | 'code-fix' | 'audit' | 'final-fix' | 'compile' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
+/** #51: 'extract' | 'map' | 'parse' | 'check' | 'fix' | 'present' are the six loop phases; 'read' is kept as a
+ * force-rerun alias for Map + Parse. The rest are legacy/tooling stage ids. */
+export type PipelineStageId = 'extract' | 'map' | 'parse' | 'check' | 'fix' | 'read' | 'compile' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
 
 export interface StageStatus {
   id: PipelineStageId;

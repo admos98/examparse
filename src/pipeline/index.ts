@@ -1,7 +1,8 @@
-/** #46 default path: extraction capabilities → six local loop steps → Present.
+/** #46/#51 default path: six phases — Extract → Map → Parse → Check → Fix → Present.
  * Model-authored JSON is authoritative. Checkers comment; only model patches change question content.
  * Legacy compile/repair/cloud modules remain available to explicit Assistant/proving-ground tools, never called here.
  */
+import { annotateSourceLines } from './lineNormalize';
 import type { AppSettings, ExamDoc, Flag, ImageAsset, PipelineStageId, ProviderConfig, SourceLine, StageStatus, UsageRecord } from '../types';
 import { computeDisplayName } from '../types';
 import { extractDocument, type ExtractedDocument } from './extract';
@@ -41,7 +42,13 @@ const usageRecord = (role: UsageRecord['role'], provider: any, usage: any, label
   inputTokens: usage?.inputTokens || 0, outputTokens: usage?.outputTokens || 0,
   costUsd: cached ? 0 : calculateActualCost(usage?.inputTokens || 0, usage?.outputTokens || 0, provider?.model || '', costTable), label, ...(cached ? { isCachedHit: true } : {}),
 });
-const stageId = (step: LoopStepId): PipelineStageId => ({ read: 'read', 'self-review': 'self-review', 'code-check': 'check', 'code-fix': 'code-fix', 'decision-audit': 'audit', 'final-fix': 'final-fix' }[step] as PipelineStageId);
+/** #51: the six loop phases ARE the Step 3 stage ids (1:1). */
+const stageId = (step: LoopStepId): PipelineStageId => step;
+/** Parse a rendered page data URL into a decision payload. Temporary: nothing new is stored. */
+export function dataUrlPayload(dataUrl: string | undefined, id: string): { id: string; mime: string; data: string } | undefined {
+  const match = dataUrl ? /^data:(image\/(?:jpeg|png|webp|gif|bmp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(dataUrl) : null;
+  return match && match[2] ? { id, mime: match[1], data: match[2] } : undefined;
+}
 export { loopFlags } from './loopFlags';
 import { loopFlags } from './loopFlags';
 async function imagePayload(image: ImageAsset): Promise<{ id: string; mime: string; data: string } | undefined> {
@@ -64,7 +71,8 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const record = (r: UsageRecord) => { usageRecords.push(r); try { appendUsageRecord(r); callbacks.onUsageUpdate?.(r); } catch { /* usage is report-only */ } };
   const fileHash = options?.fileHash || await sha256(await file.arrayBuffer());
   const force = Boolean(options?.forceRerun) || !settings.thrift.cacheEnabled;
-  const forceStage = (id: PipelineStageId) => force || Boolean(options?.forceStages?.includes(id));
+  // 'read' is the pre-#51 alias for the Map + Parse caches.
+  const forceStage = (id: PipelineStageId) => force || Boolean(options?.forceStages?.includes(id)) || ((id === 'map' || id === 'parse') && Boolean(options?.forceStages?.includes('read')));
   const cacheWrite = async (params: any, value: unknown) => { if (settings.thrift.cacheEnabled) try { await setCachedStageResult(params, value); } catch { /* optional */ } };
   const extractionNotes: string[] = [];
   stage({ id: 'extract', name: 'Extract', status: 'running', message: 'Extracting text, geometry, and images…' });
@@ -90,6 +98,8 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
       }
     } catch (error) { extractionNotes.push(`OCR unavailable — ${errorMessage(error)}; extracted text is retained.`); }
   }
+  // #50 Part C: OCR-merged lines get the same normalized twin / watermark tags as extracted ones.
+  lines = annotateSourceLines(lines);
   const storedLines = lines;
   let lineRepairs: Record<string, string> = {}; let textRepairStats: any;
   if (settings.textRepairEnabled) {
@@ -130,11 +140,12 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
   const caller = options?.loopCaller || (readProvider ? async (req: import('./localLoop').LoopModelRequest) => {
     const response = await LLMAdapter.execute({ role: 'read', system: req.system, text: req.text, label: req.label, maxOutputTokens: req.maxOutputTokens,
       providerConfig: { ...readProvider, disableReasoning: true } }, {
-      detectCountingLoop: true, salvagePartial: true,
+      // #50 Part A: generalized circuit-breaker on every generative call (map, section parse, fix passes).
+      detectCountingLoop: true, detectRepetition: true, salvagePartial: true,
       onDelta: (channel, fullText) => callbacks.onLiveText?.(stageId(req.step), req.label, channel, fullText),
       onInfo: message => callbacks.onLiveText?.(stageId(req.step), req.label, 'info', message),
     });
-    return { rawText: response.rawText, json: response.json, usage: response.usage };
+    return { rawText: response.rawText, json: response.json, usage: response.usage, ...(response.finishReason ? { finishReason: response.finishReason } : {}), ...(response.breaker ? { breaker: response.breaker } : {}) };
   } : undefined);
   const journalKey = `local-loop:${fileHash}:${linesHash}`;
   let doc: ExamDoc = {
@@ -154,16 +165,23 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
     if (nameSource === 'manual') doc.nameSource = 'manual';
   };
   const loop = await runLocalLoop({ lines, images, settings, fileHash, caller, modelId: readProvider ? `${readProvider.id}:${readProvider.model}` : 'scripted', guidance: [job?.playbook.block, job?.skillsBlock].filter(Boolean).join('\n\n'),
-    force: forceStage('read'), decisionCaller: options?.decisionCaller, imagePayload,
+    force: forceStage('map') || forceStage('parse'), decisionCaller: options?.decisionCaller, imagePayload,
+    // #51 Part A: the page image OCR rendered (or its stored thumbnail), only for the visual map audit.
+    pageImage: async page => dataUrlPayload(extracted.pageImages[page - 1], `page-${page}`)
+      ?? dataUrlPayload((await loadPageThumbDataUrls(extracted.pageThumbKeys, [page]).catch(() => new Map<number, string>())).get(page), `page-${page}`),
+    extract: { calls: usageRecords.filter(r => (r.role === 'ocr' || r.role === 'text-repair') && !r.isCachedHit).length, notes: extractionNotes },
     onJournal: async entry => { if (settings.thrift.cacheEnabled) await appendJournalCall(journalKey, { ts: new Date().toISOString(), ...entry, complete: true }); },
     onMapUpdate: map => callbacks.onMapUpdate?.(map),
     onLiveText: (step, label, channel, text) => callbacks.onLiveText?.(stageId(step), label, channel, text),
-    onUsage: (step, usage, label, cached) => record(usageRecord(step === 'decision-audit' ? 'decide' : 'read', step === 'decision-audit' ? decideProvider : readProvider, usage, label, settings.costTable, cached)),
+    onUsage: (_step, usage, label, cached, role) => record(usageRecord(role === 'decide' ? 'decide' : 'read', role === 'decide' ? decideProvider : readProvider, usage, label, settings.costTable, cached)),
     onStep: (receipt, step) => {
-      applyReceipt(receipt); const row = receipt.steps.find(s => s.step === step)!;
+      applyReceipt(receipt);
+      // Phase 1's stage line was written above with the richer extraction summary.
+      if (step === 'extract') return;
+      const row = receipt.steps.find(s => s.step === step)!;
       const status = row.status === 'running' ? 'running' : row.status === 'failed' ? 'completed-with-problems' : row.status === 'idle' ? 'idle' : row.status;
       const progress = row.auditProgress;
-      stage({ id: stageId(step), name: row.name, status, message: progress && row.status === 'running' ? `${progress.decided === 0 ? `Auditing ${progress.questions} questions + ${progress.images} images — ${progress.total} decisions · ` : ''}Decision audit · ${progress.decided}/${progress.total} decided · ${progress.catches} catches · ${progress.uncertain} uncertain · ${progress.endpointErrors} endpoint errors · ${progress.rate.toFixed(1)}/s${progress.currentItem ? ` · ${progress.currentItem}` : ''}${progress.skipped ? ' · endpoint unreachable — skipping' : ''}` : `${row.calls} call(s) · ${row.correctionsApplied} correction(s) applied · ${row.verdictsRaised} verdict(s) raised · ${row.verdictsClosed} closed.${row.notes.length ? ` ${row.notes.join(' ')}` : ''}`, inputTokens: row.inputTokens, outputTokens: row.outputTokens });
+      stage({ id: stageId(step), name: row.name, status, message: progress && row.status === 'running' ? `${progress.decided === 0 ? `Auditing ${progress.questions} questions + ${progress.images} images — ${progress.total} decisions · ` : ''}Decision audit · ${progress.decided}/${progress.total} decided · ${progress.catches} catches · ${progress.uncertain} uncertain · ${progress.endpointErrors} endpoint errors · ${progress.rate.toFixed(1)}/s${progress.currentItem ? ` · ${progress.currentItem}` : ''}${progress.skipped ? ' · endpoint unreachable — skipping' : ''}` : `${row.calls} call(s) · ${row.correctionsApplied} patch(es) applied · ${row.verdictsRaised} verdict(s) raised · ${row.verdictsClosed} closed · ${row.verdictsCarried ?? 0} carried.${row.notes.length ? ` ${row.notes.join(' ')}` : ''}`, inputTokens: row.inputTokens, outputTokens: row.outputTokens });
       callbacks.onNodeUpdate?.({ id: step, label: row.name, status: row.status, tokens: row.inputTokens + row.outputTokens });
     },
     onSave: async receipt => { applyReceipt(receipt); await saveExamDoc(doc); },

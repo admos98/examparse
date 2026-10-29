@@ -15,10 +15,34 @@ export interface LoopDecisionItem {
   images?: Array<{ id: string; mime: string; data: string }>;
 }
 export type DecisionRequestBody = any;
-export type LoopDecisionCaller = (body: DecisionRequestBody) => Promise<{ results: Array<{ name: string; probability: number; choice?: string }> }>;
+export type LoopDecisionCaller = (body: DecisionRequestBody) => Promise<{ results: Array<{ name: string; probability: number; choice?: string; distribution?: Record<string, number> }> }>;
+/** #50 Part D: ordinal difficulty levels sent as llama.cpp's native score criteria (array, index 0 = level 1). */
+export const DIFFICULTY_LEVELS = ['1: trivial recall', '2: easy', '3: medium', '4: hard', '5: very hard multi-step'] as const;
+export const DIFFICULTY_INSTRUCTIONS = 'Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard), considering the stem, options and section.';
+/** A flat level distribution is an uncertain difficulty estimate. */
+export const DIFFICULTY_UNCERTAIN_BELOW = 0.4;
+/** THX (/v1/systemone) single-question body. Score items use the shape the llama.cpp implementation accepts:
+ * { type: 'score', criteria: [level descriptions] } — the old { levels } shape is rejected with HTTP 400. */
+export function buildThxDecisionBody(item: LoopDecisionItem, model: string, state: string): DecisionRequestBody {
+  const question = item.type === 'difficulty'
+    ? { type: 'score', instructions: item.instructions, criteria: [...DIFFICULTY_LEVELS] }
+    : item.choices
+      ? { type: 'choice', instructions: item.instructions, criteria: item.choiceDescriptions || Object.fromEntries(item.choices.map(c => [c, c])) }
+      : { type: 'noul', instructions: item.instructions };
+  // #51: llama.cpp systemone accepts top-level `images` (data URLs) on mmproj builds — pixels were silently dropped before.
+  const images = (item.images || []).map(image => `data:${image.mime};base64,${image.data}`);
+  return { model, state, questions: { [item.name]: question }, ...(images.length ? { images } : {}) };
+}
+export type LoopDecisionVote = { probability: number; choice?: string; distribution?: Record<string, number> };
 export interface LoopAuditResult {
   verdicts: LoopVerdict[]; routed: LoopVerdict[]; calls: number; mode: 'shadow' | 'active' | 'skipped';
   notes: string[]; usage: { inputTokens: number; outputTokens: number }; catches: number; uncertain: number; endpointErrors: number; difficultyUncertain: number; dialect?: 'jev'|'thx'; endpointHost?: string;
+  /** #51: every vote by item id (for the Present re-check), plus re-check economy counters. */
+  votes: Map<string, LoopDecisionVote>; revoted: number; reused: number;
+}
+/** The decide endpoint takes pixels when the user marked the build multimodal (settings or provider flag). */
+export function decideIsMultimodal(settings: AppSettings, provider?: ProviderConfig): boolean {
+  return settings.decideMultimodal === true || provider?.multimodalDecisions === true;
 }
 export function resolveDecisionProvider(settings: AppSettings): (ProviderConfig & { model: string }) | undefined {
   const selection = settings.roleMapping.decide;
@@ -51,7 +75,7 @@ export function buildLoopDecisionCatalogue(params: {
     add(q, 'belongs-in-section', 'Does this question belong in its assigned printed section?', { sectionTitle: q.sectionTitle });
     const difficultyChoices = ['1', '2', '3', '4', '5'];
     items.push({ id: `Q${q.number}::difficulty`, type: 'difficulty', name: `Q${q.number} difficulty`,
-      instructions: 'Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard), considering the stem, options and section.',
+      instructions: DIFFICULTY_INSTRUCTIONS,
       questionNumbers: [q.number], input: { question: q }, choices: difficultyChoices });
     const lessons = curriculumLessons(document.meta.grade, document.meta.subject);
     const hint = keywordCurriculumHint(lessons, `${q.stem} ${q.options.map(o => o.text).join(' ')}`);
@@ -81,7 +105,7 @@ export function buildLoopDecisionCatalogue(params: {
   }
   return items;
 }
-const emptyResult = (mode: LoopAuditResult['mode'], notes: string[] = []): LoopAuditResult => ({ verdicts: [], routed: [], calls: 0, mode, notes, usage: { inputTokens: 0, outputTokens: 0 }, catches: 0, uncertain: 0, endpointErrors: 0, difficultyUncertain: 0 });
+const emptyResult = (mode: LoopAuditResult['mode'], notes: string[] = []): LoopAuditResult => ({ verdicts: [], routed: [], calls: 0, mode, notes, usage: { inputTokens: 0, outputTokens: 0 }, catches: 0, uncertain: 0, endpointErrors: 0, difficultyUncertain: 0, votes: new Map(), revoted: 0, reused: 0 });
 const clamp = (value: unknown): number | undefined => { if (value === null || value === undefined || value === '') return undefined; const p = Number(value); return Number.isFinite(p) ? Math.max(0, Math.min(1, p)) : undefined; };
 export interface LoopAuditProgress {
   total: number; questions: number; images: number; decided: number; catches: number; uncertain: number; endpointErrors: number;
@@ -93,6 +117,9 @@ export async function runLoopDecisionAudit(params: {
   imagePayload?: (image: ImageAsset) => Promise<{ id: string; mime: string; data: string } | undefined>;
   onProgress?: (progress: LoopAuditProgress) => void;
   onJournal?: (entry: { label: string; rawText: string; requestText?: string }) => void | Promise<void>;
+  /** #51 Present re-check: only items where revote() is true are sent (fresh, cache bypassed); the rest reuse
+   * their Check vote. Items with neither are left unvoted — a re-check never widens the audit. */
+  recheck?: { previous: Map<string, LoopDecisionVote>; revote: (item: LoopDecisionItem) => boolean };
 }): Promise<LoopAuditResult> {
   const { document, lines, images, settings, fileHash } = params;
   const mode = settings.decideMode ?? 'shadow';
@@ -100,7 +127,7 @@ export async function runLoopDecisionAudit(params: {
   if (!provider) return emptyResult('skipped', ['decision audit skipped — no decide endpoint configured']);
   const result = emptyResult(mode);
   try { result.dialect = provider.decideDialect || 'jev'; result.endpointHost = new URL(provider.baseURL).host; } catch { result.endpointHost = provider.baseURL; }
-  const multimodal = settings.decideMultimodal === true;
+  const multimodal = decideIsMultimodal(settings, provider);
   const payloads: Record<string, { id: string; mime: string; data: string }> = {};
   if (multimodal && params.imagePayload) {
     for (const image of images) {
@@ -108,7 +135,9 @@ export async function runLoopDecisionAudit(params: {
       catch (error) { result.notes.push(`Image ${image.id} pixels unavailable — caption-only audit (${errorMessage(error)}).`); }
     }
   }
-  const catalogue = buildLoopDecisionCatalogue({ document, lines, images, mode, multimodal, imagePayloads: payloads });
+  const fullCatalogue = buildLoopDecisionCatalogue({ document, lines, images, mode, multimodal, imagePayloads: payloads });
+  const recheck = params.recheck;
+  const catalogue = recheck ? fullCatalogue.filter(item => recheck.revote(item) || recheck.previous.has(item.id)) : fullCatalogue;
   if (!catalogue.length) return result;
   const started = Date.now();
   const progress: LoopAuditProgress = { total: catalogue.length, questions: flatAuthoredQuestions(document).length, images: catalogue.filter(item => item.type === 'image-belongs').length, decided: 0, catches: 0, uncertain: 0, endpointErrors: 0, rate: 0, recent: [] };
@@ -124,7 +153,7 @@ export async function runLoopDecisionAudit(params: {
     if (endpointError) progress.endpointErrors++;
     const p = vote && soundProbability(item, vote);
     const tagging = item.type === 'difficulty' || item.type === 'curriculum-hint';
-    const tagUncertain = p !== undefined && (p < 0.5 || (item.type === 'difficulty' && vote?.choice === '3'));
+    const tagUncertain = p !== undefined && (item.type === 'difficulty' ? p < DIFFICULTY_UNCERTAIN_BELOW : p < 0.5);
     if (p === undefined || (tagging ? tagUncertain : p > DECIDE_CATCH && p < DECIDE_PASS)) progress.uncertain++;
     else if (!tagging && p <= DECIDE_CATCH) progress.catches++;
     progress.recent.push(`${item.name.replace(' ', ' · ')} · ${p === undefined ? 'uncertain' : `p=${p.toFixed(2)} ${tagging ? (tagUncertain ? '?' : '✓') : p <= DECIDE_CATCH ? '⚠' : p >= DECIDE_PASS ? '✓' : '?'}`}${endpointError ? ' · endpoint error' : ''}`);
@@ -133,8 +162,12 @@ export async function runLoopDecisionAudit(params: {
   emit();
   const cacheEnabled = settings.thrift.cacheEnabled;
   const unresolved: LoopDecisionItem[] = [];
-  const votes = new Map<string, { probability: number; choice?: string }>();
+  const votes = result.votes;
   for (const item of catalogue) {
+    if (recheck) {
+      if (recheck.revote(item)) { unresolved.push(item); result.revoted++; continue; }
+      const prior = recheck.previous.get(item.id)!; votes.set(item.id, prior); completed(item, prior); result.reused++; continue;
+    }
     if (!cacheEnabled) { unresolved.push(item); continue; }
     const key = await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`);
     try {
@@ -162,9 +195,7 @@ export async function runLoopDecisionAudit(params: {
       let tail=sourceText;
       while(tail && estimateTokens(`${qText}\nSource: ${tail}`)>850) tail=tail.slice(0,Math.max(0,Math.floor(tail.length*0.85)));
       const state=`${qText}\nSource: ${tail}`;
-      const body: DecisionRequestBody = thx ? {
-        model: provider.model, state, questions: { [item0.name]: { type: item0.type === 'difficulty' ? 'score' : item0.choices ? 'choice' : 'noul', instructions: item0.instructions, ...(item0.type === 'difficulty' ? { levels: item0.choices } : item0.choices ? { criteria: item0.choiceDescriptions || Object.fromEntries(item0.choices.map(c=>[c,c])) } : {}) } },
-      } : {
+      const body: DecisionRequestBody = thx ? buildThxDecisionBody(item0, provider.model, state) : {
         input: { exam: fileHash.slice(0, 12), purpose: 'comment-only exam audit' },
         questions: batch.map(item => ({ type: item.choices ? 'choice' : 'probability', name: item.id, instructions: item.instructions, input: item.input, ...(item.choices ? { choices: item.choices } : {}), ...(item.images ? { images: item.images } : {}) })),
       };
@@ -175,7 +206,7 @@ export async function runLoopDecisionAudit(params: {
         for (const item of batch) {
           const row = byName.get(item.id) ?? byName.get(item.name); const p = clamp(row?.probability);
           if (p === undefined || (item.type === 'difficulty' && !['1', '2', '3', '4', '5'].includes(row?.choice || '')) || (item.type === 'curriculum-hint' && !item.choices?.includes(row?.choice || ''))) { result.notes.push(`Decision audit returned no usable verdict for ${item.id}.`); completed(item); continue; }
-          const vote = { probability: p, ...(row?.choice !== undefined ? { choice: row.choice } : {}) };
+          const vote = { probability: p, ...(row?.choice !== undefined ? { choice: row.choice } : {}), ...(row?.distribution ? { distribution: row.distribution } : {}) };
           votes.set(item.id, vote); completed(item, vote);
           if (cacheEnabled) try { await setPipelineCache(await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`), vote); } catch { /* best effort */ }
         }
@@ -202,8 +233,10 @@ export async function runLoopDecisionAudit(params: {
       const value = Number(vote.choice);
       if (Number.isInteger(value) && value >= 1 && value <= 5) {
         const q = item.input.question as import('./localLoop').AuthoredQuestion;
-        q.difficulty = { value, source: 'model' }; q.difficultyMode = mode;
-        if (probability < 0.5 || value === 3) result.difficultyUncertain++;
+        // Argmax level from the returned distribution; flat (top level < 0.4) is flagged uncertain.
+        const uncertain = probability < DIFFICULTY_UNCERTAIN_BELOW;
+        q.difficulty = { value, source: 'model', ...(uncertain ? { uncertain: true } : {}) }; q.difficultyMode = mode;
+        if (uncertain) result.difficultyUncertain++;
       }
       continue;
     }
@@ -227,7 +260,7 @@ export async function runLoopDecisionAudit(params: {
     } else if (probability < DECIDE_PASS) result.uncertain++;
   }
   result.uncertain = progress.uncertain;
-  if (result.difficultyUncertain) result.notes.push(`difficultyUncertain: ${result.difficultyUncertain} model estimate(s) peak in the middle or have diffuse scores.`);
+  if (result.difficultyUncertain) result.notes.push(`difficultyUncertain: ${result.difficultyUncertain} model estimate(s) have a flat level distribution (top level < ${DIFFICULTY_UNCERTAIN_BELOW}).`);
   if (progress.skipped || (!result.verdicts.length && result.notes.length)) result.mode = 'skipped';
   return result;
 }

@@ -162,7 +162,21 @@ export function validateDecisionsRequest(value: any): string | null {
   if (config.decisionsPath !== undefined && (typeof config.decisionsPath !== 'string' || !config.decisionsPath.startsWith('/') || config.decisionsPath.length > 300 || /[?#]/.test(config.decisionsPath))) return 'Decisions path must be a relative path.';
   const body = value.body;
   if (!body || typeof body !== 'object') return 'Decisions request body required.';
-  if (config.decideDialect === 'thx') { if (typeof body.state !== 'string' || body.state.length > 30000 || !body.questions || typeof body.questions !== 'object' || Object.keys(body.questions).length !== 1) return 'THX decisions require state text and exactly one named question.'; return null; }
+  if (config.decideDialect === 'thx') {
+    if (typeof body.state !== 'string' || body.state.length > 30000 || !body.questions || typeof body.questions !== 'object' || Object.keys(body.questions).length !== 1) return 'THX decisions require state text and exactly one named question.';
+    // #51: llama.cpp /v1/systemone takes top-level `images` as data URLs (max 8) on mmproj builds.
+    if (body.images !== undefined) {
+      if (!Array.isArray(body.images) || body.images.length > 8) return 'Decisions image batch exceeds the 8-image limit.';
+      let bytes = 0;
+      for (const image of body.images) {
+        const match = typeof image === 'string' ? /^data:(image\/(?:jpeg|png|webp|gif|bmp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(image) : null;
+        if (!match) return 'Decisions image payload is invalid.';
+        bytes += match[2].length * 0.75;
+      }
+      if (bytes > MAX_IMAGE_BYTES) return 'Decisions image payload exceeds the 32 MiB limit.';
+    }
+    return null;
+  }
   if (!Array.isArray(body.questions) || body.questions.length > 64) return 'Decisions request requires 1–64 typed questions.';
   let imageBytes = 0;
   for (const question of body.questions) {
@@ -1114,6 +1128,9 @@ app.delete('/api/usage', (_req: Request, res: Response) => {
 const REASONING_400_RE = /reasoning|thinking|enable_thinking|unsupported/i;
 const PARSE_ROLES = new Set(['read', 'meta', 'cloud', 'repair', 'fast', 'vision', 'ocr', 'escalation', 'patch']);
 const FORCED_REASONING_OFF_ROLES = new Set(['read', 'meta']);
+/** #50 Part A: read-role generative calls carry repeat_penalty (OpenAI-compatible / Ollama extra field). */
+export const READ_ROLE_REPEAT_PENALTY = 1.12;
+const READ_ROLE_REPEAT_PENALTY_ROLES = new Set(['read']);
 
 /** Extract the first balanced JSON value ({...} or [...]) starting at/after `fromIndex`. String-aware brace scan. */
 function extractBalancedJsonValue(text: string, fromIndex = 0): string | null {
@@ -1452,6 +1469,10 @@ app.post('/api/llm', async (req: Request, res: Response) => {
       if (maxOutputTokens) {
         baseBody.max_tokens = maxOutputTokens;
       }
+      // #50 Part A: belt-and-braces anti-loop sampler hint for read-role calls (llama.cpp / Ollama accept
+      // it as an extra field). A provider that rejects it gets the [no-repeat-penalty] rung; extra body
+      // JSON can override it or remove it with null.
+      if (READ_ROLE_REPEAT_PENALTY_ROLES.has(role)) baseBody.repeat_penalty = READ_ROLE_REPEAT_PENALTY;
 
       // Reasoning kill-switch (per-provider, default on) + Extra body JSON merged last.
       // read/meta are forcibly defused: provider settings and custom body JSON cannot re-enable thinking.
@@ -1517,6 +1538,7 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           const errBody = await upstream.text(); let rung = '';
           if (upstream.status === 400 && reasoningRung < 2 && REASONING_400_RE.test(errBody) && ['reasoning','reasoning_effort','thinking','enable_thinking'].some(k => k in body)) { reasoningRung = (reasoningRung + 1) as 1 | 2; rung = reasoningRung === 1 ? '[r-min]' : '[r-off]'; }
           else if (upstream.status === 400 && !dropped.has('response_format') && /response_format|json[_ -]?mode|structured/i.test(errBody) && 'response_format' in body) { dropped.add('response_format'); rung = '[no-rf]'; }
+          else if (upstream.status === 400 && !dropped.has('repeat_penalty') && /repeat_penalty/i.test(errBody) && 'repeat_penalty' in body) { dropped.add('repeat_penalty'); rung = '[no-repeat-penalty]'; }
           else if (upstream.status === 400 && !dropped.has('temperature') && /temperature/i.test(errBody) && 'temperature' in body) { dropped.add('temperature'); rung = '[no-temp]'; }
           else if (upstream.status === 400 && !dropped.has('max_tokens') && /max_tokens|max_completion_tokens/i.test(errBody) && 'max_tokens' in body) { swapMax = true; rung = '[mt-swap]'; }
           else if (upstream.status === 400 && !dropped.has('stream_options') && /stream_options/i.test(errBody) && 'stream_options' in body) { dropped.add('stream_options'); rung = '[no-stream-options]'; }
@@ -1593,6 +1615,8 @@ app.post('/api/llm', async (req: Request, res: Response) => {
           rung = reasoningRung === 1 ? '[r-min]' : '[r-off]';
         } else if (!dropped.has('response_format') && /response_format|json[_ -]?mode|structured/i.test(upstreamBodyText) && 'response_format' in attemptBody) {
           dropped.add('response_format'); rung = '[no-rf]';
+        } else if (!dropped.has('repeat_penalty') && /repeat_penalty/i.test(upstreamBodyText) && 'repeat_penalty' in attemptBody) {
+          dropped.add('repeat_penalty'); rung = '[no-repeat-penalty]';
         } else if (!dropped.has('temperature') && /temperature/i.test(upstreamBodyText) && 'temperature' in attemptBody) {
           dropped.add('temperature'); rung = '[no-temp]';
         } else if (!dropped.has('max_tokens') && /max_tokens|max_completion_tokens/i.test(upstreamBodyText) && 'max_tokens' in attemptBody) {

@@ -1,0 +1,155 @@
+{
+  "_provenance": {
+    "server": "llama.cpp llama-server, ggml-org/llama.cpp master @ 0893ec98f5eafad36a43a72cd1c3723d72b0d03a (2026-10-29), built from source, POST /v1/systemone",
+    "implementation": "tools/server/server-decision.cpp: parse_questions() requires score 'criteria' to be an ARRAY of 2-10 level descriptions (options keyed \"0\"..\"n-1\"); format_answer() returns {type,score,legend,probabilities,confidence} with 0-based level keys",
+    "model": "tiny random-weight llama-architecture GGUF tagged llama.decision.type=openjev (generated locally; HF is unreachable from the capture sandbox). Values are NOT meaningful difficulty judgements; the WIRE SHAPE is what this fixture proves. 'peaked' used the server's own llama.decision.score_bias.5.1=4.0 metadata to obtain a confident distribution from the same code path.",
+    "captured": "2026-10-29"
+  },
+  "request": {
+    "model": "local",
+    "state": "Question: {\"number\":9,\"type\":\"fillblank\",\"stem\":\"Asadi Tusi was a famous poet in the (9) ...... century.\",\"options\":[]}\nSource: Asadi Tusi was a famous poet in the (9)...... One of his best-known works is ...",
+    "questions": {
+      "Q9 difficulty": {
+        "type": "score",
+        "instructions": "Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard), considering the stem, options and section.",
+        "criteria": [
+          "1: trivial recall",
+          "2: easy",
+          "3: medium",
+          "4: hard",
+          "5: very hard multi-step"
+        ]
+      }
+    }
+  },
+  "flat": {
+    "httpStatus": 200,
+    "response": {
+      "model": "[redacted local model path]",
+      "answers": {
+        "Q9 difficulty": {
+          "type": "score",
+          "score": 2.35175589300363,
+          "legend": {
+            "0": "1: trivial recall",
+            "1": "2: easy",
+            "2": "3: medium",
+            "3": "4: hard",
+            "4": "5: very hard multi-step"
+          },
+          "probabilities": {
+            "0": 0.12742409092711451,
+            "1": 0.13573063150916415,
+            "2": 0.25794455289748275,
+            "3": 0.21546674296545373,
+            "4": 0.26343398170078486
+          },
+          "confidence": 0.0
+        }
+      },
+      "usage": {
+        "input_tokens": 351,
+        "output_tokens": 0
+      }
+    }
+  },
+  "peaked": {
+    "httpStatus": 200,
+    "response": {
+      "model": "[redacted local model path]",
+      "answers": {
+        "Q9 difficulty": {
+          "type": "score",
+          "score": 1.1633559483070433,
+          "legend": {
+            "0": "1: trivial recall",
+            "1": "2: easy",
+            "2": "3: medium",
+            "3": "4: hard",
+            "4": "5: very hard multi-step"
+          },
+          "probabilities": {
+            "0": 0.015398847764080592,
+            "1": 0.8955554453187273,
+            "2": 0.03117188337575936,
+            "3": 0.026038557928933056,
+            "4": 0.0318352656124995
+          },
+          "confidence": 0.8382052968039962
+        }
+      },
+      "usage": {
+        "input_tokens": 351,
+        "output_tokens": 0
+      }
+    }
+  },
+  "legacyLevelsShape": {
+    "request": {
+      "model": "local",
+      "state": "Question: {\"number\":9}",
+      "questions": {
+        "Q9 difficulty": {
+          "type": "score",
+          "instructions": "Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard).",
+          "levels": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5"
+          ]
+        }
+      }
+    },
+    "httpStatus": 400,
+    "response": {
+      "error": {
+        "code": 400,
+        "message": "questions.Q9 difficulty: \"criteria\" must be an array of 2 to 10 levels",
+        "type": "invalid_request_error"
+      }
+    }
+  },
+  "choiceShapeForComparison": {
+    "request": {
+      "model": "local",
+      "state": "Question: {\"number\":9}",
+      "questions": {
+        "Q9 difficulty": {
+          "type": "choice",
+          "instructions": "Rate expected student difficulty from 1 (recall/trivial) to 5 (multi-step/very hard).",
+          "criteria": {
+            "1": "trivial recall",
+            "2": "easy",
+            "3": "medium",
+            "4": "hard",
+            "5": "very hard multi-step"
+          }
+        }
+      }
+    },
+    "httpStatus": 200,
+    "response": {
+      "model": "[redacted local model path]",
+      "answers": {
+        "Q9 difficulty": {
+          "type": "choice",
+          "choice": "3",
+          "probabilities": {
+            "1": 0.1422866542969753,
+            "2": 0.160686220450639,
+            "3": 0.26158705913563157,
+            "4": 0.18949109345757761,
+            "5": 0.24594897265917656
+          },
+          "confidence": 0.07698382391953945
+        }
+      },
+      "usage": {
+        "input_tokens": 122,
+        "output_tokens": 0
+      }
+    }
+  }
+}

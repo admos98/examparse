@@ -37,6 +37,24 @@ interface Props {
   onSettingsUpdate?: (settings: AppSettings) => void;
 }
 
+export function initialLoopStages(settings: AppSettings): StageStatus[] {
+  return [
+    // #51: exactly the six loop phases, named 1:1 with the loop receipt.
+    { id: 'extract', name: 'Extract', status: 'completed', message: 'Text, OCR, geometry, and images' },
+    { id: 'map', name: 'Map', status: 'idle', message: `Whole-exam map → code count → decision audit (text${settings.decideMultimodal ? ' + page images' : ''}) → re-map of indicted entries` },
+    { id: 'parse', name: 'Parse', status: 'idle', message: 'Each section against its map contract' },
+    { id: 'check', name: 'Check', status: 'idle', message: `Code checks, then decision audit (${settings.decideMode || 'shadow'} mode) — comments only, one merged list` },
+    { id: 'fix', name: 'Fix', status: 'idle', message: 'One patch pass on the merged verdicts, batched by section' },
+    { id: 'present', name: 'Present', status: 'idle', message: 'Re-check what Fix changed, then save with the attention list' },
+  ];
+}
+/** #51: the six phases, with the map outline (incl. visual seen markers) directly under Map — before Parse. */
+export const LoopPhaseList: React.FC<{ stages: StageStatus[]; map?: LoopMapReceipt | null; onSelect?: (id: string) => void }> = ({ stages, map, onSelect }) =>
+  <ol className="space-y-3">{stages.map((stage, index) => <li key={stage.id} className="flex items-start gap-3 text-xs" data-loop-stage={stage.id}>
+        <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border ${stage.status === 'running' ? 'animate-pulse border-[var(--accent)] text-[var(--accent-ink)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{stage.status === 'completed' || stage.status === 'completed-with-problems' ? <CheckCircle2 className="h-4 w-4" /> : stage.status === 'running' ? <RotateCcw className="h-3.5 w-3.5 animate-spin" /> : index + 1}</span>
+        <div className="min-w-0"><button className="font-semibold hover:underline" onClick={() => onSelect?.(stage.id)}>{stage.name}</button><span className="ms-2 text-[var(--ink-2)]">{stage.status}</span><p className="mt-0.5 text-[var(--ink-2)]" aria-live="polite">{stage.message || 'Waiting'}</p></div>
+      </li>).flatMap(item => item.key === 'map' && map ? [item, <li key="map-outline" data-loop-stage-outline="map"><MapOutline map={map} /></li>] : [item])}</ol>;
+
 export const Step3Analyze: React.FC<Props> = ({
   extractedDoc,
   rawFile,
@@ -74,20 +92,11 @@ export const Step3Analyze: React.FC<Props> = ({
   const pages = Math.max(1, extractedDoc.pages);
   const textTokens = estimateTextTokens(extractedDoc.lines.map(l => l.text).join('\n'), detectLanguageAndDirection(extractedDoc.lines.slice(0, 40).map(l => l.text).join(' ')).direction === 'rtl');
   const imageTokens = extractedDoc.images.reduce((sum, image) => sum + estimateImageTokens(image.width, image.height, false), 0);
-  // READ + fresh SELF-REVIEW + two optional scoped patch passes. This is an estimate, never a cap.
+  // Map + per-section Parse + one Fix pass (with source context). This is an estimate, never a cap.
   const estimatedInput = textTokens * 3 + imageTokens + extractedDoc.scannedPageIndices.length * 500;
   const estimatedOutput = Math.ceil(textTokens * 1.4) + extractedDoc.images.length * 40;
   const estimatedCost = calculateActualCost(estimatedInput, estimatedOutput, selection.model, settings.costTable);
-  const initialStages: StageStatus[] = [
-    { id: 'extract', name: 'Extract', status: 'completed', message: 'Text, OCR, geometry, and images' },
-    { id: 'read', name: '1. Read', status: 'idle', message: 'Map first, then parse each section' },
-    { id: 'self-review', name: '2. Self-review', status: 'idle', message: 'Fresh model call against the original text' },
-    { id: 'check', name: '3. Code check', status: 'idle', message: 'Comments only — no edits or gates' },
-    { id: 'code-fix', name: '4. Code-verdict fix', status: 'idle', message: 'One model patch pass on flagged objects' },
-    { id: 'audit', name: '5. Decision audit', status: 'idle', message: `Optional local endpoint · ${settings.decideMode || 'shadow'} mode` },
-    { id: 'final-fix', name: '6. Final fix', status: 'idle', message: 'One patch pass for active confident-wrong verdicts, then stop' },
-    { id: 'present', name: 'Present', status: 'idle', message: 'Saved document + loop receipt + attention' },
-  ];
+  const initialStages = initialLoopStages(settings);
   const shownStages = stages.length ? stages : initialStages;
 
   const handleStartAnalysis = async () => {
@@ -100,7 +109,7 @@ export const Step3Analyze: React.FC<Props> = ({
         onStageUpdate: updated => onStagesUpdate(prev => prev.map(s => s.id === updated.id ? { ...s, ...updated } : s)),
         onLiveText: (stage, label, channel, fullText) => {
           liveRef.current = { ...liveRef.current, stage, label,
-            ...(channel === 'output' ? { output: fullText, ...(stage === 'audit' ? { info: '' } : {}) } : channel === 'info' ? { info: `${liveRef.current.info}\n${fullText}`.trim() } : {}) };
+            ...(channel === 'output' ? { output: fullText, ...(stage === 'check' ? { info: '' } : {}) } : channel === 'info' ? { info: `${liveRef.current.info}\n${fullText}`.trim() } : {}) };
         },
       }, { forceRerun, preExtracted: extractedDoc, fileHash: fileHashProp, answerKeyFile });
       onAnalysisComplete(result);
@@ -126,13 +135,9 @@ export const Step3Analyze: React.FC<Props> = ({
       <div className="flex flex-wrap items-center justify-between gap-3"><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={forceRerun} onChange={event => setForceRerun(event.target.checked)} />Force re-run (bypass content-hash cache)</label><button disabled={isAnalyzing || !rawFile} onClick={() => void handleStartAnalysis()} className="flex items-center gap-2 rounded-[6px] bg-[var(--accent)] px-6 py-2.5 text-xs font-semibold text-[var(--on-accent)] disabled:opacity-50"><Play className="h-4 w-4" />{isAnalyzing ? 'Running local loop…' : 'Run Analysis'}</button></div>
     </section>
     <section className="ep-card rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] p-5 space-y-3" aria-label="Local loop progress">
-      <h2 className="text-sm font-bold">Six-step local loop</h2>
-      <ol className="space-y-3">{shownStages.map((stage, index) => <li key={stage.id} className="flex items-start gap-3 text-xs" data-loop-stage={stage.id}>
-        <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border ${stage.status === 'running' ? 'animate-pulse border-[var(--accent)] text-[var(--accent-ink)]' : 'border-[var(--rule)] text-[var(--ink-2)]'}`}>{stage.status === 'completed' || stage.status === 'completed-with-problems' ? <CheckCircle2 className="h-4 w-4" /> : stage.status === 'running' ? <RotateCcw className="h-3.5 w-3.5 animate-spin" /> : index + 1}</span>
-        <div className="min-w-0"><button className="font-semibold hover:underline" onClick={() => { setAttemptStage(current => current === stage.id ? null : stage.id); setLiveOpen(true); }}>{stage.name}</button><span className="ms-2 text-[var(--ink-2)]">{stage.status}</span><p className="mt-0.5 text-[var(--ink-2)]" aria-live="polite">{stage.message || 'Waiting'}</p></div>
-      </li>)}</ol>
+      <h2 className="text-sm font-bold">Six-phase local loop</h2>
+      <LoopPhaseList stages={shownStages} map={map} onSelect={id => { setAttemptStage(current => current === id ? null : id); setLiveOpen(true); }} />
     </section>
-    {map && <MapOutline map={map} />}
     <section className="rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] p-4 text-xs">
       <button className="font-semibold" onClick={() => setLiveOpen(value => !value)}>{liveOpen ? 'Hide' : 'Show'} live model output</button>
       {liveOpen && <div ref={liveScroll} className="mt-3 max-h-80 overflow-auto rounded-[6px] bg-[var(--paper)] p-3"><div className="mb-2 text-[var(--ink-2)]">{live.stage} · {live.label} {attemptStage ? `(filter: ${attemptStage})` : ''}</div>{live.info && <pre className="mb-2 whitespace-pre-wrap text-[var(--ink-2)]">{live.info.slice(-4000)}</pre>}<pre className="whitespace-pre-wrap font-mono">{(!attemptStage || live.stage === attemptStage ? live.output : '').slice(-12000)}</pre></div>}

@@ -27,7 +27,7 @@ const localSettings = (extra: Partial<AppSettings> = {}): AppSettings => ({
   thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false },
   ...extra,
 } as AppSettings);
-const readCaller = (doc = authored()): LoopModelCaller => async req => req.step === 'read'
+const readCaller = (doc = authored()): LoopModelCaller => async req => req.step !== 'fix'
   ? { rawText: JSON.stringify(doc), json: doc, usage: { inputTokens: 10, outputTokens: 10 } }
   : { rawText: '{"corrections":[]}', json: { corrections: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
 
@@ -79,7 +79,7 @@ test('#46 audit: multimodal build sends pixels; caption-only build sends caption
   assert.deepEqual(caption.choices, ['this question', 'another question on the page', 'no question']);
 });
 
-test('#46 audit: shadow routes nothing; active routes confident-wrong exactly once to Final fix', async () => {
+test('#46/#51 audit: shadow routes nothing; active routes confident-wrong exactly once to the single Fix pass', async () => {
   const image: ImageAsset = { id: 'img1', page: 1, bbox: { x: 0, y: 0, w: 10, h: 10 }, mime: 'image/png', sha: 'sha', width: 10, height: 10 } as ImageAsset;
   const decisionCaller = async (body: any) => ({ results: body.questions.map((item: any) => ({ name: item.name, probability: item.name.includes('Q1::stem-faithful') ? 0.05 : 0.95 })) });
   const shadow = await runLoopDecisionAudit({ document: authored(), lines, images: [image], settings: localSettings({ decideMode: 'shadow' }), fileHash: 'h', decisionCaller });
@@ -88,18 +88,19 @@ test('#46 audit: shadow routes nothing; active routes confident-wrong exactly on
   assert.ok(shadow.verdicts.some(v => v.probability === 0.05));
   const finalInputs: string[] = [];
   const caller: LoopModelCaller = async req => {
-    if (req.step === 'read') return readCaller()(req);
-    if (req.step === 'final-fix') { finalInputs.push(req.text); return { rawText: JSON.stringify({ corrections: [{ action: 'replace', questionNumber: 1, question: { ...authored().questions[0], stem: 'Audit-corrected stem.' } }] }), json: undefined }; }
+    if (req.step !== 'fix') return readCaller()(req);
+    if (req.step === 'fix') { finalInputs.push(req.text); return { rawText: JSON.stringify({ corrections: [{ action: 'replace', questionNumber: 1, question: { ...authored().questions[0], stem: 'Audit-corrected stem.' } }] }), json: undefined }; }
     return { rawText: '{"corrections":[]}', json: { corrections: [] } };
   };
   const receipt = await runLocalLoop({ lines, images: [image], settings: localSettings({ decideMode: 'active' }), fileHash: 'h2', caller, decisionCaller });
   assert.equal(receipt.auditMode, 'active');
-  assert.equal(receipt.steps[5].calls, 1, 'one final patch pass');
+  const fix = receipt.steps.find(s => s.step === 'fix')!;
+  assert.equal(fix.calls, 1, 'one patch pass');
   assert.equal(finalInputs.length, 1);
   assert.equal((finalInputs[0].match(/"number":1/g) || []).length, 1, 'question 1 is sent exactly once');
   assert.match(finalInputs[0], /stem-faithful/);
   assert.equal(receipt.document.questions[0].stem, 'Audit-corrected stem.');
-  assert.equal(receipt.steps[5].correctionsApplied, 1);
+  assert.equal(fix.correctionsApplied, 1);
 });
 
 test('#46 never-empty fault injection: every model step throws, including replayed image-payload failure; Present completes and the shell is saved', async () => {
@@ -115,7 +116,7 @@ test('#46 never-empty fault injection: every model step throws, including replay
     const doc = await runFullPipeline(file, localSettings({ decideMode: 'active' }), { onStageUpdate: stage => stages.push(`${stage.id}:${stage.status}`) }, { preExtracted, fileHash, loopCaller: throwingCaller, decisionCaller: async () => { throw new Error('decisions endpoint down'); } });
     assert.ok(stages.some(stage => stage.startsWith('present:completed')), 'Present completes');
     assert.equal(doc.loop!.steps.length, 6);
-    for (const step of ['read', 'self-review', 'code-fix', 'decision-audit', 'final-fix']) assert.ok(doc.loop!.steps.find(s => s.step === step)!.notes.length > 0, `${step} has a one-line note`);
+    for (const step of ['map', 'parse', 'check', 'fix', 'present']) assert.ok(doc.loop!.steps.find(s => s.step === step)!.notes.length > 0, `${step} has a one-line note`);
     assert.ok(doc.source.lines.length > 0, 'extraction shell retained');
     assert.ok(storage.saved.has(doc.id), 'document saved despite every model throwing');
     assert.ok(computeAttention(doc).length > 0);
@@ -127,7 +128,7 @@ test('#46 never-empty fault injection: every model step throws, including replay
 test('#46 corpus loop mode reports every entry plus the mock against printed truth without hard gates', async () => {
   const { results, ok } = await runCorpus({ mode: 'loop', print: false });
   assert.equal(ok, true);
-  assert.equal(results.length, 14);
+  assert.equal(results.length, 15); // #50 Part B added cloze-passage
   assert.ok(results.some(result => result.exam === 'mock-born-digital'));
   for (const result of results) {
     assert.match(result.recall, /^\d+\/\d+$/);

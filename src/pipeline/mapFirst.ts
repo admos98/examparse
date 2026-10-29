@@ -2,18 +2,31 @@
 import type { AppSettings, ImageAsset, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { DECIDE_CATCH, DECIDE_PASS, DECIDE_TIMEOUT_MS } from './audit';
-import { resolveDecisionProvider, type LoopDecisionCaller } from './loopAudit';
+import { decideIsMultimodal, resolveDecisionProvider, type LoopDecisionCaller } from './loopAudit';
 import { enumerateExpectedQuestionNos } from './quality';
 import { estimateTokens } from './memory/tokens';
-import { errorMessage, flatAuthoredQuestions, normalizeAuthoredDocument, parseLoopJson, type AuthoredDocument, type LoopModelResponse, type LoopVerdict } from './localLoop';
+import { modelText } from './lineNormalize';
+import { callWithOneRetry, dedupeText, responsePathology, errorMessage, fixOutputCap, flatAuthoredQuestions, MAP_OUTPUT_CAP, normalizeAuthoredDocument, parseLoopJson, reconcileAuthoredQuestions, reconcileList, sectionOutputCap, type AuthoredDocument, type LoopModelResponse, type LoopPathologyRecord, type LoopVerdict } from './localLoop';
 
 export type MapStatus = 'counted' | 'audited' | 'uncertain' | 'disputed';
 export interface MapSection { title: string; firstQuestion: number; lastQuestion: number; questionCount: number; kind: string; status: MapStatus }
 export interface MapGroup { appliesToFirst: number; appliesToLast: number; text: string; status: MapStatus }
-export interface MapPassage extends MapGroup { id: string; sectionTitle: string }
+/** #50 Part B: `blanks` lists numbered cloze blanks like (9) (10); each blank IS a question. */
+export interface MapPassage extends MapGroup { id: string; sectionTitle: string; blanks?: number[] }
 export interface MapImage { imageId: string; sectionTitle: string; aboutQuestion?: number; status: MapStatus }
 export interface MapVerdict { id: string; kind: string; entryIds: string[]; message: string; questionNumbers: number[] }
-export interface MapVote { entryId: string; kind: string; probability: number; choice?: string; indicted: boolean }
+/** `visual` = voted from the rendered page image (#51 Part A), not from the text. */
+export interface MapVote { entryId: string; kind: string; probability: number; choice?: string; indicted: boolean; visual?: boolean }
+/** #51 Part A: visual noul claims checked against the page image OCR already rendered. */
+export const VISUAL_MAP_KINDS = ['section-start-visible', 'pictures-present', 'passage-visible'] as const;
+export type SeenMark = 'pass' | 'uncertain' | 'catch';
+/** Worst visual vote on an entry: catch > uncertain > pass; undefined = text-only. */
+export function seenMark(map: Pick<LoopMapReceipt, 'auditVotes'>, entryId: string): SeenMark | undefined {
+  const votes = (map.auditVotes || []).filter(v => v.visual && v.entryId === entryId);
+  if (!votes.length) return undefined;
+  const p = Math.min(...votes.map(v => v.probability));
+  return p <= DECIDE_CATCH ? 'catch' : p < DECIDE_PASS ? 'uncertain' : 'pass';
+}
 export interface LoopMapReceipt {
   meta: Record<string, unknown>; sections: MapSection[]; instructionGroups: MapGroup[]; passages: MapPassage[]; images: MapImage[];
   answerKey?: { present: boolean; firstQuestion?: number; lastQuestion?: number };
@@ -21,20 +34,35 @@ export interface LoopMapReceipt {
   agreement: { agree: number; disagree: number; uncertain: number };
   auditCalls: number; auditErrors: number; auditUsage: { inputTokens: number; outputTokens: number };
   sectionFindings?: MapVerdict[];
+  /** #50 Part A: elements dropped at compile — beyond a declared count, or exact duplicates. */
+  reconciled?: { truncated: number; deduped: number };
+  /** #50 Part E: automatic section re-reads after an under-count. */
+  sectionReReads?: number;
+  /** #51 Part A: visual items built / answered / skipped (errors or endpoint without image support). */
+  visualAudit?: { items: number; voted: number; skipped: number };
   phase: 'map' | 'audit' | 'remap' | 'parse' | 'completed' | 'fallback'; currentSection?: string; parsedSections: number; totalSections: number; notes: string[];
 }
 const obj = (v: unknown): Record<string, any> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, any> : {};
 const positive = (v: unknown): number | undefined => { const n = Number(v); return Number.isInteger(n) && n >= 1 && n <= 1000 ? n : undefined; };
 const str = (v: unknown) => typeof v === 'string' ? v.trim() : '';
 const status = 'counted' as const;
-export const MAP_SYSTEM = `Map the WHOLE printed exam, not question bodies. Return ONLY JSON: {"meta":{"subject":"...","grade":"...","totalPoints":40,"durationMinutes":100},"sections":[{"title":"Listening","firstQuestion":1,"lastQuestion":8,"questionCount":8,"kind":"listening|vocabulary|grammar|reading|writing|other"}],"instructionGroups":[{"appliesToFirst":1,"appliesToLast":8,"text":"exact printed instruction"}],"passages":[{"id":"p1","sectionTitle":"Reading","appliesToFirst":41,"appliesToLast":45,"text":"full printed passage"}],"images":[{"imageId":"img_001","sectionTitle":"Listening","aboutQuestion":1}],"answerKey":{"present":false}}. Use ranges and counts only, never enumerate line numbers. Preserve instructions and passages verbatim and identify all printed sections and questions. Do not invent content or author questions. /no_think`;
+export const MAP_SYSTEM = `Map the WHOLE printed exam, not question bodies. Return ONLY JSON: {"meta":{"subject":"...","grade":"...","totalPoints":40,"durationMinutes":100},"sectionCount":3,"sections":[{"title":"Listening","firstQuestion":1,"lastQuestion":8,"questionCount":8,"kind":"listening|vocabulary|grammar|reading|writing|other"}],"instructionGroupCount":1,"instructionGroups":[{"appliesToFirst":1,"appliesToLast":8,"text":"exact printed instruction"}],"passageCount":1,"passages":[{"id":"p1","sectionTitle":"Reading","appliesToFirst":9,"appliesToLast":13,"text":"full printed passage","blanks":[9,10,11,12,13]}],"imageCount":1,"images":[{"imageId":"img_001","sectionTitle":"Listening","aboutQuestion":1}],"answerKey":{"present":false}}. Declare each count BEFORE its list, then emit each entry exactly once. If a passage contains numbered blanks like (9) (10), list them in blanks: each blank IS a question in that range, and the section's range and questionCount must include those blank-questions. Use ranges and counts only, never enumerate line numbers. Preserve instructions and passages verbatim and identify all printed sections and questions. Do not invent content or author questions. /no_think`;
 export const REMAP_SYSTEM = `Correct ONLY the indicated map entry using the supplied source and quoted verdict. Return that single corrected section, instruction group, passage, or image object as JSON, with the same keys. Do not author questions or edit other entries. /no_think`;
-export const SECTION_SYSTEM = `Read the supplied section as full authored JSON. Return {"sections":[{"title":"..."}],"questions":[{"number":1,"sectionTitle":"...","type":"mcq|truefalse|fillblank|short|matching|other","stem":"full printed question text","options":[{"key":"a","text":"..."}],"answer":"only if printed","points":1,"imageIds":[],"passageId":"p1"}],"passages":[]}. The map is a proposed contract, not permission to invent questions, answers, or points. Report only what the source contains. Use the printed question number to identify its section even for continuations at a boundary. Preserve blanks, all options, instructions, and image claims. Link passage-dependent questions to supplied passageId; do not copy passage into stems. Do not enumerate source lines. /no_think`;
+export const SECTION_SYSTEM = `Read the supplied section as full authored JSON. Return {"sections":[{"title":"..."}],"questionCount":1,"questions":[{"number":1,"sectionTitle":"...","type":"mcq|truefalse|fillblank|short|matching|other","stem":"full printed question text","options":[{"key":"a","text":"..."}],"answer":"only if printed","points":1,"imageIds":[],"passageId":"p1"}],"passages":[]}. Declare questionCount BEFORE the questions list, then emit each question exactly once. If a contract passage lists blanks, return one question per blank: type fillblank, number = the blank's number, stem = the sentence (or passage excerpt) around that blank, passageId = that passage. The map is a proposed contract, not permission to invent questions, answers, or points. Report only what the source contains. Use the printed question number to identify its section even for continuations at a boundary. Preserve blanks, all options, instructions, and image claims. Link passage-dependent questions to supplied passageId; do not copy passage into stems. Do not enumerate source lines. /no_think`;
 
 export function parseExamMap(response: LoopModelResponse): LoopMapReceipt | undefined {
   const parsedResponse = parseLoopJson(response);
-  const raw = obj(parsedResponse.value);
+  const raw = { ...obj(parsedResponse.value) };
   if (!Array.isArray(raw.sections) || !raw.sections.length) return undefined;
+  // #50 Part A: compile-time reconciliation BEFORE any check — exact duplicates are dropped, then any
+  // list beyond its declared count is truncated (dedupe first never loses a distinct entry that
+  // truncate-first would keep). Counts land in the receipt.
+  const reconciled = { truncated: 0, deduped: 0 };
+  const range = (v: any) => `${Number(v?.appliesToFirst)}-${Number(v?.appliesToLast)}`;
+  raw.sections = reconcileList(raw.sections, raw.sectionCount, (v: any) => `${dedupeText(v?.title)}\u0000${Number(v?.firstQuestion)}-${Number(v?.lastQuestion)}`, reconciled, 1);
+  if (Array.isArray(raw.instructionGroups)) raw.instructionGroups = reconcileList(raw.instructionGroups, raw.instructionGroupCount, (v: any) => `${range(v)}\u0000${dedupeText(v?.text)}`, reconciled);
+  if (Array.isArray(raw.passages)) raw.passages = reconcileList(raw.passages, raw.passageCount, (v: any) => `${range(v)}\u0000${dedupeText(v?.text)}`, reconciled);
+  if (Array.isArray(raw.images)) raw.images = reconcileList(raw.images, raw.imageCount, (v: any) => dedupeText(v), reconciled);
   const sections: MapSection[] = raw.sections.map((s: any): MapSection | undefined => {
     const title = str(s?.title), firstQuestion = positive(s?.firstQuestion), lastQuestion = positive(s?.lastQuestion), count = Number(s?.questionCount);
     if (!title || !firstQuestion || !lastQuestion || s?.questionCount === null || s?.questionCount === undefined || s?.questionCount === '' || lastQuestion < firstQuestion || !Number.isInteger(count) || count < 0 || count > 1000) return undefined;
@@ -47,10 +75,11 @@ export function parseExamMap(response: LoopModelResponse): LoopMapReceipt | unde
     return { appliesToFirst, appliesToLast, text, status };
   };
   const instructionGroups: MapGroup[] = (Array.isArray(raw.instructionGroups) ? raw.instructionGroups : []).map(group).filter((g: MapGroup | undefined): g is MapGroup => Boolean(g));
-  const passages: MapPassage[] = (Array.isArray(raw.passages) ? raw.passages : []).map((p: any, i: number) => { const g = group(p); return g ? { ...g, id: str(p.id) || `p${i + 1}`, sectionTitle: str(p.sectionTitle) } : undefined; }).filter((p: MapPassage | undefined): p is MapPassage => Boolean(p));
+  const blanksOf = (p: any): number[] => Array.isArray(p?.blanks) ? [...new Set(p.blanks.map(positive).filter((n: number | undefined): n is number => n !== undefined) as number[])].sort((a, b) => a - b) : [];
+  const passages: MapPassage[] = (Array.isArray(raw.passages) ? raw.passages : []).map((p: any, i: number) => { const g = group(p); const blanks = blanksOf(p); return g ? { ...g, id: str(p.id) || `p${i + 1}`, sectionTitle: str(p.sectionTitle), ...(blanks.length ? { blanks } : {}) } : undefined; }).filter((p: MapPassage | undefined): p is MapPassage => Boolean(p));
   const images: MapImage[] = (Array.isArray(raw.images) ? raw.images : []).filter((i: any) => str(i?.imageId)).map((i: any) => ({ imageId: str(i.imageId), sectionTitle: str(i.sectionTitle), ...(positive(i.aboutQuestion) ? { aboutQuestion: positive(i.aboutQuestion) } : {}), status }));
   const malformedNotes = [ ...(parsedResponse.salvaged ? ['Map output required JSON salvage; review the proposed map.'] : []), ...[ ['instruction group', raw.instructionGroups, instructionGroups], ['passage', raw.passages, passages], ['image', raw.images, images] ].flatMap(([name, input, output]) => Array.isArray(input) && Array.isArray(output) && input.length > output.length ? [`${input.length - output.length} malformed ${name} map entr${input.length - output.length === 1 ? 'y was' : 'ies were'} omitted; teacher review required.`] : []) ];
-  return { meta: obj(raw.meta), sections, instructionGroups, passages, images, ...(raw.answerKey && typeof raw.answerKey.present === 'boolean' ? { answerKey: { present: raw.answerKey.present, ...(positive(raw.answerKey.firstQuestion) ? { firstQuestion: positive(raw.answerKey.firstQuestion) } : {}), ...(positive(raw.answerKey.lastQuestion) ? { lastQuestion: positive(raw.answerKey.lastQuestion) } : {}) } } : {}), codeVerdicts: [], auditVotes: [], remaps: [], agreement: { agree: 0, disagree: 0, uncertain: 0 }, auditCalls: 0, auditErrors: 0, auditUsage: { inputTokens: 0, outputTokens: 0 }, phase: 'map', parsedSections: 0, totalSections: sections.length, notes: malformedNotes };
+  return { meta: obj(raw.meta), sections, instructionGroups, passages, images, ...(raw.answerKey && typeof raw.answerKey.present === 'boolean' ? { answerKey: { present: raw.answerKey.present, ...(positive(raw.answerKey.firstQuestion) ? { firstQuestion: positive(raw.answerKey.firstQuestion) } : {}), ...(positive(raw.answerKey.lastQuestion) ? { lastQuestion: positive(raw.answerKey.lastQuestion) } : {}) } } : {}), codeVerdicts: [], auditVotes: [], remaps: [], agreement: { agree: 0, disagree: 0, uncertain: 0 }, auditCalls: 0, auditErrors: 0, auditUsage: { inputTokens: 0, outputTokens: 0 }, phase: 'map', parsedSections: 0, totalSections: sections.length, notes: malformedNotes, reconciled, sectionReReads: 0 };
 }
 export function mapEntries(map: LoopMapReceipt): Array<{ id: string; value: MapSection | MapGroup | MapPassage | MapImage }> {
   return [ ...map.sections.map((value, i) => ({ id: `section:${i}`, value })), ...map.instructionGroups.map((value, i) => ({ id: `instruction:${i}`, value })), ...map.passages.map((value, i) => ({ id: `passage:${i}`, value })), ...map.images.map((value, i) => ({ id: `image:${i}`, value })) ];
@@ -98,9 +127,9 @@ export function regionForRange(lines: SourceLine[], first: number, last: number,
 }
 export function edgeText(lines: SourceLine[], first: number, last: number, maxChars = 1800): string {
   const expected = enumerateExpectedQuestionNos(lines); const indexes = [first, last].map(n => lineIndex(lines, expected.lineByNumber.get(n))).filter(n => n >= 0);
-  if (!indexes.length) return lines.slice(0, 10).map(l => l.text).join('\n').slice(0, maxChars);
+  if (!indexes.length) return lines.filter(l => !l.watermark).slice(0, 10).map(modelText).join('\n').slice(0, maxChars);
   const selected = new Set<number>(); for (const idx of indexes) for (let i = Math.max(0, idx-3); i < Math.min(lines.length, idx+4); i++) selected.add(i);
-  return [...selected].sort((a,b)=>a-b).map(i => lines[i].text).join('\n').slice(0, maxChars);
+  return [...selected].sort((a,b)=>a-b).filter(i => !lines[i].watermark).map(i => modelText(lines[i])).join('\n').slice(0, maxChars);
 }
 export function sectionContract(map: LoopMapReceipt, section: MapSection): object {
   return { section: { title: section.title, firstQuestion: section.firstQuestion, lastQuestion: section.lastQuestion, questionCount: section.questionCount, kind: section.kind, status: section.status },
@@ -108,7 +137,12 @@ export function sectionContract(map: LoopMapReceipt, section: MapSection): objec
     passages: map.passages.filter(p => p.sectionTitle === section.title || (p.appliesToFirst <= section.lastQuestion && p.appliesToLast >= section.firstQuestion)),
     images: map.images.filter(i => i.sectionTitle === section.title || (i.aboutQuestion !== undefined && i.aboutQuestion >= section.firstQuestion && i.aboutQuestion <= section.lastQuestion)), answerKey: map.answerKey };
 }
-export function sectionReadVerdicts(map: LoopMapReceipt | undefined, doc: AuthoredDocument): LoopVerdict[] {
+/** Page of the printed blank "(n)" (for section-scoped fix input), if the source shows it. */
+function blankPage(lines: SourceLine[] | undefined, n: number): number | undefined {
+  const re = new RegExp(`\\(\\s*${n}\\s*\\)`);
+  return lines?.find(l => !l.watermark && re.test(modelText(l)))?.page;
+}
+export function sectionReadVerdicts(map: LoopMapReceipt | undefined, doc: AuthoredDocument, lines?: SourceLine[]): LoopVerdict[] {
   if (!map || map.phase === 'fallback') return [];
   const questions = flatAuthoredQuestions(doc);
   const counts: LoopVerdict[] = map.sections.flatMap((s,i) => {
@@ -122,20 +156,34 @@ export function sectionReadVerdicts(map: LoopMapReceipt | undefined, doc: Author
     id: `code:passage-link-missing:${p.id}:${q.number}`, kind:'passage-link-missing' as const, questionNumbers:[q.number], source:'code' as const,
     message:`The map proposes passage ${p.id} for Q${q.number}, but ${q.passageId === p.id ? 'the passage body is missing' : q.passageId ? `the section parse linked ${q.passageId}` : 'the section parse did not link a passage'}. Review the source and map.`,
   })));
-  return [...counts, ...passageLinks];
+  // #50 Part B: a map-declared cloze blank with no question after parse.
+  const present = new Set(questions.map(q => q.number));
+  const blanks: LoopVerdict[] = map.passages.flatMap(p => (p.blanks || []).filter(n => !present.has(n)).map(n => {
+    const page = blankPage(lines, n);
+    return { id: `code:blank-missing:${p.id}:${n}`, kind: 'blank-missing' as const, questionNumbers: [n], source: 'code' as const, ...(page !== undefined ? { page } : {}),
+      message: `The map lists blank (${n}) in passage ${p.id}, but no question ${n} was parsed. Each numbered blank is a fillblank question: stem = the sentence around the blank, passageId = ${p.id}.` };
+  }));
+  return [...counts, ...passageLinks, ...blanks];
 }
 
 export interface MapFirstReadParams {
   lines: SourceLine[]; images: ImageAsset[]; settings: AppSettings; guidance?: string; fileHash: string;
-  call: (label: string, system: string, text: string) => Promise<LoopModelResponse>;
+  /** `cap` is the proportional output cap for this call (#50 Part A). */
+  call: (label: string, system: string, text: string, cap?: number) => Promise<LoopModelResponse>;
   decisionCaller?: LoopDecisionCaller;
+  onPathology?: (record: LoopPathologyRecord) => void;
   cacheGet: <T>(key: string) => Promise<T | undefined>; cacheSet: (key: string, value: unknown) => Promise<void>;
   cacheKey: (text: string) => Promise<string>;
   onUpdate?: (map: LoopMapReceipt) => void | Promise<void>;
   onNote?: (message: string) => void;
   onAuditUsage?: (usage: { inputTokens: number; outputTokens: number }, label: string) => void;
+  /** #51: the page image OCR rendered (temporary, never stored again). Absent → no visual items. */
+  pageImage?: (page: number) => Promise<{ id: string; mime: string; data: string } | undefined>;
+  /** #51: phase timeline hook — fired when the code count runs (no model call). */
+  onCode?: () => void;
 }
-const sourceText = (lines: SourceLine[]) => lines.map(l => `PAGE ${l.page}: ${l.text}`).join('\n');
+/** #50 Part C: the normalized twin, never a watermark line, in every map/section prompt. */
+const sourceText = (lines: SourceLine[]) => lines.filter(l => !l.watermark).map(l => `PAGE ${l.page}: ${modelText(l)}`).join('\n');
 function remapRegion(lines: SourceLine[], first: number, last: number): SourceLine[] {
   const expected = enumerateExpectedQuestionNos(lines);
   const indexes = expected.numbers.filter(n => n >= first && n <= last).map(n => lineIndex(lines, expected.lineByNumber.get(n))).filter(i=>i>=0);
@@ -174,7 +222,21 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
   });
   map.instructionGroups.forEach((g,i) => items.push({ id:`instruction:${i}`, kind:'instruction-scope', first:g.appliesToFirst,last:g.appliesToLast, context:g, instructions:`Does this instruction govern questions ${g.appliesToFirst}–${g.appliesToLast}?` }));
   map.passages.forEach((p,i) => items.push({ id:`passage:${i}`, kind:'passage-scope', first:p.appliesToFirst,last:p.appliesToLast, context:p, instructions:`Is this the passage questions ${p.appliesToFirst}–${p.appliesToLast} refer to?` }));
-  let errors = 0;
+  let errors = 0; let endpointDown = false;
+  const recordVote = (entryIds: string[], kind: string, probability: number, choice: string | undefined, visual: boolean) => {
+    const indicted = mode === 'active' && probability <= DECIDE_CATCH;
+    if (probability <= DECIDE_CATCH) map.agreement.disagree++; else if (probability >= DECIDE_PASS) map.agreement.agree++; else map.agreement.uncertain++;
+    for (const entryId of entryIds) {
+      map.auditVotes.push({ entryId, kind, probability, ...(choice ? { choice } : {}), indicted, ...(visual ? { visual: true } : {}) });
+      const entry = mapEntries(map).find(e=>e.id === entryId)?.value;
+      if (entry) {
+        if (probability <= DECIDE_CATCH) entry.status = 'disputed';
+        else if (entry.status !== 'disputed' && probability > DECIDE_CATCH && probability < DECIDE_PASS) entry.status = 'uncertain';
+        else if (entry.status === 'counted' && probability >= DECIDE_PASS) entry.status = 'audited';
+      }
+    }
+  };
+  const caller = params.decisionCaller || ((body: any) => LLMAdapter.executeDecisions({ providerConfig: provider, body, timeoutMs: DECIDE_TIMEOUT_MS }));
   for (const item of items) {
     const thx = provider.decideDialect === 'thx';
     // Keep the THX record compact without slicing JSON mid-object or dropping section criteria.
@@ -199,7 +261,6 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
     const usage = { inputTokens: estimateTokens(JSON.stringify(body)), outputTokens: 0 };
     map.auditCalls++; map.auditUsage.inputTokens += usage.inputTokens;
     try {
-      const caller = params.decisionCaller || ((body: any) => LLMAdapter.executeDecisions({ providerConfig: provider, body, timeoutMs: DECIDE_TIMEOUT_MS }));
       const response = await caller(body); usage.outputTokens = estimateTokens(JSON.stringify(response.results)); map.auditUsage.outputTokens += usage.outputTokens; errors = 0; const row = response.results.find(r=>r.name === name); const p = row?.probability;
       if (typeof p !== 'number' || !Number.isFinite(p)) { map.notes.push(`Map audit returned no usable ${item.kind} verdict for ${item.id}.`); continue; }
       errors = 0;
@@ -208,33 +269,99 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
         const s = map.sections[Number(item.id.split(':')[1])];
         probability = row?.choice === s.title ? probability : row?.choice && item.choices?.includes(row.choice) ? 1 - probability : 0.5;
       }
-      const indicted = mode === 'active' && probability <= DECIDE_CATCH;
-      if (probability <= DECIDE_CATCH) map.agreement.disagree++; else if (probability >= DECIDE_PASS) map.agreement.agree++; else map.agreement.uncertain++;
-      map.auditVotes.push({ entryId: item.id, kind: item.kind, probability, ...(row?.choice ? { choice: row.choice } : {}), indicted });
-      const entry = mapEntries(map).find(e=>e.id === item.id)?.value;
-      if (entry) {
-        if (probability <= DECIDE_CATCH) entry.status = 'disputed';
-        else if (entry.status !== 'disputed' && probability > DECIDE_CATCH && probability < DECIDE_PASS) entry.status = 'uncertain';
-        else if (entry.status === 'counted' && probability >= DECIDE_PASS) entry.status = 'audited';
-      }
+      recordVote([item.id], item.kind, probability, row?.choice, false);
     } catch (error) {
-      errors++; map.auditErrors++; if (errors >= 5) { map.notes.push(`Map audit endpoint unreachable — skipped after ${errors} errors; parsing continues (${errorMessage(error)}).`); break; }
+      errors++; map.auditErrors++; if (errors >= 5) { endpointDown = true; map.notes.push(`Map audit endpoint unreachable — skipped after ${errors} errors; parsing continues (${errorMessage(error)}).`); break; }
     } finally { try { params.onAuditUsage?.(usage, `Map audit · ${item.kind}`); } catch { /* usage is advisory */ } await params.onUpdate?.(map); }
   }
   if (errors > 0 && errors < 5) map.notes.push(`Map audit had ${errors} endpoint error(s); parsing continues.`);
+  if (!endpointDown) await auditMapVisually(map, params, provider, caller, recordVote);
   if (mode === 'shadow') map.notes.push('Map audit shadow mode — votes recorded; no audit indictments routed.');
 }
 
-/** Returns undefined when the map cannot be authored, so the caller can use the never-empty legacy fallback. */
+/** #51 Part A: page of each claim, from text evidence only (never a guess). */
+export function visualMapItems(map: LoopMapReceipt, lines: SourceLine[], images: ImageAsset[]): Array<{ kind: typeof VISUAL_MAP_KINDS[number]; entryIds: string[]; page: number; claim: string }> {
+  const expected = enumerateExpectedQuestionNos(lines);
+  const pageOfNumber = (n: number) => { const i = lineIndex(lines, expected.lineByNumber.get(n)); return i >= 0 ? lines[i].page : blankPage(lines, n); };
+  const items: Array<{ kind: typeof VISUAL_MAP_KINDS[number]; entryIds: string[]; page: number; claim: string }> = [];
+  map.sections.forEach((s, i) => {
+    const page = pageOfNumber(s.firstQuestion);
+    if (page !== undefined) items.push({ kind: 'section-start-visible', entryIds: [`section:${i}`], page, claim: `The map claims a section titled '${s.title}' begins on this page (question ${s.firstQuestion}).` });
+  });
+  const imagePages = new Map<number, string[]>();
+  map.images.forEach((m, i) => { const page = images.find(im => im.id === m.imageId)?.page; if (page !== undefined) imagePages.set(page, [...(imagePages.get(page) || []), `image:${i}`]); });
+  for (const [page, entryIds] of [...imagePages].sort((a, b) => a[0] - b[0])) items.push({ kind: 'pictures-present', entryIds, page, claim: 'This page contains one or more pictures that exam questions refer to.' });
+  const squash = (t: string) => t.replace(/\s+/g, ' ').trim().toLowerCase();
+  map.passages.forEach((p, i) => {
+    const prefix = squash(p.text).slice(0, 40);
+    const textLine = prefix.length >= 12 ? lines.find(l => { if (l.watermark) return false; const t = squash(modelText(l)); return t.length >= 12 && (t.includes(prefix) || squash(p.text).startsWith(t)); }) : undefined;
+    const page = textLine?.page ?? pageOfNumber(p.appliesToFirst);
+    if (page !== undefined) items.push({ kind: 'passage-visible', entryIds: [`passage:${i}`], page, claim: 'This page contains a distinct reading-passage text block.' });
+  });
+  return items;
+}
+const VISUAL_ERROR_BREAK = 3;
+/** #51 Part A: one page image per item; votes route exactly like text votes. An erroring visual item is
+ * skipped and counted; it never touches the text audit (which already finished). */
+async function auditMapVisually(map: LoopMapReceipt, params: MapFirstReadParams, provider: NonNullable<ReturnType<typeof resolveDecisionProvider>>, caller: LoopDecisionCaller,
+  recordVote: (entryIds: string[], kind: string, probability: number, choice: string | undefined, visual: boolean) => void): Promise<void> {
+  if (!decideIsMultimodal(params.settings, provider) || !params.pageImage) return;
+  const items = visualMapItems(map, params.lines, params.images);
+  map.visualAudit = { items: items.length, voted: 0, skipped: 0 };
+  if (!items.length) return;
+  const thx = provider.decideDialect === 'thx';
+  let consecutive = 0;
+  for (const [index, item] of items.entries()) {
+    if (consecutive >= VISUAL_ERROR_BREAK) {
+      map.visualAudit.skipped += items.length - index;
+      map.notes.push(`Visual map audit: ${items.length - index} remaining item(s) skipped after ${VISUAL_ERROR_BREAK} consecutive image errors; text votes stand.`);
+      break;
+    }
+    const name = `${item.entryIds.join('+')} ${item.kind}`;
+    const usage = { inputTokens: 0, outputTokens: 0 };
+    try {
+      const image = await params.pageImage(item.page);
+      if (!image) { map.visualAudit.skipped++; continue; }
+      const instructions = 'Looking only at the attached page image, is this statement true?';
+      const body: any = thx
+        ? { model: provider.model, state: item.claim, questions: { [name]: { type: 'noul', instructions } }, images: [`data:${image.mime};base64,${image.data}`] }
+        : { input: { purpose: 'audit proposed exam map against the rendered page' }, questions: [{ name, type: 'probability', instructions: `${item.claim} ${instructions}`, input: { claim: item.claim, page: item.page }, images: [image] }] };
+      usage.inputTokens = estimateTokens(JSON.stringify({ ...body, images: undefined, questions: thx ? body.questions : body.questions.map((q: any) => ({ ...q, images: undefined })) })) + 256;
+      map.auditCalls++; map.auditUsage.inputTokens += usage.inputTokens;
+      const response = await caller(body);
+      usage.outputTokens = estimateTokens(JSON.stringify(response.results)); map.auditUsage.outputTokens += usage.outputTokens;
+      const p = response.results.find(r => r.name === name)?.probability;
+      if (typeof p !== 'number' || !Number.isFinite(p)) { map.visualAudit.skipped++; consecutive++; map.notes.push(`Visual map audit returned no usable ${item.kind} vote for page ${item.page}; skipped.`); continue; }
+      consecutive = 0; map.visualAudit.voted++;
+      recordVote(item.entryIds, item.kind, Math.max(0, Math.min(1, p)), undefined, true);
+    } catch (error) {
+      consecutive++; map.visualAudit.skipped++; map.auditErrors++;
+      map.notes.push(`Visual map audit ${item.kind} (page ${item.page}) skipped — ${errorMessage(error)}.`);
+    } finally { try { if (usage.inputTokens) params.onAuditUsage?.(usage, `Map audit · ${item.kind}`); } catch { /* advisory */ } await params.onUpdate?.(map); }
+  }
+}
+
+/** Map + Parse in one call (kept for direct callers and tests). The loop runner calls the phases separately. */
 export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map: LoopMapReceipt; document: AuthoredDocument } | undefined> {
+  const map = await runMapPhase(params);
+  if (!map) return undefined;
+  return { map, document: await runParsePhase(map, params) };
+}
+/** Phase 2 — Map: generative map → code count → decision audit (text + visual) → re-map of indicted entries only.
+ * Returns undefined when the map cannot be authored, so the caller can use the never-empty page fallback. */
+export async function runMapPhase(params: MapFirstReadParams): Promise<LoopMapReceipt | undefined> {
   const guidance = params.guidance ? `\nPLAYBOOK AND SKILLS:\n${params.guidance}` : '';
   // Try the whole paper first. Split at page boundaries with 30 lines of overlap only when the provider reports a context limit.
   const chunks: SourceLine[][] = [params.lines];
   let map: LoopMapReceipt | undefined;
+  const pathologyNotes: string[] = [];
+  const onNote = (message: string) => { pathologyNotes.push(message); params.onNote?.(message); };
   for (let i = 0; i < chunks.length; i++) {
     const text = `EXAM SOURCE${chunks.length > 1 ? ` (part ${i+1}/${chunks.length}, includes context overlap)` : ''}:\n${sourceText(chunks[i])}\n\nIMAGE INVENTORY: ${JSON.stringify(params.images.map(im=>({ imageId:im.id, page:im.page, caption:im.label?.caption })))}${guidance}`;
     let parsed: LoopMapReceipt | undefined;
-    try { parsed = parseExamMap(await params.call(`Map · ${i+1}/${chunks.length}`, MAP_SYSTEM, text)); }
+    // #50 Part A: map cap ≈ 3000 tokens; a breaker/cap cut salvages its complete prefix and takes ONE retry.
+    try { parsed = (await callWithOneRetry({ label: `Map · ${i+1}/${chunks.length}`, text, cap: MAP_OUTPUT_CAP, call: (label, body) => params.call(label, MAP_SYSTEM, body, MAP_OUTPUT_CAP),
+      parse: parseExamMap, count: m => m ? mapEntries(m).length : 0, onNote, onPathology: params.onPathology })).value; }
     catch (error) {
       const message = errorMessage(error);
       const pages = [...new Set(params.lines.map(l=>l.page))];
@@ -260,11 +387,15 @@ export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map
       for (const image of parsed.images) if (!map.images.some(x=>x.imageId===image.imageId)) map.images.push(image);
       Object.assign(map.meta, Object.fromEntries(Object.entries(parsed.meta).filter(([k])=>map!.meta[k] === undefined)));
       if (parsed.answerKey?.present && !map.answerKey?.present) map.answerKey = parsed.answerKey;
+      map.reconciled = { truncated: (map.reconciled?.truncated || 0) + (parsed.reconciled?.truncated || 0), deduped: (map.reconciled?.deduped || 0) + (parsed.reconciled?.deduped || 0) };
     }
   }
   if (!map) return undefined;
+  map.reconciled ||= { truncated: 0, deduped: 0 }; map.sectionReReads ||= 0;
+  for (const message of pathologyNotes) if (!map.notes.includes(message)) map.notes.push(message);
+  if (map.reconciled.truncated || map.reconciled.deduped) map.notes.push(`Map compile reconciled: ${map.reconciled.truncated} truncated beyond declared counts, ${map.reconciled.deduped} exact duplicate(s) dropped.`);
   map.totalSections = map.sections.length;
-  map.codeVerdicts = countExamMap(map, params.lines, params.images);
+  map.codeVerdicts = countExamMap(map, params.lines, params.images); params.onCode?.();
   for (const entry of mapEntries(map)) if (map.codeVerdicts.some(v=>v.entryIds.includes(entry.id))) entry.value.status = 'disputed';
   map.phase = 'audit'; await params.onUpdate?.(map);
   await auditMap(map, params);
@@ -272,11 +403,14 @@ export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map
   const affected = new Set([...map.codeVerdicts.flatMap(v=>v.entryIds), ...map.auditVotes.filter(v=>v.indicted).map(v=>v.entryId)]);
   for (const id of affected) {
     const entry = mapEntries(map).find(e=>e.id === id); if (!entry) continue;
-    const messages = [...map.codeVerdicts.filter(v=>v.entryIds.includes(id)).map(v=>`code: ${v.message}`), ...map.auditVotes.filter(v=>v.entryId===id && v.indicted).map(v=>`audit ${v.kind} p=${v.probability.toFixed(2)}`)];
+    const messages = [...map.codeVerdicts.filter(v=>v.entryIds.includes(id)).map(v=>`code: ${v.message}`), ...map.auditVotes.filter(v=>v.entryId===id && v.indicted).map(v=>`audit ${v.kind} p=${v.probability.toFixed(2)}${v.visual ? ' (seen on the page image)' : ''}`)];
     const before = structuredClone(entry.value);
     const [first,last] = rangeForEntry(map,id); const region = remapRegion(params.lines, first, last);
     try {
-      const response = await params.call(`Re-map · ${id}`, REMAP_SYSTEM, `ENTRY ${id}: ${JSON.stringify(entry.value)}\nINDICTMENTS: ${messages.join('; ')}\nSOURCE REGION:\n${sourceText(region)}${guidance}`);
+      // #50 Part A: one entry → fix-pass cap (proportional to a passage body when the entry carries one).
+      const remapCap = Math.min(8192, Math.max(fixOutputCap(1), Math.ceil(estimateTokens(String((entry.value as any).text || '')) * 1.5) + 200));
+      const { value: response } = await callWithOneRetry({ label: `Re-map · ${id}`, text: `ENTRY ${id}: ${JSON.stringify(entry.value)}\nINDICTMENTS: ${messages.join('; ')}\nSOURCE REGION:\n${sourceText(region)}${guidance}`, cap: remapCap,
+        call: (label, body) => params.call(label, REMAP_SYSTEM, body, remapCap), parse: r => r, count: r => parseLoopJson(r).value ? 1 : 0, onNote: m => map!.notes.push(m), onPathology: params.onPathology });
       const raw = obj(parseLoopJson(response).value); const candidateValue = raw.entry || raw.section || raw.instructionGroup || raw.passage || raw.image || (id.startsWith('section:') ? raw.sections?.[0] : id.startsWith('instruction:') ? raw.instructionGroups?.[0] : id.startsWith('passage:') ? raw.passages?.[0] : raw.images?.[0]) || raw;
       const candidate = structuredClone(map);
       const prior = countExamMap(map, params.lines, params.images);
@@ -287,13 +421,17 @@ export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map
       const updated = mapEntries(candidate).find(e=>e.id === id)?.value as any;
       const previous = before as any;
       // A no-op cannot resolve a confident-wrong decision. Keep the original disputed instead of
-      // calling it repaired; the section parse and self-review can still arbitrate it.
+      // calling it repaired; the section parse and the Check/Fix phases can still arbitrate it.
       const unchangedIndictment = map.auditVotes.filter(v=>v.entryId===id && v.indicted).some(v => {
         if (v.kind === 'section-boundary') return previous.firstQuestion === updated?.firstQuestion && previous.lastQuestion === updated?.lastQuestion;
         if (v.kind === 'section-title') return previous.title === updated?.title;
         if (v.kind === 'kind-plausible') return previous.kind === updated?.kind;
         if (v.kind === 'instruction-scope' || v.kind === 'passage-scope') return previous.appliesToFirst === updated?.appliesToFirst && previous.appliesToLast === updated?.appliesToLast && previous.text === updated?.text;
-        return false;
+        if (v.kind === 'section-start-visible') return previous.title === updated?.title && previous.firstQuestion === updated?.firstQuestion;
+        if (v.kind === 'passage-visible') return previous.text === updated?.text && previous.appliesToFirst === updated?.appliesToFirst;
+        // Generic: an entry that comes back identical (status aside) cannot answer any indictment.
+        const plain = (x: any) => { if (!x || typeof x !== 'object') return JSON.stringify(x); const { status: _s, ...rest } = x; return JSON.stringify(rest); };
+        return plain(previous) === plain(updated);
       });
       if (!valid || relatedRemain || introduced || unchangedIndictment) {
         entry.value.status = 'disputed'; map.remaps.push({ entryId:id, applied:false, reason:'Invalid or still disputed; original retained.', before });
@@ -303,6 +441,13 @@ export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map
     } catch (error) { entry.value.status = 'disputed'; map.remaps.push({ entryId:id, applied:false, reason:`Original retained — ${errorMessage(error)}`, before }); }
     await params.onUpdate?.(map);
   }
+  await params.onUpdate?.(map);
+  return map;
+}
+/** Phase 3 — Parse: per section against the map contract (with the #50 re-read rule and cloze blanks), then
+ * one scoped parse for any numbered questions outside every mapped section. */
+export async function runParsePhase(map: LoopMapReceipt, params: MapFirstReadParams): Promise<AuthoredDocument> {
+  const guidance = params.guidance ? `\nPLAYBOOK AND SKILLS:\n${params.guidance}` : '';
   // Preserve original findings for the receipt; section-level checks use the final proposal.
   map.phase = 'parse'; await params.onUpdate?.(map);
   const documents: AuthoredDocument[] = [];
@@ -311,30 +456,65 @@ export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map
     const regionIds = new Set(region.map(line => line.id));
     const keyLines = params.lines.filter(line => keyLineNos.has(Number(line.id.replace(/\D/g, ''))) && !regionIds.has(line.id));
     const text = `MAP CONTRACT: ${JSON.stringify(contract)}\nSECTION SOURCE (includes neighbouring context):\n${sourceText(region)}${keyLines.length ? `\n\nANSWER KEY SOURCE (if relevant to this section):\n${sourceText(keyLines)}` : ''}${guidance}`;
-    const key = await params.cacheKey(`map-section-v1:${text}`);
+    // #50 Part A: section cap ≈ 800 + expected × 220.
+    const expectedCount = section ? section.questionCount : Array.isArray((contract as any)?.numberedQuestions) ? (contract as any).numberedQuestions.length : 0;
+    const cap = sectionOutputCap(Math.max(1, expectedCount));
+    type Attempt = { document: AuthoredDocument; unreadable: boolean; salvaged: boolean; reconciled: { truncated: number; deduped: number } };
+    const attempt = (response: LoopModelResponse): Attempt => {
+      const parsed = parseLoopJson(response);
+      const reconciled = { truncated: 0, deduped: 0 };
+      // Compile-time reconciliation before any check: duplicates (same number + same stem), then questionCount.
+      const document = reconcileAuthoredQuestions(normalizeAuthoredDocument(parsed.value), obj(parsed.value).questionCount, reconciled);
+      return { document, unreadable: parsed.value === null, salvaged: parsed.salvaged, reconciled };
+    };
+    const inRange = (doc: AuthoredDocument) => new Set(flatAuthoredQuestions(doc).map(q => q.number).filter(n => !section || (n >= section.firstQuestion && n <= section.lastQuestion))).size;
+    // Each distinct prompt (first attempt, or re-read with its complaint) is cached only when clean and non-empty.
+    const cachedCall = async (callLabel: string, body: string): Promise<LoopModelResponse> => {
+      const key = await params.cacheKey(`map-section-v1:${body}`);
+      const cached = await params.cacheGet<LoopModelResponse>(key);
+      if (cached) return cached;
+      const response = await params.call(callLabel, SECTION_SYSTEM, body, cap);
+      const check = attempt(response);
+      if (!responsePathology(response) && check.document.questions.length && !check.salvaged) await params.cacheSet(key, { rawText: response.rawText, json: response.json });
+      return response;
+    };
     try {
-      let response = await params.cacheGet<LoopModelResponse>(key); const cached = Boolean(response);
-      if (!response) response = await params.call(label, SECTION_SYSTEM, text);
-      const parsed = parseLoopJson(response); const document = normalizeAuthoredDocument(parsed.value);
-      if (parsed.value === null || !document.questions.length) map.notes.push(`${label}: no complete questions returned${parsed.value === null ? ' (unreadable output)' : ''}.`);
-      if (!cached && document.questions.length && !parsed.salvaged) await params.cacheSet(key, { rawText: response.rawText, json: response.json });
+      let reReadReason = false;
+      const result = await callWithOneRetry({ label, text, cap, call: cachedCall, parse: attempt, count: a => inRange(a.document),
+        onNote: m => map!.notes.push(m), onPathology: params.onPathology,
+        // #50 Part E: < 50% of the map's expected count (or zero when ≥3 expected) earns ONE automatic re-read.
+        extraComplaint: a => {
+          if (!section) return undefined;
+          const got = inRange(a.document), want = section.questionCount;
+          if (!(got < want * 0.5 || (got === 0 && want >= 3))) return undefined;
+          reReadReason = true;
+          return `previous attempt returned ${got} of ${want} expected questions — find the missing ones, especially any passage blanks`;
+        } });
+      if (reReadReason) {
+        map!.sectionReReads = (map!.sectionReReads || 0) + 1;
+        map!.notes.push(`${label}: re-read once after an under-count — kept ${inRange(result.value.document)} of ${section!.questionCount} expected (${result.usedRetry ? 're-read replaced the first attempt' : 'first attempt was better and kept'}).`);
+      }
+      const { document, unreadable, reconciled } = result.value;
+      map!.reconciled = { truncated: (map!.reconciled?.truncated || 0) + reconciled.truncated, deduped: (map!.reconciled?.deduped || 0) + reconciled.deduped };
+      if (reconciled.truncated || reconciled.deduped) map!.notes.push(`${label}: compile reconciled ${reconciled.truncated} truncated beyond questionCount, ${reconciled.deduped} duplicate question(s) dropped.`);
+      if (unreadable || !document.questions.length) map!.notes.push(`${label}: no complete questions returned${unreadable ? ' (unreadable output)' : ''}.`);
       const expected = enumerateExpectedQuestionNos(params.lines);
       if (section) {
         const outside = [...new Set(flatAuthoredQuestions(document).map(q=>q.number).filter(n=>n<section.firstQuestion || n>section.lastQuestion))];
         if (outside.length) {
-          map.sectionFindings ||= [];
-          map.sectionFindings.push({ id:`section-range-mismatch:${map.sections.indexOf(section)}`, kind:'section-range-mismatch', entryIds:[`section:${map.sections.indexOf(section)}`], questionNumbers:outside,
+          map!.sectionFindings ||= [];
+          map!.sectionFindings.push({ id:`section-range-mismatch:${map!.sections.indexOf(section)}`, kind:'section-range-mismatch', entryIds:[`section:${map!.sections.indexOf(section)}`], questionNumbers:outside,
             message:`Section ${section.title} returned ${outside.map(n=>`Q${n}`).join(', ')} outside its mapped range Q${section.firstQuestion}–${section.lastQuestion}; assigned by number.` });
         }
       }
       for (const q of flatAuthoredQuestions(document)) {
-        const owner = map.sections.find(s=>q.number>=s.firstQuestion && q.number<=s.lastQuestion);
+        const owner = map!.sections.find(s=>q.number>=s.firstQuestion && q.number<=s.lastQuestion);
         q.sectionTitle = owner?.title || (section ? 'Unmapped questions' : fallbackTitle || q.sectionTitle);
         const idx = lineIndex(params.lines, expected.lineByNumber.get(q.number));
         q.sourcePages = idx >= 0 ? [params.lines[idx].page] : [...new Set(region.map(l=>l.page))];
       }
       documents.push(document);
-    } catch (error) { map.notes.push(`${label} skipped — ${errorMessage(error)}.`); }
+    } catch (error) { map!.notes.push(`${label} skipped — ${errorMessage(error)}.`); }
   };
   for (const section of map.sections) {
     map.currentSection = section.title; await params.onUpdate?.(map);
@@ -384,5 +564,5 @@ export async function runMapFirstRead(params: MapFirstReadParams): Promise<{ map
   const linked = new Set(flatAuthoredQuestions(result).map(q => q.passageId).filter(Boolean));
   for (const { status: _status, ...passage } of map.passages) if (linked.has(passage.id) && !result.passages!.some(p => p.id === passage.id)) result.passages!.push(passage);
   result.questions.sort((a,b)=>a.number-b.number); map.phase = 'completed'; map.currentSection = undefined; await params.onUpdate?.(map);
-  return { map, document: result };
+  return result;
 }

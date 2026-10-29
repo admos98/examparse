@@ -48,6 +48,7 @@ Regenerate with `npm run corpus -- --write-coverage` after adding/reviewing entr
 |---|---|---|---|---|---|---|---|---|
 | born-digital-mock | **EMPTY** | mock-born-digital | **EMPTY** | mock-born-digital | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** |
 | iranian-national-final-en | **EMPTY** | english-final-13991009pq89w65173, iranian-rtl, probe-scanned-noise, probe-two-column | **EMPTY** | english-final-13991009pq89w65173, iranian-rtl, probe-scanned-noise, probe-two-column | probe-scanned-noise | probe-two-column | **EMPTY** | english-final-13991009pq89w65173, probe-scanned-noise, probe-two-column |
+| synthetic-cloze | cloze-passage | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** |
 | synthetic-english | english-mcq, probe-refurnished | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** |
 | synthetic-gauntlet | gauntlet-lazy | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** |
 | synthetic-giant | giant-120 | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** |
@@ -57,18 +58,18 @@ Regenerate with `npm run corpus -- --write-coverage` after adding/reviewing entr
 | synthetic-scanned | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | scanned-noisy | **EMPTY** | **EMPTY** | **EMPTY** |
 | synthetic-two-column | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | **EMPTY** | two-column | **EMPTY** | **EMPTY** |
 
-Entries: 14 (4 reviewed/gating, 10 unreviewed/report-only).
+Entries: 15 (4 reviewed/gating, 11 unreviewed/report-only).
 
 **Uncovered corpus-wide (promote a real exam with these first):** `dialogue`.
 
 **Empty cells by feature (shopping list):**
 - `mcq-heavy`: empty for born-digital-mock, iranian-national-final-en, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
-- `matching`: empty for synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
-- `dialogue`: empty for born-digital-mock, iranian-national-final-en, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
-- `writing-topics`: empty for synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
-- `scanned-ocr`: empty for born-digital-mock, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-two-column
-- `two-column`: empty for born-digital-mock, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned
-- `separate-key-file`: empty for born-digital-mock, iranian-national-final-en, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-pathological, synthetic-scanned, synthetic-two-column
-- `image-heavy`: empty for born-digital-mock, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
+- `matching`: empty for synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
+- `dialogue`: empty for born-digital-mock, iranian-national-final-en, synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
+- `writing-topics`: empty for synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
+- `scanned-ocr`: empty for born-digital-mock, synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-two-column
+- `two-column`: empty for born-digital-mock, synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-keyfile, synthetic-pathological, synthetic-scanned
+- `separate-key-file`: empty for born-digital-mock, iranian-national-final-en, synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-image, synthetic-pathological, synthetic-scanned, synthetic-two-column
+- `image-heavy`: empty for born-digital-mock, synthetic-cloze, synthetic-english, synthetic-gauntlet, synthetic-giant, synthetic-keyfile, synthetic-pathological, synthetic-scanned, synthetic-two-column
 
 <!-- CORPUS-COVERAGE:END -->

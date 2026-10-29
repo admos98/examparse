@@ -65,7 +65,7 @@ test('section prompts include group and passage contract; passage is shared and 
   assert.equal(projected.questions.find(q=>q.no===1)?.instructionGroups,undefined);
   const before = snapshots.find(s=>s.phase==='parse' && s.parsedSections===0)!;
   assert.ok(before); const html = renderToStaticMarkup(React.createElement(MapOutline,{map:before}));
-  assert.match(html,/1a · Exam map/); assert.match(html,/1e Section parse 0\/1/); assert.match(html,/Read the passage/);
+  assert.match(html,/Exam map/); assert.match(html,/Parse: section 0\/1/); assert.match(html,/Read the passage/);
 });
 
 test('section count mismatch is scoped and a boundary continuation merges by number', async () => {

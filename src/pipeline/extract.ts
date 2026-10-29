@@ -2,6 +2,7 @@
  * Stage 1: Document Extraction Pipeline (§6.1)
  * Extracts text lines, line coordinates, and embedded images from PDF, DOCX, TXT, MD, and image scans.
  */
+import { annotateSourceLines } from './lineNormalize';
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
 import { ImageAsset, SourceLine } from '../types';
@@ -54,7 +55,8 @@ export async function extractDocument(
     : extension === 'docx' ? await extractDocx(file, options)
     : ['jpg', 'jpeg', 'png', 'webp'].includes(extension || '') ? await extractSingleImageScan(file)
     : await extractPlainText(file);
-  result.lines = tagFurniture(result.lines, result.pages);
+  // #50 Part C: normalized digit twin + digit-suspect + watermark tags (original text untouched).
+  result.lines = annotateSourceLines(tagFurniture(result.lines, result.pages));
   // A3: line quality scoring (unifies garbled detection)
   const quality = computeLineQuality(result.lines);
   const garbledSet = new Set(quality.filter(q => q.garbled).map(q => q.line));

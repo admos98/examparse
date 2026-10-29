@@ -274,3 +274,20 @@ Suites after the sweep: tsc clean · **163 tests pass** · bench PASS · `vite b
 - Local-only token savings — a regex-only pass cannot omit lines safely (only AI-confirmed junk conf ≥ 8 is omitted), so the F2 token column is honest about −0.6 %.
 - Rewrites that translate or invent, rewrites on numbered/option/digit lines, or any rewrite outside the `rewrites` channel.
 - Any model call in gap completion, ownership, gates, META_TOTAL or the "Fix it" path — all deterministic by design.
+
+## Follow-up #50 — Fix the input, tame the pathologies
+Full report: [`docs/followup-50-report.md`](docs/followup-50-report.md).
+- **A:** stream breaker on every generative call (3 identical top-level items cut the stream). Declared counts plus compile-time reconciliation (`reconciled{truncated,deduped}`). Proportional caps (map 3000, section 800+n×220, fix 400+n×300 clamped to 800–8192). Salvage plus ONE complaint retry. Read-role `repeat_penalty 1.12` with a `[no-repeat-penalty]` rung.
+- **B:** map passage `blanks`; one `fillblank` per blank; `blank-missing` verdict with a section-scoped fix; `cloze-passage` corpus entry at 15/15.
+- **C:** a normalised digit twin per line (original text untouched); `digitSuspect` for corrupt digit runs; `watermark` lines kept but hidden from every prompt.
+- **D:** difficulty is sent as the native llama.cpp score (`criteria` array), gated on a real captured server response. Stored as argmax, `uncertain` when the top level is below 0.4.
+- **E:** one automatic section re-read when a section returns under 50% of its expected questions; the better attempt is kept; counted in `sectionReReads`.
+- Checks: `npm test` 420/420, `tsc` and build clean; existing corpus entries are byte-identical to before.
+
+## Follow-up #51 — Visual map audit + six phases (check, then fix once)
+Full report: [`docs/followup-51-report.md`](docs/followup-51-report.md).
+- **Six phases, one order:** Extract → Map → Parse → Check → Fix → Present. Step 3, the loop receipt (`local-loop-v2`) and the stage ids all use the same six names. `receipt.timeline` records what ran. v1 receipts with the old step names still parse and render.
+- **A, visual map audit:** on a multimodal decide endpoint, three new item kinds (`section-start-visible`, `pictures-present`, `passage-visible`) each send one page image (reused from OCR; nothing new is stored). They route exactly like text votes. Image errors are skipped and counted (short-circuit after 3 in a row) and never stop the text audit. The map outline shows seen ✓ / seen ? / seen ✗ / text only. THX `image-belongs` now actually sends pixels.
+- **B, check then fix once:** Check produces one merged, source-tagged list. When code and the decision audit flag the same concern on the same item, that counts as one verdict and keeps the decision probability. Fix is ONE generative pass batched by section; uncertain votes are hints only. Present re-checks: code with 0 calls, decision re-votes only changed or indicted items (fixture: 30 of 600).
+- **C, deleted:** the self-review step (its instructions moved into the Fix prompt), Final fix as its own phase, and the code-fix-before-audit ordering.
+- Checks: `npm test` 434/434 (−1 deleted self-review test, +15 new). `tsc` and build clean. Corpus entries are identical to #50 on questions, sections, points and surviving verdicts.

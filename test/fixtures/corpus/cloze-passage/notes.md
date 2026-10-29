@@ -1,0 +1,1 @@
+Provenance: synthetic fixture authored for Follow-up #50 Part B. A cloze passage whose numbered blanks (9)–(13) are the questions of Section B — none of them starts a line, so line-start numbering alone never sees them. The scripted reader must map them as passage blanks and parse one fillblank question per blank.

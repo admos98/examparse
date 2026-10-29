@@ -39,7 +39,7 @@ test('THX adapter sends keyed text-only payload and normalizes choice and noul m
   const choiceBody:any={model:provider.model,state:'Q details',questions:{'Q1 choice':{type:'choice',instructions:'Choose',criteria:{a:'a',b:'b'}}}};
   response={'Q1 choice':{a:0.2,b:0.8}};
   const choice=await LLMAdapter.executeDecisions({providerConfig:provider,body:choiceBody});
-  assert.deepEqual(choice.results,[{name:'Q1 choice',probability:0.8,choice:'b'}]);
+  assert.deepEqual(choice.results,[{name:'Q1 choice',probability:0.8,choice:'b',distribution:{a:0.2,b:0.8}}]);
   assert.deepEqual(Object.keys(sent[0].body.questions),['Q1 choice']);assert.equal(sent[0].body.state,'Q details');
   response={'Q2 complete':{yes:0.73}};
   const noul=await LLMAdapter.executeDecisions({providerConfig:provider,body:{model:provider.model,state:'Q',questions:{'Q2 complete':{type:'noul',instructions:'Is complete?'}}} as any});

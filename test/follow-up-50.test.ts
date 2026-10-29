@@ -331,7 +331,7 @@ test('D: captured score responses parse to argmax level + distribution; top < 0.
     const top = Object.entries(distribution).sort((a, b) => b[1] - a[1])[0];
     const document = normalizeAuthoredDocument({ questions: [{ number: 9, type: 'fillblank', stem: 'Asadi Tusi was a famous poet in the (9) ...... century.' }] });
     const dsettings = { ...settings, providers: [{ id: 'llama', name: 'llama', kind: 'openai-compatible', baseURL: 'http://localhost:8080/v1', apiKey: '', decideDialect: 'thx', model: 'local' }], roleMapping: { ...settings.roleMapping, decide: { providerId: 'llama', model: 'local' } } };
-    const result = await runLoopDecisionAudit({ document, lines: [], images: [], settings: dsettings, fileHash: `d-${which}`, decisionCaller: async body => {
+    const result = await runLoopDecisionAudit({ document, lines: [{ id: 'L0001', page: 1, text: 'Asadi Tusi was a famous poet in the (9) ...... century.' }], images: [], settings: dsettings, fileHash: `d-${which}`, decisionCaller: async body => {
       const name = Object.keys(body.questions)[0];
       return name.endsWith('difficulty') ? { results: [{ name, probability: top[1], choice: top[0], distribution }] } : { results: [{ name, probability: .95 }] };
     } });

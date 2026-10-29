@@ -8,6 +8,8 @@ import { DEFAULT_SETTINGS } from '../src/store';
 
 const provider = { id: 'llama', name: 'llama', kind: 'openai-compatible' as const, baseURL: 'http://localhost:8080/v1', apiKey: '', decideDialect: 'thx' as const, model: 'local' };
 const settings = { ...DEFAULT_SETTINGS, providers: [provider], roleMapping: { ...DEFAULT_SETTINGS.roleMapping, decide: { providerId: 'llama', model: 'local' } }, thrift: { ...DEFAULT_SETTINGS.thrift, cacheEnabled: false } };
+// #52: transport tests supply evidence; no-source audits now intentionally make zero calls.
+const evidence = [{ id: 'L0001', page: 1, text: 'A question? Choose the correct word.' }];
 const doc = () => normalizeAuthoredDocument({ questions: [{ number: 1, type: 'short', stem: 'A question?', options: [] }] });
 
 test('THX parses the systemone answers envelope and retains existing fallbacks', async () => {
@@ -19,9 +21,9 @@ test('THX parses the systemone answers envelope and retains existing fallbacks',
     const run = (name: string, question: any) => LLMAdapter.executeDecisions({ providerConfig: provider, body: { state: 'Q', questions: { [name]: question } } as any });
     assert.deepEqual((await run('Q1 complete', { type: 'noul' })).results, [{ name: 'Q1 complete', probability: .87 }]);
     data.answers = { 'Q1 choice': { answer: 'b', probabilities: { a: .2, b: .8 } } };
-    assert.deepEqual((await run('Q1 choice', { type: 'choice', criteria: { a: 'a', b: 'b' } })).results, [{ name: 'Q1 choice', probability: .8, choice: 'b' }]);
+    assert.deepEqual((await run('Q1 choice', { type: 'choice', criteria: { a: 'a', b: 'b' } })).results, [{ name: 'Q1 choice', probability: .8, choice: 'b', distribution: { a: .2, b: .8 } }]);
     data.answers['Q1 choice'] = { probabilities: { a: .9, b: .1 } };
-    assert.deepEqual((await run('Q1 choice', { type: 'choice', criteria: { a: 'a', b: 'b' } })).results, [{ name: 'Q1 choice', probability: .9, choice: 'a' }]);
+    assert.deepEqual((await run('Q1 choice', { type: 'choice', criteria: { a: 'a', b: 'b' } })).results, [{ name: 'Q1 choice', probability: .9, choice: 'a', distribution: { a: .9, b: .1 } }]);
     data.answers = { 'Q1 complete': { probability: .6 } };
     assert.equal((await run('Q1 complete', { type: 'noul' })).results[0].probability, .6);
   } finally { globalThis.fetch = old; }
@@ -29,7 +31,7 @@ test('THX parses the systemone answers envelope and retains existing fallbacks',
 
 test('audit reports progress and defaults localhost THX to one in-flight request', async () => {
   let running = 0, max = 0, calls = 0, binary = 0; const updates: LoopAuditProgress[] = [];
-  const result = await runLoopDecisionAudit({ document: doc(), lines: [], images: [], settings, fileHash: 'test', onProgress: p => updates.push(p), decisionCaller: async body => {
+  const result = await runLoopDecisionAudit({ document: doc(), lines: evidence, images: [], settings, fileHash: 'test', onProgress: p => updates.push(p), decisionCaller: async body => {
     running++; max = Math.max(max, running); await new Promise(r => setTimeout(r, 2)); running--; calls++;
     const name = Object.keys(body.questions)[0];
     // #50 Part D: difficulty is uncertain when its top level is below 0.4 (was: "value 3 is uncertain").
@@ -37,14 +39,14 @@ test('audit reports progress and defaults localhost THX to one in-flight request
     binary++;
     return { results: [{ name, probability: binary === 1 ? .1 : binary === 2 ? .5 : .95 }] };
   } });
-  assert.equal(max, 1); assert.equal(calls, 9); assert.equal(result.catches, 1); assert.equal(result.uncertain, 2);
-  assert.equal(updates[0].total, 9); assert.equal(updates.at(-1)?.decided, 9); assert.equal(updates.at(-1)?.endpointErrors, 0);
-  assert.equal(updates.at(-1)?.recent.length, 9);
+  assert.equal(max, 1); assert.equal(calls, 7); assert.equal(result.catches, 1); assert.equal(result.uncertain, 2);
+  assert.equal(updates[0].total, 7); assert.equal(updates.at(-1)?.decided, 7); assert.equal(updates.at(-1)?.endpointErrors, 0);
+  assert.equal(updates.at(-1)?.recent.length, 7);
 });
 
 test('audit fast-skips after five consecutive endpoint errors', async () => {
   let calls = 0; let progress: LoopAuditProgress | undefined;
-  const result = await runLoopDecisionAudit({ document: doc(), lines: [], images: [], settings, fileHash: 'test', onProgress: p => { progress = p; }, decisionCaller: async () => { calls++; throw new Error('Decisions endpoint HTTP 502'); } });
+  const result = await runLoopDecisionAudit({ document: doc(), lines: evidence, images: [], settings, fileHash: 'test', onProgress: p => { progress = p; }, decisionCaller: async () => { calls++; throw new Error('Decisions endpoint HTTP 502'); } });
   assert.equal(calls, 5); assert.equal(result.mode, 'skipped'); assert.equal(result.endpointErrors, 5);
   assert.equal(progress?.decided, 5); assert.equal(progress?.uncertain, 5); assert.match(result.notes.join(' '), /endpoint unreachable — skipping \(5 errors\)/);
 });
@@ -61,7 +63,7 @@ test('difficulty score uses argmax and is stored as a shadow proposal', async ()
     assert.deepEqual(parsed.results, [{ name: 'Q1 difficulty', probability: .4, choice: '3', distribution: { '1': .1, '2': .2, '3': .4, '4': .2, '5': .1 } }]);
   } finally { globalThis.fetch = old; }
   const document = doc();
-  const result = await runLoopDecisionAudit({ document, lines: [], images: [], settings, fileHash: 'score', decisionCaller: async body => {
+  const result = await runLoopDecisionAudit({ document, lines: evidence, images: [], settings, fileHash: 'score', decisionCaller: async body => {
     const name = Object.keys(body.questions)[0];
     return { results: [{ name, probability: name.endsWith('difficulty') ? .4 : .95, ...(name.endsWith('difficulty') ? { choice: '3' } : {}) }] };
   } });
@@ -80,7 +82,7 @@ test('curriculum keywords choose a clear lesson, and ambiguous active questions 
     { number: 2, type: 'short', stem: 'Choose the correct word.' },
   ] });
   const choiceRequests: any[] = [];
-  await runLoopDecisionAudit({ document, lines: [], images: [], settings: { ...settings, decideMode: 'active' }, fileHash: 'hint', decisionCaller: async body => {
+  await runLoopDecisionAudit({ document, lines: evidence, images: [], settings: { ...settings, decideMode: 'active' }, fileHash: 'hint', decisionCaller: async body => {
     const [name, item] = Object.entries(body.questions)[0] as [string, any];
     if (item.type === 'choice') { choiceRequests.push(item); return { results: [{ name, probability: .6, choice: lessons[0].title }] }; }
     return { results: [{ name, probability: .95, ...(item.type === 'score' ? { choice: '2' } : {}) }] };
@@ -93,7 +95,7 @@ test('curriculum keywords choose a clear lesson, and ambiguous active questions 
 
 test('unmapped subjects and low-confidence curriculum choices remain untagged', async () => {
   const document = normalizeAuthoredDocument({ meta: { grade: '12', subject: 'English' }, questions: [{ number: 1, type: 'short', stem: 'Choose.' }] });
-  await runLoopDecisionAudit({ document, lines: [], images: [], settings: { ...settings, decideMode: 'active' }, fileHash: 'hint-low', decisionCaller: async body => {
+  await runLoopDecisionAudit({ document, lines: evidence, images: [], settings: { ...settings, decideMode: 'active' }, fileHash: 'hint-low', decisionCaller: async body => {
     const [name, item] = Object.entries(body.questions)[0] as [string, any];
     return { results: [{ name, probability: item.type === 'choice' ? .3 : .95, ...(item.type === 'choice' ? { choice: Object.keys(item.criteria)[0] } : item.type === 'score' ? { choice: '2' } : {}) }] };
   } });
@@ -109,14 +111,14 @@ test('actual redacted llama-server systemone capture parses noul and choice', as
     const noul = await LLMAdapter.executeDecisions({ providerConfig: provider, body: { state: 'Q', questions: { answer_ok: { type: 'noul' } } } as any });
     const choice = await LLMAdapter.executeDecisions({ providerConfig: provider, body: { state: 'Q', questions: { correct_letter: { type: 'choice', criteria: { A: 'because', B: 'so', C: 'although', D: 'unless' } } } } as any });
     assert.deepEqual(noul.results, [{ name: 'answer_ok', probability: 0.6527858416386044 }]);
-    assert.deepEqual(choice.results, [{ name: 'correct_letter', probability: 0.6365900484187214, choice: 'B' }]);
+    assert.deepEqual(choice.results, [{ name: 'correct_letter', probability: 0.6365900484187214, choice: 'B', distribution: capture.answers.correct_letter.probabilities }]);
   } finally { globalThis.fetch = old; }
 });
 
 test('explicit local concurrency overrides the single-slot default', async () => {
   let running = 0, max = 0;
   const concurrentSettings = { ...settings, providers: [{ ...provider, decideConcurrency: 2 }] };
-  await runLoopDecisionAudit({ document: doc(), lines: [], images: [], settings: concurrentSettings, fileHash: 'c2', decisionCaller: async body => {
+  await runLoopDecisionAudit({ document: doc(), lines: evidence, images: [], settings: concurrentSettings, fileHash: 'c2', decisionCaller: async body => {
     running++; max = Math.max(max, running); await new Promise(r => setTimeout(r, 4)); running--;
     const name = Object.keys(body.questions)[0];
     return { results: [{ name, probability: .9, ...(name.endsWith('difficulty') ? { choice: '2' } : {}) }] };
@@ -154,8 +156,8 @@ test('live audit transport consumes delayed systemone envelopes and reaches the 
     return { ok: true, json: async () => ({ model: 'redacted', answers: { [name]: answer }, usage: {} }) } as any;
   }) as any;
   try {
-    const result = await runLoopDecisionAudit({ document: doc(), lines: [], images: [], settings, fileHash: 'transport', onProgress: p => updates.push(p) });
-    assert.equal(count, 9); assert.equal(result.verdicts.length, 8); assert.equal(result.catches, 1);
+    const result = await runLoopDecisionAudit({ document: doc(), lines: evidence, images: [], settings, fileHash: 'transport', onProgress: p => updates.push(p) });
+    assert.equal(count, 7); assert.equal(result.verdicts.length, 6); assert.equal(result.catches, 1);
     assert.equal(updates.at(-1)?.decided, updates.at(-1)?.total); assert.equal(updates.at(-1)?.endpointErrors, 0);
   } finally { globalThis.fetch = old; }
 });

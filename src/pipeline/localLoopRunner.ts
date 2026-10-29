@@ -9,7 +9,7 @@ import { DECIDE_CATCH, DECIDE_PASS, DECIDE_TIMEOUT_MS } from './audit';
 import {
   LOOP_VERSION, LOOP_FIX_SYSTEM, LOOP_READ_SYSTEM, applyCorrections, applyMetaCorrection,
   buildLoopPagePrompt, buildLoopPages, checkAuthoredDocument, assignAuthoredImages, errorMessage, flaggedFixInput,
-  mergePageReads, newLoopReceipt, pageFromResponse, parseCorrections, mergeVerdicts, batchVerdictsBySection, changedQuestionNumbers,
+  mergePageReads, newLoopReceipt, pageFromResponse, parseCorrections, mergeVerdicts, batchVerdictsBySection, fixRouting, changedQuestionNumbers,
   callWithOneRetry, fixOutputCap, pathologyNote, responsePathology, flatAuthoredQuestions,
   type LoopModelCaller, type LoopPathologyRecord, type LoopReceipt, type LoopPhaseId, type LoopStepId, type LoopVerdict,
 } from './localLoop';
@@ -202,7 +202,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     id: `code:invalid-json-remnant:page-${p.page}`, kind: 'invalid-json-remnant' as const, questionNumbers: [], source: 'code' as const, page: p.page,
     message: `Page ${p.page} contained an invalid JSON remnant; only complete question objects were kept.`,
   })) ];
-  const check = () => [...checkAuthoredDocument(receipt.document, images, remnants), ...sectionReadVerdicts(receipt.map, receipt.document, lines)];
+  const check = () => [...checkAuthoredDocument(receipt.document, images, remnants, lines), ...sectionReadVerdicts(receipt.map, receipt.document, lines)];
   const auditProgressText = (count: number) => `Auditing ${count} questions + ${images.length} images`;
   let audit: LoopAuditResult | undefined;
   await safe('check', async () => {
@@ -221,10 +221,10 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
         } });
     } catch (error) { note(receipt, 'check', `Decision audit skipped — ${errorMessage(error)}; code verdicts stand alone.`); }
     if (audit) {
-      receipt.auditMode = audit.mode; receipt.auditVerdicts = audit.verdicts;
+      receipt.auditMode = audit.mode; receipt.auditVerdicts = audit.verdicts; receipt.skippedNoEvidence = audit.skippedNoEvidence;
       if (audit.dialect && audit.endpointHost) receipt.decisionProvenance = { dialect: audit.dialect, host: audit.endpointHost };
       row.calls = audit.calls; row.inputTokens = audit.usage.inputTokens; row.outputTokens = audit.usage.outputTokens;
-      if (row.auditProgress) { const p = row.auditProgress; note(receipt, 'check', `Decision audit · ${p.decided}/${p.total} decided · ${p.catches} catches · ${p.uncertain} uncertain · ${p.endpointErrors} endpoint errors · ${p.rate.toFixed(1)}/s`); }
+      if (row.auditProgress) { const p = row.auditProgress; note(receipt, 'check', `Decision audit · ${p.decided}/${p.total} decided · ${p.catches} catches · ${p.uncertain} uncertain · ${p.endpointErrors} endpoint errors · ${p.skippedNoEvidence} skipped-no-evidence · ${p.rate.toFixed(1)}/s`); }
       if (audit.calls) params.onUsage?.('check', audit.usage, `Decision audit · ${audit.calls} request(s)`, false, 'decide');
       for (const message of audit.notes) note(receipt, 'check', message);
       if (audit.mode === 'shadow') note(receipt, 'check', 'Shadow mode — decision verdicts reported only; Fix receives the code verdicts alone.');
@@ -246,10 +246,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
   const active = receipt.auditMode === 'active';
   const merged = receipt.mergedVerdicts || [];
   // Shadow mode reports only: the fixer never sees a decision probability.
-  const scope = active
-    ? merged.filter(v => v.source === 'code' || v.sources?.includes('code') || (v.source === 'decision' && (v.probability ?? 1) <= DECIDE_CATCH))
-    : receipt.codeVerdicts;
-  const hints = active ? merged.filter(v => v.source === 'decision' && !v.sources && (v.probability ?? 1) > DECIDE_CATCH && (v.probability ?? 1) < DECIDE_PASS).map(v => ({ ...v, hint: true })) : [];
+  const { scope, hints } = fixRouting(receipt.codeVerdicts, receipt.auditVerdicts, active, DECIDE_CATCH, DECIDE_PASS);
   let changed: number[] = [];
   await safe('fix', async () => {
     const row = phaseRow('fix');

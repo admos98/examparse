@@ -15,6 +15,7 @@ import {
   FileCheck,
 } from 'lucide-react';
 import { AppSettings, ProviderConfig, ProviderKind } from '../types';
+import { calibrationSummary, parseDecisionCalibrationReport } from '../pipeline/decisionCalibration';
 import { applyTheme } from '../pipeline/agentTheme';
 import { StoragePanel } from './StoragePanel';
 import { MemoryPanel } from './MemoryPanel';
@@ -662,6 +663,15 @@ export const SettingsModal: React.FC<Props> = ({
                           <label className="block text-[length:var(--type-12)]">Decisions path<input value={current.providers.find(p => p.id === sel.providerId)?.decisionsPath || '/v1/decisions'} onChange={event => handleUpdateProvider(sel.providerId, { decisionsPath: event.target.value })} className="mt-1 w-full rounded-[6px] border bg-[var(--paper-raised)] p-2 font-mono" /></label>
                           <label className="flex items-center gap-2"><input type="checkbox" checked={current.decideMultimodal === true} onChange={event => setCurrent(prev => ({ ...prev, decideMultimodal: event.target.checked }))} />Multimodal build (mmproj): send image pixels for image-belongs and the visual map audit</label>
                           <label className="flex items-center gap-2">Mode<select value={current.decideMode || 'shadow'} onChange={event => setCurrent(prev => ({ ...prev, decideMode: event.target.value as 'shadow' | 'active' }))} className="rounded-[6px] border bg-[var(--paper-raised)] p-1"><option value="shadow">Shadow — report only</option><option value="active">Active — route confident-wrong items to Fix</option></select></label>
+                          <p className="text-[length:var(--type-12)] text-[var(--ink-2)]">{calibrationSummary(current.decideCalibration, sel.model, (() => { try { return new URL(current.providers.find(p => p.id === sel.providerId)?.baseURL || '').host; } catch { return ''; } })(), current.providers.find(p => p.id === sel.providerId)?.decideDialect || 'jev')}</p>
+                          <label className="block text-[length:var(--type-12)]">Import calibration report (report-only; never enables Active)<input type="file" accept="application/json,.json" className="mt-1 block" onChange={async event => {
+                            const file = event.target.files?.[0]; if (!file) return;
+                            try { const report = parseDecisionCalibrationReport(JSON.parse(await file.text())); setCurrent(prev => ({ ...prev, decideCalibration: report })); }
+                            catch { window.alert('Invalid calibration report. Run npm run calibrate:decide -- --live and import its JSON output.'); }
+                            event.target.value = '';
+                          }} /></label>
+                          {current.decideCalibration && <details className="text-[length:var(--type-12)]"><summary>Per-kind calibration ({current.decideCalibration.mode})</summary>{Object.entries(current.decideCalibration.perKind).map(([kind, counts]) => <p key={kind}>{kind}: catches {counts.catches}/{counts.planted}; false indictments {counts.falseAlarms}/{counts.clean}</p>)}</details>}
+
                         </div>}
                         {(() => {
                           const sbRole = role === 'agent' ? 'fast' : role;

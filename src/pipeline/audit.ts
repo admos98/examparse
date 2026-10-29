@@ -28,6 +28,13 @@ import { scopedReask } from './compile';
 import type { RepairState } from './repairLoop';
 import { lineNo } from './classify';
 
+/** #52: noul bands are unchanged, NOT empirically calibrated. The synthetic-65-v1
+ * SCRIPTED Check→Fix harness catches 7/7 plants with 0/67 clean-unit indictments;
+ * that proves routing only, not model reliability. Field evidence: ratification hedges
+ * at .55–.77; blind choices agree on 50, disagree on 2 ambiguous, flat on 6;
+ * thematic sentence choices 4/4 at .97–.98. These are not per-kind ROC estimates.
+ * Use `npm run calibrate:decide -- --live` before promotion. No per-kind threshold
+ * adjustments are licensed without live fixture catch/false-alarm numbers in the PR. */
 export const DECIDE_PASS = 0.80;
 export const DECIDE_CATCH = 0.20;
 export const DECIDE_TIMEOUT_MS = 30000;

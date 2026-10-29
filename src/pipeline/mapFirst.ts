@@ -2,7 +2,7 @@
 import type { AppSettings, ImageAsset, SourceLine } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { DECIDE_CATCH, DECIDE_PASS, DECIDE_TIMEOUT_MS } from './audit';
-import { decideIsMultimodal, resolveDecisionProvider, type LoopDecisionCaller } from './loopAudit';
+import { elideMiddle, blindChoiceSoundProbability, decideIsMultimodal, resolveDecisionProvider, type LoopDecisionCaller } from './loopAudit';
 import { enumerateExpectedQuestionNos } from './quality';
 import { estimateTokens } from './memory/tokens';
 import { modelText } from './lineNormalize';
@@ -127,9 +127,9 @@ export function regionForRange(lines: SourceLine[], first: number, last: number,
 }
 export function edgeText(lines: SourceLine[], first: number, last: number, maxChars = 1800): string {
   const expected = enumerateExpectedQuestionNos(lines); const indexes = [first, last].map(n => lineIndex(lines, expected.lineByNumber.get(n))).filter(n => n >= 0);
-  if (!indexes.length) return lines.filter(l => !l.watermark).slice(0, 10).map(modelText).join('\n').slice(0, maxChars);
+  if (!indexes.length) return elideMiddle(lines.filter(l => !l.watermark).slice(0, 10).map(modelText).join('\n'), maxChars);
   const selected = new Set<number>(); for (const idx of indexes) for (let i = Math.max(0, idx-3); i < Math.min(lines.length, idx+4); i++) selected.add(i);
-  return [...selected].sort((a,b)=>a-b).filter(i => !lines[i].watermark).map(i => modelText(lines[i])).join('\n').slice(0, maxChars);
+  return elideMiddle([...selected].sort((a,b)=>a-b).filter(i => !lines[i].watermark).map(i => modelText(lines[i])).join('\n'), maxChars);
 }
 export function sectionContract(map: LoopMapReceipt, section: MapSection): object {
   return { section: { title: section.title, firstQuestion: section.firstQuestion, lastQuestion: section.lastQuestion, questionCount: section.questionCount, kind: section.kind, status: section.status },
@@ -213,7 +213,7 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
   const provider = resolveDecisionProvider(params.settings);
   if (!provider) { map.notes.push('Map audit skipped — no decide endpoint configured; raw map retained.'); return; }
   const mode = params.settings.decideMode ?? 'shadow';
-  const items: Array<{ id: string; kind: string; instructions: string; choices?: string[]; first: number; last: number; context: unknown }> = [];
+  const items: Array<{ id: string; kind: string; instructions: string; choices?: string[]; choiceDescriptions?: Record<string, string>; first: number; last: number; context: unknown }> = [];
   map.sections.forEach((s, i) => {
     const contract = sectionContract(map, s); const common = { id: `section:${i}`, first: s.firstQuestion, last: s.lastQuestion, context: contract };
     items.push({ ...common, kind: 'section-boundary', instructions: `In the source, does section ${s.title} span questions ${s.firstQuestion}–${s.lastQuestion}?` });
@@ -221,7 +221,11 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
     items.push({ ...common, kind: 'kind-plausible', instructions: `Is the declared kind ${s.kind} right for this section's questions?` });
   });
   map.instructionGroups.forEach((g,i) => items.push({ id:`instruction:${i}`, kind:'instruction-scope', first:g.appliesToFirst,last:g.appliesToLast, context:g, instructions:`Does this instruction govern questions ${g.appliesToFirst}–${g.appliesToLast}?` }));
-  map.passages.forEach((p,i) => items.push({ id:`passage:${i}`, kind:'passage-scope', first:p.appliesToFirst,last:p.appliesToLast, context:p, instructions:`Is this the passage questions ${p.appliesToFirst}–${p.appliesToLast} refer to?` }));
+  map.passages.forEach((p,i) => items.push({ id:`passage:${i}`, kind:'passage-scope', first:p.appliesToFirst,last:p.appliesToLast,
+    context: { firstQuestion: p.appliesToFirst, lastQuestion: p.appliesToLast },
+    instructions: `Which passage do questions ${p.appliesToFirst}–${p.appliesToLast} refer to?`,
+    choices: [...map.passages.map((_, index) => `passage-${index + 1}`), 'none'],
+    choiceDescriptions: { ...Object.fromEntries(map.passages.map((candidate, index) => [`passage-${index + 1}`, candidate.text])), none: 'None of these passages' } }));
   let errors = 0; let endpointDown = false;
   const recordVote = (entryIds: string[], kind: string, probability: number, choice: string | undefined, visual: boolean) => {
     const indicted = mode === 'active' && probability <= DECIDE_CATCH;
@@ -250,11 +254,11 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
     let context = JSON.stringify(summarize(item.context, summaryLimit));
     let edge = edgeText(params.lines, item.first, item.last, thx ? 1200 : 10000);
     const name = `${item.id} ${item.kind}`;
-    const makeBody = (): any => thx ? { model: provider.model, state: `Map entry: ${context}\nSource edges: ${edge}`, questions: { [name]: { type: item.choices ? 'choice' : 'noul', instructions: item.instructions, ...(item.choices ? { criteria: Object.fromEntries(item.choices.map(c=>[c,c])) } : {}) } } }
-      : { input: { purpose: 'audit proposed exam map' }, questions: [{ name, type: item.choices ? 'choice' : 'probability', instructions: item.instructions, input: { entry: item.context, sourceEdges: edge }, ...(item.choices ? { choices: item.choices } : {}) }] };
+    const makeBody = (): any => thx ? { model: provider.model, state: `Map entry: ${context}\nSource edges: ${edge}`, questions: { [name]: { type: item.choices ? 'choice' : 'noul', instructions: item.instructions, ...(item.choices ? { criteria: item.choiceDescriptions || Object.fromEntries(item.choices.map(c=>[c,c])) } : {}) } } }
+      : { input: { purpose: 'audit proposed exam map' }, questions: [{ name, type: item.choices ? 'choice' : 'probability', instructions: item.instructions, input: { entry: item.context, sourceEdges: edge }, ...(item.choices ? { choices: item.choices, ...(item.choiceDescriptions ? { choiceDescriptions: item.choiceDescriptions } : {}) } : {}) }] };
     let body = makeBody();
     if (thx) {
-      while (edge.length > 200 && estimateTokens(JSON.stringify(body)) > 900) { edge = edge.slice(0, Math.floor(edge.length * 0.8)); body = makeBody(); }
+      while (edge.length > 200 && estimateTokens(JSON.stringify(body)) > 900) { edge = elideMiddle(edge, Math.floor(edge.length * 0.8)); body = makeBody(); }
       while (summaryLimit > 20 && estimateTokens(JSON.stringify(body)) > 900) { summaryLimit = Math.max(20, Math.floor(summaryLimit * 0.7)); context = JSON.stringify(summarize(item.context, summaryLimit)); body = makeBody(); }
       if (estimateTokens(JSON.stringify(body)) > 1000) { map.notes.push(`Map audit ${item.kind} for ${item.id} exceeds the THX context cap; entry remains unreviewed.`); continue; }
     }
@@ -268,6 +272,10 @@ async function auditMap(map: LoopMapReceipt, params: MapFirstReadParams): Promis
       if (item.kind === 'section-title') {
         const s = map.sections[Number(item.id.split(':')[1])];
         probability = row?.choice === s.title ? probability : row?.choice && item.choices?.includes(row.choice) ? 1 - probability : 0.5;
+      }
+      if (item.kind === 'passage-scope' && item.choices) {
+        const expected = `passage-${Number(item.id.split(':')[1]) + 1}`;
+        probability = blindChoiceSoundProbability(expected, item.choices, { probability: p, choice: row?.choice, distribution: row?.distribution });
       }
       recordVote([item.id], item.kind, probability, row?.choice, false);
     } catch (error) {
@@ -290,7 +298,7 @@ export function visualMapItems(map: LoopMapReceipt, lines: SourceLine[], images:
   });
   const imagePages = new Map<number, string[]>();
   map.images.forEach((m, i) => { const page = images.find(im => im.id === m.imageId)?.page; if (page !== undefined) imagePages.set(page, [...(imagePages.get(page) || []), `image:${i}`]); });
-  for (const [page, entryIds] of [...imagePages].sort((a, b) => a[0] - b[0])) items.push({ kind: 'pictures-present', entryIds, page, claim: 'This page contains one or more pictures that exam questions refer to.' });
+  for (const [page, entryIds] of [...imagePages].sort((a, b) => a[0] - b[0])) items.push({ kind: 'pictures-present', entryIds, page, claim: 'This page contains one or more pictures that exam questions refer to. A picture belongs to a question when it shows the situation, activity, or subject that question or its correct sentence describes; a typical illustrative scene counts as a match.' });
   const squash = (t: string) => t.replace(/\s+/g, ' ').trim().toLowerCase();
   map.passages.forEach((p, i) => {
     const prefix = squash(p.text).slice(0, 40);

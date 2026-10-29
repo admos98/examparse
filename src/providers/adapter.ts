@@ -201,6 +201,16 @@ export class LLMAdapter {
       const response = await fetch('/api/decisions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providerConfig, body }), signal: controller.signal });
       if (!response.ok) throw new Error(`Decisions endpoint HTTP ${response.status}`);
       const data = await response.json();
+      return LLMAdapter.parseDecisionResponse(providerConfig, body, data);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Shared decoder for the browser proxy and the report-only direct calibration CLI. */
+  static parseDecisionResponse(providerConfig: ProviderConfig, body: any, data: any): {
+    results: Array<{ name: string; probability: number; choice?: string; distribution?: Record<string, number> }>
+  } {
       if (providerConfig.decideDialect === 'thx') {
         const item = Array.isArray(body.questions) ? body.questions[0] : (() => { const [name, value] = Object.entries(body.questions as any)[0] || ['', {}]; return { name, ...(value as any) }; })();
         const itemName = item.name || Object.keys(body.questions as any)[0];
@@ -225,11 +235,11 @@ export class LLMAdapter {
           const candidates = choices.length ? choices : Object.keys(values).filter(c => validNumber(values[c]));
           const available = candidates.filter((c: string) => values[c] !== undefined && validNumber(values[c]));
           const answer = typeof map.answer === 'string' ? map.answer : typeof map.choice === 'string' ? map.choice : undefined;
-          const choice = item.type !== 'score' && answer && (available.includes(answer) || !available.length) ? answer : available.reduce((best: string, c: string) => Number(values[c]) > Number(values[best]) ? c : best, available[0]);
+          const choice = available.length ? available.reduce((best: string, c: string) => Number(values[c]) > Number(values[best]) ? c : best, available[0]) : answer;
           const rawProbability = choice !== undefined ? (values[choice] ?? map.probability) : map.probability;
           const probability = Number(rawProbability);
           if (!choice || !validNumber(rawProbability)) throw new Error('THX decision response malformed');
-          return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, probability)), choice }] };
+          return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, probability)), choice, ...(available.length ? { distribution: Object.fromEntries(available.map((c: string) => [c, Math.min(1, Math.max(0, Number(values[c])))])) } : {}) }] };
         }
         const rawYes = values.yes ?? values.Yes ?? map.noul ?? map.probability;
         const yes = Number(rawYes);
@@ -237,10 +247,7 @@ export class LLMAdapter {
         return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, yes)) }] };
       }
       if (!data || !Array.isArray(data.results)) throw new Error('Decisions endpoint returned no results array');
-      return { results: data.results.filter((result: any) => result && result.probability !== null && result.probability !== undefined && result.probability !== '' && Number.isFinite(Number(result.probability))).map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability))), ...(result.choice === undefined ? {} : { choice: String(result.choice) }) })) };
-    } finally {
-      clearTimeout(timer);
-    }
+      return { results: data.results.filter((result: any) => result && result.probability !== null && result.probability !== undefined && result.probability !== '' && Number.isFinite(Number(result.probability))).map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability))), ...(result.choice === undefined ? {} : { choice: String(result.choice) }), ...(result.distribution && typeof result.distribution === 'object' ? { distribution: result.distribution } : {}) })) };
   }
 
   /**

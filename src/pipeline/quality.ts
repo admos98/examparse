@@ -563,7 +563,7 @@ export interface MetaTotalReconciliation {
   totals: DocumentTotals;
 }
 /** C1 — source-declared total wins; question-point mismatches are reported, never repaired by changing the total. */
-export function reconcileMetaTotal(metaTotal: number | undefined, lines: SourceLine[], keyLines: Set<number> | number[], _questions: Array<{ points?: number; parentId?: string }> = []): MetaTotalReconciliation {
+export function reconcileMetaTotal(metaTotal: number | undefined, lines: SourceLine[], keyLines: Set<number> | number[], _questions: Array<{ points?: number | null; parentId?: string }> = []): MetaTotalReconciliation {
   const totals = extractDocumentTotals(lines, keyLines);
   let total = metaTotal;
   let flag: MetaTotalReconciliation['flag'];

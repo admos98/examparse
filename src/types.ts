@@ -75,7 +75,12 @@ export interface Question {
   sectionId?: string;
   spans: LineSpan[]; // stem location(s) in source
   stem?: string; // assembled locally from spans + rewrites
-  points?: number;
+  points?: number | null;
+  /** Original package fields, retained verbatim and never used as model-authored provenance. */
+  imported?: Record<string, any>;
+  /** Offsets into the imported stem for inline image references. */
+  packageImagePositions?: Array<{ imageId: string; offset: number }>;
+  enrichment?: QuestionEnrichment;
   type:
     | 'mcq'
     | 'truefalse'
@@ -125,6 +130,21 @@ export interface Question {
   /** Optional deterministic provenance; legacy persisted questions need not carry it. */
   receipt?: QuestionReceipt;
   flags?: string[];
+}
+
+export interface QuestionEnrichment {
+  source: 'model';
+  verification: 'verified' | 'disagreed' | 'uncertain' | 'unjudged';
+  verificationProbability?: number;
+  checkerChoice?: string;
+  completeness?: { probability: number };
+  lessons?: Array<{ lesson: string; probability: number }>;
+  lessonDistribution?: Record<string, number>;
+  origin?: 'single' | 'multi' | 'beyond-book';
+  demand?: { value: 'recall' | 'comprehension' | 'inference'; probability: number; distribution?: Record<string, number> };
+  readingMode?: { value: 'direct-finding' | 'comprehension'; probability: number; distribution?: Record<string, number> };
+  teacherLesson?: { lesson: string; source: 'teacher' };
+  imagePlacement?: Array<{ imageId: string; state: 'verified' | 'disagreed' | 'uncertain' | 'skipped-no-evidence'; probability?: number; choice?: string }>;
 }
 
 export interface ImageAsset {
@@ -254,6 +274,11 @@ export interface ExamDoc {
   questions: Question[];
   images: ImageAsset[];
   source: {
+    kind?: 'package' | 'pdf' | 'word';
+    packageBatchId?: string;
+    packageDataset?: string;
+    enrichmentStatus?: 'not run' | 'completed' | 'partial';
+    enrichmentNotes?: string[];
     diagnostics?: import('./pipeline/extractionQuality').ExtractionDiagnostics;
     lines: SourceLine[];
     pages: number;

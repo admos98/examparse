@@ -363,6 +363,13 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     }));
   }
 
+  for (const flag of flags.filter(flag => flag.code === 'PACKAGE_ENRICHMENT')) {
+    const question = questionById(doc, flag.questionId);
+    if (!question) continue;
+    items.push(questionItem({ kind: 'audit-catch', rootCauseId: flag.rootCauseId || flag.id, question,
+      sentence: `${labelOf(question)}: ${flag.message}`, actionLabel: 'Go', severity: 'warn' }));
+  }
+
   // 5. Metadata and failed Global Read (per-page or whole-paper) are explicit teacher work, never silent parse state.
   for (const flag of flags.filter(flag => flag.code === 'META_MISSING')) {
     items.push({ id: `metadata-missing_${flag.rootCauseId || flag.id}`, kind: 'metadata-missing', rootCauseId: flag.rootCauseId || flag.id, plainSentence: `${flag.message} [Set]`, action: { target: 'question', label: 'Set' }, questionIds: [], imageIds: [], count: 1, severity: 'warn' });

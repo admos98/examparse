@@ -94,7 +94,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
           <span className="ep-question-number">{nestedLabel}</span>
           <div className="ep-question-stem"><DirectionalText text={stem} fallback={fallbackDir} /></div>
         </div>
-        {q.points !== undefined && <span className="ep-marginalia">({formatNum(q.points)} {t('points', 'نمره')})</span>}
+        {q.points != null && <span className="ep-marginalia">({formatNum(q.points)} {t('points', 'نمره')})</span>}
       </div>
       {groupImages && groupImages.some(Boolean) && <div className="py-1 text-center">{groupImages}</div>}
       {q.tables?.length ? <div className="py-2 overflow-x-auto">{q.tables.map((table, index) => {

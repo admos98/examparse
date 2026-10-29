@@ -15,17 +15,19 @@ import { createDemoExamDoc } from '../pipeline/demoData';
 import { ExamDoc, getDisplayName } from '../types';
 import { loadExamDoc } from '../store';
 import { sha256 } from '../utils/hash';
+import { importQuestionPackage } from '../pipeline/packageImport';
 import { MAX_SOURCE_FILE_BYTES } from '../utils/validation';
 
 interface Props {
   onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null, fileHash?: string) => void;
   onDemoLoaded: (demoDoc: ExamDoc) => void;
+  onPackageLoaded: (doc: ExamDoc) => void | Promise<void>;
   isLoading: boolean;
   cacheEnabled?: boolean;
   onOpenSavedExam?: (doc: ExamDoc) => void;
 }
 
-export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
+export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, onPackageLoaded, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
   const [dragOver, setDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'upload' | 'paste'>('upload');
@@ -85,11 +87,21 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
     }
   };
 
+  const handlePackageFiles = async (files: File[]) => {
+    setErrorMessage(null);
+    try {
+      if (files.reduce((sum, f) => sum + f.size, 0) > MAX_SOURCE_FILE_BYTES) throw new Error('Package exceeds the import size limit.');
+      await onPackageLoaded(await importQuestionPackage(files));
+    } catch (err: any) { setErrorMessage(`Failed to import package: ${err.message || err}`); }
+  };
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileProcess(e.dataTransfer.files[0]);
+      const files = Array.from(e.dataTransfer.files);
+      if (files.some(f => /\.json$/i.test(f.name))) void handlePackageFiles(files);
+      else handleFileProcess(files[0]);
     }
   };
 
@@ -277,6 +289,15 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, i
           </div>
         </div>
       )}
+
+      <div className="p-4 rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] space-y-2">
+        <h2 className="font-semibold text-sm">Import question package</h2>
+        <p className="text-xs text-[var(--ink-2)]">Select a package JSON with its images, or choose its folder. Appendix A batches are supported too.</p>
+        <div className="flex gap-3 flex-wrap text-xs">
+          <label className="border rounded px-3 py-2 cursor-pointer">Choose files<input type="file" multiple accept=".json,image/*" className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
+          <label className="border rounded px-3 py-2 cursor-pointer">Choose folder<input type="file" multiple {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
+        </div>
+      </div>
 
       {/* Secondary Options Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

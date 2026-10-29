@@ -17,14 +17,14 @@ export function QuestionBankExportDialog({ doc, settings, onClose, onTagged }: {
   const [warning, setWarning] = useState('');
   const summary = useMemo(() => {
     const questions = bankQuestions(doc); const lessons = curriculumLessons(doc.meta.grade, doc.meta.subject);
-    const tagged = questions.filter(q => q.curriculumHints?.lesson || keywordCurriculumHint(lessons, `${bankStem(doc, q)} ${bankOptions(doc, q).map(o => o.text).join(' ')}`)).length;
+    const tagged = questions.filter(q => doc.source.kind === 'package' ? Boolean(q.enrichment?.teacherLesson || (q.enrichment?.lessons?.[0]?.probability ?? 0) >= .5) : Boolean(q.curriculumHints?.lesson || keywordCurriculumHint(lessons, `${bankStem(doc, q)} ${bankOptions(doc, q).map(o => o.text).join(' ')}`))).length;
     return { total: questions.length, tagged, untagged: questions.length - tagged };
   }, [doc]);
   const invalidate = () => { setResult(null); setError(''); setWarning(''); };
   const generate = async () => {
     setBusy(true); setError(''); setResult(null); setWarning('');
     try {
-      const tagged = await tagBankQuestions({ doc, settings, includeModelDifficulty, onProgress: p => {
+      const tagged = doc.source.kind === 'package' ? { doc, skipped: false, endpointErrors: 0 } : await tagBankQuestions({ doc, settings, includeModelDifficulty, onProgress: p => {
         setStatus(p.total ? `Tagging ${p.total} questions… ${p.completed}/${p.total}${p.skipped ? ` · endpoint unreachable — skipping (${p.endpointErrors} errors)` : ''}` : 'Preparing question bank…');
       } });
       if (tagged.skipped) setWarning(`Decision endpoint unreachable — tagging stopped after ${tagged.endpointErrors} errors. Untagged questions are still exported.`);
@@ -41,8 +41,8 @@ export function QuestionBankExportDialog({ doc, settings, onClose, onTagged }: {
       <label className="block font-medium">Source dataset<input className="mt-1 w-full rounded border bg-[var(--paper-raised)] p-2" value={sourceDataset} onChange={e => { setSourceDataset(e.target.value); invalidate(); }} disabled={busy} /></label>
       <div><strong>Provenance:</strong> {provenance.source_type === 'official_cited' ? 'Official cited' : 'Authored'}{provenance.source_type === 'authored' && ' · source reference: null'}</div>
       {provenance.source_type === 'official_cited' && <label className="block font-medium">Source reference<input className="mt-1 w-full rounded border bg-[var(--paper-raised)] p-2" value={sourceRef} onChange={e => { setSourceRef(e.target.value); invalidate(); }} disabled={busy} /></label>}
-      <label className="flex items-center gap-2"><input type="checkbox" checked={includeModelDifficulty} disabled={busy} onChange={e => { setIncludeModelDifficulty(e.target.checked); invalidate(); }} />Include model-estimated difficulty proposals (shadow mode)</label>
-      <p>Curriculum hints: {summary.tagged} tagged · {summary.untagged} untagged of {summary.total}. Active decision mode may add hints during export.</p>
+      {doc.source.kind !== 'package' && <label className="flex items-center gap-2"><input type="checkbox" checked={includeModelDifficulty} disabled={busy} onChange={e => { setIncludeModelDifficulty(e.target.checked); invalidate(); }} />Include model-estimated difficulty proposals (shadow mode)</label>}
+      <p>Curriculum hints: {summary.tagged} tagged · {summary.untagged} untagged of {summary.total}. {doc.source.kind === 'package' ? 'Package exports use confirmed or sufficiently strong enrichment lessons.' : 'Active decision mode may add hints during export.'}</p>
       {status && <p role="status" aria-live="polite">{status}</p>}
       {warning && <p role="status" className="text-[var(--warn-ink)]">{warning}</p>}
       {error && <p role="alert" className="text-[var(--danger)]">{error}</p>}

@@ -93,6 +93,7 @@ export interface LoopReceipt {
   notes: string[];
   auditMode: 'shadow' | 'active' | 'skipped';
   map?: import('./mapFirst').LoopMapReceipt;
+  skippedNoEvidence?: number;
   pointsWithdrawn?: number;
   /** #50 Part A: list elements dropped at compile (beyond a declared count / exact duplicates). */
   reconciled?: { truncated: number; deduped: number };
@@ -180,6 +181,13 @@ export function hintMessage(v: LoopVerdict): string {
   const what = HINT_PHRASE[v.kind as LoopDecisionKind] || v.kind;
   const who = v.imageId ? `image ${v.imageId}` : v.questionNumbers.map(n => `Q${n}`).join(', ') || 'this item';
   return `Hint: the audit is unsure whether ${who} is ${what} (p=${(v.probability ?? 0.5).toFixed(2)}) — check it while you're here; change it only if the source shows a defect.`;
+}
+/** Shared Check → Fix routing law. Calibration plants defects at this boundary (after compile). */
+export function fixRouting(code: LoopVerdict[], decisions: LoopVerdict[], active: boolean, catchAt = 0.20, passAt = 0.80) {
+  const merged = mergeVerdicts(code, decisions, passAt);
+  const scope = active ? merged.filter(v => v.source === 'code' || v.sources?.includes('code') || (v.source === 'decision' && (v.probability ?? 1) <= catchAt)) : code;
+  const hints = active ? merged.filter(v => v.source === 'decision' && !v.sources && (v.probability ?? 1) > catchAt && (v.probability ?? 1) < passAt).map(v => ({ ...v, hint: true })) : [];
+  return { merged, scope, hints };
 }
 /** Fix batches: by section, ≤ maxQuestions flagged numbers each; every verdict travels once with its
  * questions. Document-level verdicts (no numbers) ride in the first batch. Hints join only batches that
@@ -542,7 +550,18 @@ export function assignAuthoredImages(doc: AuthoredDocument, images: ImageAsset[]
   }
 }
 
-export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[], remnants: LoopVerdict[] = []): LoopVerdict[] {
+/** Conservative source-prefix check: only an explicit numbered source question can prove a
+ * nonempty authored stem was cut off mid-sentence. No language-model vote is needed. */
+export function sourceProvesTruncatedStem(q: AuthoredQuestion, lines: SourceLine[]): boolean {
+  if (q.stem.trim().length < 12 || /[.?!…؟]$/.test(q.stem.trim())) return false;
+  return lines.some(line => {
+    const match = /^\s*(\d+)[.)]\s+(.+)$/.exec(normalizeDigits(line.text));
+    if (!match || Number(match[1]) !== q.number) return false;
+    const source = match[2].replace(/\s+[a-d]\)\s.*$/i, '').replace(/\s*\[[\d.]+\]\s*$/, '').trim();
+    return source.startsWith(q.stem.trim()) && source.length - q.stem.trim().length >= 4 && /[.?!؟]$/.test(source);
+  });
+}
+export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[], remnants: LoopVerdict[] = [], lines: SourceLine[] = []): LoopVerdict[] {
   const verdicts: LoopVerdict[] = [...remnants];
   const questions = flatAuthoredQuestions(doc);
   const add = (kind: CodeVerdictKind, numbers: number[], message: string, extra: Partial<LoopVerdict> = {}) => verdicts.push({ id: `code:${kind}:${numbers.join(',') || extra.imageId || 'exam'}`, kind, questionNumbers: numbers, message, source: 'code', ...extra });
@@ -564,6 +583,7 @@ export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[
     if (q.passageId && !(doc.passages || []).some(p => p.id === q.passageId)) add('passage-missing', [q.number], `Question ${q.number} links passage ${q.passageId}, but the passage body is absent.`, { page: q.sourcePages?.[0] });
     if (passage && q.stem.length>300 && passage.text.length>100 && q.stem.includes(passage.text.slice(0,100))) add('passage-in-stem',[q.number],`Question ${q.number} duplicates passage text in its stem.`);
     if (!q.passageId && (/\b(passage|paragraph|text above|second line)\b/i.test(q.stem) || /reading/i.test(q.sectionTitle||'')) && !(doc.passages||[]).some(p=>sectionKey(p.sectionTitle)===sectionKey(q.sectionTitle))) add('passage-missing',[q.number],`Question ${q.number} refers to a passage but no passage is attached.`,{page:q.sourcePages?.[0]});
+    if (sourceProvesTruncatedStem(q, lines)) add('empty-stem', [q.number], `Question ${q.number} has source-proven truncated question text.`);
     if (!q.stem.trim() && !q.subQuestions?.length) add('empty-stem', [q.number], `Question ${q.number} has no question text.`);
     if (['mcq', 'multi', 'truefalse', 'matching'].includes(q.type) && q.options.length < 2 && !q.subQuestions?.length) add('options-missing-for-type', [q.number], `Question ${q.number} is ${q.type} but its answer choices are missing or incomplete.`);
   }

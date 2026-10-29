@@ -473,7 +473,7 @@ export interface ProviderConfig {
   decideDialect?: 'jev' | 'thx';
   /** Maximum simultaneous decision requests. Local THX defaults to one. */
   decideConcurrency?: number;
-  /** #46 mmproj-capable decisions build. Off means image decisions are caption-only. */
+  /** #46 mmproj-capable decisions build. Off means image decisions are skipped (no pixels, no vote). */
   multimodalDecisions?: boolean;
   defaultHeaders?: Record<string, string>;
   /** When true (default), reasoning/thinking is disabled (or minimised for the solver) on OpenAI-compatible calls. */
@@ -572,6 +572,8 @@ export interface AppSettings {
   textRepairEnabled?: boolean;
   /** #43 decision audit mode: shadow (compute + report only, never routes) or active (routes confident-wrong catches to repair/teacher). Default shadow. */
   decideMode?: 'shadow' | 'active';
+  /** Imported report-only calibration, scoped to this endpoint/model; never a promotion switch. */
+  decideCalibration?: import('./pipeline/decisionCalibration').DecisionCalibrationReport;
   /** Send image pixels to the local decisions endpoint only when its mmproj build is enabled. */
   decideMultimodal?: boolean;
 }

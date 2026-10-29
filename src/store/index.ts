@@ -379,7 +379,7 @@ export async function saveExamDoc(
   // invariants describe parsed exams, so drafts skip the gate and only get image-id hygiene.
   const isSourceOnlyDraft = (doc.flags || []).some((flag) => flag.code === 'SOURCE_ONLY');
   // #46 checkers are comments, not save gates. The loop already owns its closed verdict list.
-  const isLocalLoop = Boolean(doc.loop);
+  const isLocalLoop = Boolean(doc.loop) || doc.source?.kind === 'package';
   try {
     if (isLocalLoop) {
       // Storage hygiene only; never run legacy semantic invariants or demote a loop document.

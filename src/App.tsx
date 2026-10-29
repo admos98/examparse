@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { appendJournalCall } from './pipeline/journal';
+import { PackageAnalyze } from './views/PackageAnalyze';
 import { createLocalDraft } from './pipeline/localDraft';
 import { sha256 } from './utils/hash';
 import { ExamHealthBanner } from './components/ExamHealthBanner';
@@ -154,6 +156,17 @@ export default function App() {
     setAnswerKeyFile(keyFile || null);
     setCurrentStep(2);
     setMaxReachedStep(2);
+  };
+
+  const handlePackageLoaded = async (doc: ExamDoc) => {
+    setAssistantMode('closed'); setStages([]); setAnswerKeyFile(null); setRawFile(null);
+    const existing = await loadExamDoc(doc.id);
+    if (existing) { handleOpenExamFromLibrary(existing); return; }
+    await saveExamDoc(doc);
+    try { await appendJournalCall(`package-import:${doc.fileHash}`, { ts: new Date().toISOString(), label: 'Step 1 · package import', rawText: JSON.stringify({ kind: 'package', batchId: doc.source.packageBatchId, questions: doc.questions.length, images: doc.images.length }), complete: true }); } catch { /* import remains usable if the journal is unavailable */ }
+    setExamDoc(doc); setImportedFileHash(doc.fileHash);
+    setExtractedDoc({ lines: [], pages: 1, ocrUsed: false, fileName: doc.source.fileName, images: doc.images, scannedPageIndices: [], pageImages: [], pageThumbKeys: [] });
+    setCurrentStep(3); setMaxReachedStep(3); await refreshSummaries();
   };
 
   const handleDemoLoaded = (demo: ExamDoc, persist = true) => {
@@ -366,9 +379,10 @@ export default function App() {
         {examDoc && currentStep === 4 && <div className="ep-main-content print:hidden"><ExamVersions doc={examDoc} onRestore={handleDocUpdated} /></div>}
         {currentStep === 2 && examDoc && <div className="ep-main-content"><ExamHealthBanner doc={examDoc} /></div>}
         <main id="main-content" tabIndex={-1} className="ep-main-content flex-1 pb-16">
-          {currentStep === 1 && <Step1Import onDocumentLoaded={handleDocumentLoaded} onDemoLoaded={handleDemoLoaded} isLoading={false} cacheEnabled={settings.thrift.cacheEnabled} onOpenSavedExam={handleOpenExamFromLibrary} />}
+          {currentStep === 1 && <Step1Import onPackageLoaded={handlePackageLoaded} onDocumentLoaded={handleDocumentLoaded} onDemoLoaded={handleDemoLoaded} isLoading={false} cacheEnabled={settings.thrift.cacheEnabled} onOpenSavedExam={handleOpenExamFromLibrary} />}
           {currentStep === 2 && extractedDoc && <Step2Source diagnostics={extractedDoc.diagnostics} lines={extractedDoc.lines} pages={extractedDoc.pages} ocrUsed={extractedDoc.ocrUsed} pageImages={extractedDoc.pageImages} pageThumbKeys={extractedDoc.pageThumbKeys} images={extractedDoc.images} fileHash={importedFileHash || undefined} taggedLines={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lines : undefined} lineRepairs={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.lineRepairs : undefined} onRevertLineRepair={handleRevertTextRepair} focusLine={sourceFocusLine} orphanLineNos={examDoc && importedFileHash && examDoc.fileHash === importedFileHash ? examDoc.source.orphanLineNos : undefined} onProceedToAnalyze={() => { setSourceFocusLine(undefined); setCurrentStep(3); setMaxReachedStep(prev => Math.max(prev, 3) as StepNumber); }} />}
-          {currentStep === 3 && extractedDoc && <Step3Analyze extractedDoc={extractedDoc} rawFile={rawFile} answerKeyFile={answerKeyFile} settings={settings} stages={stages} onStagesUpdate={setStages} onAnalysisComplete={handleAnalysisComplete} isAnalyzing={isAnalyzing} setIsAnalyzing={setIsAnalyzing} fileHash={importedFileHash || undefined} onOpenSavedExam={handleOpenExamFromLibrary} onSettingsUpdate={handleUpdateSettings} />}
+          {currentStep === 3 && examDoc?.source.kind === 'package' && <PackageAnalyze doc={examDoc} settings={settings} onComplete={handleAnalysisComplete} />}
+          {currentStep === 3 && extractedDoc && examDoc?.source.kind !== 'package' && <Step3Analyze extractedDoc={extractedDoc} rawFile={rawFile} answerKeyFile={answerKeyFile} settings={settings} stages={stages} onStagesUpdate={setStages} onAnalysisComplete={handleAnalysisComplete} isAnalyzing={isAnalyzing} setIsAnalyzing={setIsAnalyzing} fileHash={importedFileHash || undefined} onOpenSavedExam={handleOpenExamFromLibrary} onSettingsUpdate={handleUpdateSettings} />}
           {currentStep === 4 && examDoc && <Step4Review key={examDoc.id} examDoc={examDoc} rawFile={rawFile} settings={settings} onUpdateDoc={handleDocUpdated} onProceedToExamView={() => { setCurrentStep(5); setMaxReachedStep(5); }} retryRequest={retryRequest} onRetryRequestHandled={() => setRetryRequest(0)} onJumpToSource={extractedDoc && importedFileHash && examDoc.fileHash === importedFileHash ? (lineNo) => { setSourceFocusLine(lineNo); navigateToStep(2); } : undefined} />}
           {currentStep === 5 && examDoc && <Step5Exam defaultExamMode={settings.defaultExamMode} doc={examDoc} onUpdateDoc={handleDocUpdated} exportRequest={exportRequest} />}
         </main>

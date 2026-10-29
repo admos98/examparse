@@ -4,7 +4,7 @@ import { spanBounds } from './spans';
 import { PARSER_VERSION } from './prompts';
 import { computeQualityScore } from '../utils/qualityScore';
 
-export interface DossierQuestionIndex { no: number; label: string; sectionId?: string; type: string; points?: number; spanRange: [number, number] | null; hasImages: boolean; answerPresent: boolean; confidence: number; }
+export interface DossierQuestionIndex { no: number; label: string; sectionId?: string; type: string; points?: number | null; spanRange: [number, number] | null; hasImages: boolean; answerPresent: boolean; confidence: number; }
 export interface DossierImageIndex { id: string; page: number; anchorLine?: number; assignedTo?: string; role?: string; suspectStrip: boolean; }
 export interface DossierSectionMap { id: string; title: string; kind?: string; lineRange: [number, number]; questionNos: number[]; points?: number; }
 export interface DossierLedgerEntry { ts: string; turnId: string; tool: string; argsSummary: string; outcome: { added?: number; removed?: number; changed?: number; error?: string; addedCount?: number; stillMissing?: number[] }; healthBefore?: any; healthAfter?: any; modelCallsUsed: number; }

@@ -14,7 +14,8 @@ export interface BankExportReport {
 export type BankQuestionType = 'multiple_choice' | 'true_false' | 'short_answer' | 'fill_in_blank' | 'matching' | 'ordering';
 export interface BankQuestion {
   type: BankQuestionType; title: string; stem?: string; stem_blocks?: Array<{ t: 'text'; v: string } | { t: 'img'; asset: string }>;
-  options?: Array<{ key: string; text: string }>; answer_key?: { correct: string[]; grading: 'auto' };
+  options?: Array<{ key: string; text: string }>; answer_key?: { correct: string[]; grading: 'auto' } | null;
+  enrichment?: Question['enrichment'];
   explanation: null; points: number | null; grade: string; subject: string;
   curriculum_hints: { chapter: string | null; lesson: string | null; topic: string | null };
   difficulty?: { value: number; source: 'model' };
@@ -111,7 +112,8 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     const label = `Q${q.label || q.no}`;
     const type = typeMap[q.type] || 'short_answer';
     if (!typeMap[q.type]) report.notes.push(`${label}: ${q.type} exported as short_answer.`);
-    const stem = bankStem(doc, q).trim();
+    const passage = doc.source.kind === 'package' ? doc.passages?.find(p => p.id === q.passageId)?.text : undefined;
+    const stem = [passage, bankStem(doc, q).trim()].filter(Boolean).join('\n\n');
     const bankOptionsForQuestion = bankOptions(doc, q);
     const optionImages = (q.images || []).filter(i => i.role === 'option');
     if (optionImages.length) {
@@ -123,28 +125,59 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
         else bankOptionsForQuestion.push({ key: String(bankOptionsForQuestion.length + 1), text: '[Image option not supported in v1]' });
       });
     }
-    const hints = q.curriculumHints || emptyCurriculumHints();
+    const baseHints = q.curriculumHints || emptyCurriculumHints();
+    const suggested = q.enrichment?.lessons?.[0];
+    const selectedLesson = q.enrichment?.teacherLesson?.lesson || (suggested && suggested.probability >= .5 ? suggested.lesson : undefined);
+    const hints = selectedLesson ? { ...baseHints, lesson: selectedLesson } : baseHints;
     if (hints.chapter || hints.lesson || hints.topic) report.tagged++; else report.untagged++;
     const section = doc.sections.find(s => s.id === q.sectionId)?.title;
     const row: BankQuestion = { type, title: stem.slice(0, 60), explanation: null,
       points: typeof q.points === 'number' && Number.isFinite(q.points) && q.points >= 0 ? q.points : null,
-      grade: doc.meta.grade || '', subject: doc.meta.subject || '', curriculum_hints: hints,
+      grade: String(q.imported?.grade ?? doc.meta.grade ?? ''), subject: String(q.imported?.subject ?? doc.meta.subject ?? ''), curriculum_hints: hints,
       provenance: { ...provenance }, tags: [...new Set([section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
     const stemImages = (q.images || []).filter(i => i.role === 'stem' || i.role === 'table');
     if (stemImages.length) {
       const blocks: NonNullable<BankQuestion['stem_blocks']> = [];
       const imgBlocks = await Promise.all(stemImages.map(async image => ({ t: 'img' as const, asset: await resolveAsset(image.imageId) })));
-      const leadIn = /(?:picture|image|photo|figure|diagram)\s+(?:shown\s+)?below|(?:تصویر|شکل)\s*(?:زیر|پایین)/i.test(stem);
-      if (leadIn) blocks.push(...imgBlocks, { t: 'text', v: stem }); else blocks.push({ t: 'text', v: stem }, ...imgBlocks);
+      const positions = q.packageImagePositions?.filter(p => stemImages.some(i => i.imageId === p.imageId)).sort((a, b) => a.offset - b.offset) || [];
+      if (doc.source.kind === 'package' && positions.length) {
+        if (passage) blocks.push({ t: 'text', v: passage + '\n\n' });
+        const text = bankStem(doc, q).trim(); let at = 0; const placed = new Set<string>();
+        for (const position of positions) {
+          const offset = Math.max(at, Math.min(text.length, position.offset));
+          if (offset > at) blocks.push({ t: 'text', v: text.slice(at, offset) });
+          const idx = stemImages.findIndex(image => image.imageId === position.imageId);
+          if (idx >= 0) { blocks.push(imgBlocks[idx]); placed.add(position.imageId); }
+          at = offset;
+        }
+        if (at < text.length) blocks.push({ t: 'text', v: text.slice(at) });
+        stemImages.forEach((image, i) => { if (!placed.has(image.imageId)) blocks.push(imgBlocks[i]); });
+      } else {
+        const leadIn = /(?:picture|image|photo|figure|diagram)\s+(?:shown\s+)?below|(?:تصویر|شکل)\s*(?:زیر|پایین)/i.test(stem);
+        if (leadIn) blocks.push(...imgBlocks, { t: 'text', v: stem }); else blocks.push({ t: 'text', v: stem }, ...imgBlocks);
+      }
       row.stem_blocks = blocks;
     } else row.stem = stem;
     if (bankOptionsForQuestion.length) row.options = bankOptionsForQuestion;
-    if (autoTypes.has(type)) {
+    if (q.enrichment) row.enrichment = q.enrichment;
+    if (doc.source.kind === 'package' && q.imported) {
+      const importedKey = q.imported.answer_key;
+      const original = Array.isArray(importedKey?.correct) ? importedKey.correct.map(String).join(', ') : undefined;
+      // Honor teacher edits; never silently resurrect an imported key after it was removed.
+      const current = q.answer?.source === 'ai' ? undefined : q.answer?.text;
+      const answers: string[] = current === original ? (importedKey?.correct || []).map(String) : current ? [current] : [];
+      const mapped = answers.map(value => {
+        const i = (q.options || []).findIndex(o => normalized(o.key) === normalized(value) || normalized(o.text || '') === normalized(value));
+        return i >= 0 ? String(i + 1) : undefined;
+      });
+      if (autoTypes.has(type) && mapped.length && mapped.every(Boolean)) row.answer_key = { correct: mapped as string[], grading: 'auto' };
+      else if (autoTypes.has(type)) report.needs_answer_key.push({ question: label, reason: answers.length ? 'Answer cannot be represented as an Appendix A option key.' : 'Package has no answer key.' });
+    } else if (autoTypes.has(type)) {
       const correct = resolveAnswer(doc, q, bankOptions(doc, q));
       if (correct) row.answer_key = { correct: [correct], grading: 'auto' };
       else report.needs_answer_key.push({ question: label, reason: 'No confident answer matched an option.' });
     }
-    if (q.difficulty && q.difficulty.source === 'model' && Number.isInteger(q.difficulty.value) && q.difficulty.value >= 1 && q.difficulty.value <= 5 && (q.difficultyMode === 'active' || options.includeModelDifficulty === true)) row.difficulty = { value: q.difficulty.value, source: 'model' };
+    if (doc.source.kind !== 'package' && q.difficulty && q.difficulty.source === 'model' && Number.isInteger(q.difficulty.value) && q.difficulty.value >= 1 && q.difficulty.value <= 5 && (q.difficultyMode === 'active' || options.includeModelDifficulty === true)) row.difficulty = { value: q.difficulty.value, source: 'model' };
     batch.questions.push(row); report.exported++;
   }
   report.asset_count = assets.size; report.total_bytes = [...assets.values()].reduce((sum, asset) => sum + asset.bytes.length, 0);

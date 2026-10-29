@@ -4,6 +4,7 @@ import { getExamHealth } from './quality';
 
 /** Remove superseded snapshots, never historical per-question repair receipts. */
 export function reconcileFinalFlags(doc: ExamDoc): ExamDoc {
+  if (doc.source?.kind === 'package') return doc;
   const health = getExamHealth(doc);
   const snapshotCodes = new Set([
     'POINTS_MISMATCH',

@@ -1,3 +1,4 @@
+import { curriculumLessons } from '../pipeline/curriculumHints';
 import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences, restoreMissingImageFromSource } from '../pipeline/reviewIntegrity';
 import { IntegrityFlags } from '../components/IntegrityFlags';
 import { attentionQuestionIds, computeAttention, type AttentionItem } from '../utils/attention';
@@ -316,8 +317,14 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
   // Update a question in examDoc
   const handleUpdateQuestion = (qId: string, updates: Partial<Question>) => {
-    const updatedQuestions = examDoc.questions.map(q => (q.id === qId ? { ...q, ...updates } : q));
-    const newDoc = { ...examDoc, questions: updatedQuestions };
+    const contentChanged = ['stem', 'options', 'answer', 'images', 'type'].some(key => Object.prototype.hasOwnProperty.call(updates, key));
+    const updatedQuestions = examDoc.questions.map(q => {
+      if (q.id !== qId) return q;
+      const updated = { ...q, ...updates };
+      if (q.imported && q.enrichment && contentChanged) updated.enrichment = { source: 'model', verification: 'unjudged', ...(q.enrichment.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}) };
+      return updated;
+    });
+    const newDoc = { ...examDoc, questions: updatedQuestions, flags: contentChanged ? examDoc.flags.filter(f => !(f.questionId === qId && f.code === 'PACKAGE_ENRICHMENT')) : examDoc.flags };
     onUpdateDoc(newDoc);
     saveExamDoc(newDoc);
   };
@@ -544,6 +551,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
   return (
     <div className="max-w-6xl mx-auto py-6 px-4 space-y-6">
+      {examDoc.source.kind === 'package' && examDoc.source.enrichmentNotes?.length ? <div className="rounded border p-3 text-xs">{examDoc.source.enrichmentNotes.map(note => <div key={note}>{note}</div>)}</div> : null}
       {bankExportOpen && <QuestionBankExportDialog doc={examDoc} settings={settings} onClose={() => setBankExportOpen(false)} onTagged={async doc => { await saveExamDoc(doc); onUpdateDoc(doc); }} />}
       <button onClick={() => setBankExportOpen(true)} className="rounded-[6px] border border-[var(--rule)] px-4 py-2 text-xs font-semibold">Export · Question Bank batch</button>
       <section className="p-4 rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] space-y-3">
@@ -985,7 +993,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                 {q.type}
                               </span>
 
-                              {q.points !== undefined && (
+                              {q.points != null && (
                                 <span className="px-2 py-0.5 rounded-[6px] text-[length:var(--type-12)] font-mono bg-[var(--ok-soft)] text-[var(--ok)] font-semibold">
                                   {q.points} pts
                                 </span>
@@ -1052,7 +1060,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                           {isExpanded && (
                             <div data-question-internals={q.id} className="flex flex-wrap items-center gap-2 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] px-2.5 py-1.5 text-[length:var(--type-12)] font-mono text-[var(--ink-2)]">
                               <span>spans: {formatSpans(q.spans)}</span>
-                              <span
+                              {!q.imported && <span
                                 className={`px-1.5 py-0.5 rounded-[6px] ${
                                   q.confidence >= 0.8
                                     ? 'bg-[var(--ok-soft)] text-[var(--ok)]'
@@ -1060,7 +1068,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                 }`}
                               >
                                 {((q.confidence ?? 1) * 100).toFixed(0)}% conf
-                              </span>
+                              </span>}
                               {q.receipt && (
                                 <span aria-label="Deterministic parse provenance">
                                   Built by: {q.receipt.ruleChain.map(rule => rule === 'question-start' ? 'seg-number' : rule === 'watermark-excised' ? 'excision' : rule).join(' → ')} · conf {Math.round(q.receipt.ruleConfidence)}
@@ -1070,6 +1078,19 @@ export const Step4ReviewContent: React.FC<Props> = ({
                             </div>
                           )}
 
+                          {q.imported && <div className="text-xs text-[var(--ink-2)] space-y-1">
+                            <div>Package provenance: {JSON.stringify(q.imported.provenance ?? null)}</div>
+                            {q.enrichment ? <div className="space-y-1">
+                              <div>Model estimate · answer: {q.enrichment.verification}{q.enrichment.verificationProbability != null ? ` (${Math.round(q.enrichment.verificationProbability * 100)}%)` : ''}
+                                {q.enrichment.origin && ` · origin: ${q.enrichment.origin}`}{q.enrichment.demand && ` · demand: ${q.enrichment.demand.value} (${Math.round(q.enrichment.demand.probability * 100)}%)`}{q.enrichment.readingMode && ` · reading: ${q.enrichment.readingMode.value} (${Math.round(q.enrichment.readingMode.probability * 100)}%)`}</div>
+                              {q.enrichment.imagePlacement?.map(image => <div key={image.imageId}>Image placement: {image.state}{image.probability != null ? ` (${Math.round(image.probability * 100)}%)` : ''}</div>)}
+                              <div className="flex flex-wrap gap-2">{q.enrichment.lessons?.map(item => <span key={item.lesson} className="rounded border px-2 py-1">{item.lesson} · {Math.round(item.probability * 100)}%</span>)}</div>
+                              {examDoc.flags.filter(f => f.code === 'PACKAGE_ENRICHMENT' && f.questionId === q.id).map(f => <div key={f.id} className="text-[var(--warn-ink)]">{f.message}</div>)}
+                            </div> : <div>Enrichment not run</div>}
+                            <label>Teacher-confirmed lesson <select value={q.enrichment?.teacherLesson?.lesson || ''} onChange={event => handleUpdateQuestion(q.id, { enrichment: { ...(q.enrichment || { source: 'model' as const, verification: 'unjudged' as const }), teacherLesson: event.target.value ? { lesson: event.target.value, source: 'teacher' } : undefined } })} className="border rounded p-1 bg-[var(--paper-raised)]"><option value="">Not confirmed</option>{curriculumLessons(q.imported.grade ?? examDoc.meta.grade, q.imported.subject ?? examDoc.meta.subject).map(lesson => <option key={lesson.title} value={lesson.title}>{lesson.title}</option>)}</select></label>
+                          </div>}
+
+                          {q.passageId && examDoc.questions.find(item => item.passageId === q.passageId)?.id === q.id && <div className="rounded border p-3 text-xs whitespace-pre-wrap"><strong>Shared passage</strong><div>{examDoc.passages?.find(p => p.id === q.passageId)?.text}</div></div>}
                           {/* Stem Text */}
                           <div>
                             {isExpanded ? (
@@ -1191,7 +1212,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                       }`}
                                     >
                                       {q.answer.source === 'paper'
-                                        ? 'In-Doc Key'
+                                        ? (q.imported ? 'Package key' : 'In-Doc Key')
                                         : q.answer.source === 'keyfile'
                                         ? 'Key File'
                                         : q.answer.source === 'ai'

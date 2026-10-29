@@ -1,10 +1,12 @@
 import React from 'react';
 import type { LoopReceipt as Receipt } from '../pipeline/localLoop';
+import { MapOutline } from './MapOutline';
 
 /** One receipt shared by Step 4 and the parse report. Comments never become save gates. */
 export const LoopReceipt: React.FC<{ receipt: Receipt }> = ({ receipt }) => <details className="ep-card rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)] p-4 text-xs" data-testid="loop-receipt">
   <summary className="cursor-pointer font-bold text-[var(--ink)]">Loop receipt — six local steps</summary>
   <p className="mt-2 text-[var(--ink-2)]">Raw model-authored JSON is retained. Checkers comment; only model patches change questions. Nothing here blocks saving.</p>
+  {receipt.map && <div className="mt-3"><MapOutline map={receipt.map} /></div>}
   <div className="mt-3 overflow-x-auto"><table className="w-full text-start text-[length:var(--type-12)]">
     <thead><tr className="border-b border-[var(--rule)] text-[var(--ink-2)]"><th className="p-2 text-start">Step</th><th className="p-2">Status</th><th className="p-2">Calls</th><th className="p-2">Corrections applied</th><th className="p-2">Verdicts raised</th><th className="p-2">Verdicts closed</th></tr></thead>
     <tbody>{receipt.steps.map(step => <tr key={step.step} className="border-b border-[var(--rule)]" data-loop-step={step.step}>

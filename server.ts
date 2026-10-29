@@ -167,7 +167,7 @@ export function validateDecisionsRequest(value: any): string | null {
   let imageBytes = 0;
   for (const question of body.questions) {
     if (!question || !['probability', 'choice'].includes(question.type) || typeof question.name !== 'string' || question.name.length > 300 || typeof question.instructions !== 'string' || question.instructions.length > 20000) return 'Decisions question is invalid.';
-    if (question.type === 'choice' && (!Array.isArray(question.choices) || question.choices.length < 2 || question.choices.length > 8 || question.choices.some((choice: any) => typeof choice !== 'string' || choice.length > 200))) return 'Choice decisions require 2–8 choices.';
+    if (question.type === 'choice' && (!Array.isArray(question.choices) || question.choices.length < 2 || question.choices.length > 64 || question.choices.some((choice: any) => typeof choice !== 'string' || choice.length > 200))) return 'Choice decisions require 2–64 choices.';
     if (question.images !== undefined) {
       if (!Array.isArray(question.images) || question.images.length > 8) return 'Decisions image batch exceeds the 8-image limit.';
       for (const image of question.images) {

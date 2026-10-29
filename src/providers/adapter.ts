@@ -186,20 +186,28 @@ export class LLMAdapter {
       if (providerConfig.decideDialect === 'thx') {
         const item = Array.isArray(body.questions) ? body.questions[0] : (() => { const [name, value] = Object.entries(body.questions as any)[0] || ['', {}]; return { name, ...(value as any) }; })();
         const itemName = item.name || Object.keys(body.questions as any)[0];
-        const raw = data?.results?.[itemName] ?? data?.[itemName] ?? data?.probabilities ?? data;
-        const choices = item.choices || Object.keys(item.criteria || {});
+        const raw = data?.answers?.[itemName] ?? data?.results?.[itemName] ?? data?.[itemName] ?? data?.probabilities ?? data;
+        const choices = item.choices || item.levels || Object.keys(item.criteria || {});
         const map = raw && typeof raw === 'object' ? raw : {};
-        if (choices.length) {
-          const values = map.probabilities || map;
-          const choice = choices.reduce((best: string, c: string) => Number(values[c] ?? 0) > Number(values[best] ?? 0) ? c : best, choices[0] as string);
-          return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, Number(values[choice]) || 0)), choice }] };
+        const validNumber = (value: unknown) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+        const values = map.probabilities && typeof map.probabilities === 'object' ? map.probabilities : map;
+        if (choices.length || item.type === 'choice' || item.type === 'score') {
+          const candidates = choices.length ? choices : Object.keys(values).filter(c => validNumber(values[c]));
+          const available = candidates.filter((c: string) => values[c] !== undefined && validNumber(values[c]));
+          const answer = typeof map.answer === 'string' ? map.answer : typeof map.choice === 'string' ? map.choice : undefined;
+          const choice = item.type !== 'score' && answer && (available.includes(answer) || !available.length) ? answer : available.reduce((best: string, c: string) => Number(values[c]) > Number(values[best]) ? c : best, available[0]);
+          const rawProbability = choice !== undefined ? (values[choice] ?? map.probability) : map.probability;
+          const probability = Number(rawProbability);
+          if (!choice || !validNumber(rawProbability)) throw new Error('THX decision response malformed');
+          return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, probability)), choice }] };
         }
-        const yes = Number(map.yes ?? map.Yes ?? map.probabilities?.yes);
-        if (!Number.isFinite(yes)) throw new Error('THX decision response malformed');
+        const rawYes = values.yes ?? values.Yes ?? map.noul ?? map.probability;
+        const yes = Number(rawYes);
+        if (!validNumber(rawYes)) throw new Error('THX decision response malformed');
         return { results: [{ name: itemName, probability: Math.min(1, Math.max(0, yes)) }] };
       }
       if (!data || !Array.isArray(data.results)) throw new Error('Decisions endpoint returned no results array');
-      return { results: data.results.map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability) || 0)), ...(result.choice === undefined ? {} : { choice: String(result.choice) }) })) };
+      return { results: data.results.filter((result: any) => result && result.probability !== null && result.probability !== undefined && result.probability !== '' && Number.isFinite(Number(result.probability))).map((result: any) => ({ name: String(result.name ?? ''), probability: Math.min(1, Math.max(0, Number(result.probability))), ...(result.choice === undefined ? {} : { choice: String(result.choice) }) })) };
     } finally {
       clearTimeout(timer);
     }

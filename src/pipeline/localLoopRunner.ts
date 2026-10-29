@@ -9,6 +9,7 @@ import {
   type LoopModelCaller, type LoopReceipt, type LoopStepId, type LoopVerdict,
 } from './localLoop';
 import { runLoopDecisionAudit, type LoopDecisionCaller } from './loopAudit';
+import { runMapFirstRead, sectionReadVerdicts, type LoopMapReceipt } from './mapFirst';
 import type { AppSettings } from '../types';
 
 export interface LocalLoopParams {
@@ -17,6 +18,7 @@ export interface LocalLoopParams {
   decisionCaller?: LoopDecisionCaller;
   imagePayload?: (image: ImageAsset) => Promise<{ id: string; mime: string; data: string } | undefined>;
   onStep?: (receipt: LoopReceipt, step: LoopStepId) => void | Promise<void>;
+  onMapUpdate?: (map: LoopMapReceipt) => void | Promise<void>;
   /** Called after READ and each subsequent step, including applied patches. Persistence is owned by the app shell. */
   onSave?: (receipt: LoopReceipt, step: LoopStepId) => Promise<void>;
   onLiveText?: (step: LoopStepId, label: string, channel: 'output' | 'reasoning' | 'info', text: string) => void;
@@ -52,6 +54,17 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     try { await params.onJournal?.({ label, rawText: response.rawText, requestText: text }); } catch { /* optional */ }
     return response;
   };
+  const parseWithRetry = async (step: 'self-review' | 'code-fix' | 'final-fix', label: string, system: string, text: string) => {
+    let response = await call(step, label, system, text);
+    let corrections = parseCorrections(response);
+    if (!corrections) {
+      note(receipt, step, `${label}: unparseable correction output — retried: true (once).`);
+      const example = 'Return only JSON, for example: {"corrections":[{"action":"replace","questionNumber":1,"question":{"number":1,"type":"short","stem":"Example question?","options":[],"imageIds":[]}}]}. Include complete corrected objects and any passages. No invented answers or points.';
+      response = await call(step, `${label} · retry`, example, text);
+      corrections = parseCorrections(response);
+    }
+    return { response, corrections };
+  };
   const safe = async (step: LoopStepId, work: () => Promise<void>) => {
     const row = receipt.steps.find(s => s.step === step)!; row.status = 'running';
     await notify(params, receipt, step);
@@ -60,9 +73,29 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     await notify(params, receipt, step, true);
   };
 
-  // 1. READ — one local call per page, cached by that page's actual input, never by a call allowance.
+  // 1. MAP, count, audit, scoped re-map, then section READ. Page READ is a never-empty fallback.
   await safe('read', async () => {
     const row = receipt.steps[0]; const pages = buildLoopPages(lines); const reads = [];
+    if (lines.length && params.caller) {
+      try {
+        const mapped = await runMapFirstRead({ lines, images, settings, fileHash, guidance: params.guidance, decisionCaller: params.decisionCaller,
+          call: (label, system, text) => call('read', label, system, text), cacheGet, cacheSet,
+          cacheKey: text => sha256(`${LOOP_VERSION}:map-read:${params.modelId || 'scripted'}:${guidanceHash}:${text}`),
+          onNote: message => note(receipt, 'read', message),
+          onAuditUsage: (usage, label) => params.onUsage?.('decision-audit', usage, label),
+          onUpdate: async map => {
+            receipt.map = structuredClone(map);
+            try { await params.onMapUpdate?.(structuredClone(map)); } catch { /* UI is advisory */ }
+            await notify(params, receipt, 'read');
+          },
+        });
+        if (mapped) {
+          receipt.map = mapped.map; receipt.document = mapped.document;
+          for (const message of mapped.map.notes) note(receipt, 'read', message);
+          return;
+        }
+      } catch (error) { note(receipt, 'read', `Map-first READ unavailable — ${errorMessage(error)}; falling back to page READ.`); }
+    }
     if (!pages.length) note(receipt, 'read', 'No extracted page text; the source document shell is still saved.');
     for (const chunk of pages) {
       const text = buildLoopPagePrompt(chunk, images, params.guidance);
@@ -92,7 +125,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
   });
 
   // Code image assignment follows READ and precedes SELF-REVIEW.
-  assignAuthoredImages(receipt.document, images, lines);
+  assignAuthoredImages(receipt.document, images, lines, receipt.map);
 
   const patchTeacherVerdicts: LoopVerdict[] = [];
   const recordPatchNotes=(messages:string[])=>messages.forEach((message,index)=>{
@@ -106,10 +139,10 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     if (!receipt.document.questions.length) { row.status = 'skipped'; note(receipt, 'self-review', 'Self-review skipped — no authored questions yet.'); return; }
     for (const [index, chunk] of buildReviewChunks(receipt.document, lines).entries()) {
       const label = `Self-review · ${index + 1}`;
-      const text = `YOUR PARSE:\n${JSON.stringify(chunk.document)}\n\nORIGINAL TEXT:\n${chunk.source}`;
+      const mapDisputes = receipt.map ? [...receipt.map.codeVerdicts.map(v => v.message), ...receipt.map.remaps.filter(r => !r.applied).map(r => `${r.entryId}: ${r.reason}`)] : [];
+      const text = `YOUR PARSE:\n${JSON.stringify(chunk.document)}${mapDisputes.length ? `\n\nMAP FINDINGS (proposals, not facts):\n${mapDisputes.join('\n')}` : ''}\n\nORIGINAL TEXT:\n${chunk.source}`;
       try {
-        const response = await call('self-review', label, LOOP_REVIEW_SYSTEM, text);
-        const corrections = parseCorrections(response);
+        const { corrections } = await parseWithRetry('self-review', label, LOOP_REVIEW_SYSTEM, text);
         if (!corrections) { note(receipt, 'self-review', `${label}: unparseable correction output — step chunk skipped.`); continue; }
         const applied = applyCorrections(receipt.document, corrections);
         receipt.document = applied.document; row.correctionsApplied += applied.applied;
@@ -121,12 +154,13 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
   });
 
   // 3. CODE CHECK — closed verdict vocabulary; no content mutation and no gate.
-  const remnants: LoopVerdict[] = receipt.pages.filter(p => p.status === 'salvaged').map(p => ({
-    id: `code:invalid-json-remnant:page-${p.page}`, kind: 'invalid-json-remnant', questionNumbers: [], source: 'code', page: p.page,
+  const remnants: LoopVerdict[] = [ ...(receipt.map?.sectionFindings?.map(v => ({ id: `code:${v.id}`, kind: 'section-range-mismatch' as const, questionNumbers: v.questionNumbers, source: 'code' as const, message: v.message })) || []), ...(receipt.map?.codeVerdicts.filter(v => v.kind === 'section-missing').map(v => ({ id: `code:${v.id}`, kind: 'section-missing' as const, questionNumbers: v.questionNumbers, source: 'code' as const, message: v.message })) || []), ...receipt.pages.filter(p => p.status === 'salvaged').map(p => ({
+    id: `code:invalid-json-remnant:page-${p.page}`, kind: 'invalid-json-remnant' as const, questionNumbers: [], source: 'code' as const, page: p.page,
     message: `Page ${p.page} contained an invalid JSON remnant; only complete question objects were kept.`,
-  }));
+  })) ];
+  const check = () => [...checkAuthoredDocument(receipt.document, images, remnants), ...sectionReadVerdicts(receipt.map, receipt.document)];
   await safe('code-check', async () => {
-    receipt.codeVerdicts = checkAuthoredDocument(receipt.document, images, remnants);
+    receipt.codeVerdicts = check();
     receipt.steps[2].verdictsRaised = receipt.codeVerdicts.length;
   });
 
@@ -138,32 +172,39 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     for (const [index, group] of groups.entries()) {
       const label = `Code-verdict fix · ${index + 1}`;
       try {
-        const response = await call('code-fix', label, LOOP_FIX_SYSTEM, flaggedFixInput(receipt.document, group, lines));
-        const corrections = parseCorrections(response);
+        const proposedPassages = receipt.map?.passages.filter(p => group.some(v => v.kind === 'passage-link-missing' && v.questionNumbers.some(n => n >= p.appliesToFirst && n <= p.appliesToLast))) || [];
+        const fixInput = flaggedFixInput(receipt.document, group, lines) + (proposedPassages.length ? `\n\nPROPOSED MAP PASSAGES (verify against source):\n${JSON.stringify(proposedPassages)}` : '');
+        const { response, corrections } = await parseWithRetry('code-fix', label, LOOP_FIX_SYSTEM, fixInput);
         if (!corrections) { note(receipt, 'code-fix', `${label}: unparseable correction output — patch skipped.`); continue; }
-        const before = checkAuthoredDocument(receipt.document, images, remnants);
+        const before = check();
         receipt.pointsWithdrawn = (receipt.pointsWithdrawn || 0) + corrections.filter(c=>c.pointsWithdrawn).length;
         let applied = applyCorrections(receipt.document, corrections);
         applied.document = applyMetaCorrection(response, applied.document, group);
         receipt.document = applied.document; row.correctionsApplied += applied.applied;
-        const after = checkAuthoredDocument(receipt.document, images, remnants);
+        const after = check();
         row.verdictsClosed += closedVerdictIds(before, after).length;
         for (const message of applied.notes) note(receipt, 'code-fix', message);
         recordPatchNotes(applied.notes);
         if (applied.applied) await notify(params, receipt, 'code-fix', true);
       } catch (error) { note(receipt, 'code-fix', `${label} skipped — ${errorMessage(error)}.`); }
     }
-    receipt.codeVerdicts = checkAuthoredDocument(receipt.document, images, remnants);
+    receipt.codeVerdicts = check();
   });
 
   // 5. DECISION AUDIT — comments only; active mode merely selects the final pass's input.
   await safe('decision-audit', async () => {
     const audit = await runLoopDecisionAudit({ document: receipt.document, lines, images, settings, fileHash,
-      decisionCaller: params.decisionCaller, imagePayload: params.imagePayload, onJournal: params.onJournal });
+      decisionCaller: params.decisionCaller, imagePayload: params.imagePayload, onJournal: params.onJournal,
+      onProgress: progress => {
+        receipt.steps[4].auditProgress = progress;
+        params.onLiveText?.('decision-audit', progress.currentItem || `Auditing ${receipt.document.questions.length} questions + ${images.length} images — ${progress.total} decisions`, 'output', progress.recent.join('\n'));
+        void notify(params, receipt, 'decision-audit');
+      } });
     receipt.auditMode = audit.mode; receipt.auditVerdicts = audit.verdicts;
     if(audit.dialect && audit.endpointHost) receipt.decisionProvenance={dialect:audit.dialect,host:audit.endpointHost};
     receipt.steps[4].calls = audit.calls; receipt.steps[4].inputTokens = audit.usage.inputTokens; receipt.steps[4].outputTokens = audit.usage.outputTokens;
     receipt.steps[4].verdictsRaised = audit.verdicts.filter(v => (v.probability ?? 1) < 0.8).length;
+    if (receipt.steps[4].auditProgress) { const p = receipt.steps[4].auditProgress; note(receipt, 'decision-audit', `Decision audit · ${p.decided}/${p.total} decided · ${p.catches} catches · ${p.uncertain} uncertain · ${p.endpointErrors} endpoint errors · ${p.rate.toFixed(1)}/s`); }
     if (audit.calls) params.onUsage?.('decision-audit', audit.usage, `Decision audit · ${audit.calls} request(s)`);
     for (const message of audit.notes) note(receipt, 'decision-audit', message);
     if (audit.mode === 'skipped') receipt.steps[4].status = 'skipped';
@@ -179,13 +220,12 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
     for (const [index, group] of chunkVerdicts(routed).entries()) {
       const label = `Final fix · ${index + 1}`;
       try {
-        const response = await call('final-fix', label, LOOP_FIX_SYSTEM, flaggedFixInput(receipt.document, group, lines, true));
-        const corrections = parseCorrections(response);
+        const { corrections } = await parseWithRetry('final-fix', label, LOOP_FIX_SYSTEM, flaggedFixInput(receipt.document, group, lines, true));
         if (!corrections) { note(receipt, 'final-fix', `${label}: unparseable correction output — patch skipped.`); continue; }
-        const before = checkAuthoredDocument(receipt.document, images, remnants);
+        const before = check();
         const applied = applyCorrections(receipt.document, corrections);
         receipt.document = applied.document; row.correctionsApplied += applied.applied;
-        row.verdictsClosed += closedVerdictIds(before, checkAuthoredDocument(receipt.document, images, remnants)).length;
+        row.verdictsClosed += closedVerdictIds(before, check()).length;
         if (applied.applied) {
           const patched = new Set((corrections || []).filter(c => c.action !== 'delete').map(c => c.questionNumber));
           for (const verdict of group) if (verdict.questionNumbers.some(no => patched.has(no))) { verdict.closed = true; row.verdictsClosed++; }
@@ -196,7 +236,7 @@ export async function runLocalLoop(params: LocalLoopParams): Promise<LoopReceipt
       } catch (error) { note(receipt, 'final-fix', `${label} skipped — ${errorMessage(error)}.`); }
     }
   });
-  receipt.codeVerdicts = [...checkAuthoredDocument(receipt.document, images, remnants), ...patchTeacherVerdicts];
+  receipt.codeVerdicts = [...check(), ...patchTeacherVerdicts];
   receipt.survivingVerdicts = [...receipt.codeVerdicts, ...receipt.auditVerdicts.filter(v => !v.closed && (v.probability ?? 1) < 0.8)];
   return receipt;
 }

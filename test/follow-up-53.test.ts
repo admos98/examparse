@@ -99,10 +99,10 @@ test('#53 multimodal picture choice sends pixels and uses illustrative-scene cri
  assert.equal(result.questions[0].enrichment?.imagePlacement?.[0].state, 'disagreed'); assert.ok(result.flags.some(f => /Image may belong/.test(f.message)));
 });
 
-test('#53 absent listening script produces one exam note and no content votes', async () => {
+test('#53 absent listening script produces one exam note and skips only answer votes', async () => {
  const doc = await imported(); doc.questions = doc.questions.slice(0,2); doc.questions.forEach(q => { q.stem = 'Listen to the audio and answer.'; }); const calls: any[] = [];
  const result = await enrichPackage(doc, settings, { decisionCaller: async body => { calls.push(body); return { results: [] }; } });
- assert.equal(calls.length, 0); assert.equal(result.source.enrichmentNotes?.filter(n => n.includes('Listening')).length, 1);
+ assert.ok(calls.some(b => Object.keys(b.questions)[0].includes('complete'))); assert.ok(!calls.some(b => Object.keys(b.questions)[0].includes('blind-answer'))); assert.equal(result.source.enrichmentNotes?.filter(n => n.includes('Listening')).length, 1);
 });
 
 test('#53 package persists in the folder library and reopens with assets', { timeout: 30000 }, async () => {

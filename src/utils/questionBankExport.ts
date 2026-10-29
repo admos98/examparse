@@ -10,6 +10,8 @@ export interface BankExportReport {
   questions: number; exported: number; needs_answer_key: Array<{ question: string; reason: string }>;
   untagged: number; tagged: number; asset_count: number; total_bytes: number;
   image_options: string[]; notes: string[];
+  package_section_receipt?: ExamDoc['source']['packageSectionReceipt'];
+  enrichment_notes?: string[];
 }
 export type BankQuestionType = 'multiple_choice' | 'true_false' | 'short_answer' | 'fill_in_blank' | 'matching' | 'ordering';
 export interface BankQuestion {
@@ -107,6 +109,8 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     if (!assets.has(hash)) assets.set(hash, { ext, bytes });
     imageHashes.set(imageId, hash); return hash;
   };
+  if (doc.source.packageSectionReceipt) report.package_section_receipt = doc.source.packageSectionReceipt;
+  if (doc.source.enrichmentNotes?.length) report.enrichment_notes = doc.source.enrichmentNotes;
   const batch: BankBatch = { batch_id: crypto.randomUUID(), source_dataset: sourceDataset, questions: [] };
   for (const q of questions) {
     const label = `Q${q.label || q.no}`;

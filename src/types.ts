@@ -79,6 +79,7 @@ export interface Question {
   /** Original package fields, retained verbatim and never used as model-authored provenance. */
   imported?: Record<string, any>;
   /** Offsets into the imported stem for inline image references. */
+  packageSourceTextLength?: number;
   packageImagePositions?: Array<{ imageId: string; offset: number }>;
   enrichment?: QuestionEnrichment;
   type:
@@ -140,7 +141,7 @@ export interface QuestionEnrichment {
   completeness?: { probability: number };
   lessons?: Array<{ lesson: string; probability: number }>;
   lessonDistribution?: Record<string, number>;
-  origin?: 'single' | 'multi' | 'beyond-book';
+  origin?: 'single' | 'multi' | 'beyond-book' | 'unknown';
   demand?: { value: 'recall' | 'comprehension' | 'inference'; probability: number; distribution?: Record<string, number> };
   readingMode?: { value: 'direct-finding' | 'comprehension'; probability: number; distribution?: Record<string, number> };
   teacherLesson?: { lesson: string; source: 'teacher' };
@@ -188,6 +189,7 @@ export interface ImageAsset {
   dataUrl?: string; // cached in-memory preview
   /** True when the image blob was missing or failed to write to local folder storage (recoverable from source). */
   storageMissing?: boolean;
+  packageShared?: { ownerIds: string[]; structural: boolean };
   exportPath?: string; // relative path reference in JSON exports
   localUrl?: string; // local folder-storage endpoint reference (/api/images/<blobKey>)
 }
@@ -249,6 +251,7 @@ export interface ExamMeta {
   title?: string;
   subject?: string;
   grade?: string;
+  gradeDisplay?: string;
   school?: string;
   term?: string;
   year?: string;
@@ -277,6 +280,8 @@ export interface ExamDoc {
     kind?: 'package' | 'pdf' | 'word';
     packageBatchId?: string;
     packageDataset?: string;
+    packageIdentity?: { grade?: unknown; subject?: unknown; title?: unknown };
+    packageSectionReceipt?: { rule: 'explicit' | 'title-suffix' | 'marker' | 'fallback'; sections: Array<{ title: string; questionNumbers: number[] }> };
     enrichmentStatus?: 'not run' | 'completed' | 'partial';
     enrichmentNotes?: string[];
     diagnostics?: import('./pipeline/extractionQuality').ExtractionDiagnostics;
@@ -451,7 +456,7 @@ export function computeDisplayName(
   meta?: Partial<ExamMeta> | null,
   fileName?: string | null
 ): string {
-  const parts = [nonEmpty(meta?.subject), nonEmpty(meta?.grade)].filter(Boolean);
+  const parts = [nonEmpty(meta?.subject), nonEmpty(meta?.gradeDisplay || meta?.grade)].filter(Boolean);
   if (parts.length > 0) return parts.join(' \u2014 ');
   const title = nonEmpty(meta?.title);
   if (title) return title;

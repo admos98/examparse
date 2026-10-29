@@ -8,6 +8,7 @@
  * retries) are never attention items — they live in "What the app already fixed"/technical log.
  */
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
+import { plainDecisionSentence } from '../pipeline/localLoop';
 
 export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed' | 'audit-catch' | 'loop-verdict' | 'loop-note';
 
@@ -135,7 +136,9 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
         : verdict.source === 'decision' ? 'audit-catch' : 'loop-verdict';
       const action: AttentionAction = verdict.imageId ? { target: 'image-tray', imageIds: [verdict.imageId], label: 'Review image' }
         : { target: 'question', questionId: affected[0]?.id, label: affected.length ? 'Review' : 'Review exam' };
-      return { id: verdict.id, kind, rootCauseId: verdict.id, plainSentence: `${verdict.message} [${action.label}]`, action,
+      // #51: a decision-only verdict reads as a plain sentence; merged verdicts already quote the code complaint.
+      const sentence = verdict.source === 'decision' && !verdict.sources ? plainDecisionSentence(verdict) : verdict.message;
+      return { id: verdict.id, kind, rootCauseId: verdict.id, plainSentence: `${sentence} [${action.label}]`, action,
         questionIds: affected.map(q => q.id), imageIds: verdict.imageId ? [verdict.imageId] : [], count: 1, severity: 'warn' };
     });
     for (const page of doc.loop.pages.filter(p => p.status === 'failed' || p.status === 'empty')) items.push({

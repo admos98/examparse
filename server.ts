@@ -162,7 +162,21 @@ export function validateDecisionsRequest(value: any): string | null {
   if (config.decisionsPath !== undefined && (typeof config.decisionsPath !== 'string' || !config.decisionsPath.startsWith('/') || config.decisionsPath.length > 300 || /[?#]/.test(config.decisionsPath))) return 'Decisions path must be a relative path.';
   const body = value.body;
   if (!body || typeof body !== 'object') return 'Decisions request body required.';
-  if (config.decideDialect === 'thx') { if (typeof body.state !== 'string' || body.state.length > 30000 || !body.questions || typeof body.questions !== 'object' || Object.keys(body.questions).length !== 1) return 'THX decisions require state text and exactly one named question.'; return null; }
+  if (config.decideDialect === 'thx') {
+    if (typeof body.state !== 'string' || body.state.length > 30000 || !body.questions || typeof body.questions !== 'object' || Object.keys(body.questions).length !== 1) return 'THX decisions require state text and exactly one named question.';
+    // #51: llama.cpp /v1/systemone takes top-level `images` as data URLs (max 8) on mmproj builds.
+    if (body.images !== undefined) {
+      if (!Array.isArray(body.images) || body.images.length > 8) return 'Decisions image batch exceeds the 8-image limit.';
+      let bytes = 0;
+      for (const image of body.images) {
+        const match = typeof image === 'string' ? /^data:(image\/(?:jpeg|png|webp|gif|bmp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(image) : null;
+        if (!match) return 'Decisions image payload is invalid.';
+        bytes += match[2].length * 0.75;
+      }
+      if (bytes > MAX_IMAGE_BYTES) return 'Decisions image payload exceeds the 32 MiB limit.';
+    }
+    return null;
+  }
   if (!Array.isArray(body.questions) || body.questions.length > 64) return 'Decisions request requires 1–64 typed questions.';
   let imageBytes = 0;
   for (const question of body.questions) {

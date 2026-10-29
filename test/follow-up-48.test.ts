@@ -49,15 +49,7 @@ test('audit fast-skips after five consecutive endpoint errors', async () => {
   assert.equal(progress?.decided, 5); assert.equal(progress?.uncertain, 5); assert.match(result.notes.join(' '), /endpoint unreachable — skipping \(5 errors\)/);
 });
 
-test('self-review retries malformed output only once and records the attempt', async () => {
-  let reviews = 0;
-  const receipt = await runLocalLoop({ lines: [{ id: 'L1', page: 1, y: 1, text: '1. A question?' }], images: [], settings: { ...settings, roleMapping: { ...settings.roleMapping, decide: undefined } }, fileHash: 'retry', caller: async req => {
-    if (req.step === 'read') return { rawText: JSON.stringify(doc()) };
-    if (req.step === 'self-review') { reviews++; return { rawText: reviews === 1 ? 'not json' : '{"corrections":[]}' }; }
-    return { rawText: '{"corrections":[]}' };
-  } });
-  assert.equal(reviews, 2); assert.match(receipt.steps[1].notes.join(' '), /retried: true/);
-});
+// #51: the self-review step and its retry test were deleted together (its instructions live in the Fix prompt).
 
 test('difficulty score uses argmax and is stored as a shadow proposal', async () => {
   const old = globalThis.fetch;
@@ -132,15 +124,15 @@ test('explicit local concurrency overrides the single-slot default', async () =>
   assert.equal(max, 2);
 });
 
-test('code-fix retries a malformed passage patch once and records the retry', async () => {
+test('Fix retries a malformed passage patch once and records the retry', async () => {
   let fixes = 0;
   const passageDoc = normalizeAuthoredDocument({ questions: [{ number: 1, sectionTitle: 'Reading', type: 'short', stem: 'What does the passage say?', options: [] }] });
   const receipt = await runLocalLoop({ lines: [{ id: 'L1', page: 1, y: 1, text: '1. What does the passage say?' }], images: [], settings: { ...settings, roleMapping: { ...settings.roleMapping, decide: undefined } }, fileHash: 'passage', caller: async req => {
-    if (req.step === 'read') return { rawText: JSON.stringify(passageDoc) };
-    if (req.step === 'code-fix') { fixes++; return { rawText: fixes === 1 ? '{bad' : JSON.stringify({ passages: [{ id: 'p1', sectionTitle: 'Reading', text: 'A source passage.' }], corrections: [{ action: 'replace', questionNumber: 1, question: { ...passageDoc.questions[0], passageId: 'p1' } }] }) }; }
+    if (req.step !== 'fix') return { rawText: JSON.stringify(passageDoc) };
+    if (req.step === 'fix') { fixes++; return { rawText: fixes === 1 ? '{bad' : JSON.stringify({ passages: [{ id: 'p1', sectionTitle: 'Reading', text: 'A source passage.' }], corrections: [{ action: 'replace', questionNumber: 1, question: { ...passageDoc.questions[0], passageId: 'p1' } }] }) }; }
     return { rawText: '{"corrections":[]}' };
   } });
-  assert.equal(fixes, 2); assert.match(receipt.steps[3].notes.join(' '), /retried: true/);
+  assert.equal(fixes, 2); assert.match(receipt.steps.find(s => s.step === 'fix')!.notes.join(' '), /retried: true/);
   assert.equal(receipt.document.passages?.[0].text, 'A source passage.');
 });
 

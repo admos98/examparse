@@ -458,7 +458,8 @@ test('#46 page-wise loop: failing page 2 ships pages 1+3, notes page 2, streams 
     assert.deepEqual(doc.questions.map(q => q.no), [1, 2, 3, 9, 10, 11]);
     assert.equal(callLog.filter(c => c.role === 'cloud').length, 0, 'no cloud anywhere');
     assert.equal(callLog.filter(c => c.role === 'read' && /PAGE 2 SOURCE:/.test(c.text)).length, 1, 'one local read per page, no retry allowance');
-    assert.ok(stageUpdates.includes('read') && stageUpdates.includes('self-review') && stageUpdates.includes('present'));
+    for (const phase of ['map', 'parse', 'check', 'fix', 'present']) assert.ok(stageUpdates.includes(phase), phase);
+    assert.ok(!stageUpdates.includes('self-review') && !stageUpdates.includes('final-fix'));
     assert.ok(doc.loop!.pages.find(p => p.page === 2)?.status === 'empty');
     assert.ok(computeAttention(doc).some(item => item.action.target === 'page-retry' && item.action.page === 2));
     const retried = await retryFailedPage(doc, 2, settings, { persist: false });

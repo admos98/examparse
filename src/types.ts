@@ -303,7 +303,7 @@ export interface ExamDoc {
   traces?: any[];
   /** Legacy receipts remain readable; never produced by the #46 default path. */
   spine?: SpineRecord;
-  /** #46 raw authored working document, six-step receipt, and comment-only verdicts. */
+  /** #46/#51 raw authored working document, six-phase receipt, and comment-only verdicts. */
   loop?: import('./pipeline/localLoop').LoopReceipt;
 }
 
@@ -628,7 +628,9 @@ export interface LLMResponse {
 /**
  * Pipeline Stage State
  */
-export type PipelineStageId = 'extract' | 'read' | 'self-review' | 'check' | 'code-fix' | 'audit' | 'final-fix' | 'compile' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
+/** #51: 'extract' | 'map' | 'parse' | 'check' | 'fix' | 'present' are the six loop phases; 'read' is kept as a
+ * force-rerun alias for Map + Parse. The rest are legacy/tooling stage ids. */
+export type PipelineStageId = 'extract' | 'map' | 'parse' | 'check' | 'fix' | 'read' | 'compile' | 'repair' | 'present' | 'ocr' | 'text-repair' | 'vision' | 'classify' | 'structure' | 'assemble' | 'cleanup';
 
 export interface StageStatus {
   id: PipelineStageId;

@@ -30,8 +30,8 @@ const clozeDir = 'test/fixtures/corpus/cloze-passage';
 const clozeLines = (): SourceLine[] => JSON.parse(fs.readFileSync(path.join(clozeDir, 'source-lines.json'), 'utf8'));
 const clozeTruth = () => JSON.parse(fs.readFileSync(path.join(clozeDir, 'truth.json'), 'utf8'));
 const corrections = (rows: unknown[] = []) => ({ rawText: JSON.stringify({ corrections: rows }) });
-const isMap = (req: LoopModelRequest) => req.step === 'read' && req.label.startsWith('Map ·');
-const isSection = (req: LoopModelRequest) => req.step === 'read' && req.label.startsWith('Section parse ·');
+const isMap = (req: LoopModelRequest) => req.step === 'map' && req.label.startsWith('Map ·');
+const isSection = (req: LoopModelRequest) => req.step === 'parse' && req.label.startsWith('Section parse ·');
 
 // -------------------------------------------------------------------------------------------------
 // A — loops can't hurt
@@ -112,8 +112,9 @@ test('A: proportional output caps per call type (map / section parse / fix passe
   assert.equal(cap('Section parse · Vocabulary'), sectionOutputCap(8));
   assert.equal(cap('Section parse · Reading'), sectionOutputCap(5));
   assert.equal(cap('Section parse · Writing'), sectionOutputCap(2));
-  assert.equal(cap('Self-review · 1'), fixOutputCap(15));
-  const fix = caps.find(([l]) => l.startsWith('Code-verdict fix'));
+  // #51: self-review is deleted; the one Fix pass is capped per section batch.
+  assert.ok(!caps.some(([l]) => /self-review/i.test(l)), JSON.stringify(caps));
+  const fix = caps.find(([l]) => l.startsWith('Fix · '));
   assert.ok(fix && fix[1] >= 800 && fix[1] <= 8192, JSON.stringify(caps));
 });
 
@@ -150,8 +151,8 @@ test('A: a fix pass cut by the breaker salvages its complete corrections and ret
   const fixCalls: LoopModelRequest[] = [];
   const receipt = await runLocalLoop({ lines, images: [], settings, fileHash: 'fixcut', caller: async req => {
     if (isMap(req)) return { rawText: '{}' };
-    if (req.step === 'read') return { rawText: JSON.stringify({ questions: [{ number: 1, type: 'short', stem: 'What is force?' }, { number: 2, type: 'short', stem: '' }] }) };
-    if (req.step === 'code-fix') {
+    if (req.step === 'parse') return { rawText: JSON.stringify({ questions: [{ number: 1, type: 'short', stem: 'What is force?' }, { number: 2, type: 'short', stem: '' }] }) };
+    if (req.step === 'fix') {
       fixCalls.push(req);
       if (fixCalls.length === 1) return { rawText: `{"corrections":[${JSON.stringify(fixed)},${JSON.stringify(fixed)},${JSON.stringify(fixed)}`, finishReason: 'repetition-loop', breaker: { kind: 'repetition', completedItems: 3 } };
       return corrections();
@@ -163,7 +164,7 @@ test('A: a fix pass cut by the breaker salvages its complete corrections and ret
   assert.ok([fixOutputCap(1), fixOutputCap(2)].includes(fixCalls[0].maxOutputTokens!), String(fixCalls[0].maxOutputTokens));
   assert.equal(fixCalls[1].maxOutputTokens, fixCalls[0].maxOutputTokens, 'the retry keeps the cap');
   assert.equal(receipt.document.questions.find(q => q.number === 2)?.stem, 'Name a planet.', 'salvaged correction applied (deduped to one)');
-  assert.ok(receipt.notes.some(n => /Code-verdict fix · 1: generation loop cut at item 3 — salvaged 1 item/.test(n)), receipt.notes.join('\n'));
+  assert.ok(receipt.notes.some(n => /Fix · [^:]+: generation loop cut at item 3 — salvaged 1 item/.test(n)), receipt.notes.join('\n'));
   // Without a pathology flag, an unparseable patch is still all-or-nothing.
   assert.equal(parseCorrections({ rawText: `{"corrections":[${JSON.stringify(fixed)}` }), undefined);
 });
@@ -232,7 +233,7 @@ test('B: blank-missing fires when the section parse drops a map-declared blank, 
       json.questions = json.questions.filter((q: any) => q.number !== 11); json.questionCount = json.questions.length;
       return { rawText: JSON.stringify(json) };
     }
-    if (req.step === 'code-fix') fixInputs.push(req.text);
+    if (req.step === 'fix') fixInputs.push(req.text);
     return reader(req);
   } });
   const verdict = receipt.codeVerdicts.find(v => v.kind === 'blank-missing');
@@ -289,7 +290,7 @@ test('C: watermark lines are tagged, kept in storage and absent from the built m
 test('C: model prompts read the normalized twin (Persian digits arrive Latin)', async () => {
   const lines = annotateSourceLines([{ id: 'L0001', page: 1, text: '۱. کدام گزینه صحیح است؟' }, { id: 'L0002', page: 1, text: '۲. پایتخت ایران کجاست؟' }]);
   const prompts: string[] = [];
-  await runLocalLoop({ lines, images: [], settings, fileHash: 'digits', caller: async req => { prompts.push(req.text); return isMap(req) || req.step === 'read' ? { rawText: '{}' } : corrections(); } });
+  await runLocalLoop({ lines, images: [], settings, fileHash: 'digits', caller: async req => { prompts.push(req.text); return req.step !== 'fix' ? { rawText: '{}' } : corrections(); } });
   assert.ok(prompts[0].includes('1. کدام گزینه'), prompts[0]);
   assert.ok(!prompts[0].includes('۱.'));
 });
@@ -363,8 +364,10 @@ test('E: a section parse returning 0 of 9 earns exactly one re-read; the better 
   assert.match(sectionCalls[1].text, /MAP CONTRACT: .*\nSECTION SOURCE/s, 'map contract quoted, same lines');
   assert.equal(receipt.sectionReReads, 1); assert.equal(receipt.map?.sectionReReads, 1);
   assert.equal(receipt.document.questions.length, 9);
-  const selfReview = receipt.steps.find(s => s.step === 'self-review')!;
-  assert.ok(selfReview.calls >= 1, 're-read happens before self-review, which still runs');
+  // #51: the re-read lives inside Parse; Check runs after it and no self-review step exists.
+  const phases = receipt.timeline!.map(e => e.phase);
+  assert.ok(phases.lastIndexOf('parse') < phases.indexOf('check'), JSON.stringify(receipt.timeline));
+  assert.ok(!receipt.steps.some(s => (s.step as string) === 'self-review'));
 });
 
 test('E: if the re-read returns fewer, the first attempt is kept; a healthy parse is never re-read', async () => {

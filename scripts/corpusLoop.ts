@@ -66,7 +66,7 @@ export function scriptedLoopReader(sourceLines: SourceLine[], images: ImageAsset
   }
   const clozeLineIds = new Set(clozePassages.flatMap(p => lines.filter(l => blanksIn(l.text).some(n => p.blanks.includes(n))).map(l => l.id)));
   const legacyReader: LoopModelCaller = async req => {
-    if (req.step !== 'read') return { rawText: JSON.stringify({ corrections: [] }), json: { corrections: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
+    if (req.step !== 'parse') return { rawText: JSON.stringify({ corrections: [] }), json: { corrections: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
     const page = Number(/PAGE (\d+) SOURCE:/.exec(req.text)?.[1] || 0);
     const owned = lines.filter(l => l.page === page && !keyLines.has(Number(l.id.replace(/\D/g, ''))));
     const questions: any[] = [];
@@ -94,7 +94,7 @@ export function scriptedLoopReader(sourceLines: SourceLine[], images: ImageAsset
     return { rawText: JSON.stringify(doc), json: doc, usage: { inputTokens: Math.ceil(req.text.length / 4), outputTokens: Math.ceil(JSON.stringify(doc).length / 4) } };
   };
   return async req => {
-    if (req.step === 'read' && req.label.startsWith('Map ·')) {
+    if (req.step === 'map' && req.label.startsWith('Map ·')) {
       const candidates = lines.filter(l => !keyLines.has(Number(l.id.replace(/\D/g, '')))).flatMap(l => {
         const n = numberAt(l.text); if (n === undefined) return [];
         const lineNo = Number(l.id.replace(/\D/g, ''));
@@ -118,7 +118,7 @@ export function scriptedLoopReader(sourceLines: SourceLine[], images: ImageAsset
         return { rawText: JSON.stringify(result), json: result };
       }
     }
-    if (req.step === 'read' && req.label.startsWith('Section parse ·')) {
+    if (req.step === 'parse' && req.label.startsWith('Section parse ·')) {
       const pages = [...new Set(lines.map(l => l.page))];
       const pieces = await Promise.all(pages.map(page => legacyReader({ ...req, text: `PAGE ${page} SOURCE:` })));
       const docs = pieces.map(p => p.json as any);

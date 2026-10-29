@@ -29,11 +29,20 @@ export function buildThxDecisionBody(item: LoopDecisionItem, model: string, stat
     : item.choices
       ? { type: 'choice', instructions: item.instructions, criteria: item.choiceDescriptions || Object.fromEntries(item.choices.map(c => [c, c])) }
       : { type: 'noul', instructions: item.instructions };
-  return { model, state, questions: { [item.name]: question } };
+  // #51: llama.cpp systemone accepts top-level `images` (data URLs) on mmproj builds — pixels were silently dropped before.
+  const images = (item.images || []).map(image => `data:${image.mime};base64,${image.data}`);
+  return { model, state, questions: { [item.name]: question }, ...(images.length ? { images } : {}) };
 }
+export type LoopDecisionVote = { probability: number; choice?: string; distribution?: Record<string, number> };
 export interface LoopAuditResult {
   verdicts: LoopVerdict[]; routed: LoopVerdict[]; calls: number; mode: 'shadow' | 'active' | 'skipped';
   notes: string[]; usage: { inputTokens: number; outputTokens: number }; catches: number; uncertain: number; endpointErrors: number; difficultyUncertain: number; dialect?: 'jev'|'thx'; endpointHost?: string;
+  /** #51: every vote by item id (for the Present re-check), plus re-check economy counters. */
+  votes: Map<string, LoopDecisionVote>; revoted: number; reused: number;
+}
+/** The decide endpoint takes pixels when the user marked the build multimodal (settings or provider flag). */
+export function decideIsMultimodal(settings: AppSettings, provider?: ProviderConfig): boolean {
+  return settings.decideMultimodal === true || provider?.multimodalDecisions === true;
 }
 export function resolveDecisionProvider(settings: AppSettings): (ProviderConfig & { model: string }) | undefined {
   const selection = settings.roleMapping.decide;
@@ -96,7 +105,7 @@ export function buildLoopDecisionCatalogue(params: {
   }
   return items;
 }
-const emptyResult = (mode: LoopAuditResult['mode'], notes: string[] = []): LoopAuditResult => ({ verdicts: [], routed: [], calls: 0, mode, notes, usage: { inputTokens: 0, outputTokens: 0 }, catches: 0, uncertain: 0, endpointErrors: 0, difficultyUncertain: 0 });
+const emptyResult = (mode: LoopAuditResult['mode'], notes: string[] = []): LoopAuditResult => ({ verdicts: [], routed: [], calls: 0, mode, notes, usage: { inputTokens: 0, outputTokens: 0 }, catches: 0, uncertain: 0, endpointErrors: 0, difficultyUncertain: 0, votes: new Map(), revoted: 0, reused: 0 });
 const clamp = (value: unknown): number | undefined => { if (value === null || value === undefined || value === '') return undefined; const p = Number(value); return Number.isFinite(p) ? Math.max(0, Math.min(1, p)) : undefined; };
 export interface LoopAuditProgress {
   total: number; questions: number; images: number; decided: number; catches: number; uncertain: number; endpointErrors: number;
@@ -108,6 +117,9 @@ export async function runLoopDecisionAudit(params: {
   imagePayload?: (image: ImageAsset) => Promise<{ id: string; mime: string; data: string } | undefined>;
   onProgress?: (progress: LoopAuditProgress) => void;
   onJournal?: (entry: { label: string; rawText: string; requestText?: string }) => void | Promise<void>;
+  /** #51 Present re-check: only items where revote() is true are sent (fresh, cache bypassed); the rest reuse
+   * their Check vote. Items with neither are left unvoted — a re-check never widens the audit. */
+  recheck?: { previous: Map<string, LoopDecisionVote>; revote: (item: LoopDecisionItem) => boolean };
 }): Promise<LoopAuditResult> {
   const { document, lines, images, settings, fileHash } = params;
   const mode = settings.decideMode ?? 'shadow';
@@ -115,7 +127,7 @@ export async function runLoopDecisionAudit(params: {
   if (!provider) return emptyResult('skipped', ['decision audit skipped — no decide endpoint configured']);
   const result = emptyResult(mode);
   try { result.dialect = provider.decideDialect || 'jev'; result.endpointHost = new URL(provider.baseURL).host; } catch { result.endpointHost = provider.baseURL; }
-  const multimodal = settings.decideMultimodal === true;
+  const multimodal = decideIsMultimodal(settings, provider);
   const payloads: Record<string, { id: string; mime: string; data: string }> = {};
   if (multimodal && params.imagePayload) {
     for (const image of images) {
@@ -123,7 +135,9 @@ export async function runLoopDecisionAudit(params: {
       catch (error) { result.notes.push(`Image ${image.id} pixels unavailable — caption-only audit (${errorMessage(error)}).`); }
     }
   }
-  const catalogue = buildLoopDecisionCatalogue({ document, lines, images, mode, multimodal, imagePayloads: payloads });
+  const fullCatalogue = buildLoopDecisionCatalogue({ document, lines, images, mode, multimodal, imagePayloads: payloads });
+  const recheck = params.recheck;
+  const catalogue = recheck ? fullCatalogue.filter(item => recheck.revote(item) || recheck.previous.has(item.id)) : fullCatalogue;
   if (!catalogue.length) return result;
   const started = Date.now();
   const progress: LoopAuditProgress = { total: catalogue.length, questions: flatAuthoredQuestions(document).length, images: catalogue.filter(item => item.type === 'image-belongs').length, decided: 0, catches: 0, uncertain: 0, endpointErrors: 0, rate: 0, recent: [] };
@@ -148,8 +162,12 @@ export async function runLoopDecisionAudit(params: {
   emit();
   const cacheEnabled = settings.thrift.cacheEnabled;
   const unresolved: LoopDecisionItem[] = [];
-  const votes = new Map<string, { probability: number; choice?: string; distribution?: Record<string, number> }>();
+  const votes = result.votes;
   for (const item of catalogue) {
+    if (recheck) {
+      if (recheck.revote(item)) { unresolved.push(item); result.revoted++; continue; }
+      const prior = recheck.previous.get(item.id)!; votes.set(item.id, prior); completed(item, prior); result.reused++; continue;
+    }
     if (!cacheEnabled) { unresolved.push(item); continue; }
     const key = await sha256(`loop-decide-v1:${fileHash}:${provider.id}:${provider.model}:${multimodal}:${JSON.stringify(item)}`);
     try {

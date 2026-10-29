@@ -113,7 +113,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxModelCalls: 30,
     maxToolExecutions: 200,
   },
-  // Legacy optional tools are uncalled by the six-step local loop.
+  // Legacy optional tools are uncalled by the six-phase local loop.
   cleanupEnabled: false,
   consensusEnabled: false,
   criticEnabled: false,

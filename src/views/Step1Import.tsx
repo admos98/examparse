@@ -12,8 +12,10 @@ import {
 import { ExtractedDocument } from '../pipeline/extract';
 import { getOrExtractDocument } from '../pipeline/extractCache';
 import { createDemoExamDoc } from '../pipeline/demoData';
-import { ExamDoc, getDisplayName } from '../types';
+import { AppSettings, ExamDoc, getDisplayName } from '../types';
 import { loadExamDoc, listExamSummaries, saveExamDoc } from '../store';
+import { enrichPackage } from '../pipeline/packageEnrichment';
+import { appendJournalCall } from '../pipeline/journal';
 import { importPackageFolder } from '../pipeline/packageBatchImport';
 import { sha256 } from '../utils/hash';
 import { importQuestionPackage } from '../pipeline/packageImport';
@@ -23,13 +25,16 @@ interface Props {
   onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null, fileHash?: string) => void;
   onDemoLoaded: (demoDoc: ExamDoc) => void;
   onPackageLoaded: (doc: ExamDoc) => void | Promise<void>;
+  settings: AppSettings;
   onBatchImported?: () => void | Promise<void>;
   isLoading: boolean;
   cacheEnabled?: boolean;
   onOpenSavedExam?: (doc: ExamDoc) => void;
 }
 
-export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, onPackageLoaded, onBatchImported, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
+export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, onPackageLoaded, onBatchImported, settings, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
+  const [importOnly, setImportOnly] = useState(false);
+  const [batchRunning, setBatchRunning] = useState(false);
   const [batchMessage, setBatchMessage] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -99,14 +104,15 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
   };
 
   const handleBatchFiles = async (files: File[]) => {
-    setErrorMessage(null); setBatchMessage('Loading library…');
+    if (batchRunning) return;
+    setBatchRunning(true); setErrorMessage(null); setBatchMessage('Loading library…');
     try {
       const summaries = await listExamSummaries();
       const existing = (await Promise.all(summaries.map(s => loadExamDoc(s.id)))).filter((d): d is ExamDoc => !!d);
-      const result = await importPackageFolder(files, existing, doc => saveExamDoc(doc, undefined, { requireImages: true }), setBatchMessage);
+      const result = await importPackageFolder(files, existing, doc => saveExamDoc(doc, undefined, { requireImages: true }), setBatchMessage, importOnly ? undefined : (doc, onProgress) => enrichPackage(doc, settings, { onProgress, onJournal: entry => appendJournalCall(`package-enrichment:${doc.fileHash}`, { ...entry, ts: new Date().toISOString(), complete: true }) }));
       await onBatchImported?.();
       setBatchMessage(`Imported ${result.imported} / duplicates ${result.duplicates} / failed ${result.failed} / not a package ${result.notPackage}\n${result.details.join('\n')}`);
-    } catch (err: any) { setErrorMessage(`Batch import failed: ${err.message || err}`); setBatchMessage(''); }
+    } catch (err: any) { setErrorMessage(`Batch import failed: ${err.message || err}`); setBatchMessage(''); } finally { setBatchRunning(false); }
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -308,12 +314,13 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
         <h2 className="font-semibold text-sm">Import question package</h2>
         <p className="text-xs text-[var(--ink-2)]">Select a package JSON with its images, or choose its folder. Appendix A batches are supported too.</p>
         <div className="flex gap-3 flex-wrap text-xs">
-          <label className="border rounded px-3 py-2 cursor-pointer">Choose files<input type="file" multiple accept=".json,image/*" className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
-          <label className="border rounded px-3 py-2 cursor-pointer">Choose parent folder (batch)<input type="file" multiple {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handleBatchFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
-          <label className="border rounded px-3 py-2 cursor-pointer">Choose folder<input type="file" multiple {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
+          <label className="border rounded px-3 py-2 cursor-pointer">Choose files<input type="file" multiple accept=".json,.md,image/*" className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
+          <label className="border rounded px-3 py-2 cursor-pointer">Choose parent folder (batch)<input type="file" multiple disabled={batchRunning} {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handleBatchFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
+          <label className="border rounded px-3 py-2 cursor-pointer">Choose folder<input type="file" multiple disabled={batchRunning} {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
         </div>
       </div>
 
+      <label className="flex items-center gap-2 text-sm"><input type="checkbox" disabled={batchRunning} checked={importOnly} onChange={e => setImportOnly(e.target.checked)} /> Import only, don’t enrich</label>
       {batchMessage && <div role="status" className="whitespace-pre-line text-sm">{batchMessage}</div>}
 
       {/* Secondary Options Grid */}

@@ -1,3 +1,4 @@
+import { reviewTags } from './explanationVisibility';
 /** Appendix A Question Bank v1.1 export. The importer owns rejection; this exporter reports missing data. */
 import JSZip from 'jszip';
 import type { ExamDoc, ImageAsset, Question } from '../types';
@@ -19,6 +20,7 @@ export interface BankQuestion {
   type: BankQuestionType; title: string; stem?: string; stem_blocks?: Array<{ t: 'text'; v: string } | { t: 'img'; asset: string }>;
   options?: Array<{ key: string; text: string }>; answer_key?: { correct: string[]; grading: 'auto' } | null;
   enrichment?: Question['enrichment'];
+  label?: string; optional_group_id?: string; optional_branch?: string;
   explanation: { text: string; source: 'model' } | null; points: number | null; grade: string; subject: string;
   curriculum_hints: { chapter: string | null; lesson: string | null; topic: string | null };
   difficulty?: { value: number; source: 'model' };
@@ -137,10 +139,11 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     const hints = teacher ? hintsForLesson(teacher) : selectedLesson ? { ...baseHints, lesson: selectedLesson } : baseHints;
     if (hints.chapter || hints.lesson || hints.topic) report.tagged++; else report.untagged++;
     const section = doc.sections.find(s => s.id === q.sectionId)?.title;
-    const row: BankQuestion = { type, title: stem.slice(0, 60), explanation: q.enrichment?.explanationCheck?.state === 'rejected' ? null : q.explanation || null,
+    // Student-facing bank exports omit uncertain, unjudged, and rejected explanations; structured exports retain uncertain prose with its check state.
+    const row: BankQuestion = { type, title: doc.source.kind === 'package' ? `Question ${q.label}` : stem.slice(0, 60), ...(doc.source.kind === 'package' ? { label: q.label } : {}), ...(q.optionalGroupId ? { optional_group_id: q.optionalGroupId, optional_branch: q.optionalBranch } : {}), explanation: q.explanation && q.enrichment?.explanationCheck?.state === 'verified' ? q.explanation : null,
       points: typeof q.points === 'number' && Number.isFinite(q.points) && q.points >= 0 ? q.points : null,
       ...exportIdentity(doc.meta.grade, doc.meta.subject), curriculum_hints: hints,
-      provenance: { ...provenance, ...(q.imported?.provenance?.source_ref ? { source_ref: q.imported.provenance.source_ref } : {}) }, tags: [...new Set([section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
+      provenance: { ...provenance, ...(q.imported?.provenance?.source_ref ? { source_ref: q.imported.provenance.source_ref } : {}) }, tags: [...new Set([...reviewTags(q), section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
     const stemImages = (q.images || []).filter(i => i.role === 'stem' || i.role === 'table');
     if (stemImages.length) {
       const blocks: NonNullable<BankQuestion['stem_blocks']> = [];

@@ -1,3 +1,4 @@
+import { optionalPoints } from '../pipeline/optionalGroups';
 import { curriculumLessons } from '../pipeline/curriculumHints';
 import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences, restoreMissingImageFromSource } from '../pipeline/reviewIntegrity';
 import { IntegrityFlags } from '../components/IntegrityFlags';
@@ -900,7 +901,13 @@ export const Step4ReviewContent: React.FC<Props> = ({
         {sections.map(sec => {
           const secQuestions = questionsBySection[sec.id] || [];
           const hierarchy = buildQuestionTree(secQuestions);
-          const rootQuestions = hierarchy.roots;
+          const groupStart = new Map<string, number>();
+          hierarchy.roots.forEach((q, i) => { if (q.optionalGroupId && !groupStart.has(q.optionalGroupId)) groupStart.set(q.optionalGroupId, i); });
+          const rootQuestions = [...hierarchy.roots].sort((a, b) => {
+            const ai = a.optionalGroupId ? groupStart.get(a.optionalGroupId)! : hierarchy.roots.indexOf(a);
+            const bi = b.optionalGroupId ? groupStart.get(b.optionalGroupId)! : hierarchy.roots.indexOf(b);
+            return ai - bi || (a.optionalBranch || '').localeCompare(b.optionalBranch || '') || a.no - b.no || a.label.localeCompare(b.label);
+          });
           const renderNestedChildren = (parentId: string, depth = 1): React.ReactNode => {
             const children = hierarchy.children.get(parentId) || [];
             if (!children.length) return null;
@@ -921,7 +928,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
           const secPoints = sec.points !== undefined
             ? sec.points
-            : Number(secQuestions.reduce((sum, q) => sum + (q.points || 0), 0).toFixed(2));
+            : optionalPoints(examDoc, secQuestions);
           const secAttentionCount = secQuestions.filter(q => attentionQuestionIdSet.has(q.id)).length;
           const isSectionExpanded = expandedSections.has(sec.id) || filterType !== 'all';
 
@@ -966,7 +973,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
                   {/* Question Cards List */}
                   <div className="space-y-3">
-                    {rootQuestions.map(q => {
+                    {rootQuestions.map((q, rootIndex) => {
                       const hasAttention = attentionQuestionIdSet.has(q.id);
                       const isExpanded = expandedQuestions.has(q.id) || activeQuestionId === q.id;
                       const groupChildren = hierarchy.children.get(q.id) || [];
@@ -981,6 +988,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                           tabIndex={-1}
                           className="bg-[var(--paper)] border border-[var(--rule)] rounded-[10px] p-4 space-y-2.5 transition hover:border-[var(--rule-strong)]"
                         >
+                          {q.optionalGroupId && (rootIndex === 0 || rootQuestions[rootIndex - 1].optionalGroupId !== q.optionalGroupId || rootQuestions[rootIndex - 1].optionalBranch !== q.optionalBranch) && <div className="text-xs font-semibold text-[var(--accent-ink)]">Optional group · branch {q.optionalBranch} · {examDoc.optionalGroups?.find(g => g.id === q.optionalGroupId)?.rule === 'choose-one-branch' ? 'choose one branch' : 'choose one per number'}</div>}
                           {/* Question Header Row (Calm Review Form: number, type chip, points, actions) */}
                           <div className="flex items-center justify-between gap-3 text-xs">
                             <div className="flex items-center gap-2 flex-wrap">

@@ -30,6 +30,11 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
   const decisionProvider = decide && settings.providers.find(p => p.id === decide.providerId);
   if (decide && decide.model === provider.model && (decide.providerId === provider.id || (decisionProvider?.baseURL && decisionProvider.baseURL.replace(/\/+$/, '') === provider.baseURL.replace(/\/+$/, '')))) return ['Explanation generation not run — the read role selects the decision model.', `explanations: 0 of ${doc.questions.filter(q => explanationKey(q)).length} keyed questions`];
   const notes: string[] = [];
+  // #57 Part E — intermediate narration is counted, never one line per section; it only
+  // reaches the final notes when the final outcome is incomplete, as ONE summary line.
+  let malformed = 0;
+  let omittedBatches = 0;
+  let failedBatches = 0;
   const eligible = doc.questions.filter(q => explanationKey(q));
   const system = 'Write student-facing explanations in the exam language. For each keyed question, use only the question, passage and options: explain in one or two sentences why the marked answer is correct and, for multiple choice, briefly why it beats the alternatives. Do not use outside facts or invent answers. Return JSON only: {"corrections":[{"questionNumber":"55A","explanation":"..."}]}. Use the exact label supplied as questionNumber. /no_think';
   const run = async (batch: Question[], section: string) => {
@@ -44,7 +49,7 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
         catch {
           // Salvage complete JSON objects, never guess truncated explanation text.
           const rows: any[] = []; for (const m of response.rawText.matchAll(/\{[^{}]*\}/g)) { try { rows.push(JSON.parse(m[0])); } catch { /* incomplete object */ } }
-          value = { corrections: rows }; notes.push(`Explanation generation returned malformed JSON for ${section}.`);
+          value = { corrections: rows }; malformed++;
         }
       }
       const rows = Array.isArray(value?.corrections) ? value.corrections : [];
@@ -56,9 +61,9 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
         if (matches.length !== 1) continue;
         seen.add(label); matches[0].explanation = { text: row.explanation.trim(), source: 'model' };
       }
-      if (seen.size < batch.length) notes.push(`Explanation generation omitted or returned malformed items in ${section}.`);
+      if (seen.size < batch.length) omittedBatches++;
       try { await options.onJournal?.({ label: request.label, rawText: response.rawText || JSON.stringify(value), requestText: JSON.stringify({ system, text }) }); } catch { /* best effort */ }
-    } catch { notes.push(`Explanation generation failed for ${section}; judging continues.`); }
+    } catch { failedBatches++; }
   };
   // Never mix instruction groups or sections, and never send more than four items.
   const groups = new Map<string, Question[]>();
@@ -75,6 +80,15 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
       for (const q of batch.filter(q => !q.explanation)) await run([q], section);
     }
   }
-  notes.push(`explanations: ${eligible.filter(q => q.explanation).length} of ${eligible.length} keyed questions`);
+  const made = eligible.filter(q => q.explanation).length;
+  if (made < eligible.length) {
+    const parts = [
+      ...(failedBatches ? [`generation failed for ${failedBatches} batch call(s)`] : []),
+      ...(malformed ? [`${malformed} malformed response(s)`] : []),
+      ...(omittedBatches ? [`${omittedBatches} batch(es) omitted or malformed items`] : []),
+    ];
+    notes.push(`explanations incomplete: ${parts.length ? parts.join(', ') : 'no usable rows returned'} — ${eligible.length - made} of ${eligible.length} keyed items still missing after one retry each.`);
+  }
+  notes.push(`explanations: ${made} of ${eligible.length} keyed questions`);
   return [...new Set(notes)];
 }

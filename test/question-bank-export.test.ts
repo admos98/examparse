@@ -19,7 +19,7 @@ const doc = (): ExamDoc => ({ id: 'e', fileHash: 'x', createdAt: '', displayName
  q(4, { type: 'essay', options: [], points: undefined, stem: 'Explain.' }),
 ], images: [image('i1'), image('i2'), image('i3')], source: { lines: [], pages: 1, ocrUsed: false, fileName: 'exam.pdf' }, flags: [], usage: [] });
 const schema = z.object({ batch_id: z.string().uuid(), source_dataset: z.string().min(1), questions: z.array(z.object({
- type: z.enum(['multiple_choice','true_false','short_answer','fill_in_blank','matching','ordering']), title: z.string(), stem: z.string().optional(),
+ type: z.enum(['multiple_choice','true_false','short_answer','long_answer','fill_in_blank','matching','ordering']), title: z.string(), stem: z.string().optional(),
  stem_blocks: z.array(z.union([z.object({ t: z.literal('text'), v: z.string() }), z.object({ t: z.literal('img'), asset: z.string().regex(/^[0-9a-f]{64}$/) })])).optional(),
  options: z.array(z.object({ key: z.string().regex(/^[1-9]\d*$/), text: z.string() })).optional(),
  answer_key: z.object({ correct: z.array(z.string().regex(/^[1-9]\d*$/)), grading: z.literal('auto') }).optional(),
@@ -40,21 +40,40 @@ test('batch follows Appendix A, deduplicates and verifies binary assets, and nev
  assert.deepEqual(result.report.needs_answer_key.map(x => x.question), ['Q2','Q3']);
  assert.equal(result.report.asset_count, 1); assert.equal(result.report.total_bytes, png.length);
  assert.deepEqual(result.report.image_options, ['Q3']); assert.match(third.options![0].text, /Image option/);
- assert.equal(fourth.type, 'short_answer'); assert.equal(fourth.points, null);
+ // #57 Part A — essay/paragraph/writing travel as bank long_answer; short_answer stays short_answer.
+ assert.equal(fourth.type, 'long_answer'); assert.equal(fourth.points, null);
+ assert.equal(result.report.images_placed, 1); assert.equal(result.report.image_references, 2);
  assert.deepEqual(first.difficulty, { value: 3, source: 'model' });
  const zip = await JSZip.loadAsync(result.zip); const root = result.filename.replace(/\.zip$/, '');
  const hash = createHash('sha256').update(png).digest('hex');
  assert.deepEqual(await zip.file(`${root}/assets/${hash}.png`)!.async('uint8array'), png);
  assert.equal(Object.keys(zip.files).filter(k => /assets\/[^/]+\.png$/.test(k)).length, 1);
+ // #57 Part C — v1.1 manifest: asset id → file, sha, mime, byte size (content-addressed).
+ const manifest = JSON.parse(await zip.file(`${root}/assets/manifest.json`)!.async('string'));
+ assert.equal(manifest.format, 'appendix-a-assets/1.1');
+ assert.equal(manifest.assets.length, 1);
+ assert.equal(manifest.assets[0].id, hash);
+ assert.deepEqual(manifest.assets[0].used_by.sort(), ['i1', 'i2']);
+ assert.ok(manifest.assets.every((a: any) => a.file === `assets/${hash}.png` && a.sha256 === hash && a.mime === 'image/png' && a.bytes === png.length));
  assert.deepEqual(JSON.parse(await zip.file(`${root}/export-report.json`)!.async('string')), result.report);
  assert.deepEqual(JSON.parse(await zip.file(`${root}/batch.json`)!.async('string')), result.batch);
  const secondExport = await createQuestionBankExport(exam, { sourceDataset: 'english-konkur-1402', includeModelDifficulty: false }, async () => new Blob([png]));
  assert.notEqual(result.batch.batch_id, secondExport.batch.batch_id); assert.equal(secondExport.batch.questions[0].difficulty, undefined);
 });
 
-test('missing images fail safely and official refs cannot be blank', async () => {
+test('#57 missing images export with explicit missing-asset markers and official refs cannot be blank', async () => {
  await assert.rejects(() => createQuestionBankExport(doc(), { sourceDataset: 'dataset', sourceRef: '' }, async () => new Blob([png])), /source reference/);
- await assert.rejects(() => createQuestionBankExport(doc(), { sourceDataset: 'dataset' }, async () => undefined), /unavailable/);
+ // #57 Part C — unavailable pixels never fail the export and never leave a silent token.
+ const result = await createQuestionBankExport(doc(), { sourceDataset: 'dataset' }, async () => undefined);
+ assert.deepEqual(result.report.missing_assets.map(entry => entry.image), ['i1', 'i2']);
+ assert.equal(result.report.images_placed, 0);
+ assert.equal(result.report.image_references, 2);
+ assert.ok(result.report.notes.some(note => /missing-asset marker/.test(note)));
+ const first = result.batch.questions[0].stem_blocks!.filter(block => block.t === 'img');
+ assert.ok(first.length > 0 && first.every(block => block.t === 'img' && block.asset.startsWith('missing:i')));
+ const zip = await JSZip.loadAsync(result.zip);
+ const batchText = await zip.file(`${result.filename.replace(/\.zip$/, '')}/batch.json`)!.async('string');
+ assert.doesNotMatch(batchText, /img_[0-9a-f]{16,}/i, 'no placeholder token ever appears in an export');
 });
 
 test('answer audit uncertainty prevents exporting a key', async () => {

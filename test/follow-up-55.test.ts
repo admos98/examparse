@@ -76,7 +76,10 @@ test('#55 explain precedes judge; malformed items are isolated and rejected pros
  const settings = {...DEFAULT_SETTINGS, providers:[{id:'read',name:'local',kind:'openai-compatible' as const,baseURL:'http://localhost:1234/v1',apiKey:''},{id:'d',name:'judge',kind:'openai-compatible' as const,baseURL:'http://localhost:8080',apiKey:'',decideDialect:'thx' as const}],roleMapping:{...DEFAULT_SETTINGS.roleMapping,read:{providerId:'read',model:'writer'},decide:{providerId:'d',model:'judge'}}};
  const events: string[] = []; const records: any[] = [];
  const result = await enrichPackage(doc, settings, {
-  explanationCaller:async request => { events.push('explain'); const sent = JSON.parse(request.text); assert.deepEqual(sent.questions.map((q:any) => q.number),[1,2]); return {json:{corrections:[{questionNumber:1,explanation:'Unique wrong prose.'},{questionNumber:2,explanation:4}]},rawText:''}; },
+  explanationCaller:async request => { const sent = JSON.parse(request.text);
+   // #57 Part A — the tashrihi pass rides the same local generative role with its own batch/label.
+   if (String(request.label).startsWith('Package tashrihi')) { events.push('tashrihi'); assert.deepEqual(sent.questions.map((q:any) => q.number),[3]); return {json:{corrections:[{questionNumber:3,sampleAnswer:'A model paragraph answer.',rubric:[{criterion:'Answers the task',maxPoints:1},{criterion:'Clear and complete',maxPoints:1}]}]},rawText:''}; }
+   events.push('explain'); assert.deepEqual(sent.questions.map((q:any) => q.number),[1,2]); return {json:{corrections:[{questionNumber:1,explanation:'Unique wrong prose.'},{questionNumber:2,explanation:4}]},rawText:''}; },
   decisionCaller:async body => { events.push('judge'); records.push(body); const name = Object.keys(body.questions)[0];
    if (name.includes('explanation-check')) return {results:[{name,probability:.1}]};
    if (name.includes('blind-answer')) return {results:[{name,probability:.9,choice:'A'}]};

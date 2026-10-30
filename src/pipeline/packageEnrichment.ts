@@ -5,6 +5,7 @@ import { getReviewImageBlob } from '../store';
 import { canonicalLetter, parseAnswerLetter } from './answerCorrectness';
 import { curriculumLessons, hintsForLesson } from './curriculumHints';
 import { generatePackageExplanations, explanationKey } from './packageExplanations';
+import { generatePackageTashrihi, judgeState, RUBRIC_JUDGE, SAMPLE_ANSWER_JUDGE } from './packageTashrihi';
 import { normalizeIdentity } from './identity';
 import { isPackageListeningQuestion } from './packageListening';
 import { hasCompletenessCorroboration } from './completenessCorroboration';
@@ -12,6 +13,8 @@ import { DIFFICULTY_LEVELS, DIFFICULTY_INSTRUCTIONS, blindChoiceSoundProbability
 import { DECIDE_TIMEOUT_MS } from './audit';
 
 const OUTSIDE = "not from this textbook's lessons";
+/** #57 Part B — auto-graded types whose keyless items may receive (but never be written) a proposal. */
+const AUTO_GRADED_TYPES: ReadonlySet<Question['type']> = new Set<Question['type']>(['mcq', 'fillblank', 'matching']);
 export function lessonRanking(distribution: Record<string, number>, outside = OUTSIDE): Pick<QuestionEnrichment, 'lessons' | 'origin' | 'lessonDistribution'> {
   const entries = Object.entries(distribution).filter(([, p]) => Number.isFinite(p) && p >= 0 && p <= 1).sort((a, b) => b[1] - a[1]);
   const top = entries[0];
@@ -31,9 +34,11 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
     if (!listening) delete q.imported.transcript;
   }
   const explanationNotes = await generatePackageExplanations(out, settings, { caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal });
+  // #57 Part A — the same local generative pass proposes sample answers + rubrics for keyless tashrihi items.
+  const tashrihiNotes = await generatePackageTashrihi(out, settings, { caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal });
   const provider = resolveDecisionProvider(settings);
   if (!provider) {
-    out.source.enrichmentStatus = 'not run'; out.source.enrichmentNotes = [...explanationNotes, 'No decision provider configured.'];
+    out.source.enrichmentStatus = 'not run'; out.source.enrichmentNotes = [...explanationNotes, ...tashrihiNotes, 'No decision provider configured.'];
     for (const q of out.questions) { q.confidence = null as unknown as number; q.enrichment = { source: 'model', verification: 'unjudged', ...(q.enrichment?.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}), ...(q.explanation ? { explanationCheck: { state: 'unjudged' } } : {}) }; }
     const identity = normalizeIdentity(out.meta.grade, out.meta.subject);
     if (!curriculumLessons(identity.grade, identity.subject).length) {
@@ -43,7 +48,7 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
     return out;
   }
   const caller = options.decisionCaller || (body => LLMAdapter.executeDecisions({ providerConfig: provider, body, timeoutMs: DECIDE_TIMEOUT_MS }));
-  const notes = new Set<string>(explanationNotes); let failures = 0; let calls = 0; let consecutiveErrors = 0;
+  const notes = new Set<string>([...explanationNotes, ...tashrihiNotes]); let failures = 0; let calls = 0; let consecutiveErrors = 0;
   const flag = (q: Question, code: string, message: string) => { out.flags.push({ id: `enrichment_${q.id}_${code}`, code: 'PACKAGE_ENRICHMENT', severity: 'warn', questionId: q.id, message, rootCauseId: `enrichment_${q.id}_${code}` }); };
   out.flags = out.flags.filter(f => f.code !== 'PACKAGE_ENRICHMENT');
   const decide = async (q: Question, name: string, instructions: string, input: Record<string, unknown>, choices?: Record<string, string>, images?: LoopDecisionItem['images']): Promise<LoopDecisionVote | undefined> => {
@@ -95,6 +100,13 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       } else if (answer && !opts.length) {
         const vote = await decide(q, 'answer', `The answer '${answer}' is a correct answer to this question.`, input, undefined, payloads);
         if (vote) { e.verificationProbability = vote.probability; e.verification = vote.probability >= .8 ? 'verified' : vote.probability <= .2 ? 'disagreed' : 'uncertain'; if (e.verification === 'disagreed') flag(q, 'answer', 'The checker disagrees with the answer key.'); }
+      } else if (!q.answer?.text?.trim() && opts.length >= 2 && AUTO_GRADED_TYPES.has(q.type)) {
+        // #57 Part B — propose, never execute. The checker may name a candidate for a keyless
+        // auto-graded item, but the proposal lives ONLY in enrichment.proposedAnswer: it is never
+        // written to answer / answer_key / any executable grading field. Adoption is a teacher
+        // action in Step 4 (their save stores it as teacher-entered).
+        const proposal = await decide(q, 'answer-proposal', 'Propose the correct answer to this question.', input, Object.fromEntries(opts.map(o => [o.key, o.text || ''])), payloads);
+        if (proposal?.choice) e.proposedAnswer = { text: proposal.choice, source: 'model', probability: proposal.probability };
       }
     }
     if (q.explanation && !listening && !visualMissing) {
@@ -102,6 +114,17 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       e.explanationCheck = check ? { probability: check.probability, state: check.probability >= .8 ? 'verified' : check.probability <= .2 ? 'rejected' : 'uncertain' } : { state: 'unjudged' };
     }
     if (q.explanation && (listening || visualMissing)) e.explanationCheck = { state: 'unjudged' };
+    // #57 Part A — the decision judge grades each model artifact with its single clause and
+    // routes it (≥0.80 verified · ≤0.20 rejected · middle uncertain). Teacher confirmation in
+    // Step 4 is still the only promotion; rejected artifacts stay in the record, never in exports.
+    if (q.sampleAnswer?.source === 'model') {
+      const check = await decide(q, 'sample-answer-check', SAMPLE_ANSWER_JUDGE, { ...input, sampleAnswer: q.sampleAnswer.text });
+      if (check) { q.sampleAnswer.probability = check.probability; q.sampleAnswer.judged = judgeState(check.probability); }
+    }
+    if (q.rubric?.source === 'model') {
+      const check = await decide(q, 'rubric-check', RUBRIC_JUDGE, { ...input, rubric: q.rubric.criteria, points: typeof q.points === 'number' ? q.points : null });
+      if (check) { q.rubric.probability = check.probability; q.rubric.judged = judgeState(check.probability); }
+    }
     const complete = await decide(q, 'complete', 'This question can be answered from the text given, without anything missing.', input, undefined, payloads);
     if (complete) { e.completeness = { probability: complete.probability }; if (complete.probability <= .2 && hasCompletenessCorroboration(q, passage?.text)) flag(q, 'complete', 'The checker thinks this question may be incomplete.'); }
     const identity = normalizeIdentity(out.meta.grade, out.meta.subject);
@@ -135,8 +158,9 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       const capped = e.readingMode?.value === 'direct-finding' && vote.choice === 'inference';
       if (!capped || valid(vote.distribution?.comprehension)) e.demand = { value: (capped ? 'comprehension' : vote.choice) as 'recall' | 'comprehension' | 'inference', probability: capped ? vote.distribution!.comprehension : vote.probability, distribution: vote.distribution };
     }
-    // Confidence precedence: blind-answer sound, completeness, then demand; no vote means null.
-    q.confidence = e.verificationProbability ?? e.completeness?.probability ?? e.demand?.probability ?? (null as unknown as number);
+    // Confidence precedence (#57 Part D): blind-answer sound first, then demand; completeness no
+    // longer feeds confidence (it is displayed only through its corroborated flag). No vote → null.
+    q.confidence = e.verificationProbability ?? e.demand?.probability ?? (null as unknown as number);
     for (const ref of q.images) {
       e.imagePlacement ||= []; const payload = payloads.find(p => p.id === ref.imageId);
       if (!payload) { e.imagePlacement.push({ imageId: ref.imageId, state: 'skipped-no-evidence' }); continue; }
@@ -164,6 +188,45 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       e.imagePlacement.push({ imageId: ref.imageId, state, ...(vote ? { probability: vote.probability, choice: vote.choice } : {}) });
       if (state === 'disagreed') flag(q, `image_${ref.imageId}`, 'Image may belong to another question or sentence.');
     }
+  }
+  // #57 Part E — judge each factored passage once; member questions whose own lesson vote
+  // abstained (no hint under the ≥0.50/margin rule) inherit the passage's confident lesson,
+  // stored with curriculumSource 'inherited'. Teacher and confident individual votes always win.
+  const lessonIdentity = normalizeIdentity(out.meta.grade, out.meta.subject);
+  const lessonOptions = curriculumLessons(lessonIdentity.grade, lessonIdentity.subject);
+  if (lessonOptions.length && consecutiveErrors < 5) {
+    const criteria = Object.fromEntries([...lessonOptions.map(l => [l.title, [l.keywords, l.grammar?.join('; '), l.writingFocus, l.function].filter(Boolean).join('; ')]), [OUTSIDE, "not from this textbook's lessons"]]);
+    const judged = new Set<string>();
+    for (const q of out.questions) {
+      const passage = q.passageId ? out.passages?.find(p => p.id === q.passageId) : undefined;
+      if (!passage || !passage.text.trim() || judged.has(passage.id)) continue;
+      judged.add(passage.id);
+      const vote = await decide(q, 'passage-lessons', 'Choose the lesson most relevant to this passage.', { passageText: passage.text }, criteria);
+      if (!vote?.distribution) continue;
+      const ranked = Object.entries(vote.distribution).filter(([, p]) => valid(p)).sort((a, b) => b[1] - a[1]);
+      const selected = lessonOptions.find(l => l.title === ranked[0]?.[0]);
+      if (!selected || ranked[0][1] < .5 || ranked[0][1] - (ranked[1]?.[1] || 0) < .15) continue;
+      for (const member of out.questions.filter(item => item.passageId === passage.id)) {
+        // Individual abstention only: a confident individual hint or a teacher lesson is never overridden.
+        if (member.enrichment?.teacherLesson || member.curriculumHints?.lesson) continue;
+        if (!member.enrichment?.lessonDistribution) continue;
+        member.curriculumHints = hintsForLesson(selected);
+        member.curriculumSource = 'inherited';
+      }
+    }
+  }
+  // #57 Part E — outcome-first notes: the final state first; intermediate narration survives
+  // only when the final outcome is incomplete (kept as counted summary lines from generation).
+  const eligibleExplanations = out.questions.filter(q => explanationKey(q)).length;
+  const madeExplanations = out.questions.filter(q => explanationKey(q) && q.explanation).length;
+  const rejectedExplanations = out.questions.filter(q => q.enrichment?.explanationCheck?.state === 'rejected').length;
+  for (const note of [...notes]) if (note.startsWith('explanations:')) notes.delete(note);
+  notes.add(`explanations: ${madeExplanations} of ${eligibleExplanations} keyed questions${rejectedExplanations ? `; ${rejectedExplanations} rejected by the checker` : ''}`);
+  const artifacts = out.questions.flatMap(q => [q.sampleAnswer, q.rubric]).filter(artifact => Boolean(artifact));
+  if (artifacts.length) {
+    const tally = { verified: 0, uncertain: 0, rejected: 0, unjudged: 0 };
+    for (const artifact of artifacts) tally[artifact!.judged]++;
+    notes.add(`sample & rubric checks: ${tally.verified} verified · ${tally.uncertain} uncertain · ${tally.rejected} rejected${tally.unjudged ? ` · ${tally.unjudged} unjudged` : ''}`);
   }
   const missingExplanations = out.questions.some(q => explanationKey(q) && !q.explanation);
   out.source.enrichmentStatus = !calls || failures === calls ? 'not run' : failures || consecutiveErrors >= 5 || missingExplanations ? 'partial' : 'completed'; out.source.enrichmentNotes = [...notes];

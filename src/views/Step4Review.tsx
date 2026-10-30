@@ -6,6 +6,8 @@ import { attentionQuestionIds, computeAttention, type AttentionItem } from '../u
 import { getReviewImageBlob, getSourceFile } from '../store';
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
+import { stripImagePlaceholderTokens } from '../pipeline/imagePlaceholders';
+import { confirmTashrihi } from '../pipeline/packageTashrihi';
 import { revertTextRepairOverlays } from '../pipeline/textRepair';
 import { formatSpans } from '../pipeline/spans';
 import React, { useEffect, useRef, useState } from 'react';
@@ -28,7 +30,7 @@ import {
   Combine,
   ListOrdered,
 } from 'lucide-react';
-import { AppSettings, ExamDoc, Flag, Question } from '../types';
+import { AppSettings, ExamDoc, Flag, Question, RubricCriterion } from '../types';
 import { regenerateQuestionPatch } from '../pipeline/patch';
 import { saveExamDoc } from '../store';
 import { ExamHealthBanner } from '../components/ExamHealthBanner';
@@ -55,7 +57,71 @@ interface Props {
   /** B3 — orphan jump to Step 2 (only when the import is still open in this session). */
   onJumpToSource?: (lineNo: number) => void;
   initialExpandedSectionIds?: string[];
+  /** #57 Part D — default filter is "Needs attention"; tests/print flows can ask for 'all'. */
+  initialFilterType?: 'attention' | 'all';
 }
+
+/** #57 Part A — Step 4 shows "model sample + rubric proposed — confirm or edit".
+ * Confirm (or confirmed edits) is the ONLY promotion: provenance flips to teacher. */
+const TashrihiProposalCard: React.FC<{ question: Question; onConfirm: (sample?: string, criteria?: RubricCriterion[]) => void }> = ({ question, onConfirm }) => {
+  const [sampleText, setSampleText] = useState(question.sampleAnswer?.text || '');
+  const [criteria, setCriteria] = useState<RubricCriterion[]>(question.rubric?.criteria || []);
+  const [editing, setEditing] = useState(false);
+  const modelArtifacts = question.sampleAnswer?.source === 'model' || question.rubric?.source === 'model';
+  if (!modelArtifacts) return null;
+  const badge = (state: string, probability?: number) => (
+    <span className={`font-mono px-1.5 py-0.5 rounded-[6px] ${state === 'verified' ? 'bg-[var(--ok-soft)] text-[var(--ok)]' : state === 'rejected' ? 'bg-[var(--danger-soft)] text-[var(--danger)]' : 'bg-[var(--paper)] text-[var(--ink-2)]'}`}>
+      {state}{probability != null ? ` ${Math.round(probability * 100)}%` : ''}
+    </span>
+  );
+  return (
+    <div data-tashrihi-proposal={question.id} className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2.5 text-[length:var(--type-12)] space-y-1.5">
+      <div className="font-semibold text-[var(--warn-ink)]">model sample + rubric proposed — confirm or edit</div>
+      {question.sampleAnswer && (
+        <div className="space-y-1">
+          <div className="flex items-center gap-2"><span className="font-semibold text-[var(--ink)]">Model sample answer</span>{badge(question.sampleAnswer.judged, question.sampleAnswer.probability)}</div>
+          {editing
+            ? <textarea rows={2} value={sampleText} onChange={event => setSampleText(event.target.value)} aria-label="Edit sample answer" className="w-full p-2 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-sans" />
+            : <div dir="auto" className="whitespace-pre-wrap text-[var(--ink)]">{question.sampleAnswer.text}</div>}
+        </div>
+      )}
+      {question.rubric && (
+        <div className="space-y-1">
+          <div className="flex items-center gap-2"><span className="font-semibold text-[var(--ink)]">Model rubric</span>{badge(question.rubric.judged, question.rubric.probability)}
+            <span className="text-[var(--ink-2)]">{criteria.reduce((sum, row) => sum + (Number(row.maxPoints) || 0), 0)} pts total{typeof question.points === 'number' && question.points > 0 ? ` of ${question.points}` : ''}</span>
+          </div>
+          <ol className="space-y-1">
+            {criteria.map((row, index) => (
+              <li key={index} className="flex items-center gap-1.5">
+                <span className="w-5 font-mono text-[var(--ink-2)]">{index + 1}.</span>
+                {editing
+                  ? <input value={row.criterion} aria-label={`Criterion ${index + 1}`} onChange={event => setCriteria(current => current.map((item, i) => i === index ? { ...item, criterion: event.target.value } : item))} className="flex-1 min-w-0 p-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)]" />
+                  : <span className="flex-1 min-w-0 text-[var(--ink)]">{row.criterion}</span>}
+                <span className="font-mono text-[var(--ok)]">{row.maxPoints}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <button type="button" onClick={() => setEditing(value => !value)} className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-semibold cursor-pointer">{editing ? 'Keep edits' : 'Edit'}</button>
+        <button
+          type="button"
+          data-confirm-tashrihi={question.id}
+          onClick={() => onConfirm(question.sampleAnswer ? sampleText : undefined, question.rubric ? criteria : undefined)}
+          className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer"
+        >
+          Confirm as teacher-confirmed
+        </button>
+      </div>
+    </div>
+  );
+};
+
+/** #57 Part C — package asset ids are content hashes (img_<sha256>): display a short ref so the
+ * placeholder token form never renders as text. Ordinary ids (img_001) render unchanged. */
+const imageRefLabel = (imageId: string): string =>
+  /^img_[0-9a-f]{16,}$/i.test(imageId) ? `img_${imageId.slice(4, 12)}…` : imageId;
 
 export const Step4Review: React.FC<Props> = (props) => {
   const [ready, setReady] = useState<{ input: ExamDoc; doc: ExamDoc } | null>(() =>
@@ -111,6 +177,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
   onRetryRequestHandled,
   onJumpToSource,
   initialExpandedSectionIds,
+  initialFilterType,
 }) => {
   const [bankExportOpen, setBankExportOpen] = useState(false);
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
@@ -124,7 +191,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
     usage?: { inputTokens: number; outputTokens: number; cachedTokens?: number };
   } | null>(null);
 
-  const [filterType, setFilterType] = useState<string>('all');
+  // #57 Part D — the reading experience opens on "Needs attention"; quiet items are one
+  // expandable + searchable summary line, and the header count IS the visible list's set.
+  const [filterType, setFilterType] = useState<string>(initialFilterType || 'attention');
+  const [shownQuiet, setShownQuiet] = useState<Set<string>>(() => new Set());
+  const [quietQuery, setQuietQuery] = useState('');
+  const [adoptProposal, setAdoptProposal] = useState<{ questionId: string; text: string } | null>(null);
   const [showFlagsPanel, setShowFlagsPanel] = useState<boolean>(true);
   const [showImageManager, setShowImageManager] = useState<boolean>(false);
   const [isSolvingBatch, setIsSolvingBatch] = useState<boolean>(false);
@@ -322,12 +394,29 @@ export const Step4ReviewContent: React.FC<Props> = ({
     const updatedQuestions = examDoc.questions.map(q => {
       if (q.id !== qId) return q;
       const updated = { ...q, ...updates };
-      if (q.imported && q.enrichment && contentChanged) updated.enrichment = { source: 'model', verification: 'unjudged', ...(q.enrichment.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}) };
+      if (q.imported && q.enrichment && contentChanged) updated.enrichment = {
+        source: 'model',
+        verification: 'unjudged',
+        ...(q.enrichment.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}),
+        // #57 Part B — the proposal survives as review provenance; a teacher's adopted key marks it.
+        ...(q.enrichment.proposedAnswer ? { proposedAnswer: { ...q.enrichment.proposedAnswer, ...(updates.answer?.text?.trim() ? { adopted: true } : {}) } } : {}),
+      };
       return updated;
     });
     const newDoc = { ...examDoc, questions: updatedQuestions, flags: contentChanged ? examDoc.flags.filter(f => !(f.questionId === qId && f.code === 'PACKAGE_ENRICHMENT')) : examDoc.flags };
     onUpdateDoc(newDoc);
     saveExamDoc(newDoc);
+  };
+
+  // #57 Part A — teacher confirmation is the ONLY promotion: provenance flips to 'teacher'
+  // and the needs_rubric tag clears. Nothing about grading behaviour changes until this click.
+  const handleConfirmTashrihi = (qId: string, sampleText?: string, criteria?: RubricCriterion[]) => {
+    const next = {
+      ...examDoc,
+      questions: examDoc.questions.map(q => (q.id === qId ? confirmTashrihi(q, sampleText, criteria) : q)),
+    };
+    onUpdateDoc(next);
+    saveExamDoc(next);
   };
 
   // Delete a question
@@ -725,7 +814,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
             {missingBlobImages.map(image => (
               <div key={image.id} className="flex items-center justify-between gap-3 rounded-[10px] border border-[var(--warn)] bg-[var(--paper-raised)] p-3">
                 <div className="min-w-0">
-                  <div className="font-mono font-bold text-[var(--ink)]">{image.id} · page {image.page}</div>
+                  <div className="font-mono font-bold text-[var(--ink)]">{imageRefLabel(image.id)} · page {image.page}</div>
                   <div className="truncate text-[var(--ink-2)]">{image.label?.questionRef ? `Q${image.label.questionRef}` : 'Unassigned'} · {image.width}×{image.height}</div>
                 </div>
                 <button
@@ -746,8 +835,8 @@ export const Step4ReviewContent: React.FC<Props> = ({
           <h2 id="unplaced-images" className="font-bold text-[var(--warn-ink)] ">Unplaced image assets ({health.unplacedImages.length}) — none are hidden</h2>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{health.unplacedImages.map(image => (
             <div key={image.id} className="flex gap-3 rounded-[10px] border border-[var(--warn)] bg-[var(--paper-raised)] p-2  ">
-              <img src={image.dataUrl} alt={image.label?.caption || image.id} className="h-16 w-20 object-contain rounded-[6px] bg-[var(--paper)]" />
-              <div className="min-w-0 flex-1"><div className="font-mono font-bold">{image.id} · page {image.page}</div><div className="truncate text-[var(--ink-2)]">{image.label?.caption || 'Unassigned extracted image'}</div><label className="mt-1 block text-[length:var(--type-12)]">Assign to question<select value="" onChange={event => event.target.value && handleAssignImage(image.id, event.target.value)} className="mt-1 w-full rounded-[6px] border border-[var(--warn)] bg-[var(--paper-raised)] p-1 "><option value="">Choose question…</option>{examDoc.questions.filter(question => !question.parentId).map(question => <option key={question.id} value={question.id}>Q{question.label} — {(question.stem || '').slice(0, 60)}</option>)}</select></label></div>
+              <img src={image.dataUrl} alt={image.label?.caption || imageRefLabel(image.id)} className="h-16 w-20 object-contain rounded-[6px] bg-[var(--paper)]" />
+              <div className="min-w-0 flex-1"><div className="font-mono font-bold">{imageRefLabel(image.id)} · page {image.page}</div><div className="truncate text-[var(--ink-2)]">{image.label?.caption || 'Unassigned extracted image'}</div><label className="mt-1 block text-[length:var(--type-12)]">Assign to question<select value="" onChange={event => event.target.value && handleAssignImage(image.id, event.target.value)} className="mt-1 w-full rounded-[6px] border border-[var(--warn)] bg-[var(--paper-raised)] p-1 "><option value="">Choose question…</option>{examDoc.questions.filter(question => !question.parentId).map(question => <option key={question.id} value={question.id}>Q{question.label} — {(question.stem || '').slice(0, 60)}</option>)}</select></label></div>
             </div>
           ))}</div>
         </section>
@@ -828,12 +917,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
                 {img.dataUrl ? (
                   <img
                     src={img.dataUrl}
-                    alt={img.id}
+                    alt={imageRefLabel(img.id)}
                     className="w-full h-28 object-contain rounded-[10px] bg-[var(--paper-raised)] border border-[var(--rule)] "
                   />
                 ) : (
                   <div className="w-full h-28 rounded-[10px] bg-[var(--paper)] flex flex-col items-center justify-center gap-2 text-[var(--ink-2)] p-2">
-                    <span>Image {img.id} (missing blob)</span>
+                    <span>Image {imageRefLabel(img.id)} (missing blob)</span>
                     <button
                       type="button"
                       disabled={restoringImageId === img.id}
@@ -847,7 +936,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
                 <div className="space-y-1">
                   <div className="flex justify-between items-center font-mono text-[length:var(--type-12)] text-[var(--ink-2)]">
-                    <span>{img.id} (P{img.page})</span>
+                    <span>{imageRefLabel(img.id)} (P{img.page})</span>
                     <span>{img.width}×{img.height}</span>
                   </div>
                   {img.label?.assignment && (
@@ -884,8 +973,29 @@ export const Step4ReviewContent: React.FC<Props> = ({
       )}
 
       {/* Question Cards by Section (Part C: Sections collapsed by default; calm review cards) */}
-      <div className="flex items-center justify-between text-xs text-[var(--ink-2)]">
-        <span>{sections.length} section(s) · click a section to expand its questions</span>
+      <div className="flex items-center justify-between gap-3 text-xs text-[var(--ink-2)]">
+        <span className="flex items-center gap-2 flex-wrap">
+          {/* #57 Part D — default filter is Needs attention; the header count and this list are one set. */}
+          <button
+            type="button"
+            data-filter-attention="true"
+            aria-pressed={filterType === 'attention'}
+            onClick={() => setFilterType('attention')}
+            className={`px-2.5 py-1 rounded-[6px] border font-semibold cursor-pointer ${filterType === 'attention' ? 'bg-[var(--warn-soft)] border-[var(--warn)] text-[var(--warn-ink)]' : 'bg-[var(--paper-raised)] border-[var(--rule)] text-[var(--ink-2)]'}`}
+          >
+            Needs attention ({attentionItems.length})
+          </button>
+          <button
+            type="button"
+            data-filter-all="true"
+            aria-pressed={filterType === 'all'}
+            onClick={() => setFilterType('all')}
+            className={`px-2.5 py-1 rounded-[6px] border font-semibold cursor-pointer ${filterType === 'all' ? 'bg-[var(--accent)] border-[var(--accent)] text-[var(--on-accent)]' : 'bg-[var(--paper-raised)] border-[var(--rule)] text-[var(--ink-2)]'}`}
+          >
+            All questions
+          </button>
+          <span>· {sections.length} section(s)</span>
+        </span>
         <button
           type="button"
           onClick={() => {
@@ -916,7 +1026,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                 const childExpanded = expandedQuestions.has(child.id) || activeQuestionId === child.id;
                 return <div key={child.id} id={`review-q-${child.id}`} data-review-question={child.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-3 text-xs  ">
                   <div className="flex items-start justify-between gap-2"><div className="flex items-start gap-2"><span className="rounded-[6px] bg-[var(--paper)] px-1.5 py-0.5 font-mono font-bold text-[var(--accent-ink)]  ">{String.fromCharCode(97 + childIndex % 26)}) · {child.label}</span>{child.points !== undefined && <span className="font-mono text-[var(--ok)]">{child.points} pts</span>}{childExpanded && <span className="text-[length:var(--type-12)] text-[var(--ink-2)]">{((child.confidence ?? 1) * 100).toFixed(0)}% confidence · {formatSpans(child.spans)}</span>}</div><button onClick={() => toggleQuestionExpanded(child.id)} className="text-[length:var(--type-12)] font-semibold text-[var(--accent-ink)] underline ">{childExpanded ? 'Close edit' : 'Inspect / Edit'}</button></div>
-                  {childExpanded ? <textarea rows={2} value={child.stem || ''} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{child.stem}</div>}
+                  {childExpanded ? <textarea rows={2} value={stripImagePlaceholderTokens(child.stem || '')} onChange={event => handleUpdateQuestion(child.id, { stem: event.target.value })} className="mt-2 w-full rounded-[6px] border border-[var(--accent)] bg-[var(--paper-raised)] p-2 " /> : <div dir="auto" className="mt-2 whitespace-pre-wrap">{stripImagePlaceholderTokens(child.stem || '')}</div>}
                   {(child.options || []).length > 0 && <div className="mt-2 grid gap-1 sm:grid-cols-2">{child.options?.map(option => <div key={option.key}><b>{option.key}.</b> {option.text}</div>)}</div>}
                   {child.answer?.text && <div className="mt-2 border-t border-[var(--accent)] pt-2"><b>Answer:</b> {child.answer.text}</div>}
                   {renderNestedChildren(child.id, depth + 1)}
@@ -930,7 +1040,20 @@ export const Step4ReviewContent: React.FC<Props> = ({
             ? sec.points
             : optionalPoints(examDoc, secQuestions);
           const secAttentionCount = secQuestions.filter(q => attentionQuestionIdSet.has(q.id)).length;
-          const isSectionExpanded = expandedSections.has(sec.id) || filterType !== 'all';
+          const attentionMode = filterType === 'attention';
+          const includeQuiet = shownQuiet.has(sec.id);
+          // #57 Part D — attention mode shows exactly the attention set (nested items keep their
+          // ancestors for structure); every quiet item collapses into one summary line.
+          const hasAttentionDescendant = (root: Question): boolean =>
+            attentionQuestionIdSet.has(root.id) || (hierarchy.children.get(root.id) || []).some(hasAttentionDescendant);
+          const attentionRoots = rootQuestions.filter(hasAttentionDescendant);
+          const quietRoots = rootQuestions.filter(root => !hasAttentionDescendant(root));
+          const quietNeedle = quietQuery.trim().toLowerCase();
+          const visibleQuiet = quietRoots.filter(root => !quietNeedle || `${root.label || root.no} ${root.stem || ''}`.toLowerCase().includes(quietNeedle));
+          const displayRoots = attentionMode ? (includeQuiet ? [...attentionRoots, ...visibleQuiet] : attentionRoots) : rootQuestions;
+          const isSectionExpanded = attentionMode
+            ? attentionRoots.length > 0 || expandedSections.has(sec.id)
+            : expandedSections.has(sec.id) || (filterType !== 'all' && filterType !== 'attention');
 
           return (
             <div key={sec.id} data-review-section={sec.id} className="rounded-[10px] border border-[var(--rule)] bg-[var(--paper-raised)]">
@@ -971,9 +1094,38 @@ export const Step4ReviewContent: React.FC<Props> = ({
                   {sec.instructions && <p dir="auto" className="text-[length:var(--type-12)] text-[var(--ink-2)] italic">{sec.instructions}</p>}
                   {sec.passage && <div dir="auto" className="max-w-4xl max-h-60 overflow-y-auto whitespace-pre-wrap rounded-[10px] border border-[var(--rule)] bg-[var(--paper)] p-3 text-xs leading-relaxed text-[var(--ink)]">{sec.passage}</div>}
 
+                  {/* #57 Part D — quiet items are one expandable + searchable summary line. */}
+                  {attentionMode && quietRoots.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 text-[length:var(--type-12)] text-[var(--ink-2)]" data-quiet-summary={sec.id}>
+                      <button
+                        type="button"
+                        data-quiet-toggle={sec.id}
+                        onClick={() => setShownQuiet(prev => {
+                          const next = new Set(prev);
+                          if (next.has(sec.id)) next.delete(sec.id); else next.add(sec.id);
+                          return next;
+                        })}
+                        className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] hover:bg-[var(--paper)] cursor-pointer font-medium text-[var(--ink)]"
+                      >
+                        {quietRoots.length} verified · {includeQuiet ? 'hide' : 'show'}
+                      </button>
+                      {includeQuiet && quietRoots.length > 4 && (
+                        <input
+                          type="search"
+                          value={quietQuery}
+                          onChange={event => setQuietQuery(event.target.value)}
+                          placeholder="Search quiet questions…"
+                          aria-label="Search quiet questions"
+                          className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] w-44"
+                        />
+                      )}
+                      {includeQuiet && quietNeedle && <span>{visibleQuiet.length} of {quietRoots.length} match</span>}
+                    </div>
+                  )}
+
                   {/* Question Cards List */}
                   <div className="space-y-3">
-                    {rootQuestions.map((q, rootIndex) => {
+                    {displayRoots.map((q, rootIndex) => {
                       const hasAttention = attentionQuestionIdSet.has(q.id);
                       const isExpanded = expandedQuestions.has(q.id) || activeQuestionId === q.id;
                       const groupChildren = hierarchy.children.get(q.id) || [];
@@ -988,7 +1140,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                           tabIndex={-1}
                           className="bg-[var(--paper)] border border-[var(--rule)] rounded-[10px] p-4 space-y-2.5 transition hover:border-[var(--rule-strong)]"
                         >
-                          {q.optionalGroupId && (rootIndex === 0 || rootQuestions[rootIndex - 1].optionalGroupId !== q.optionalGroupId || rootQuestions[rootIndex - 1].optionalBranch !== q.optionalBranch) && <div className="text-xs font-semibold text-[var(--accent-ink)]">Optional group · branch {q.optionalBranch} · {examDoc.optionalGroups?.find(g => g.id === q.optionalGroupId)?.rule === 'choose-one-branch' ? 'choose one branch' : 'choose one per number'}</div>}
+                          {q.optionalGroupId && (rootIndex === 0 || displayRoots[rootIndex - 1].optionalGroupId !== q.optionalGroupId || displayRoots[rootIndex - 1].optionalBranch !== q.optionalBranch) && <div className="text-xs font-semibold text-[var(--accent-ink)]">Optional group · branch {q.optionalBranch} · {examDoc.optionalGroups?.find(g => g.id === q.optionalGroupId)?.rule === 'choose-one-branch' ? 'choose one branch' : 'choose one per number'}</div>}
                           {/* Question Header Row (Calm Review Form: number, type chip, points, actions) */}
                           <div className="flex items-center justify-between gap-3 text-xs">
                             <div className="flex items-center gap-2 flex-wrap">
@@ -1090,7 +1242,9 @@ export const Step4ReviewContent: React.FC<Props> = ({
                             <div>Package provenance: {JSON.stringify(q.imported.provenance ?? null)}</div>
                             {q.enrichment ? <div className="space-y-1">
                               <div>Model estimate · answer: {q.enrichment.verification}{q.enrichment.verificationProbability != null ? ` (${Math.round(q.enrichment.verificationProbability * 100)}%)` : ''}
-                                {q.enrichment.completeness && ` · completeness: ${Math.round(q.enrichment.completeness.probability * 100)}%`}{q.enrichment.origin && ` · origin: ${q.enrichment.origin}`}{q.enrichment.demand && ` · demand: ${q.enrichment.demand.value} (${Math.round(q.enrichment.demand.probability * 100)}%)`}{q.enrichment.readingMode && ` · reading: ${q.enrichment.readingMode.value} (${Math.round(q.enrichment.readingMode.probability * 100)}%)`}</div>
+                                {/* #57 Part D — completeness is displayed only when it produced a corroborated flag. */}
+                                {q.enrichment.completeness && examDoc.flags.some(f => f.questionId === q.id && f.code === 'PACKAGE_ENRICHMENT' && /incomplete/i.test(f.message)) && ` · completeness: ${Math.round(q.enrichment.completeness.probability * 100)}% (flagged)`}{q.enrichment.origin && ` · origin: ${q.enrichment.origin}`}{q.enrichment.demand && ` · demand: ${q.enrichment.demand.value} (${Math.round(q.enrichment.demand.probability * 100)}%)`}{q.enrichment.readingMode && ` · reading: ${q.enrichment.readingMode.value} (${Math.round(q.enrichment.readingMode.probability * 100)}%)`}</div>
+                                {q.enrichment.proposedAnswer && <div className="text-[var(--warn-ink)]">Checker proposes {q.enrichment.proposedAnswer.text}{q.enrichment.proposedAnswer.probability != null ? ` (${Math.round(q.enrichment.proposedAnswer.probability * 100)}%)` : ''} — {q.enrichment.proposedAnswer.adopted ? 'adopted as teacher-entered key' : 'adopt in the answer box below'}.</div>}
                               {q.explanation && <div>{q.enrichment.explanationCheck?.state === 'rejected' ? 'Explanation rejected (suppressed)' : <>Explanation: {q.explanation.text}{q.enrichment.explanationCheck?.state === 'uncertain' && ' · uncertain'}</>}</div>}
                               {q.enrichment.imagePlacement?.map(image => <div key={image.imageId}>Image placement: {image.state}{image.probability != null ? ` (${Math.round(image.probability * 100)}%)` : ''}</div>)}
                               <div className="flex flex-wrap gap-2">{q.enrichment.lessons?.map(item => <span key={item.lesson} className="rounded border px-2 py-1">{item.lesson} · {Math.round(item.probability * 100)}%</span>)}</div>
@@ -1105,13 +1259,13 @@ export const Step4ReviewContent: React.FC<Props> = ({
                             {isExpanded ? (
                               <textarea
                                 rows={3}
-                                value={q.stem || ''}
+                                value={stripImagePlaceholderTokens(q.stem || '')}
                                 onChange={e => handleUpdateQuestion(q.id, { stem: e.target.value })}
                                 className="w-full p-2.5 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] text-xs font-sans text-[var(--ink)]"
                               />
                             ) : (
                               <div dir="auto" className="max-h-56 overflow-y-auto text-xs text-[var(--ink)] whitespace-pre-wrap leading-relaxed">
-                                {q.stem}
+                                {stripImagePlaceholderTokens(q.stem || '')}
                               </div>
                             )}
                             {/* D — rewrites are rendering-only: show original ⮕ rewrite with one-click revert when expanded */}
@@ -1149,7 +1303,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                 const asset = examDoc.images.find(i => i.id === imgRef.imageId);
                                 if (!asset || !asset.dataUrl || asset.storageMissing) return (
                                   <div key={imgRef.imageId} className="flex items-center gap-2 rounded-[10px] border-2 border-dashed border-[var(--warn)] bg-[var(--warn-soft)] p-3 text-[length:var(--type-12)] text-[var(--warn-ink)]">
-                                    <span>Missing image {imgRef.imageId} (page {asset?.page ?? 'unknown'})</span>
+                                    <span>Missing image {imageRefLabel(imgRef.imageId)} (page {asset?.page ?? 'unknown'})</span>
                                     {asset && (
                                       <button
                                         type="button"
@@ -1169,7 +1323,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                   >
                                     <img
                                       src={asset.dataUrl}
-                                      alt={asset.id}
+                                      alt={imageRefLabel(asset.id)}
                                       onError={event => { event.currentTarget.style.display = 'none'; const fallback = event.currentTarget.parentElement?.querySelector('[data-image-error]') as HTMLElement | null; if (fallback) fallback.hidden = false; }}
                                       className="max-h-24 rounded-[10px] object-contain bg-[var(--paper-raised)]"
                                     />
@@ -1248,31 +1402,82 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                 )}
                               </div>
                             ) : (
-                              <div className="flex items-center justify-between p-2 rounded-[10px] border border-dashed border-[var(--rule-strong)] text-[length:var(--type-12)] text-[var(--ink-2)]">
-                                <span>No answer linked yet</span>
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    onClick={() => handleSolveSingle(q)}
-                                    className="text-[var(--accent-ink)] hover:underline cursor-pointer flex items-center gap-1 font-medium"
-                                  >
-                                    <Sparkles className="w-3 h-3" />
-                                    <span>Solve with AI</span>
-                                  </button>
-                                  <span>•</span>
-                                  <button
-                                    onClick={() =>
-                                      handleUpdateQuestion(q.id, {
-                                        answer: { text: '', source: 'manual' },
-                                      })
-                                    }
-                                    className="text-[var(--accent-ink)] hover:underline cursor-pointer"
-                                  >
-                                    + Add manual
-                                  </button>
-                                </div>
+                              <div className="space-y-2">
+                                {/* #57 Part B — the proposal surfaces here as a review payload only;
+                                    Adopt pre-fills the key editor; the teacher's save commits it. */}
+                                {q.enrichment?.proposedAnswer && !q.enrichment.proposedAnswer.adopted && adoptProposal?.questionId !== q.id && (
+                                  <div data-question-proposal={q.id} className="flex flex-wrap items-center gap-2 rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2 text-[length:var(--type-12)] text-[var(--warn-ink)]">
+                                    <span>checker proposes <b className="font-mono">{q.enrichment.proposedAnswer.text}</b> — adopt?</span>
+                                    <button
+                                      type="button"
+                                      data-adopt-proposal={q.id}
+                                      onClick={() => setAdoptProposal({ questionId: q.id, text: q.enrichment!.proposedAnswer!.text })}
+                                      className="px-2 py-0.5 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer"
+                                    >
+                                      Adopt
+                                    </button>
+                                  </div>
+                                )}
+                                {adoptProposal?.questionId === q.id ? (
+                                  <div data-adopt-editor={q.id} className="rounded-[10px] border border-[var(--accent)] bg-[var(--paper)] p-2.5 space-y-1.5 text-[length:var(--type-12)]">
+                                    <div className="font-semibold text-[var(--accent-ink)]">Key editor pre-filled from the proposal — your save stores it as teacher-entered.</div>
+                                    <textarea
+                                      rows={1}
+                                      value={adoptProposal.text}
+                                      onChange={event => setAdoptProposal({ questionId: q.id, text: event.target.value })}
+                                      aria-label="Proposed key"
+                                      className="w-full p-2 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-mono"
+                                    />
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        data-adopt-save={q.id}
+                                        onClick={() => {
+                                          handleUpdateQuestion(q.id, { answer: { text: adoptProposal.text, source: 'manual' } });
+                                          setAdoptProposal(null);
+                                        }}
+                                        className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer"
+                                      >
+                                        Save as key (teacher-entered)
+                                      </button>
+                                      <button type="button" onClick={() => setAdoptProposal(null)} className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)]">Cancel</button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between p-2 rounded-[10px] border border-dashed border-[var(--rule-strong)] text-[length:var(--type-12)] text-[var(--ink-2)]">
+                                    <span>No answer linked yet</span>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        onClick={() => handleSolveSingle(q)}
+                                        className="text-[var(--accent-ink)] hover:underline cursor-pointer flex items-center gap-1 font-medium"
+                                      >
+                                        <Sparkles className="w-3 h-3" />
+                                        <span>Solve with AI</span>
+                                      </button>
+                                      <span>•</span>
+                                      <button
+                                        onClick={() =>
+                                          handleUpdateQuestion(q.id, {
+                                            answer: { text: '', source: 'manual' },
+                                          })
+                                        }
+                                        className="text-[var(--accent-ink)] hover:underline cursor-pointer"
+                                      >
+                                        + Add manual
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>
+                          {/* #57 Part A — judged sample answer + rubric await the teacher's confirmation. */}
+                          {(q.sampleAnswer || q.rubric) && (
+                            <TashrihiProposalCard
+                              question={q}
+                              onConfirm={(sample, criteria) => handleConfirmTashrihi(q.id, sample, criteria)}
+                            />
+                          )}
                           {showChildren && groupChildren.length > 0 && renderNestedChildren(q.id)}
                         </div>
                       );

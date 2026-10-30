@@ -120,6 +120,15 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
       }
       stem += row.stem.slice(previous);
     }
+    // Script filenames are provenance, not instructions a student can follow.
+    const originalStem = stem;
+    const replacements: Array<{ start: number; end: number; length: number }> = [];
+    stem = stem.replace(/Listen to[^.\n]*?\b(?:listening[^\s,]*|transcript[^\s,]*)\.md(?:\s*,?\s*Section\s+(\d+))?\s*\./gi,
+      (match, section, offset) => { const clean = `Listen to the recording${section ? ` (Section ${section})` : ''}.`; replacements.push({ start: offset, end: offset + match.length, length: clean.length }); return clean; });
+    for (const position of positions) {
+      const original = position.offset;
+      position.offset = original + replacements.reduce((delta, r) => delta + (original >= r.end ? r.length - (r.end - r.start) : original > r.start ? r.length - (original - r.start) : 0), 0);
+    }
     for (const ref of refs) markStructural(ref.imageId, `q_${index + 1}`);
     const sourceTextLength = stem.trim().length + (Array.isArray(row.options) ? row.options.reduce((n: number, o: any) => n + String(o?.text ?? '').length, 0) : 0);
     const leading = stem.length - stem.trimStart().length;
@@ -127,9 +136,23 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     const key = row.answer_key;
     const answer = key && Array.isArray(key.correct) && key.correct.length ? { text: key.correct.map(String).join(', '), source: 'paper' as const } : undefined;
     const { stem: _stem, stem_blocks: _blocks, options: _options, ...metadata } = row;
+    if (stem !== originalStem) metadata.provenance = { ...(metadata.provenance || {}), source_ref: [metadata.provenance?.source_ref, originalStem.match(/[^.\n]*(?:listening|transcript)[^\n]*?\.md[^\n]*/i)?.[0]?.trim()].filter(Boolean).join(' — ') };
     questions.push({ id: `q_${index + 1}`, no, label: String(no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: types[row.type] || 'unknown',
       options: Array.isArray(row.options) ? row.options.map((o: any) => ({ key: String(o.key), text: String(o.text ?? ''), spans: [] })) : [],
-      ...(answer ? { answer } : {}), points: row.points == null ? null : row.points, images: refs, packageImagePositions: positions, packageSourceTextLength: sourceTextLength, confidence: 1, imported: structuredClone(metadata) });
+      ...(answer ? { answer } : {}), points: row.points == null ? null : row.points, images: refs, packageImagePositions: positions, packageSourceTextLength: sourceTextLength, confidence: null as unknown as number, imported: structuredClone(metadata) });
+  }
+  // Attach section-scoped collateral only to listening questions, never to unrelated items.
+  for (const file of files.filter(f => /^(?:listening.*|transcript.*)\.md$/i.test(f.name))) {
+    const text = await file.text();
+    const blocks = [...text.matchAll(/^##\s+Section\s+(\d+)\b[^\n]*\n([\s\S]*?)(?=^##\s+Section\s+\d+\b|$(?![\s\S]))/gim)];
+    for (const block of blocks) {
+      const sectionIndex = Number(block[1]) - 1;
+      const section = sections.find(s => new RegExp(`\\bsection\\s+${block[1]}\\b`, 'i').test(s.title || '')) || sections[sectionIndex];
+      if (!section) continue;
+      for (const q of questions.filter(q => q.sectionId === section.id && /\b(?:listen|listening|audio|recording|transcript)\b|شنید/i.test(`${section.title} ${q.stem}`))) {
+        q.imported = { ...q.imported, script: block[2].trim() };
+      }
+    }
   }
   // Filename assignment is explicit evidence; a duplicate asset may have multiple owners.
   for (const file of files) {
@@ -144,21 +167,62 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     if (owners.length >= 2) image.packageShared = { ownerIds: owners.map(q => q.id), structural: owners.every(q => structuralOwners.get(image.id)?.has(q.id)) };
   }
   const passages: NonNullable<ExamDoc['passages']> = [];
+  // A repeated passage can only own a contiguous run in its section. A different
+  // passage-length block is a hard boundary, even if the old text reappears later.
+  const passageRun = (anchor: number, core: string): Question[] => {
+    const sectionId = questions[anchor].sectionId;
+    const compatible = (q: Question) => q.sectionId === sectionId && (!q.passageId || !!passages.find(p => p.id === q.passageId)?.text.includes(core)) && (!(q.stem || '').split(/\n\s*\n/).some(block => block.trim().length >= 200) || (q.stem || '').includes(core));
+    let first = anchor, last = anchor;
+    while (first > 0 && questions[first].no === questions[first - 1].no + 1 && compatible(questions[first - 1])) first--;
+    while (last + 1 < questions.length && questions[last + 1].no === questions[last].no + 1 && compatible(questions[last + 1])) last++;
+    return questions.slice(first, last + 1);
+  };
   for (let i = 0; i < questions.length; i++) {
     if (questions[i].passageId) continue;
     let best = '';
-    for (let j = i + 1; j < questions.length; j++) { const prefix = commonPrefix(questions[i].stem || '', questions[j].stem || ''); if (prefix.length > best.length && questions.filter(q => !q.passageId && (q.stem || '').startsWith(prefix + '\n')).length >= 3) best = prefix; }
+    for (let j = i + 1; j < questions.length; j++) { const prefix = commonPrefix(questions[i].stem || '', questions[j].stem || ''); const core = prefix.split(/\n\s*\n/).map(b => b.trim()).filter(b => b.length >= 200).sort((a,b) => b.length-a.length)[0] || prefix; if (prefix.length > best.length && passageRun(i, core).filter(q => !q.passageId && (q.stem || '').startsWith(prefix) && /^\s*\n/.test((q.stem || '').slice(prefix.length))).length >= 3) best = prefix; }
     if (!best) continue;
-    const group = questions.filter(q => !q.passageId && (q.stem || '').startsWith(best + '\n'));
+    const bestCore = best.split(/\n\s*\n/).map(b => b.trim()).filter(b => b.length >= 200).sort((a,b) => b.length-a.length)[0] || best;
+    const group = passageRun(i, bestCore).filter(q => !q.passageId && (q.stem || '').startsWith(best) && /^\s*\n/.test((q.stem || '').slice(best.length)));
     const id = `passage_${passages.length + 1}`;
     passages.push({ id, sectionTitle: sections.find(s => s.id === group[0].sectionId)?.title || 'Imported questions', text: best });
+    const min = Math.min(...group.map(q => q.no)), max = Math.max(...group.map(q => q.no));
+    for (const q of passageRun(i, bestCore)) {
+      if (q.sectionId === group[0].sectionId && q.no >= min && q.no <= max && !q.passageId && !group.includes(q) && !(q.stem || '').split(/\n\s*\n/).some(block => block.trim().length >= 200)) q.passageId = id;
+    }
     for (const q of group) { q.passageId = id; const suffix = q.stem!.slice(best.length); const removed = best.length + suffix.length - suffix.trimStart().length; q.stem = suffix.trimStart(); q.packageImagePositions = q.packageImagePositions?.map(p => ({ ...p, offset: Math.max(0, p.offset - removed) })); }
+  }
+  // Some subheaders precede the same passage. Match the factored passage block even
+  // when it no longer begins at offset zero, then inherit across the full run.
+  for (const passage of passages) {
+    const members = questions.filter(q => q.passageId === passage.id);
+    if (!members.length) continue;
+    const sectionId = members[0].sectionId;
+    const blocks = passage.text.split(/\n\s*\n/).map(b => b.trim()).filter(b => b.length >= 200).sort((a,b) => b.length - a.length);
+    const core = blocks[0] || passage.text;
+    if (core.length < 200) continue;
+    const run = passageRun(questions.indexOf(members[0]), core);
+    for (const q of run.filter(q => q.sectionId === sectionId && !q.passageId && (q.stem || '').includes(core))) {
+      const stem = q.stem || ''; const at = stem.indexOf(core);
+      const remainder = (stem.slice(0, at) + stem.slice(at + core.length)).trim();
+      // A different passage-length block belongs to its own run.
+      if (remainder.split(/\n\s*\n/).some(block => block.trim().length >= 200)) continue;
+      q.passageId = passage.id;
+      q.stem = remainder;
+      q.packageImagePositions = q.packageImagePositions?.map(p => ({ ...p, offset: Math.max(0, p.offset <= at ? p.offset : p.offset - core.length) }));
+    }
+    const linked = questions.filter(q => q.passageId === passage.id);
+    const min = Math.min(...linked.map(q => q.no)), max = Math.max(...linked.map(q => q.no));
+    for (const q of run) if (q.sectionId === sectionId && !q.passageId && q.no >= min && q.no <= max && !(q.stem || '').split(/\n\s*\n/).some(block => block.trim().length >= 200)) q.passageId = passage.id;
   }
   const fileHash = await sha256(raw + '\n' + [...fileAssets.entries()].map(([name, image]) => `${name}:${image.sha}`).sort().join('\n') + [...byHash.keys()].sort().join('\n')); 
   const originalGrade = batch.grade ?? batch.questions[0]?.grade; const originalSubject = batch.subject ?? batch.questions[0]?.subject;
   const identity = normalizeIdentity(originalGrade, originalSubject);
   const title = typeof batch.title === 'string' && batch.title.trim() ? batch.title.trim() : [identity.subject, identity.gradeDisplay || identity.grade].filter(Boolean).join(' — ') || batch.source_dataset || batch.batch_id;
+  const languageSample = questions.map(q => `${q.stem || ''} ${(q.options || []).map(o => o.text || '').join(' ')}`).join(' ');
+  const inferredRtl = (languageSample.match(/[\u0600-\u06ff]/g) || []).length > (languageSample.match(/[A-Za-z]/g) || []).length;
+  const language = typeof batch.language === 'string' && batch.language.trim() ? batch.language : inferredRtl ? 'fa' : 'en';
   const packageSectionReceipt = { rule: derivation.rule, sections: sections.map(section => ({ title: section.title || 'Imported questions', questionNumbers: questions.filter(q => q.sectionId === section.id).map(q => q.no) })) };
-  return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language: 'en', direction: 'ltr' }, sections, passages, questions, images,
-    source: { kind: 'package', packageBatchId: batch.batch_id, packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: [], usage: [] };
+  return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language, direction: batch.direction === 'rtl' || (batch.direction !== 'ltr' && /^(?:fa|ar|ur)(?:-|$)/i.test(language)) ? 'rtl' : 'ltr' }, sections, passages, questions, images,
+    source: { kind: 'package', packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: [], usage: [] };
 }

@@ -720,6 +720,8 @@ function summarizeStoredExam(doc: any): any {
   return {
     id: doc.id,
     fileHash: doc.fileHash || undefined,
+    sourceKind: doc.source?.kind,
+    packageBatchImport: doc.source?.packageBatchImport === true,
     displayName: getDisplayName(doc),
     subject: doc.meta?.subject,
     grade: doc.meta?.grade,

@@ -78,7 +78,7 @@ test('#53 bank export respects lesson threshold, teacher confirmation and passag
  doc.questions[0].enrichment = { source:'model', verification:'disagreed', lessons:[{lesson:'model lesson', probability:.55}], demand:{value:'inference',probability:.9} };
  doc.questions[1].enrichment = { source:'model', verification:'unjudged', lessons:[{lesson:'weak', probability:.49}], teacherLesson:{lesson:'teacher lesson', source:'teacher'} };
  const result = await createQuestionBankExport(doc, { sourceDataset:'synthetic' }, async image => new Blob([image.sha === createHash('sha256').update(png).digest('hex') ? png : png2]));
- assert.equal(result.batch.questions[0].curriculum_hints.lesson, 'model lesson'); assert.equal(result.batch.questions[1].curriculum_hints.lesson, 'teacher lesson');
+ assert.equal(result.batch.questions[0].curriculum_hints.lesson, null); // #55 requires a margin-qualified write-back, not a top-score guess. assert.equal(result.batch.questions[1].curriculum_hints.lesson, 'teacher lesson');
  assert.equal(result.batch.questions[0].difficulty, undefined); assert.deepEqual(result.batch.questions[0].answer_key, { correct:['1'], grading:'auto' });
  assert.equal(result.batch.questions[1].answer_key, undefined); assert.match(result.batch.questions[3].stem!, /traveller/);
  assert.equal(result.batch.questions[0].enrichment?.origin, undefined);

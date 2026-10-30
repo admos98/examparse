@@ -3,7 +3,8 @@ import JSZip from 'jszip';
 import type { ExamDoc, ImageAsset, Question } from '../types';
 import { sliceSourceSpans } from '../pipeline/assemble';
 import { getReviewImageBlob, dataUrlToBlob } from '../store';
-import { emptyCurriculumHints } from '../pipeline/curriculumHints';
+import { exportIdentity } from '../pipeline/identity';
+import { curriculumLessons, hintsForLesson, emptyCurriculumHints } from '../pipeline/curriculumHints';
 
 export interface BankExportOptions { sourceDataset: string; sourceRef?: string; includeModelDifficulty?: boolean }
 export interface BankExportReport {
@@ -18,7 +19,7 @@ export interface BankQuestion {
   type: BankQuestionType; title: string; stem?: string; stem_blocks?: Array<{ t: 'text'; v: string } | { t: 'img'; asset: string }>;
   options?: Array<{ key: string; text: string }>; answer_key?: { correct: string[]; grading: 'auto' } | null;
   enrichment?: Question['enrichment'];
-  explanation: null; points: number | null; grade: string; subject: string;
+  explanation: { text: string; source: 'model' } | null; points: number | null; grade: string; subject: string;
   curriculum_hints: { chapter: string | null; lesson: string | null; topic: string | null };
   difficulty?: { value: number; source: 'model' };
   provenance: { source_type: 'official_cited' | 'authored'; source_url: null; source_ref: string | null }; tags: string[];
@@ -131,14 +132,15 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     }
     const baseHints = q.curriculumHints || emptyCurriculumHints();
     const suggested = q.enrichment?.lessons?.[0];
-    const selectedLesson = q.enrichment?.teacherLesson?.lesson || (suggested && suggested.probability >= .5 ? suggested.lesson : undefined);
-    const hints = selectedLesson ? { ...baseHints, lesson: selectedLesson } : baseHints;
+    const selectedLesson = q.enrichment?.teacherLesson?.lesson || (doc.source.kind !== 'package' && suggested && suggested.probability >= .5 ? suggested.lesson : undefined);
+    const teacher = q.enrichment?.teacherLesson && curriculumLessons(doc.meta.grade, doc.meta.subject).find(l => l.title === selectedLesson);
+    const hints = teacher ? hintsForLesson(teacher) : selectedLesson ? { ...baseHints, lesson: selectedLesson } : baseHints;
     if (hints.chapter || hints.lesson || hints.topic) report.tagged++; else report.untagged++;
     const section = doc.sections.find(s => s.id === q.sectionId)?.title;
-    const row: BankQuestion = { type, title: stem.slice(0, 60), explanation: null,
+    const row: BankQuestion = { type, title: stem.slice(0, 60), explanation: q.enrichment?.explanationCheck?.state === 'rejected' ? null : q.explanation || null,
       points: typeof q.points === 'number' && Number.isFinite(q.points) && q.points >= 0 ? q.points : null,
-      grade: String(q.imported?.grade ?? doc.meta.grade ?? ''), subject: String(q.imported?.subject ?? doc.meta.subject ?? ''), curriculum_hints: hints,
-      provenance: { ...provenance }, tags: [...new Set([section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
+      ...exportIdentity(doc.meta.grade, doc.meta.subject), curriculum_hints: hints,
+      provenance: { ...provenance, ...(q.imported?.provenance?.source_ref ? { source_ref: q.imported.provenance.source_ref } : {}) }, tags: [...new Set([section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
     const stemImages = (q.images || []).filter(i => i.role === 'stem' || i.role === 'table');
     if (stemImages.length) {
       const blocks: NonNullable<BankQuestion['stem_blocks']> = [];
@@ -181,13 +183,18 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
       if (correct) row.answer_key = { correct: [correct], grading: 'auto' };
       else report.needs_answer_key.push({ question: label, reason: 'No confident answer matched an option.' });
     }
-    if (doc.source.kind !== 'package' && q.difficulty && q.difficulty.source === 'model' && Number.isInteger(q.difficulty.value) && q.difficulty.value >= 1 && q.difficulty.value <= 5 && (q.difficultyMode === 'active' || options.includeModelDifficulty === true)) row.difficulty = { value: q.difficulty.value, source: 'model' };
+    if (q.difficulty && q.difficulty.source === 'model' && Number.isInteger(q.difficulty.value) && q.difficulty.value >= 1 && q.difficulty.value <= 5 && (q.difficultyMode === 'active' || options.includeModelDifficulty === true)) row.difficulty = { value: q.difficulty.value, source: 'model' };
     batch.questions.push(row); report.exported++;
   }
   report.asset_count = assets.size; report.total_bytes = [...assets.values()].reduce((sum, asset) => sum + asset.bytes.length, 0);
   const slug = `${bankSlug(doc.meta.title || doc.displayName)}-batch`;
   const zip = new JSZip(); const folder = zip.folder(slug)!;
-  folder.file('batch.json', JSON.stringify(batch, null, 2)); folder.file('export-report.json', JSON.stringify(report, null, 2));
+  if (batch.questions.length <= 50) folder.file('batch.json', JSON.stringify(batch, null, 2));
+  else for (let i = 0; i < batch.questions.length; i += 50) {
+    const chunk = { ...batch, batch_id: `${batch.batch_id}-part-${Math.floor(i / 50) + 1}`, questions: batch.questions.slice(i, i + 50) };
+    folder.file(`part-${Math.floor(i / 50) + 1}/batch.json`, JSON.stringify(chunk, null, 2));
+  }
+  folder.file('export-report.json', JSON.stringify(report, null, 2));
   for (const [hash, asset] of assets) folder.file(`assets/${hash}.${asset.ext}`, asset.bytes);
   const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
   const written = await JSZip.loadAsync(bytes);

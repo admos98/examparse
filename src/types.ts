@@ -82,6 +82,7 @@ export interface Question {
   packageSourceTextLength?: number;
   packageImagePositions?: Array<{ imageId: string; offset: number }>;
   enrichment?: QuestionEnrichment;
+  explanation?: { text: string; source: 'model' };
   type:
     | 'mcq'
     | 'truefalse'
@@ -123,7 +124,7 @@ export interface Question {
     line: number;
     text: string;
   }[]; // only normalized lines
-  confidence: number; // 0..1 from model
+  confidence: number; // 0..1 from model (package imports persist null when unjudged)
   difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model'; /** #50: flat level distribution (top level < 0.4). */ uncertain?: boolean };
   difficultyMode?: 'shadow' | 'active';
   curriculumHints?: import('./pipeline/curriculumHints').CurriculumHints;
@@ -138,6 +139,8 @@ export interface QuestionEnrichment {
   verification: 'verified' | 'disagreed' | 'uncertain' | 'unjudged';
   verificationProbability?: number;
   checkerChoice?: string;
+  difficultyUncertain?: boolean;
+  explanationCheck?: { state: 'verified' | 'rejected' | 'uncertain' | 'unjudged'; probability?: number };
   completeness?: { probability: number };
   lessons?: Array<{ lesson: string; probability: number }>;
   lessonDistribution?: Record<string, number>;
@@ -279,6 +282,8 @@ export interface ExamDoc {
   source: {
     kind?: 'package' | 'pdf' | 'word';
     packageBatchId?: string;
+    packageJsonHash?: string;
+    packageBatchImport?: boolean;
     packageDataset?: string;
     packageIdentity?: { grade?: unknown; subject?: unknown; title?: unknown };
     packageSectionReceipt?: { rule: 'explicit' | 'title-suffix' | 'marker' | 'fallback'; sections: Array<{ title: string; questionNumbers: number[] }> };

@@ -10,7 +10,7 @@ export function hasEmptyOrPlaceholderOption(q: Question): boolean {
 }
 export function referencesAbsentMaterial(q: Question, passage?: string): boolean {
   const stem = q.stem || '';
-  return (/\b(?:the|this|above|following)\s+(?:reading\s+)?(?:passage|text|paragraph)\b/i.test(stem) && !passage) ||
+  return (/\b(?:the|this|above|following)\s+(?:reading\s+)?(?:passage|text|paragraph)\b/i.test(stem) && !passage && !stem.split(/\n\s*\n/).some(block => block.trim().length >= 200)) ||
     (/\b(?:picture|image|photo|illustration|diagram)\b/i.test(stem) && !q.images.length) ||
     (/\b(?:the|this|above|following)\s+(?:table|chart)\b/i.test(stem) && !q.tables?.length && !q.images.length);
 }

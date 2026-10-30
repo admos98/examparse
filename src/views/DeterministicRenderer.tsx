@@ -105,8 +105,9 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
         <span className="ep-option-key">{option.key}</span>
         <DirectionalText text={option.text || ''} fallback={fallbackDir} />
       </div>)}</div> : null}
+      {mode === 'review' && q.explanation && q.enrichment?.explanationCheck?.state !== 'rejected' && <div className="ep-review-note">{q.explanation.text}</div>}
       {mode === 'paper' && ['short', 'long', 'essay'].includes(q.type) && <div className="ep-writing-lines" style={{ height: q.type === 'essay' ? '80px' : '40px' }} />}
-      {mode === 'review' && <div className="ep-review-note"><span>{t('Source lines', 'خطوط منبع')}: {formatSpans(q.spans)}</span><span>{t('Confidence', 'اطمینان')}: {(q.confidence * 100).toFixed(0)}%</span></div>}
+      {mode === 'review' && <div className="ep-review-note"><span>{t('Source lines', 'خطوط منبع')}: {formatSpans(q.spans)}</span><span>{t('Confidence', 'اطمینان')}: {q.confidence == null ? '—' : `${(q.confidence * 100).toFixed(0)}%`}</span></div>}
       {nested.map((child, index) => renderQuestion(child, children, depth + 1, index))}
     </article>;
   };

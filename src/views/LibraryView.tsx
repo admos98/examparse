@@ -3,6 +3,7 @@
  * Lists stored exams from the local folder with open / rename / duplicate / export / delete.
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { normalizeIdentity } from '../pipeline/identity';
 import { cleanRateTrend, regressionAlarm } from '../pipeline/liveBench';
 import {
   X,
@@ -40,6 +41,7 @@ interface Props {
   onClose: () => void;
   activeExamId?: string | null;
   onOpenExam: (doc: ExamDoc) => void;
+  onVerifyPackage?: (doc: ExamDoc) => void;
   onExamRenamed: (doc: ExamDoc) => void;
   onExamDeleted: (id: string) => void;
   onGoToImport: () => void;
@@ -53,6 +55,7 @@ export const LibraryView: React.FC<Props> = ({
   onClose,
   activeExamId,
   onOpenExam,
+  onVerifyPackage,
   onExamRenamed,
   onExamDeleted,
   onGoToImport,
@@ -417,7 +420,7 @@ export const LibraryView: React.FC<Props> = ({
           <div className="space-y-3">
             {visible.map(s => {
               const termYear = [s.term, s.year].filter(Boolean).join(' ');
-              const chips = [s.subject, s.grade, termYear].filter(Boolean) as string[];
+              const chips = [s.subject, normalizeIdentity(s.grade, s.subject).gradeDisplay || s.grade, termYear, s.sourceKind === 'package' ? (s.packageBatchImport ? 'Package · batch' : 'Package') : undefined].filter(Boolean) as string[];
               const isActive = activeExamId === s.id;
               const summaryCoverage = Number.isFinite(s.coveragePercent) ? s.coveragePercent : 0;
               const summaryMissing = Array.isArray(s.missingQuestionNos) ? s.missingQuestionNos : [];
@@ -555,6 +558,10 @@ export const LibraryView: React.FC<Props> = ({
                       >
                         Open
                       </button>
+                      {s.sourceKind === 'package' && onVerifyPackage && <button
+                        onClick={() => { void loadExamDoc(s.id).then(doc => { if (doc) onVerifyPackage(doc); else setErrorMsg('That package could not be loaded.'); }).catch(() => setErrorMsg('That package could not be loaded.')); }}
+                        className="px-3 py-1.5 rounded-[6px] border border-[var(--rule)] hover:bg-[var(--paper)] transition"
+                      >Verify &amp; enrich</button>}
                       <button
                         onClick={() => startRename(s)}
                         className="flex items-center gap-1 px-2.5 py-1.5 rounded-[6px] border border-[var(--rule)]  hover:bg-[var(--paper)]  transition"

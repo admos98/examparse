@@ -16,8 +16,8 @@ export function PackageAnalyze({ doc, settings, onComplete }: { doc: ExamDoc; se
   };
   return <div className="max-w-3xl mx-auto p-6 space-y-4">
     <h1 className="text-xl font-bold">Verify &amp; enrich</h1>
-    <p className="text-sm">This package already contains {doc.questions.length} questions. The decision model checks and estimates; it never changes the package answers or text.</p>
-    {!resolveDecisionProvider(settings) && <p className="text-sm">No decision provider configured — enrichment is not run. You can review the package as-is.</p>}
+    <p className="text-sm">This package already contains {doc.questions.length} questions. A local read model first writes explanations for keyed questions, then the decision model checks and estimates. Package answers and stems are not changed.</p>
+    {!resolveDecisionProvider(settings) && <p className="text-sm">No decision provider configured — judging will not run. Local explanation generation can still run if configured.</p>}
     {progress && <p aria-live="polite" className="text-xs">{progress}</p>}{error && <p role="alert">{error}</p>}
     <div className="flex gap-3"><button disabled={running} onClick={run} className="px-4 py-2 rounded bg-[var(--accent)] text-[var(--on-accent)] disabled:opacity-50">{running ? 'Checking…' : 'Verify & enrich'}</button>
     <button disabled={running} onClick={() => onComplete(doc)} className="px-4 py-2 rounded border">Review as-is</button></div>

@@ -13,7 +13,8 @@ import { ExtractedDocument } from '../pipeline/extract';
 import { getOrExtractDocument } from '../pipeline/extractCache';
 import { createDemoExamDoc } from '../pipeline/demoData';
 import { ExamDoc, getDisplayName } from '../types';
-import { loadExamDoc } from '../store';
+import { loadExamDoc, listExamSummaries, saveExamDoc } from '../store';
+import { importPackageFolder } from '../pipeline/packageBatchImport';
 import { sha256 } from '../utils/hash';
 import { importQuestionPackage } from '../pipeline/packageImport';
 import { MAX_SOURCE_FILE_BYTES } from '../utils/validation';
@@ -22,12 +23,14 @@ interface Props {
   onDocumentLoaded: (doc: ExtractedDocument, rawFile: File, answerKeyFile?: File | null, fileHash?: string) => void;
   onDemoLoaded: (demoDoc: ExamDoc) => void;
   onPackageLoaded: (doc: ExamDoc) => void | Promise<void>;
+  onBatchImported?: () => void | Promise<void>;
   isLoading: boolean;
   cacheEnabled?: boolean;
   onOpenSavedExam?: (doc: ExamDoc) => void;
 }
 
-export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, onPackageLoaded, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
+export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, onPackageLoaded, onBatchImported, isLoading, cacheEnabled = true, onOpenSavedExam }) => {
+  const [batchMessage, setBatchMessage] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'upload' | 'paste'>('upload');
@@ -93,6 +96,17 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
       if (files.reduce((sum, f) => sum + f.size, 0) > MAX_SOURCE_FILE_BYTES) throw new Error('Package exceeds the import size limit.');
       await onPackageLoaded(await importQuestionPackage(files));
     } catch (err: any) { setErrorMessage(`Failed to import package: ${err.message || err}`); }
+  };
+
+  const handleBatchFiles = async (files: File[]) => {
+    setErrorMessage(null); setBatchMessage('Loading library…');
+    try {
+      const summaries = await listExamSummaries();
+      const existing = (await Promise.all(summaries.map(s => loadExamDoc(s.id)))).filter((d): d is ExamDoc => !!d);
+      const result = await importPackageFolder(files, existing, doc => saveExamDoc(doc, undefined, { requireImages: true }), setBatchMessage);
+      await onBatchImported?.();
+      setBatchMessage(`Imported ${result.imported} / duplicates ${result.duplicates} / failed ${result.failed} / not a package ${result.notPackage}\n${result.details.join('\n')}`);
+    } catch (err: any) { setErrorMessage(`Batch import failed: ${err.message || err}`); setBatchMessage(''); }
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -295,9 +309,12 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
         <p className="text-xs text-[var(--ink-2)]">Select a package JSON with its images, or choose its folder. Appendix A batches are supported too.</p>
         <div className="flex gap-3 flex-wrap text-xs">
           <label className="border rounded px-3 py-2 cursor-pointer">Choose files<input type="file" multiple accept=".json,image/*" className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
+          <label className="border rounded px-3 py-2 cursor-pointer">Choose parent folder (batch)<input type="file" multiple {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handleBatchFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
           <label className="border rounded px-3 py-2 cursor-pointer">Choose folder<input type="file" multiple {...({ webkitdirectory: '' } as any)} className="hidden" onChange={e => { if (e.target.files?.length) void handlePackageFiles(Array.from(e.target.files)); e.target.value = ''; }} /></label>
         </div>
       </div>
+
+      {batchMessage && <div role="status" className="whitespace-pre-line text-sm">{batchMessage}</div>}
 
       {/* Secondary Options Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

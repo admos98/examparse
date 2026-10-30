@@ -4,6 +4,8 @@
  */
 import { ExamDoc, getDisplayName, sanitizeFileName } from '../types';
 import { getExamHealth, invariantViolationQuestionNos, validateExamInvariants } from '../pipeline/quality';
+import { exportSafeQuestion } from './explanationVisibility';
+import { exportIdentity } from '../pipeline/identity';
 import { stripCredentialFields } from './validation';
 import { buildParseReport, type ParseReport } from '../pipeline/provenance';
 
@@ -61,6 +63,8 @@ export function buildExportDoc(doc: ExamDoc): any {
   const { pageImages, ...sourceWithoutPageImages } = (doc.source || {}) as any;
   return stripCredentialFields({
     ...doc,
+    meta: { ...doc.meta, ...exportIdentity(doc.meta.grade, doc.meta.subject) },
+    questions: doc.questions.map(exportSafeQuestion),
     exportMeta: {
       binariesStripped: true,
       imageMode: 'folder-blob-reference',
@@ -208,6 +212,8 @@ export function summarizeExamForLibrary(doc: ExamDoc) {
   return {
     id: doc.id,
     fileHash: doc.fileHash || undefined,
+    sourceKind: doc.source?.kind,
+    packageBatchImport: doc.source?.packageBatchImport === true,
     displayName: getDisplayName(doc),
     subject: doc.meta?.subject,
     grade: doc.meta?.grade,

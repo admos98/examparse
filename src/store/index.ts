@@ -368,6 +368,7 @@ async function putImageBlobQuietly(key: string, blob: Blob): Promise<void> {
 export async function saveExamDoc(
   doc: ExamDoc,
   expectedContentHash?: string,
+  options?: { requireImages?: boolean },
 ): Promise<SaveExamResult> {
   const { reconcileFinalFlags, repairImageReferences } = await import('../pipeline/reviewIntegrity');
   Object.assign(doc, reconcileFinalFlags(repairImageReferences(doc)));
@@ -445,6 +446,8 @@ export async function saveExamDoc(
   }
 
   const uniqueFailedIds = [...new Set(failedImageIds)];
+  // Batch packages are committed only after every referenced image is durable.
+  if (options?.requireImages && uniqueFailedIds.length) throw new Error(`Failed to store package images: ${uniqueFailedIds.join(', ')}`);
   let banner: string | undefined;
   if (uniqueFailedIds.length > 0) {
     doc.storageState = 'PARTIAL-STORAGE';
@@ -665,6 +668,8 @@ export async function getImageBlob(key: string): Promise<Blob | undefined> {
  */
 export interface ExamSummary {
   id: string;
+  sourceKind?: string;
+  packageBatchImport?: boolean;
   displayName: string;
   subject?: string;
   grade?: string;

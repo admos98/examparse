@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import { exportSafeQuestion } from './explanationVisibility';
 
 export interface MemoryBackup {
   playbook?: any;
@@ -21,7 +22,8 @@ export async function createBackup(dataDir: BackupInput): Promise<Uint8Array> {
   const zip = new JSZip();
   // Whole data dir (exams, images by sha, dossiers, settings sans keys)
   for (const [id, exam] of Object.entries(dataDir.exams)) {
-    zip.file(`exams/${id}.json`, JSON.stringify(exam, null, 2));
+    const safeExam = Array.isArray(exam?.questions) ? { ...exam, questions: exam.questions.map(exportSafeQuestion) } : exam;
+    zip.file(`exams/${id}.json`, JSON.stringify(safeExam, null, 2));
   }
   for (const [sha, blob] of Object.entries(dataDir.images)) {
     zip.file(`images/${sha}`, blob.data);

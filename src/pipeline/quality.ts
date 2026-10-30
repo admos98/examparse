@@ -1,3 +1,4 @@
+import { optionalPoints } from './optionalGroups';
 /** Deterministic completeness, key-territory, and exam-health helpers. */
 import { ExamDoc, ExamSection, Flag, ImageAsset, LineSpan, OffsetSpan, Question, SourceLine } from '../types';
 import { buildQuestionTree } from '../utils/questionTree';
@@ -650,6 +651,16 @@ export function getExamHealth(doc: ExamDoc): ExamHealth {
     effectiveExpected = effectiveExpected.filter(n => !set.has(n));
   }
   const coverage = evaluateCoverage(effectiveExpected, contentQuestions as any, doc.meta?.totalPoints);
+  if (doc.source?.kind === 'package') {
+    coverage.duplicates = coverage.duplicates.filter(no => {
+      const matches = contentQuestions.filter(q => q.no === no);
+      return new Set(matches.map(q => q.label)).size !== matches.length;
+    });
+    coverage.pointsParsed = optionalPoints(doc, contentQuestions);
+    coverage.pointDeficit = doc.meta.totalPoints === undefined ? 0 : Number((doc.meta.totalPoints - coverage.pointsParsed).toFixed(2));
+    coverage.pointsMatch = doc.meta.totalPoints === undefined || Math.abs(coverage.pointDeficit) <= .51;
+    coverage.complete = !coverage.missing.length && !coverage.duplicates.length && coverage.pointsMatch;
+  }
   const referenced = new Set<string>();
   const unresolved = new Set<string>();
   for (const q of doc.questions || []) {
@@ -1110,7 +1121,7 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
     }
   }
   // I5 points sum vs meta.totalPoints within 0.51
-  const rootSum = (doc.questions || []).filter(q => !q.parentId).reduce((s, q) => s + (q.points || 0), 0);
+  const rootSum = optionalPoints(doc, (doc.questions || []).filter(q => !q.parentId));
   const total = doc.meta?.totalPoints;
   if (typeof total === 'number' && Math.abs(rootSum - total) > 0.51) {
     violations.push({ code: 'I5', message: `points sum ${rootSum} vs meta ${total} diff >0.51`, severity: 'error' });
@@ -1158,7 +1169,7 @@ export function validateExamInvariants(doc: ExamDoc): { ok: boolean; violations:
     // Allow if one is parent of other
     const parentIds = new Set(list.map(q => q.id));
     const isParentChild = list.some(q => q.parentId && parentIds.has(q.parentId));
-    if (!isParentChild) {
+    if (!isParentChild && !(doc.source?.kind === 'package' && new Set(list.map(q => q.label)).size === list.length)) {
       violations.push({ code: 'I8', message: `duplicate printed number ${no} without parent-child`, severity: 'error' });
       flags.push({ id: `flag_I8_${no}`, code: 'INVARIANT_I8_DUP_NUMBER', severity: 'error', message: `Duplicate printed number ${no} without parent-child relation` });
     }

@@ -81,6 +81,9 @@ export interface Question {
   /** Offsets into the imported stem for inline image references. */
   packageSourceTextLength?: number;
   packageImagePositions?: Array<{ imageId: string; offset: number }>;
+  tags?: string[];
+  optionalGroupId?: string;
+  optionalBranch?: string;
   enrichment?: QuestionEnrichment;
   explanation?: { text: string; source: 'model' };
   type:
@@ -276,6 +279,7 @@ export interface ExamDoc {
   sections: ExamSection[];
   /** Map-proposed shared text, with ranges retained for question-level ownership. */
   instructionGroups?: Array<{ appliesToFirst: number; appliesToLast: number; text: string }>;
+  optionalGroups?: Array<{ id: string; rule: 'choose-one-branch' | 'choose-one-per-number'; memberLabels: string[]; branches: Record<string, string[]>; printedTotal?: number }>;
   passages?: Array<{ id: string; sectionTitle: string; text: string; appliesToFirst?: number; appliesToLast?: number }>;
   questions: Question[];
   images: ImageAsset[];
@@ -287,6 +291,8 @@ export interface ExamDoc {
     packageDataset?: string;
     packageIdentity?: { grade?: unknown; subject?: unknown; title?: unknown };
     packageSectionReceipt?: { rule: 'explicit' | 'title-suffix' | 'marker' | 'fallback'; sections: Array<{ title: string; questionNumbers: number[] }> };
+    packageScriptReceipt?: Array<{ label: string; sectionId: string | null }>;
+    packageStructureReceipt?: { labelsPreserved: number; optionalGroups: NonNullable<ExamDoc['optionalGroups']>; collisions: Array<{ number: number; labels: string[] }> };
     enrichmentStatus?: 'not run' | 'completed' | 'partial';
     enrichmentNotes?: string[];
     diagnostics?: import('./pipeline/extractionQuality').ExtractionDiagnostics;

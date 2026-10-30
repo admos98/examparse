@@ -6,7 +6,7 @@ export interface PackageBatchSummary {
   imported: number; duplicates: number; failed: number; notPackage: number;
   details: string[];
 }
-export async function importPackageFolder(files: PackageFile[], existing: ExamDoc[], save: (doc: ExamDoc) => Promise<unknown>, progress?: (message: string) => void): Promise<PackageBatchSummary> {
+export async function importPackageFolder(files: PackageFile[], existing: ExamDoc[], save: (doc: ExamDoc) => Promise<unknown>, progress?: (message: string) => void, enrich?: (doc: ExamDoc, progress: (message: string) => void) => Promise<ExamDoc>): Promise<PackageBatchSummary> {
   const result: PackageBatchSummary = { imported: 0, duplicates: 0, failed: 0, notPackage: 0, details: [] };
   const groups = new Map<string, PackageFile[]>(); let ignored = 0;
   for (const file of files) {
@@ -18,21 +18,37 @@ export async function importPackageFolder(files: PackageFile[], existing: ExamDo
     groups.set(group, [...(groups.get(group) || []), normalized]);
   }
   if (ignored) result.details.push(`${ignored} file(s) directly in parent ignored.`);
+  const pending: Array<{ name: string; doc: ExamDoc; detail: number; position: number }> = [];
   let i = 0;
   for (const [name, group] of groups) {
-    progress?.(`${++i} of ${groups.size}: ${name}`);
-    if (!group.some(f => /\.json$/i.test(f.name) && !/export-report\.json$/i.test(f.name))) { result.notPackage++; result.details.push(`${name}: not a package (no JSON).`); continue; }
+    progress?.(`Exam ${++i} of ${groups.size}: ${name} · import`);
+    if (!group.some(f => /\.json$/i.test(f.name) && !/export-report\.json$/i.test(f.name))) { result.notPackage++; result.details.push(`${name}: not a package (no JSON); enrichment not-run.`); continue; }
     try {
       const doc = await importQuestionPackage(group);
       const packages = existing.filter(e => e.source.kind === 'package');
       if (packages.some(e => e.source.packageJsonHash === doc.source.packageJsonHash || e.fileHash === doc.fileHash)) {
-        result.duplicates++; result.details.push(`${name}: already imported.`); continue;
+        result.duplicates++; result.details.push(`${name}: already imported (duplicate); enrichment not-run.`); continue;
       }
       const collision = packages.some(e => e.source.packageBatchId === doc.source.packageBatchId);
       doc.source.packageBatchImport = true;
       await save(doc); existing.push(doc); result.imported++;
-      result.details.push(`${name}: imported${collision ? ' (batch ID collision; new version)' : ''}.`);
-    } catch (error) { result.failed++; result.details.push(`${name}: ${error instanceof Error ? error.message : String(error)}`); }
+      result.details.push(`${name}: imported${collision ? ' (batch ID collision; new version)' : ''}; enrichment not-run${enrich ? ' (queued)' : ' (import only)'}.`);
+      pending.push({ name, doc, detail: result.details.length - 1, position: i });
+    } catch (error) { result.failed++; result.details.push(`${name}: import failed — ${error instanceof Error ? error.message : String(error)}; enrichment not-run.`); }
+  }
+  if (enrich) for (let index = 0; index < pending.length; index++) {
+    const item = pending[index];
+    const prefix = `Exam ${item.position} of ${groups.size}: ${item.name} · `;
+    progress?.(`${prefix}verify & enrich`);
+    try {
+      const next = await enrich(item.doc, message => progress?.(`${prefix}${message}`));
+      await save(next);
+      const status = next.source.enrichmentStatus;
+      const reason = next.source.enrichmentNotes?.join('; ') || (status === 'completed' ? 'completed' : 'no decision results');
+      result.details[item.detail] = result.details[item.detail].replace(/enrichment not-run.*$/, `enrichment ${status === 'completed' ? '✓' : status === 'partial' ? 'partial' : reason.includes('No decision provider configured') ? 'not-run' : 'failed'} — ${reason}.`);
+    } catch (error) {
+      result.details[item.detail] = result.details[item.detail].replace(/enrichment not-run.*$/, `enrichment failed — ${error instanceof Error ? error.message : String(error)}.`);
+    }
   }
   return result;
 }

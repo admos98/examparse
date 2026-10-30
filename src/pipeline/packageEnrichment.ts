@@ -6,6 +6,7 @@ import { canonicalLetter, parseAnswerLetter } from './answerCorrectness';
 import { curriculumLessons, hintsForLesson } from './curriculumHints';
 import { generatePackageExplanations, explanationKey } from './packageExplanations';
 import { normalizeIdentity } from './identity';
+import { isPackageListeningQuestion } from './packageListening';
 import { hasCompletenessCorroboration } from './completenessCorroboration';
 import { DIFFICULTY_LEVELS, DIFFICULTY_INSTRUCTIONS, blindChoiceSoundProbability, buildLoopDecisionState, buildThxDecisionBody, decideIsMultimodal, IMAGE_OWNERSHIP_INSTRUCTIONS, resolveDecisionProvider, type LoopDecisionCaller, type LoopDecisionItem, type LoopDecisionVote } from './loopAudit';
 import { DECIDE_TIMEOUT_MS } from './audit';
@@ -20,6 +21,15 @@ export function lessonRanking(distribution: Record<string, number>, outside = OU
 const valid = (p: unknown): p is number => typeof p === 'number' && Number.isFinite(p) && p >= 0 && p <= 1;
 export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options: { explanationCaller?: NonNullable<Parameters<typeof generatePackageExplanations>[2]>['caller']; decisionCaller?: LoopDecisionCaller; onProgress?: (message: string) => void; onJournal?: (entry: { label: string; rawText: string; requestText: string }) => Promise<void> } = {}): Promise<ExamDoc> {
   const out: ExamDoc = structuredClone(doc);
+  // Legacy package imports may contain the old first-section fallback. Without a
+  // mapping receipt it is unsafe evidence, even on re-enrichment.
+  for (const q of out.questions) {
+    if (!q.imported) continue;
+    const listening = isPackageListeningQuestion(q, out.sections.find(s => s.id === q.sectionId)?.title);
+    const mapped = out.source.packageScriptReceipt?.some(r => r.label === q.label && r.sectionId != null);
+    if (!listening || !mapped) delete q.imported.script;
+    if (!listening) delete q.imported.transcript;
+  }
   const explanationNotes = await generatePackageExplanations(out, settings, { caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal });
   const provider = resolveDecisionProvider(settings);
   if (!provider) {
@@ -40,7 +50,7 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
     if (consecutiveErrors >= 5) return undefined;
     const item: LoopDecisionItem = { id: `${q.id}::${name}`, name: `${q.id} ${name}`, type: name === 'difficulty' ? 'difficulty' : 'complete', questionNumbers: [q.no], instructions, input, ...(choices ? { choices: Object.keys(choices), choiceDescriptions: choices } : {}), ...(images ? { images } : {}) };
     const body = provider.decideDialect === 'thx' ? buildThxDecisionBody(item, provider.model, buildLoopDecisionState(item)) : { input: { exam: doc.fileHash.slice(0, 12), purpose: 'package enrichment' }, questions: [{ name: item.id, type: name === 'difficulty' ? 'score' : choices ? 'choice' : 'probability', instructions, input, ...(name === 'difficulty' ? { criteria: [...DIFFICULTY_LEVELS] } : {}), ...(choices ? { choices: Object.keys(choices), choiceDescriptions: choices } : {}), ...(images ? { images } : {}) }] };
-    options.onProgress?.(`Q${q.no} · ${name}`); calls++;
+    options.onProgress?.(`Q${q.label || q.no} · ${name}`); calls++;
     try {
       const response = await caller(body); consecutiveErrors = 0; const row = response.results.find(r => r.name === item.id || r.name === item.name);
       if (!row || !valid(row.probability)) { failures++; return undefined; }
@@ -58,8 +68,8 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
   for (const q of out.questions) {
     const e: QuestionEnrichment = { source: 'model', verification: 'unjudged', origin: 'unknown', ...(q.enrichment?.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}) }; q.enrichment = e;
     const passage = out.passages?.find(p => p.id === q.passageId);
-    const input = { question: { number: q.no, type: q.type, stem: q.stem, options: (q.options || []).map(o => ({ key: o.key, text: o.text })) }, ...(passage ? { passageText: passage.text } : {}), ...((typeof q.imported?.transcript === 'string' && q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && q.imported.script.trim()) ? { listeningScript: q.imported?.transcript?.trim() || q.imported?.script?.trim() } : {}) };
-    const listening = /\b(?:listen|listening|audio|recording|transcript)\b|شنید/i.test(`${q.imported?.title || ''} ${out.sections.find(s => s.id === q.sectionId)?.title || ''} ${q.stem || ''}`) && !(/\b(?:listening script|transcript)\s*:/i.test(`${passage?.text || ''} ${q.stem || ''}`) || (typeof q.imported?.transcript === 'string' && !!q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && !!q.imported.script.trim()));
+    const input = { question: { number: q.no, label: q.label, type: q.type, stem: q.stem, options: (q.options || []).map(o => ({ key: o.key, text: o.text })) }, ...(passage ? { passageText: passage.text } : {}), ...((typeof q.imported?.transcript === 'string' && q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && q.imported.script.trim()) ? { listeningScript: q.imported?.transcript?.trim() || q.imported?.script?.trim() } : {}) };
+    const listening = isPackageListeningQuestion(q, out.sections.find(s => s.id === q.sectionId)?.title) && !(/\b(?:listening script|transcript)\s*:/i.test(`${passage?.text || ''} ${q.stem || ''}`) || (typeof q.imported?.transcript === 'string' && !!q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && !!q.imported.script.trim()));
     const payloads: NonNullable<LoopDecisionItem['images']> = [];
     if (multimodal) for (const ref of q.images) {
       const image = out.images.find(i => i.id === ref.imageId); if (!image) continue;
@@ -87,10 +97,11 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
         if (vote) { e.verificationProbability = vote.probability; e.verification = vote.probability >= .8 ? 'verified' : vote.probability <= .2 ? 'disagreed' : 'uncertain'; if (e.verification === 'disagreed') flag(q, 'answer', 'The checker disagrees with the answer key.'); }
       }
     }
-    if (q.explanation) {
+    if (q.explanation && !listening && !visualMissing) {
       const check = await decide(q, 'explanation-check', 'This explanation correctly explains why the marked answer is correct.', { ...input, key: explanationKey(q), explanation: q.explanation.text });
       e.explanationCheck = check ? { probability: check.probability, state: check.probability >= .8 ? 'verified' : check.probability <= .2 ? 'rejected' : 'uncertain' } : { state: 'unjudged' };
     }
+    if (q.explanation && (listening || visualMissing)) e.explanationCheck = { state: 'unjudged' };
     const complete = await decide(q, 'complete', 'This question can be answered from the text given, without anything missing.', input, undefined, payloads);
     if (complete) { e.completeness = { probability: complete.probability }; if (complete.probability <= .2 && hasCompletenessCorroboration(q, passage?.text)) flag(q, 'complete', 'The checker thinks this question may be incomplete.'); }
     const identity = normalizeIdentity(out.meta.grade, out.meta.subject);
@@ -136,8 +147,8 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       if (shared) {
         const structurallyAssigned = image?.packageShared?.structural && owners.every(owner => image.packageShared!.ownerIds.includes(owner.id));
         if (isMatching || structurallyAssigned) {
-          const numbers = owners.map(owner => owner.no).sort((a, b) => a - b);
-          notes.add(`Image shared by ${numbers.map(n => `Q${n}`).join('–')} — judged as a group.`);
+          const labels = [...new Set(owners.map(owner => owner.label || String(owner.no)))];
+          notes.add(`Image shared by ${labels.map(label => `Q${label}`).join('–')} — judged as a group.`);
         }
         if (!isMatching) {
           e.imagePlacement.push({ imageId: ref.imageId, state: structurallyAssigned ? 'verified' : 'skipped-no-evidence' });
@@ -154,6 +165,7 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       if (state === 'disagreed') flag(q, `image_${ref.imageId}`, 'Image may belong to another question or sentence.');
     }
   }
-  out.source.enrichmentStatus = !calls || failures === calls ? 'not run' : failures || consecutiveErrors >= 5 ? 'partial' : 'completed'; out.source.enrichmentNotes = [...notes];
+  const missingExplanations = out.questions.some(q => explanationKey(q) && !q.explanation);
+  out.source.enrichmentStatus = !calls || failures === calls ? 'not run' : failures || consecutiveErrors >= 5 || missingExplanations ? 'partial' : 'completed'; out.source.enrichmentNotes = [...notes];
   return out;
 }

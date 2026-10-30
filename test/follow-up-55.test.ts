@@ -86,7 +86,7 @@ test('#55 explain precedes judge; malformed items are isolated and rejected pros
    return {results:[{name,probability:.9}]};
   }
  });
- assert.equal(events[0],'explain'); assert.ok(events.slice(1).every(e => e === 'judge'));
+ assert.equal(events[0],'explain'); assert.ok(events.indexOf('judge') > 0); assert.ok(events.slice(events.indexOf('judge')).every(e => e === 'judge')); assert.equal(events.filter(e => e === 'explain').length, 2);
  assert.equal(result.questions[0].explanation?.text,'Unique wrong prose.'); assert.equal(result.questions[0].enrichment?.explanationCheck?.state,'rejected');
  assert.ok(result.questions.slice(1).every(q => !q.explanation));
  const check = records.find(b => Object.keys(b.questions)[0].includes('explanation-check')); assert.match(JSON.stringify(check), /Unique wrong prose/); assert.match(check.state, /"key":"A"/);

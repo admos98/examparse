@@ -2,13 +2,17 @@
 import type { ExamDoc, ImageAsset, Question } from '../types';
 import { sha256 } from '../utils/hash';
 import { normalizeIdentity } from './identity';
+import { isPackageListeningQuestion, packageListeningEvidence } from './packageListening';
 
 export interface PackageFile { name: string; arrayBuffer(): Promise<ArrayBuffer>; text(): Promise<string>; type?: string; webkitRelativePath?: string }
 const types: Record<string, Question['type']> = { multiple_choice: 'mcq', true_false: 'truefalse', fill_in_blank: 'fillblank', short_answer: 'short', matching: 'matching', ordering: 'multi' };
 const mimeFor = (name: string) => ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' } as Record<string, string>)[name.split('.').pop()!.toLowerCase()];
 function numberFromTitle(title: string, fallback: number): number {
-  const match = /(?:question|\bq)\s*[-#.:]?\s*(\d+)/i.exec(title) || /^\s*(\d+)\s*[.):]/.exec(title);
+  const match = /(?:question|\bq)\s*[-#.:]?\s*(\d+)/i.exec(title) || /^\s*(\d+)(?=[A-Za-z]|\s*[.):])/.exec(title);
   return match ? Number(match[1]) : fallback;
+}
+function labelFromTitle(title: string, fallback: number): string {
+  return /(?:question|\bq)\s*[-#.:]?\s*(\d+[A-Za-z]?(?:[-–][A-Za-z0-9]+)?)(?![A-Za-z0-9])/i.exec(title)?.[1] || /^\s*(\d+[A-Za-z]?(?:[-–][A-Za-z0-9]+)?)(?=\s|[.):]|$)/.exec(title)?.[1] || String(fallback);
 }
 function sectionTitle(title: string): string | undefined {
   const range = title.match(/^(.*?\b(?:questions?|q)\s*\d+\s*[-–]\s*\d+[^\n]*)/i);
@@ -95,7 +99,8 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     const row = batch.questions[index];
     if (!row || typeof row !== 'object' || typeof row.type !== 'string' || (typeof row.stem !== 'string' && !Array.isArray(row.stem_blocks))) throw new Error(`Question ${index + 1} needs a type and stem or stem_blocks.`);
     const title = typeof row.title === 'string' ? row.title : '';
-    const no = numberFromTitle(title, index + 1); const st = derivation.labels[index];
+    const explicitLabel = typeof row.label === 'string' && /^\d+[A-Za-z]?(?:[-–][A-Za-z0-9]+)?$/.test(row.label.trim()) ? row.label.trim() : undefined;
+    const no = explicitLabel ? Number(/^\d+/.exec(explicitLabel)![0]) : numberFromTitle(title, index + 1); const st = derivation.labels[index];
     if (!sections.length || sections[sections.length - 1].title !== st) sections.push({ id: `section_${sections.length + 1}`, index: sections.length, title: st, spans: [] });
     const refs: Question['images'] = [];
     const positions: NonNullable<Question['packageImagePositions']> = [];
@@ -137,30 +142,55 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     const answer = key && Array.isArray(key.correct) && key.correct.length ? { text: key.correct.map(String).join(', '), source: 'paper' as const } : undefined;
     const { stem: _stem, stem_blocks: _blocks, options: _options, ...metadata } = row;
     if (stem !== originalStem) metadata.provenance = { ...(metadata.provenance || {}), source_ref: [metadata.provenance?.source_ref, originalStem.match(/[^.\n]*(?:listening|transcript)[^\n]*?\.md[^\n]*/i)?.[0]?.trim()].filter(Boolean).join(' — ') };
-    questions.push({ id: `q_${index + 1}`, no, label: String(no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: types[row.type] || 'unknown',
+    questions.push({ id: `q_${index + 1}`, no, label: explicitLabel || labelFromTitle(title, no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: types[row.type] || 'unknown',
       options: Array.isArray(row.options) ? row.options.map((o: any) => ({ key: String(o.key), text: String(o.text ?? ''), spans: [] })) : [],
       ...(answer ? { answer } : {}), points: row.points == null ? null : row.points, images: refs, packageImagePositions: positions, packageSourceTextLength: sourceTextLength, confidence: null as unknown as number, imported: structuredClone(metadata) });
   }
-  // Attach section-scoped collateral only to listening questions, never to unrelated items.
+  // Only an explicit section or an unambiguous range is evidence of ownership.
+  const scripts: Array<{ id: string; text: string; first?: number; last?: number }> = [];
   for (const file of files.filter(f => /^(?:listening.*|transcript.*)\.md$/i.test(f.name))) {
     const text = await file.text();
-    const blocks = [...text.matchAll(/^##\s+Section\s+(\d+)\b[^\n]*\n([\s\S]*?)(?=^##\s+Section\s+\d+\b|$(?![\s\S]))/gim)];
-    for (const block of blocks) {
-      const sectionIndex = Number(block[1]) - 1;
-      const section = sections.find(s => new RegExp(`\\bsection\\s+${block[1]}\\b`, 'i').test(s.title || '')) || sections[sectionIndex];
-      if (!section) continue;
-      for (const q of questions.filter(q => q.sectionId === section.id && /\b(?:listen|listening|audio|recording|transcript)\b|شنید/i.test(`${section.title} ${q.stem}`))) {
-        q.imported = { ...q.imported, script: block[2].trim() };
-      }
+    for (const block of text.matchAll(/^##\s+Section\s+(\d+)\b([^\n]*)\n([\s\S]*?)(?=^##\s+|$(?![\s\S]))/gim)) {
+      const range = /(?:questions?|q(?:uestions)?\.?|items?)\s*(\d+)\s*[-–—]\s*(?:q(?:uestions)?\.?\s*)?(\d+)/i.exec(block[2]) || /\(\s*(\d+)\s*[-–—]\s*(\d+)\s*\)/.exec(block[2]);
+      scripts.push({ id: block[1], text: block[3].trim(), ...(range ? { first: Number(range[1]), last: Number(range[2]) } : {}) });
     }
+  }
+  const packageScriptReceipt: NonNullable<ExamDoc['source']['packageScriptReceipt']> = [];
+  for (const q of questions) {
+    // Do not trust an unscoped script supplied in generic metadata.
+    const directTranscript = typeof q.imported?.transcript === 'string' ? q.imported.transcript : undefined;
+    if (q.imported) { delete q.imported.script; delete q.imported.transcript; }
+    const section = sections.find(s => s.id === q.sectionId);
+    const evidence = packageListeningEvidence(q);
+    if (!isPackageListeningQuestion(q, section?.title)) continue;
+    const refs = [...evidence.matchAll(/\b(?:section|group)\s+(\d+)\b/gi)].map(m => m[1]);
+    const explicit = [...new Set(refs)];
+    let candidates = explicit.length ? (explicit.length === 1 ? scripts.filter(b => b.id === explicit[0]) : []) : scripts.filter(b => b.first != null && q.no >= b.first && q.no <= b.last!);
+    if (!explicit.length && candidates.length === 0) {
+      const groups = Array.isArray(batch.instructionGroups) ? batch.instructionGroups : Array.isArray(batch.instruction_groups) ? batch.instruction_groups : [];
+      const memberships = groups.filter((g: any) => {
+        const ids = q.instructionGroups || q.imported?.instructionGroups || q.imported?.instruction_groups || [];
+        const refs = Array.isArray(ids) ? ids : [ids];
+        const members = g.questions ?? g.question_numbers ?? g.members ?? [];
+        return (g.id != null && refs.some((id: unknown) => String(id) === String(g.id))) ||
+          (Array.isArray(members) && members.some((member: any) => String(member?.id ?? member?.label ?? member) === q.label || (q.imported?.id != null && String(member?.id ?? member) === String(q.imported.id)))) ||
+          (q.no >= Number(g.appliesToFirst ?? g.start) && q.no <= Number(g.appliesToLast ?? g.end));
+      });
+      candidates = scripts.filter(b => b.first != null && memberships.some((g: any) => Number(g.appliesToFirst ?? g.start) >= b.first! && Number(g.appliesToLast ?? g.end) <= b.last!));
+    }
+    const mapped = candidates.length === 1 && candidates[0].text ? candidates[0] : undefined;
+    if (mapped) q.imported = { ...q.imported, script: mapped.text };
+    else if (!scripts.length && directTranscript?.trim()) q.imported = { ...q.imported, transcript: directTranscript };
+    packageScriptReceipt.push({ label: q.label, sectionId: mapped?.id || null });
   }
   // Filename assignment is explicit evidence; a duplicate asset may have multiple owners.
   for (const file of files) {
-    const match = /(?:^|[\/\\])questions?[-_\s]*(\d+)(?:[-_](\d+))?(?=\.[^.]+$)/i.exec(file.webkitRelativePath || file.name);
+    const match = /(?:^|[\/\\])questions?[-_\s]*(\d+[A-Za-z]?(?:[-_][A-Za-z0-9]+)?)(?=\.[^.]+$)/i.exec(file.webkitRelativePath || file.name);
     if (!match) continue;
     const asset = fileAssets.get((file.webkitRelativePath || file.name).toLowerCase()) || fileAssets.get(file.name.toLowerCase()); if (!asset) continue;
-    const start = Number(match[1]), end = match[2] ? Number(match[2]) : start;
-    for (const q of questions) if (q.no >= start && q.no <= end) { if (!q.images.some(r => r.imageId === asset.id)) q.images.push({ imageId: asset.id, role: 'stem' }); markStructural(asset.id, q.id); }
+    const label = match[1].replace(/_/g, '-');
+    const range = /^(\d+)-(\d+)$/.exec(label);
+    for (const q of questions) if (range ? q.no >= Number(range[1]) && q.no <= Number(range[2]) && /^\d+$/.test(q.label) : q.label.toLowerCase() === label.toLowerCase()) { if (!q.images.some(r => r.imageId === asset.id)) q.images.push({ imageId: asset.id, role: 'stem' }); markStructural(asset.id, q.id); }
   }
   for (const image of images) {
     const owners = questions.filter(q => q.images.some(ref => ref.imageId === image.id));
@@ -215,6 +245,48 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     const min = Math.min(...linked.map(q => q.no)), max = Math.max(...linked.map(q => q.no));
     for (const q of run) if (q.sectionId === sectionId && !q.passageId && q.no >= min && q.no <= max && !(q.stem || '').split(/\n\s*\n/).some(block => block.trim().length >= 200)) q.passageId = passage.id;
   }
+  const optionalGroups: NonNullable<ExamDoc['optionalGroups']> = [];
+  // An announced pair of labelled ranges is stronger than adjacency and also
+  // covers packages which print the instruction only on the first item.
+  for (const q of questions) {
+    const text = `${q.imported?.instructions || ''} ${q.stem || ''}`;
+    if (!/\b(?:either|optional|choose|select)\b/i.test(text) || !/\bor\b/i.test(text)) continue;
+    const ranges = [...text.matchAll(/\b(\d+)([A-Za-z])\s*[-–—]\s*(\d+)\2\b/gi)];
+    if (ranges.length !== 2 || ranges[0][2].toUpperCase() === ranges[1][2].toUpperCase()) continue;
+    const branches: Record<string, string[]> = {};
+    for (const range of ranges) {
+      const branch = range[2].toUpperCase(); const first = Number(range[1]), last = Number(range[3]);
+      branches[branch] = questions.filter(item => !item.optionalGroupId && item.no >= first && item.no <= last && new RegExp(`^\\d+${branch}$`, 'i').test(item.label)).map(item => item.label);
+    }
+    if (Object.values(branches).some(labels => !labels.length)) continue;
+    const id = `optional_${optionalGroups.length + 1}`; const memberLabels = Object.values(branches).flat();
+    for (const item of questions.filter(item => memberLabels.includes(item.label))) { item.optionalGroupId = id; item.optionalBranch = Object.keys(branches).find(branch => branches[branch].includes(item.label)); }
+    const total = /(?:total|each (?:branch|part))\s*[:=]?\s*(\d+(?:\.\d+)?)/i.exec(text);
+    optionalGroups.push({ id, rule: 'choose-one-branch', memberLabels, branches, ...(total ? { printedTotal: Number(total[1]) } : {}) });
+  }
+  const byBase = new Map<number, Question[]>();
+  for (const q of questions.filter(q => !q.optionalGroupId)) { const m = /^(\d+)([A-Za-z])(?:[-–][A-Za-z0-9]+)?$/.exec(q.label); if (m) byBase.set(q.no, [...(byBase.get(q.no) || []), q]); }
+  const paired = [...byBase.entries()].filter(([, qs]) => new Set(qs.map(q => /^(?:\d+)([A-Za-z])/.exec(q.label)![1].toUpperCase())).size === 2).sort((a,b) => a[0]-b[0]);
+  for (let i = 0; i < paired.length;) {
+    let j = i + 1;
+    const signature = (qs: Question[]) => [...new Set(qs.map(q => /^(?:\d+)([A-Za-z])/.exec(q.label)![1].toUpperCase()))].sort().join('');
+    const ruleText = (qs: Question[]) => String(qs[0].imported?.instructions || /(?:optional\s+group[^\n]*|(?:answer|choose|select)\s+either[^\n]*)/i.exec(qs[0].stem || '')?.[0] || '').trim();
+    while (j < paired.length && paired[j][0] === paired[j-1][0] + 1 && signature(paired[j][1]) === signature(paired[i][1]) && paired[j][1][0].sectionId === paired[i][1][0].sectionId && ruleText(paired[j][1]) === ruleText(paired[i][1])) j++;
+    const candidates = paired.slice(i,j).flatMap(([, qs]) => qs);
+    const announcement = candidates.map(q => `${q.stem || ''} ${q.imported?.instructions || ''}`).join(' ');
+    const announcedBranch = /(?:answer|choose|select)\s+either[\s\S]{0,200}\bor\b|optional\s+group/i.test(announcement);
+    // Label pairs are only optional when under a shared instruction, or an explicit rule.
+    const instruction = (q: Question) => q.imported?.instructions || (Array.isArray(q.imported?.instructionGroups) ? JSON.stringify(q.imported.instructionGroups) : '');
+    const sameInstruction = candidates.every(q => q.sectionId === candidates[0].sectionId && instruction(q) === instruction(candidates[0]));
+    if (announcedBranch || (sameInstruction && !!instruction(candidates[0]))) {
+      const id = `optional_${optionalGroups.length + 1}`; const branches: Record<string,string[]> = {};
+      for (const q of candidates) { const branch = /^(?:\d+)([A-Za-z])/.exec(q.label)![1].toUpperCase(); (branches[branch] ||= []).push(q.label); q.optionalGroupId = id; q.optionalBranch = branch; }
+      const total = /(?:total|each (?:branch|part))\s*[:=]?\s*(\d+(?:\.\d+)?)/i.exec(announcement);
+      optionalGroups.push({ id, rule: announcedBranch && paired.slice(i,j).length > 1 ? 'choose-one-branch' : 'choose-one-per-number', memberLabels: candidates.map(q => q.label), branches, ...(total ? { printedTotal: Number(total[1]) } : {}) });
+    }
+    i = j;
+  }
+  const collisions = [...new Set(questions.map(q => q.no))].map(number => ({ number, labels: questions.filter(q => q.no === number).map(q => q.label) })).filter(c => c.labels.length > 1 && new Set(c.labels).size === c.labels.length);
   const fileHash = await sha256(raw + '\n' + [...fileAssets.entries()].map(([name, image]) => `${name}:${image.sha}`).sort().join('\n') + [...byHash.keys()].sort().join('\n')); 
   const originalGrade = batch.grade ?? batch.questions[0]?.grade; const originalSubject = batch.subject ?? batch.questions[0]?.subject;
   const identity = normalizeIdentity(originalGrade, originalSubject);
@@ -223,6 +295,6 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
   const inferredRtl = (languageSample.match(/[\u0600-\u06ff]/g) || []).length > (languageSample.match(/[A-Za-z]/g) || []).length;
   const language = typeof batch.language === 'string' && batch.language.trim() ? batch.language : inferredRtl ? 'fa' : 'en';
   const packageSectionReceipt = { rule: derivation.rule, sections: sections.map(section => ({ title: section.title || 'Imported questions', questionNumbers: questions.filter(q => q.sectionId === section.id).map(q => q.no) })) };
-  return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language, direction: batch.direction === 'rtl' || (batch.direction !== 'ltr' && /^(?:fa|ar|ur)(?:-|$)/i.test(language)) ? 'rtl' : 'ltr' }, sections, passages, questions, images,
-    source: { kind: 'package', packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: [], usage: [] };
+  return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language, direction: batch.direction === 'rtl' || (batch.direction !== 'ltr' && /^(?:fa|ar|ur)(?:-|$)/i.test(language)) ? 'rtl' : 'ltr' }, sections, passages, optionalGroups, questions, images,
+    source: { kind: 'package', packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: [], usage: [] };
 }

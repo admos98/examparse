@@ -109,6 +109,11 @@ export interface Question {
   /** Optional shared or inline word-bank items associated with fill-in-the-blank questions. */
   wordBank?: string[];
   subQuestions?: Question[];
+  /** #57 Part A — model sample answer for a keyless descriptive (tashrihi) item.
+   * Teacher confirmation is the only promotion: `source` flips to 'teacher' on the Step-4 confirm. */
+  sampleAnswer?: { text: string; source: 'model' | 'teacher'; judged: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number };
+  /** #57 Part A — 2–4 graded criteria (bank RubricCriterion shape) proposed for the same item. */
+  rubric?: { criteria: RubricCriterion[]; source: 'model' | 'teacher'; judged: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number };
   answer?: {
     spans?: LineSpan[];
     text?: string;
@@ -131,10 +136,18 @@ export interface Question {
   difficulty?: { value: 1 | 2 | 3 | 4 | 5; source: 'model'; /** #50: flat level distribution (top level < 0.4). */ uncertain?: boolean };
   difficultyMode?: 'shadow' | 'active';
   curriculumHints?: import('./pipeline/curriculumHints').CurriculumHints;
-  curriculumSource?: 'keyword' | 'decision';
+  /** #57 Part E — 'inherited' marks a lesson that came from the factored passage judgement,
+   * never from this question's own (abstaining) vote. Teacher/individual votes always win. */
+  curriculumSource?: 'keyword' | 'decision' | 'inherited';
   /** Optional deterministic provenance; legacy persisted questions need not carry it. */
   receipt?: QuestionReceipt;
   flags?: string[];
+}
+
+/** #57 Part A — one rubric criterion in the Appendix-A bank shape. */
+export interface RubricCriterion {
+  criterion: string;
+  maxPoints: number;
 }
 
 export interface QuestionEnrichment {
@@ -142,6 +155,10 @@ export interface QuestionEnrichment {
   verification: 'verified' | 'disagreed' | 'uncertain' | 'unjudged';
   verificationProbability?: number;
   checkerChoice?: string;
+  /** #57 Part B — a proposal for a keyless auto-graded item. Review payload ONLY:
+   * never copied into answer / answer_key / correctFillBlanks by any code path, including re-export.
+   * Adoption is a teacher action in Step 4 (`adopted` marks their save). */
+  proposedAnswer?: { text: string; source: 'model'; probability?: number; adopted?: boolean };
   difficultyUncertain?: boolean;
   explanationCheck?: { state: 'verified' | 'rejected' | 'uncertain' | 'unjudged'; probability?: number };
   completeness?: { probability: number };

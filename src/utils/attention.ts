@@ -10,7 +10,13 @@
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 import { plainDecisionSentence } from '../pipeline/localLoop';
 
-export type AttentionKind = 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing' | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing' | 'read-failed' | 'audit-catch' | 'loop-verdict' | 'loop-note';
+export type AttentionKind =
+  | 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing'
+  | 'image-unplaced' | 'image-suspect' | 'points-unresolved' | 'metadata-missing'
+  | 'read-failed' | 'audit-catch' | 'loop-verdict' | 'loop-note'
+  /** #57 Part D — enrichment-derived kinds (packages): uncertains, rejected explanations,
+   * tashrihi awaiting confirmation, and auto-graded items with no key (with/without proposal). */
+  | 'answer-uncertain' | 'explanation-rejected' | 'tashrihi-unconfirmed' | 'keyless-auto';
 
 export interface AttentionAction {
   /** 'question' scrolls to + expands that card; 'image-tray' opens the tray; 'page-retry' re-reads one failed page; 'source-page' opens that page in Source. */
@@ -44,8 +50,17 @@ const hasChildren = (doc: Pick<ExamDoc, 'questions'>, question: Question): boole
 const questionById = (doc: Pick<ExamDoc, 'questions'>, id: string | undefined): Question | undefined =>
   id ? (doc.questions || []).find(question => question.id === id) : undefined;
 
+/** #57 Part D — identity is the LABEL everywhere (17C-a, 55B), never the bare number. */
 const labelOf = (question: Question | undefined, fallback = 'This question'): string =>
-  question ? `Q${question.no}` : fallback;
+  question ? `Q${question.label || question.no}` : fallback;
+
+/** #57 Part B/D — a package keyless auto-graded item (with or without a checker proposal). */
+export function isKeylessAutoGraded(doc: Pick<ExamDoc, 'questions'>, question: Question): boolean {
+  if (question.type !== 'mcq' && question.type !== 'fillblank' && question.type !== 'matching') return false;
+  if (question.answer?.text?.trim()) return false;
+  if (question.type === 'matching' && !(question.options || []).length) return false;
+  return !doc.questions.some(item => item.parentId === question.id);
+}
 
 function questionItem(params: {
   kind: AttentionKind;
@@ -120,6 +135,27 @@ function budgetExhaustedReadPages(doc: ExamDoc): Set<number> {
   return pages;
 }
 
+/** #57 Part D — the visible list is grouped by what's needed: disagreements, uncertains,
+ * keyless items, image mismatches, rejected explanations, then everything else. */
+const KIND_PRIORITY: AttentionKind[] = [
+  'answer-conflict', 'audit-catch', 'answer-uncertain',
+  'keyless-auto', 'tashrihi-unconfirmed',
+  'image-suspect', 'image-unplaced',
+  'explanation-rejected',
+  'answer-missing', 'stem-hollow', 'options-missing',
+  'points-unresolved', 'metadata-missing', 'read-failed', 'loop-verdict', 'loop-note',
+];
+function groupedByNeed(items: AttentionItem[]): AttentionItem[] {
+  const priority = (item: AttentionItem) => {
+    const index = KIND_PRIORITY.indexOf(item.kind);
+    return index < 0 ? KIND_PRIORITY.length : index;
+  };
+  return items
+    .map((item, order) => ({ item, order }))
+    .sort((a, b) => priority(a.item) - priority(b.item) || a.order - b.order)
+    .map(({ item }) => item);
+}
+
 export function computeAttention(doc: ExamDoc): AttentionItem[] {
   const items: AttentionItem[] = [];
   const questions = doc.questions || [];
@@ -151,7 +187,7 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
       plainSentence: `${message} [Review]`, action: { target: 'question', label: 'Review' },
       questionIds: [], imageIds: [], count: 1, severity: 'warn',
     });
-    return items;
+    return groupedByNeed(items);
   }
   const flags: Flag[] = doc.flags || [];
   const readFailure = flags.find(flag => flag.code === 'GLOBAL_READ_FAILED');
@@ -189,6 +225,12 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     if (question.type === 'matching' && !question.options?.length) continue; // pool items are shared with the parent
 
     if ((question.flags || []).includes('ANSWER_MISSING_ACCEPTED')) continue;
+    // #57 Part D — package items are represented by their specific kind exactly once:
+    // keyless auto-graded items as keyless-auto, tashrihi items once a sample/rubric exists.
+    if (doc.source?.kind === 'package') {
+      if (isKeylessAutoGraded(doc, question)) continue;
+      if (question.sampleAnswer || question.rubric) continue;
+    }
     if (question.type === 'essay' || question.type === 'long') {
       items.push(questionItem({
         kind: 'answer-missing', rootCauseId: `question_${question.id}`, question,
@@ -326,14 +368,20 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
   }
   for (const [rootCauseId, bucket] of buckets) {
     const affected = [...new Set(bucket.map(flag => flag.questionId).filter((id): id is string => Boolean(id)))];
-    const nos = affected.map(id => questionById(doc, id)?.no).filter((no): no is number => typeof no === 'number').sort((a, b) => a - b);
-    const questionList = nos.length
-      ? (nos.length <= 4 ? nos.map(no => `Q${no}`).join(', ') : `Q${nos[0]}–Q${nos[nos.length - 1]}`)
+    const affectedQuestions = affected
+      .map(id => questionById(doc, id))
+      .filter((question): question is Question => Boolean(question))
+      .sort((a, b) => a.no - b.no);
+    // #57 Part D — the list shows labels (identities), never bare numbers.
+    const questionList = affectedQuestions.length
+      ? (affectedQuestions.length <= 4
+        ? affectedQuestions.map(question => `Q${question.label || question.no}`).join(', ')
+        : `Q${affectedQuestions[0].label || affectedQuestions[0].no}–Q${affectedQuestions[affectedQuestions.length - 1].label || affectedQuestions[affectedQuestions.length - 1].no}`)
       : 'This exam';
     const single = bucket[0];
     const code = single.code;
-    const sentence = nos.length
-      ? `${questionList} ${nos.length === 1 ? 'has' : 'have'} no usable mark${nos.length === 1 ? '' : 's'} — set the points.`
+    const sentence = affectedQuestions.length
+      ? `${questionList} ${affectedQuestions.length === 1 ? 'has' : 'have'} no usable mark${affectedQuestions.length === 1 ? '' : 's'} — set the points.`
       : 'The exam total does not add up — set the marks.';
     const actionTarget: AttentionAction = affected.length
       ? { target: 'question', questionId: affected[0], label: 'Go' }
@@ -363,11 +411,42 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     }));
   }
 
-  for (const flag of flags.filter(flag => flag.code === 'PACKAGE_ENRICHMENT')) {
+  for (const flag of flags.filter(flag => flag.code === 'PACKAGE_ENRICHMENT' || flag.code === 'PACKAGE_IMAGE_TOKEN_UNRESOLVED')) {
     const question = questionById(doc, flag.questionId);
     if (!question) continue;
-    items.push(questionItem({ kind: 'audit-catch', rootCauseId: flag.rootCauseId || flag.id, question,
+    items.push(questionItem({ kind: flag.code === 'PACKAGE_IMAGE_TOKEN_UNRESOLVED' ? 'image-unplaced' : 'audit-catch', rootCauseId: flag.rootCauseId || flag.id, question,
       sentence: `${labelOf(question)}: ${flag.message}`, actionLabel: 'Go', severity: 'warn' }));
+  }
+
+  // #57 Part D — enrichment states only a human can finish, derived from the saved verdicts so
+  // docs written before these flags exist still list them. Disagreements and image mismatches
+  // already travel as flags above; these are the states that never got one.
+  if (doc.source?.kind === 'package') {
+    for (const question of questions) {
+      const enrichment = question.enrichment;
+      // Keyless is keyless even for a package that was never enriched (import-only mode).
+      if (isKeylessAutoGraded(doc, question)) {
+        const proposal = enrichment?.proposedAnswer;
+        items.push(questionItem({ kind: 'keyless-auto', rootCauseId: `question_${question.id}`, question,
+          sentence: proposal
+            ? `${labelOf(question)}: checker proposes ${proposal.text} — adopt it as the key or enter another.`
+            : `${labelOf(question)} has no answer key — enter one (the checker has no proposal).`,
+          actionLabel: 'Go', severity: 'warn' }));
+      }
+      if (!enrichment) continue;
+      if (enrichment.verification === 'uncertain') {
+        items.push(questionItem({ kind: 'answer-uncertain', rootCauseId: `question_${question.id}`, question,
+          sentence: `${labelOf(question)}: the checker is unsure about the key (${Math.round((enrichment.verificationProbability ?? 0) * 100)}%) — check it yourself.`, actionLabel: 'Go', severity: 'warn' }));
+      }
+      if (enrichment.explanationCheck?.state === 'rejected') {
+        items.push(questionItem({ kind: 'explanation-rejected', rootCauseId: `question_${question.id}`, question,
+          sentence: `${labelOf(question)}'s model explanation was rejected by the checker — rewrite or remove it.`, actionLabel: 'Go', severity: 'warn' }));
+      }
+      if (question.sampleAnswer?.source === 'model' || question.rubric?.source === 'model') {
+        items.push(questionItem({ kind: 'tashrihi-unconfirmed', rootCauseId: `question_${question.id}`, question,
+          sentence: `${labelOf(question)}: model sample + rubric proposed — confirm or edit.`, actionLabel: 'Confirm', severity: 'warn' }));
+      }
+    }
   }
 
   // 5. Metadata and failed Global Read (per-page or whole-paper) are explicit teacher work, never silent parse state.
@@ -403,7 +482,7 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     }
   }
 
-  return items;
+  return groupedByNeed(items);
 }
 
 /** The ONE number every surface prints. */

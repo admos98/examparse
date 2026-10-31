@@ -460,14 +460,39 @@ test('T3 (Part C): Step 4 default view renders sections collapsed, <= attention 
   const totalDomTags = (defaultHtml.match(/<[a-zA-Z0-9-]+[\s>]/g) || []).length;
 
   assert.equal(sectionHeadersCount, 8, 'all 8 sections render header rows');
-  assert.equal(renderedQuestionCards, 0, 'sections render collapsed by default');
+  // #57 Part D — the default filter is "Needs attention": exactly the attention questions render,
+  // every quiet item collapses behind a "N verified · show" summary line, header count == this set.
+  const healthyAttentionIds = new Set(attentionQuestionIds(healthyDoc));
+  const childrenByParent = new Map<string, string[]>();
+  for (const question of healthyDoc.questions) {
+    if (question.parentId) childrenByParent.set(question.parentId, [...(childrenByParent.get(question.parentId) || []), question.id]);
+  }
+  const holdsAttention = (id: string): boolean =>
+    healthyAttentionIds.has(id) || (childrenByParent.get(id) || []).some(holdsAttention);
+  const healthyAttentionCards = new Set(
+    healthyDoc.questions.filter(question => !question.parentId && holdsAttention(question.id)).map(question => question.id),
+  );
+  assert.equal(renderedQuestionCards, healthyAttentionCards.size, 'default attention view renders exactly the attention questions (nested items keep their roots)');
   assert.ok(
-    renderedQuestionCards + sectionHeadersCount <= 0 + sectionHeadersCount,
+    renderedQuestionCards + sectionHeadersCount <= healthyAttentionIds.size + 8,
     'rendered default card count <= attention questions + section headers',
   );
-  assert.ok(totalDomTags < 350, `calm default view keeps DOM compact (${totalDomTags} elements vs ~1900 previously)`);
+  assert.match(defaultHtml, /data-filter-attention="true"[^>]*>Needs attention \(\d+\)/);
+  assert.ok(totalDomTags < 700, `attention-first default view stays compact (${totalDomTags} elements vs ~1900 full expansion)`);
   // Top-level "Answer with AI" affordance remains present for answer-less questions (e.g. Q50, Q63, Q67)
   assert.match(defaultHtml, /Answer with AI \(\d+\)/);
+
+  // #57 Part D — an explicit "all" filter keeps the old calm default: sections collapsed, 0 cards.
+  const allFilterHtml = renderToStaticMarkup(
+    React.createElement(Step4Review, {
+      examDoc: healthyDoc,
+      settings: DEFAULT_SETTINGS,
+      onUpdateDoc: () => undefined,
+      onProceedToExamView: () => undefined,
+      initialFilterType: 'all',
+    }),
+  );
+  assert.equal((allFilterHtml.match(/data-review-question="/g) || []).length, 0, 'all-questions view starts with sections collapsed');
 
   // 2. With 2 attention questions: sections show attention dot; when expanded via filter, ONLY attention questions auto-expand internals
   const qAtt1 = healthyDoc.questions.find(q => q.no === 25)!;
@@ -507,6 +532,8 @@ test('T3 (Part C): Step 4 default view renders sections collapsed, <= attention 
       onUpdateDoc: () => undefined,
       onProceedToExamView: () => undefined,
       initialExpandedSectionIds: docWithTwoAttention.sections.map(s => s.id),
+      // #57 Part D — quiet cards render under the explicit "all" filter (default is attention-first).
+      initialFilterType: 'all' as const,
     }),
   );
   const expandedQuestionCount = (expandedSectionsHtml.match(/data-question-expanded="true"/g) || []).length;

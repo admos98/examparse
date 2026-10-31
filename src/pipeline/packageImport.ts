@@ -3,9 +3,11 @@ import type { ExamDoc, ImageAsset, Question } from '../types';
 import { sha256 } from '../utils/hash';
 import { normalizeIdentity } from './identity';
 import { isPackageListeningQuestion, packageListeningEvidence } from './packageListening';
+import { findImagePlaceholderTokens, resolvePlaceholderSha, stripImagePlaceholderTokens } from './imagePlaceholders';
 
 export interface PackageFile { name: string; arrayBuffer(): Promise<ArrayBuffer>; text(): Promise<string>; type?: string; webkitRelativePath?: string }
-const types: Record<string, Question['type']> = { multiple_choice: 'mcq', true_false: 'truefalse', fill_in_blank: 'fillblank', short_answer: 'short', matching: 'matching', ordering: 'multi' };
+/** Appendix-A descriptive types (long_answer) and free-form writing variants import as our essay type. */
+const types: Record<string, Question['type']> = { multiple_choice: 'mcq', true_false: 'truefalse', fill_in_blank: 'fillblank', short_answer: 'short', matching: 'matching', ordering: 'multi', long_answer: 'essay', essay: 'essay', paragraph: 'essay', writing: 'essay' };
 const mimeFor = (name: string) => ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' } as Record<string, string>)[name.split('.').pop()!.toLowerCase()];
 function numberFromTitle(title: string, fallback: number): number {
   const match = /(?:question|\bq)\s*[-#.:]?\s*(\d+)/i.exec(title) || /^\s*(\d+)(?=[A-Za-z]|\s*[.):])/.exec(title);
@@ -95,6 +97,8 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
   const structuralOwners = new Map<string, Set<string>>();
   const markStructural = (imageId: string, questionId: string) => { const owners = structuralOwners.get(imageId) || new Set<string>(); owners.add(questionId); structuralOwners.set(imageId, owners); };
   const questions: Question[] = [];
+  /** #57 Part C — tokens whose asset file was absent: stripped from the stem, surfaced as flags. */
+  const unresolvedImageTokens: Array<{ label: string; sha: string; questionId: string }> = [];
   for (let index = 0; index < batch.questions.length; index++) {
     const row = batch.questions[index];
     if (!row || typeof row !== 'object' || typeof row.type !== 'string' || (typeof row.stem !== 'string' && !Array.isArray(row.stem_blocks))) throw new Error(`Question ${index + 1} needs a type and stem or stem_blocks.`);
@@ -134,6 +138,22 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
       const original = position.offset;
       position.offset = original + replacements.reduce((delta, r) => delta + (original >= r.end ? r.length - (r.end - r.start) : original > r.start ? r.length - (original - r.start) : 0), 0);
     }
+    // #57 Part C — placeholder tokens (img_<sha>, img_<sha>stem, assets/<sha>.<ext>) are REFERENCES:
+    // attach the matching package asset at the token's position and strip the token from the stem.
+    // The token is stripped even when its asset file is absent — it must never reach Step 4 or an export.
+    const tokenHits = findImagePlaceholderTokens(stem);
+    if (tokenHits.length) {
+      const tokenReplacements = tokenHits.map(hit => ({ start: hit.start, end: hit.end, length: 0 }));
+      const shift = (at: number) => tokenReplacements.reduce((delta, r) => delta + (at >= r.end ? r.length - (r.end - r.start) : at > r.start ? r.length - (at - r.start) : 0), 0);
+      for (const position of positions) position.offset = Math.max(0, position.offset + shift(position.offset));
+      for (const hit of tokenHits) {
+        const sha = resolvePlaceholderSha(hit.sha, byHash.keys());
+        const asset = sha ? byHash.get(sha) : undefined;
+        if (asset) { attach(asset); positions.push({ imageId: asset.id, offset: Math.max(0, hit.start + shift(hit.start)) }); }
+        else unresolvedImageTokens.push({ label: explicitLabel || labelFromTitle(title, no), sha: hit.sha, questionId: `q_${index + 1}` });
+      }
+      stem = stripImagePlaceholderTokens(stem);
+    }
     for (const ref of refs) markStructural(ref.imageId, `q_${index + 1}`);
     const sourceTextLength = stem.trim().length + (Array.isArray(row.options) ? row.options.reduce((n: number, o: any) => n + String(o?.text ?? '').length, 0) : 0);
     const leading = stem.length - stem.trimStart().length;
@@ -141,8 +161,9 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     const key = row.answer_key;
     const answer = key && Array.isArray(key.correct) && key.correct.length ? { text: key.correct.map(String).join(', '), source: 'paper' as const } : undefined;
     const { stem: _stem, stem_blocks: _blocks, options: _options, ...metadata } = row;
-    if (stem !== originalStem) metadata.provenance = { ...(metadata.provenance || {}), source_ref: [metadata.provenance?.source_ref, originalStem.match(/[^.\n]*(?:listening|transcript)[^\n]*?\.md[^\n]*/i)?.[0]?.trim()].filter(Boolean).join(' — ') };
-    questions.push({ id: `q_${index + 1}`, no, label: explicitLabel || labelFromTitle(title, no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: types[row.type] || 'unknown',
+    const scriptRef = originalStem.match(/[^.\n]*(?:listening|transcript)[^\n]*?\.md[^\n]*/i)?.[0]?.trim();
+    if (scriptRef) metadata.provenance = { ...(metadata.provenance || {}), source_ref: [metadata.provenance?.source_ref, scriptRef].filter(Boolean).join(' — ') };
+    questions.push({ id: `q_${index + 1}`, no, label: explicitLabel || labelFromTitle(title, no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: types[String(row.type || '').toLowerCase()] || 'unknown',
       options: Array.isArray(row.options) ? row.options.map((o: any) => ({ key: String(o.key), text: String(o.text ?? ''), spans: [] })) : [],
       ...(answer ? { answer } : {}), points: row.points == null ? null : row.points, images: refs, packageImagePositions: positions, packageSourceTextLength: sourceTextLength, confidence: null as unknown as number, imported: structuredClone(metadata) });
   }
@@ -295,6 +316,15 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
   const inferredRtl = (languageSample.match(/[\u0600-\u06ff]/g) || []).length > (languageSample.match(/[A-Za-z]/g) || []).length;
   const language = typeof batch.language === 'string' && batch.language.trim() ? batch.language : inferredRtl ? 'fa' : 'en';
   const packageSectionReceipt = { rule: derivation.rule, sections: sections.map(section => ({ title: section.title || 'Imported questions', questionNumbers: questions.filter(q => q.sectionId === section.id).map(q => q.no) })) };
+  // #57 Part C — a token with no matching asset file is an explicit warning, never silent text.
+  const tokenFlags = unresolvedImageTokens.map(hit => ({
+    id: `package_image_token_${hit.questionId}_${hit.sha.slice(0, 12)}`,
+    code: 'PACKAGE_IMAGE_TOKEN_UNRESOLVED',
+    severity: 'warn' as const,
+    questionId: hit.questionId,
+    message: `Q${hit.label}: image placeholder token img_${hit.sha.slice(0, 12)}… had no matching asset file — the token was removed from the question text; add the file and re-import.`,
+    rootCauseId: `package_image_token_${hit.questionId}_${hit.sha.slice(0, 12)}`,
+  }));
   return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language, direction: batch.direction === 'rtl' || (batch.direction !== 'ltr' && /^(?:fa|ar|ur)(?:-|$)/i.test(language)) ? 'rtl' : 'ltr' }, sections, passages, optionalGroups, questions, images,
-    source: { kind: 'package', packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: [], usage: [] };
+    source: { kind: 'package', packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: tokenFlags, usage: [] };
 }

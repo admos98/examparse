@@ -3,6 +3,7 @@ import { reviewTags } from './explanationVisibility';
 import JSZip from 'jszip';
 import type { ExamDoc, ImageAsset, Question } from '../types';
 import { sliceSourceSpans } from '../pipeline/assemble';
+import { stripImagePlaceholderTokens } from '../pipeline/imagePlaceholders';
 import { getReviewImageBlob, dataUrlToBlob } from '../store';
 import { exportIdentity } from '../pipeline/identity';
 import { curriculumLessons, hintsForLesson, emptyCurriculumHints } from '../pipeline/curriculumHints';
@@ -11,15 +12,22 @@ export interface BankExportOptions { sourceDataset: string; sourceRef?: string; 
 export interface BankExportReport {
   questions: number; exported: number; needs_answer_key: Array<{ question: string; reason: string }>;
   untagged: number; tagged: number; asset_count: number; total_bytes: number;
+  /** #57 Part C — truthful image counts: files actually emitted vs questions referencing them. */
+  images_placed: number; image_references: number;
+  /** #57 Part C — questions whose pixels were unavailable: exported with an explicit marker, never a token. */
+  missing_assets: Array<{ question: string; image: string }>;
   image_options: string[]; notes: string[];
   package_section_receipt?: ExamDoc['source']['packageSectionReceipt'];
   enrichment_notes?: string[];
 }
-export type BankQuestionType = 'multiple_choice' | 'true_false' | 'short_answer' | 'fill_in_blank' | 'matching' | 'ordering';
+export type BankQuestionType = 'multiple_choice' | 'true_false' | 'short_answer' | 'long_answer' | 'fill_in_blank' | 'matching' | 'ordering';
 export interface BankQuestion {
   type: BankQuestionType; title: string; stem?: string; stem_blocks?: Array<{ t: 'text'; v: string } | { t: 'img'; asset: string }>;
   options?: Array<{ key: string; text: string }>; answer_key?: { correct: string[]; grading: 'auto' } | null;
   enrichment?: Question['enrichment'];
+  /** #57 Part A — verified model/teacher sample answer and rubric travel with keyless tashrihi items. */
+  sample_answer?: { text: string; source: 'model' | 'teacher' };
+  rubric?: { criteria: Array<{ criterion: string; maxPoints: number }> };
   label?: string; optional_group_id?: string; optional_branch?: string;
   explanation: { text: string; source: 'model' } | null; points: number | null; grade: string; subject: string;
   curriculum_hints: { chapter: string | null; lesson: string | null; topic: string | null };
@@ -28,7 +36,8 @@ export interface BankQuestion {
 }
 export interface BankBatch { batch_id: string; source_dataset: string; questions: BankQuestion[] }
 export interface BankExport { batch: BankBatch; report: BankExportReport; zip: Uint8Array; filename: string }
-const typeMap: Partial<Record<Question['type'], BankQuestionType>> = { mcq: 'multiple_choice', truefalse: 'true_false', fillblank: 'fill_in_blank', short: 'short_answer', matching: 'matching' };
+/** #57 Part A — descriptive question types travel as bank long_answer; short_answer stays short_answer. */
+const typeMap: Partial<Record<Question['type'], BankQuestionType>> = { mcq: 'multiple_choice', truefalse: 'true_false', fillblank: 'fill_in_blank', short: 'short_answer', long: 'long_answer', essay: 'long_answer', matching: 'matching' };
 export function bankSlug(value: string): string { return value.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'exam'; }
 export function defaultBankDataset(doc: ExamDoc): string { return bankSlug([doc.meta.subject, doc.meta.title || doc.displayName, doc.meta.year].filter(Boolean).join('-')); }
 export function bankProvenance(doc: ExamDoc): BankQuestion['provenance'] {
@@ -37,6 +46,25 @@ export function bankProvenance(doc: ExamDoc): BankQuestion['provenance'] {
   const title = meta.title || doc.displayName || 'Exam';
   const session = [meta.year, meta.term].filter(Boolean).join(' ');
   return { source_type: official ? 'official_cited' : 'authored', source_url: null, source_ref: official ? [title, session].filter(Boolean).join(' — ') : null };
+}
+/** #57 Part E — compact physical reference per question: `<file> · p.<page> · item <label> · group <n> (<total>)`, ≤200 chars.
+ * The full prose ref (imported provenance, teacher source note) remains in the structured export only;
+ * source_type values are never remapped. */
+export function compactBankSourceRef(doc: ExamDoc, q: Question): string {
+  const file = (doc.source.fileName || doc.displayName || 'exam').replace(/\.[^./\\]+$/, '');
+  const lineNos = (q.spans || []).map(span => (Array.isArray(span) ? span[0] : span.line)).filter(n => Number.isFinite(n));
+  const pages = lineNos.map(n => doc.source.lines?.[n - 1]?.page).filter(page => Number.isFinite(page));
+  const firstImagePage = q.images?.length ? doc.images?.find(image => image.id === q.images[0].imageId)?.page : undefined;
+  const page = pages.length ? Math.min(...pages) : (Number.isFinite(firstImagePage) ? firstImagePage : 1);
+  const sectionIndex = doc.sections?.findIndex(section => section.id === q.sectionId) ?? -1;
+  const group = sectionIndex >= 0 ? sectionIndex + 1 : 1;
+  const total = Math.max(doc.sections?.length || 1, 1);
+  // The form always survives: the file component absorbs the truncation, never the tail.
+  const tail = ` · p.${page} · item ${q.label || q.no} · group ${group} (${total})`;
+  const room = Math.max(1, 200 - tail.length);
+  const head = file.length > room ? file.slice(0, room) : file;
+  const ref = `${head}${tail}`;
+  return ref.length > 200 ? ref.slice(0, 200) : ref;
 }
 export function bankQuestions(doc: ExamDoc): Question[] {
   const all: Question[] = [], seen = new Set<string>();
@@ -98,18 +126,27 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   }
   if (!globalThis.crypto?.randomUUID) throw new Error('Secure UUID generation is unavailable.');
   const questions = bankQuestions(doc);
-  const report: BankExportReport = { questions: questions.length, exported: 0, needs_answer_key: [], untagged: 0, tagged: 0, asset_count: 0, total_bytes: 0, image_options: [], notes: [] };
-  const assets = new Map<string, { ext: string; bytes: Uint8Array }>();
-  const imageHashes = new Map<string, string>();
-  const resolveAsset = async (imageId: string): Promise<string> => {
-    if (imageHashes.has(imageId)) return imageHashes.get(imageId)!;
+  const report: BankExportReport = { questions: questions.length, exported: 0, needs_answer_key: [], untagged: 0, tagged: 0, asset_count: 0, total_bytes: 0, images_placed: 0, image_references: 0, missing_assets: [], image_options: [], notes: [] };
+  const assets = new Map<string, { ext: string; bytes: Uint8Array; mime: string; imageIds: string[] }>();
+  const imageHashes = new Map<string, string | null>();
+  /** #57 Part C — resolve to the sha256 reference, or null when pixels are unavailable.
+   * Missing pixels never fail the export and never leave a silent token: the caller emits an
+   * explicit missing-asset marker and the report records the attention item. */
+  const resolveAsset = async (imageId: string): Promise<string | null> => {
+    const cached = imageHashes.get(imageId);
+    if (cached !== undefined) return cached;
     const image = doc.images.find(img => img.id === imageId);
-    if (!image) throw new Error(`Image ${imageId} is referenced but missing; restore it before export.`);
-    const blob = await loadImage(image);
-    if (!blob) throw new Error(`Image ${imageId} is unavailable in folder storage; restore it before export.`);
+    if (!image) { imageHashes.set(imageId, null); return null; }
+    let blob: Blob | undefined;
+    try { blob = await loadImage(image); } catch { blob = undefined; }
+    if (!blob) { imageHashes.set(imageId, null); return null; }
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    const hash = await realSha256(bytes); const ext = imageExtension(bytes);
-    if (!assets.has(hash)) assets.set(hash, { ext, bytes });
+    let ext: string;
+    try { ext = imageExtension(bytes); } catch { imageHashes.set(imageId, null); return null; }
+    // SHA-256 is a hard requirement of the v1.1 asset contract (names are the content hash).
+    const hash = await realSha256(bytes);
+    if (!assets.has(hash)) assets.set(hash, { ext, bytes, mime: image.mime || `image/${ext === 'jpg' ? 'jpeg' : ext}`, imageIds: [imageId] });
+    else if (!assets.get(hash)!.imageIds.includes(imageId)) assets.get(hash)!.imageIds.push(imageId);
     imageHashes.set(imageId, hash); return hash;
   };
   if (doc.source.packageSectionReceipt) report.package_section_receipt = doc.source.packageSectionReceipt;
@@ -120,7 +157,8 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     const type = typeMap[q.type] || 'short_answer';
     if (!typeMap[q.type]) report.notes.push(`${label}: ${q.type} exported as short_answer.`);
     const passage = doc.source.kind === 'package' ? doc.passages?.find(p => p.id === q.passageId)?.text : undefined;
-    const stem = [passage, bankStem(doc, q).trim()].filter(Boolean).join('\n\n');
+    // #57 Part C — placeholder tokens are never exported as text: the reference form carries the asset.
+    const stem = stripImagePlaceholderTokens([passage, bankStem(doc, q).trim()].filter(Boolean).join('\n\n')).replace(/[ \t]{2,}/g, ' ').trim();
     const bankOptionsForQuestion = bankOptions(doc, q);
     const optionImages = (q.images || []).filter(i => i.role === 'option');
     if (optionImages.length) {
@@ -143,11 +181,25 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     const row: BankQuestion = { type, title: doc.source.kind === 'package' ? `Question ${q.label}` : stem.slice(0, 60), ...(doc.source.kind === 'package' ? { label: q.label } : {}), ...(q.optionalGroupId ? { optional_group_id: q.optionalGroupId, optional_branch: q.optionalBranch } : {}), explanation: q.explanation && q.enrichment?.explanationCheck?.state === 'verified' ? q.explanation : null,
       points: typeof q.points === 'number' && Number.isFinite(q.points) && q.points >= 0 ? q.points : null,
       ...exportIdentity(doc.meta.grade, doc.meta.subject), curriculum_hints: hints,
-      provenance: { ...provenance, ...(q.imported?.provenance?.source_ref ? { source_ref: q.imported.provenance.source_ref } : {}) }, tags: [...new Set([...reviewTags(q), section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
+      // #57 Part E — compact physical ref in the bank; the full prose ref stays structured-only.
+      provenance: { ...provenance, source_ref: compactBankSourceRef(doc, q) }, tags: [...new Set([...reviewTags(q), section, doc.meta.subject].filter((s): s is string => Boolean(s?.trim())).map(s => s.trim()))] };
+    // #57 Part A — bank export carries only verified sample answers and rubrics (uncertain stays structured-only; rejected is record-only).
+    if (q.sampleAnswer?.judged === 'verified') row.sample_answer = { text: q.sampleAnswer.text, source: q.sampleAnswer.source };
+    if (q.rubric?.judged === 'verified') row.rubric = { criteria: q.rubric.criteria.map(c => ({ criterion: c.criterion, maxPoints: c.maxPoints })) };
     const stemImages = (q.images || []).filter(i => i.role === 'stem' || i.role === 'table');
     if (stemImages.length) {
       const blocks: NonNullable<BankQuestion['stem_blocks']> = [];
-      const imgBlocks = await Promise.all(stemImages.map(async image => ({ t: 'img' as const, asset: await resolveAsset(image.imageId) })));
+      // #57 Part C — every referenced image becomes either a sha256 reference or an explicit
+      // missing-asset marker (plus report attention); never a placeholder token, never a silent drop.
+      const imgBlocks = await Promise.all(stemImages.map(async image => {
+        const hash = await resolveAsset(image.imageId);
+        if (hash) return { t: 'img' as const, asset: hash };
+        report.missing_assets.push({ question: label, image: image.imageId });
+        report.notes.push(`${label}: image ${image.imageId} has no available pixels — exported with an explicit missing-asset marker (restore it before students receive this batch).`);
+        // Marker prefers the content hash so the batch string can never contain an img_<sha> token.
+        const marker = doc.images.find(img => img.id === image.imageId)?.sha || image.imageId;
+        return { t: 'img' as const, asset: `missing:${marker}` };
+      }));
       const positions = q.packageImagePositions?.filter(p => stemImages.some(i => i.imageId === p.imageId)).sort((a, b) => a.offset - b.offset) || [];
       if (doc.source.kind === 'package' && positions.length) {
         if (passage) blocks.push({ t: 'text', v: passage + '\n\n' });
@@ -165,6 +217,9 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
         const leadIn = /(?:picture|image|photo|figure|diagram)\s+(?:shown\s+)?below|(?:تصویر|شکل)\s*(?:زیر|پایین)/i.test(stem);
         if (leadIn) blocks.push(...imgBlocks, { t: 'text', v: stem }); else blocks.push({ t: 'text', v: stem }, ...imgBlocks);
       }
+      // Text segments keep their exact slicing offsets; only the token text itself is scrubbed.
+      for (const block of blocks) if (block.t === 'text') block.v = stripImagePlaceholderTokens(block.v).replace(/[ \t]{2,}/g, ' ');
+      if (blocks.some(block => block.t === 'img')) report.image_references++;
       row.stem_blocks = blocks;
     } else row.stem = stem;
     if (bankOptionsForQuestion.length) row.options = bankOptionsForQuestion;
@@ -189,7 +244,12 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     if (q.difficulty && q.difficulty.source === 'model' && Number.isInteger(q.difficulty.value) && q.difficulty.value >= 1 && q.difficulty.value <= 5 && (q.difficultyMode === 'active' || options.includeModelDifficulty === true)) row.difficulty = { value: q.difficulty.value, source: 'model' };
     batch.questions.push(row); report.exported++;
   }
-  report.asset_count = assets.size; report.total_bytes = [...assets.values()].reduce((sum, asset) => sum + asset.bytes.length, 0);
+  report.asset_count = assets.size;
+  // #57 Part C — truthful summary: files emitted vs questions referencing them; with references
+  // present, "0 images to place" is impossible because images_placed tracks the emitted pool.
+  report.images_placed = assets.size;
+  report.total_bytes = [...assets.values()].reduce((sum, asset) => sum + asset.bytes.length, 0);
+  if (report.image_references && !report.images_placed) report.notes.push(`${report.image_references} question(s) reference image assets, but no pixels were available — every reference carries an explicit missing-asset marker.`);
   const slug = `${bankSlug(doc.meta.title || doc.displayName)}-batch`;
   const zip = new JSZip(); const folder = zip.folder(slug)!;
   if (batch.questions.length <= 50) folder.file('batch.json', JSON.stringify(batch, null, 2));
@@ -198,6 +258,14 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     folder.file(`part-${Math.floor(i / 50) + 1}/batch.json`, JSON.stringify(chunk, null, 2));
   }
   folder.file('export-report.json', JSON.stringify(report, null, 2));
+  // #57 Part C — v1.1 asset manifest: content-addressed asset id → file, sha, mime, byte size.
+  // Files only, never base64; `used_by` lists the image asset ids that reference this file.
+  folder.file('assets/manifest.json', JSON.stringify({
+    format: 'appendix-a-assets/1.1',
+    assets: [...assets.entries()].map(([hash, asset]) => ({
+      id: hash, file: `assets/${hash}.${asset.ext}`, sha256: hash, mime: asset.mime, bytes: asset.bytes.length, used_by: asset.imageIds,
+    })),
+  }, null, 2));
   for (const [hash, asset] of assets) folder.file(`assets/${hash}.${asset.ext}`, asset.bytes);
   const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
   const written = await JSZip.loadAsync(bytes);

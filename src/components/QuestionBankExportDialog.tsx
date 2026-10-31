@@ -48,7 +48,10 @@ export function QuestionBankExportDialog({ doc, settings, onClose, onTagged }: {
       {error && <p role="alert" className="text-[var(--danger)]">{error}</p>}
       {result && <div className="rounded border border-[var(--rule)] p-3 space-y-1" aria-label="Export report">
         <p><strong>Export report</strong> · {result.report.exported} questions · {result.report.tagged} tagged · {result.report.untagged} untagged</p>
-        <p>{result.report.needs_answer_key.length} need answer keys · {result.report.asset_count} assets · {result.report.total_bytes} asset bytes</p>
+        {/* #57 Part C — truthful image counts: assets emitted vs questions referencing them. */}
+        <p data-export-images="true">{result.report.images_placed} image(s) placed ({result.report.image_references} question(s) reference an asset) · {result.report.asset_count} in pool · {result.report.total_bytes} asset bytes</p>
+        <p>{result.report.needs_answer_key.length} need answer keys</p>
+        {result.report.missing_assets.length > 0 && <p className="text-[var(--warn-ink)]">Missing image assets (exported with explicit markers): {result.report.missing_assets.map(entry => `${entry.question} → ${entry.image}`).join(', ')}</p>}
         {result.report.needs_answer_key.length > 0 && <p>Needs answer key: {result.report.needs_answer_key.map(q => q.question).join(', ')}</p>}
         {result.report.image_options.length > 0 && <p>Image options exported as placeholders: {result.report.image_options.join(', ')}</p>}
         {result.report.notes.map(note => <p key={note}>{note}</p>)}

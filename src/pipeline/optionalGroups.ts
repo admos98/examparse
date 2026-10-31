@@ -9,6 +9,7 @@ export function optionalPoints(doc: ExamDoc, questions: Question[]): number {
     const members = questions.filter(q => group.memberLabels.includes(q.label));
     if (!members.length) continue;
     if (group.printedTotal != null && members.length === group.memberLabels.length) { total += group.printedTotal; continue; }
+    if (group.rule === 'unknown') continue;
     if (group.rule === 'choose-one-branch') {
       const branch = Object.keys(group.branches)[0];
       total += members.filter(q => group.branches[branch].includes(q.label)).reduce((sum, q) => sum + (q.points || 0), 0);

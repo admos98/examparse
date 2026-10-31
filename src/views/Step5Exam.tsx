@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Printer, Download, Upload, Copy, FileSpreadsheet } from 'lucide-react';
+import { Printer, Download, Upload, Copy, FileSpreadsheet, Archive } from 'lucide-react';
 import { ExamDoc, ImageAsset, getDisplayName, sanitizeFileName } from '../types';
 import { LoopReceipt } from '../components/LoopReceipt';
 import { DeterministicRenderer, ExamRenderMode } from './DeterministicRenderer';
@@ -9,6 +9,7 @@ import { ExamHealthBanner } from '../components/ExamHealthBanner';
 import { MAX_EXAM_JSON_BYTES, parseExamDocImport } from '../utils/validation';
 import { printStyles, checkPrintLayout } from '../utils/printCheck';
 import { Button, ConfirmCard, Tabs } from '../design/primitives';
+import { createStandaloneExamParseZip, downloadStandaloneExamParseZip } from '../utils/examparseZip';
 
 interface Props {
   defaultExamMode?: 'exam' | 'review';
@@ -17,7 +18,7 @@ interface Props {
   exportRequest?: number;
 }
 
-type PendingAction = 'print' | 'docx' | 'json';
+type PendingAction = 'print' | 'docx' | 'json' | 'zip';
 
 export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, exportRequest = 0 }) => {
   const [renderMode, setRenderMode] = useState<ExamRenderMode>(defaultExamMode === 'review' ? 'review' : 'paper');
@@ -27,6 +28,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
   const [showReport, setShowReport] = useState(false);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [importNotice, setImportNotice] = useState('');
+  const [zipNotice, setZipNotice] = useState('');
   const printAreaRef = useRef<HTMLDivElement>(null);
   const lastExportRequest = useRef(exportRequest);
   const isPersian = /^fa|^ar/i.test(doc.meta.language || '');
@@ -88,14 +90,26 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
     setPendingAction(null);
     exportExamJson(doc);
   }, [doc]);
+  const executeZip = useCallback(async () => {
+    setPendingAction(null);
+    setZipNotice(t('Preparing standalone ExamParse ZIP locally…', 'در حال آماده‌سازی بسته مستقل ExamParse روی همین دستگاه…'));
+    try {
+      const result = await createStandaloneExamParseZip(doc);
+      downloadStandaloneExamParseZip(result);
+      setZipNotice(t(`Standalone ZIP ready: ${result.questionCount} questions, ${result.assetCount} assets, ${result.totalAssetBytes} asset bytes. No bank service or model was used.`, `بسته مستقل آماده شد: ${result.questionCount} سؤال و ${result.assetCount} تصویر. از سرویس بانک یا مدل استفاده نشد.`));
+    } catch (error) {
+      setZipNotice(t(`Standalone ZIP could not be completed: ${error instanceof Error ? error.message : String(error)}`, `ساخت بسته مستقل ناموفق بود: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }, [doc, isPersian]);
 
   const requestAction = useCallback((action: PendingAction) => {
     const hasPrintRisk = action === 'print' && checkPrintLayout(printAreaRef.current || undefined).length > 0;
     if (partialIssues.length || hasPrintRisk) setPendingAction(action);
     else if (action === 'print') executePrint();
     else if (action === 'docx') executeDocx();
-    else executeJson();
-  }, [executeDocx, executeJson, executePrint, partialIssues.length]);
+    else if (action === 'json') executeJson();
+    else void executeZip();
+  }, [executeDocx, executeJson, executePrint, executeZip, partialIssues.length]);
 
   useEffect(() => {
     if (exportRequest === lastExportRequest.current) return;
@@ -107,6 +121,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
     if (pendingAction === 'print') executePrint();
     else if (pendingAction === 'docx') executeDocx();
     else if (pendingAction === 'json') executeJson();
+    else if (pendingAction === 'zip') void executeZip();
   };
 
   const handleImportJson = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -184,6 +199,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
         <Button size="sm" variant="ghost" onClick={handleDuplicate} title={t('Duplicate exam to create Version B', 'برای ساخت نسخه ب از آزمون یک کپی بسازید')}><Copy aria-hidden="true" size={16} /><span>{t('Duplicate', 'کپی')}</span></Button>
         <Button size="sm" variant="ghost" onClick={() => requestAction('docx')} title={t('Export DOCX document', 'خروجی فایل DOCX')}><FileSpreadsheet aria-hidden="true" size={16} /><span>DOCX</span></Button>
         <Button size="sm" variant="ghost" onClick={() => requestAction('json')} title={t('Export clean ExamDoc JSON', 'خروجی JSON پاک آزمون')}><Download aria-hidden="true" size={16} /><span>{t('Export JSON', 'خروجی JSON')}</span></Button>
+        <Button size="sm" variant="ghost" onClick={() => requestAction('zip')} title={t('Export standalone ExamParse ZIP without a bank dependency', 'خروجی ZIP مستقل ExamParse بدون وابستگی به بانک')}><Archive aria-hidden="true" size={16} /><span>{t('Standalone ZIP', 'بسته مستقل')}</span></Button>
         <label className="ep-button ep-button-ghost ep-button-sm cursor-pointer">
           <Upload aria-hidden="true" size={16} /><span>{t('Import JSON', 'ورود JSON')}</span>
           <input ref={jsonInputRef} type="file" accept=".json" onChange={handleImportJson} className="sr-only" />
@@ -194,6 +210,7 @@ export const Step5Exam: React.FC<Props> = ({ defaultExamMode, doc, onUpdateDoc, 
     </div>
 
     {importNotice && <p className="max-w-5xl mx-auto text-[length:var(--type-12)]" role="status" aria-live="polite">{importNotice}</p>}
+    {zipNotice && <p className="max-w-5xl mx-auto text-[length:var(--type-12)]" role="status" aria-live="polite">{zipNotice}</p>}
     {report && <section className="ep-card ep-parse-report max-w-5xl mx-auto my-3 p-3 text-[length:var(--type-12)]" aria-label={t('Parse report', 'گزارش استخراج')}>
       <div className="font-semibold">{t('Parse report', 'گزارش استخراج')} — <span className="ep-mono">{doc.id}</span></div>
       <div>{t('Models', 'مدل‌ها')}: {Object.entries(report.models).map(([key, value]) => `${key}: ${value}`).join(' · ') || '—'}</div>

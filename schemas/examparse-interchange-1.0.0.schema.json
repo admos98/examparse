@@ -1,0 +1,578 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://examparse.local/schemas/examparse-interchange-1.0.0.schema.json",
+  "title": "ExamParse standalone interchange v1.0.0",
+  "description": "Standalone ExamParse ExamDoc with portable asset references and explicit completeness and teacher-only boundaries. See docs/examparse-interchange-v1.md.",
+  "type": "object",
+  "required": [
+    "format",
+    "formatVersion",
+    "id",
+    "meta",
+    "sections",
+    "questions",
+    "images",
+    "source",
+    "assetManifest",
+    "completeness",
+    "teacherOnly"
+  ],
+  "properties": {
+    "format": {
+      "const": "examparse.interchange"
+    },
+    "formatVersion": {
+      "const": "1.0.0"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fileHash": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "string"
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "meta": {
+      "type": "object"
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/section"
+      }
+    },
+    "passages": {
+      "type": "array"
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/question"
+      }
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/image"
+      }
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sourceLine"
+          }
+        }
+      },
+      "required": [
+        "lines"
+      ],
+      "additionalProperties": true
+    },
+    "flags": {
+      "type": "array"
+    },
+    "usage": {
+      "type": "array"
+    },
+    "assetManifest": {
+      "$ref": "#/$defs/assetManifest"
+    },
+    "completeness": {
+      "$ref": "#/$defs/completeness"
+    },
+    "teacherOnly": {
+      "$ref": "#/$defs/teacherOnly"
+    },
+    "exportMeta": {
+      "type": "object"
+    },
+    "parseReport": {
+      "type": "object"
+    },
+    "optionalGroups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "rule",
+          "memberLabels",
+          "branches"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "rule": {
+            "enum": [
+              "choose-one-branch",
+              "choose-one-per-number",
+              "unknown"
+            ]
+          },
+          "memberLabels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "branches": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "printedTotal": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "instructionGroups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "appliesToFirst",
+          "appliesToLast",
+          "text"
+        ],
+        "properties": {
+          "appliesToFirst": {
+            "type": "integer"
+          },
+          "appliesToLast": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "section": {
+      "type": "object",
+      "required": [
+        "id",
+        "index",
+        "spans"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "index": {
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "passage": {
+          "type": "string"
+        },
+        "points": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "spans": {
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "question": {
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "no",
+        "spans",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "no": {
+          "type": "integer"
+        },
+        "sectionId": {
+          "type": "string"
+        },
+        "parentId": {
+          "type": "string"
+        },
+        "points": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "spans": {
+          "type": "array"
+        },
+        "type": {
+          "type": "string"
+        },
+        "answer": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "enum": [
+                "paper",
+                "keyfile",
+                "manual",
+                "ai"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "spans": {
+              "type": "array"
+            },
+            "nonExecuting": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "source"
+          ],
+          "additionalProperties": true
+        },
+        "enrichment": {
+          "type": "object"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "imageRefs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "images": {
+          "type": "array"
+        },
+        "subQuestions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/question"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "image": {
+      "type": "object",
+      "required": [
+        "id",
+        "mime",
+        "exportPath"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mime": {
+          "type": "string"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "exportPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storageMissing": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sourceLine": {
+      "type": "object",
+      "required": [
+        "id",
+        "page",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "text": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "tagSource": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "assetManifest": {
+      "type": "object",
+      "required": [
+        "format",
+        "version",
+        "root",
+        "assets"
+      ],
+      "properties": {
+        "format": {
+          "const": "examparse.assets"
+        },
+        "version": {
+          "const": "1.0.0"
+        },
+        "root": {
+          "const": "."
+        },
+        "assets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "sha256",
+              "mime",
+              "path",
+              "state",
+              "references"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^[a-fA-F0-9]{64}$"
+              },
+              "mime": {
+                "type": "string"
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "available",
+                  "unavailable",
+                  "unassigned",
+                  "reference-only"
+                ]
+              },
+              "references": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "questionId",
+                    "label",
+                    "location"
+                  ],
+                  "properties": {
+                    "questionId": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "location": {
+                      "enum": [
+                        "stem",
+                        "option",
+                        "table",
+                        "decoration"
+                      ]
+                    },
+                    "optionId": {
+                      "type": "string"
+                    },
+                    "offset": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "reason": {
+                "type": "string"
+              },
+              "sourceIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "completeness": {
+      "type": "object",
+      "required": [
+        "state",
+        "issues"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "complete",
+            "partial",
+            "unverified"
+          ]
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "questionId": {
+                "type": "string"
+              },
+              "assetId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "teacherOnly": {
+      "type": "object",
+      "required": [
+        "boundary",
+        "fieldPaths",
+        "listeningScripts"
+      ],
+      "properties": {
+        "boundary": {
+          "const": "not-student-safe"
+        },
+        "description": {
+          "type": "string"
+        },
+        "fieldPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "listeningScripts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "questionId",
+              "label",
+              "text",
+              "evidenceType"
+            ],
+            "properties": {
+              "questionId": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "sectionId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sectionTitle": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "evidenceType": {
+                "const": "teacher-only-script"
+              },
+              "note": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

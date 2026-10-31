@@ -68,7 +68,7 @@ test('canonical normalization and source/stem/answer/option byte-invariance', ()
     'می شود a b',
   );
   const text = '۳１. كَـدام می\u200cشود؟';
-  const source = lines([text, 'الف) خُـوب ب) بَد', '31. Aَـnswer 32. B']);
+  const source = lines([text, 'الف) خُـوب ب) بَد', '31. Aَـnswer 32. B']); source[2].tag = 'key';
   const before = JSON.stringify(source);
   const q = assembleAndValidateQuestions(
     [

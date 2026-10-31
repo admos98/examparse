@@ -124,7 +124,7 @@ test('#53 package persists in the folder library and reopens with assets', { tim
   assert.ok((await listExamSummaries()).some(s => s.id === doc.id));
   const reopened = await loadExamDoc(doc.id); assert.equal(reopened?.source.kind, 'package'); assert.equal(reopened?.questions.length, 9); assert.equal(reopened?.questions[1].points, null);
   assert.ok(reopened?.images.every(image => image.dataUrl?.startsWith('/api/images/')));
-  const exported = await createQuestionBankExport(reopened!, { sourceDataset:'synthetic' }); assert.equal(exported.batch.questions.length, 9); assert.equal(exported.report.asset_count, 2);
+  const exported = await createQuestionBankExport(reopened!, { sourceDataset:'synthetic' }); assert.equal(exported.batch.questions.length, 9); assert.equal(exported.report.asset_count, 3, 'all saved assets, including unassigned pixels, ship in the standalone pool');
  } finally { globalThis.fetch = originalFetch; child.kill('SIGTERM'); await fs.rm(root, { recursive:true, force:true }); }
 });
 

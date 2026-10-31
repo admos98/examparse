@@ -127,8 +127,8 @@ export async function retryFailedPage(
       const pageRow = loop.pages.find(p => p.page === page);
       if (pageRow) Object.assign(pageRow, parsed.receipt, { status: parsed.receipt.status === 'empty' ? 'failed' : parsed.receipt.status });
       else loop.pages.push(parsed.receipt);
-      const projected = projectAuthoredDocument(loop.document);
-      const next: ExamDoc = { ...doc, questions: projected.questions, sections: projected.sections, meta: { ...doc.meta, ...projected.meta }, loop };
+      const projected = projectAuthoredDocument(loop.document, doc.source.lines);
+      const next: ExamDoc = { ...doc, questions: projected.questions, sections: projected.sections, optionalGroups: projected.optionalGroups, meta: { ...doc.meta, ...projected.meta }, loop };
       next.flags = loopFlags(loop, next);
       if (options?.persist !== false) await saveExamDoc(next);
       return { doc: next, status: parsed.receipt.status === 'empty' ? 'failed' : 'local ok', questionsAdded: Math.max(0, next.questions.length - before), message: `Page ${page} retried locally; ${applied.applied} correction(s) applied.` };

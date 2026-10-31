@@ -207,7 +207,7 @@ test('T1 (Part A): folder storage seam — 3 images save/reload/export cleanly; 
     assert.equal(exported.images.length, 3, 'JSON export never strips extracted images to []');
     assert.equal(exported.exportMeta.binariesStripped, true);
     assert.equal(exported.exportMeta.imageCount, 3);
-    assert.ok(exported.images.every((img: any) => !img.dataUrl && img.blobKey && img.localUrl?.startsWith('/api/images/') && img.exportPath));
+    assert.ok(exported.images.every((img: any) => !img.dataUrl && !img.blobKey && !img.localUrl && img.exportPath === null), 'portable JSON has no folder-local storage URL or blob key');
     // In-app doc still retains renderable URLs
     assert.ok(reloadedOk.images.every(img => Boolean(img.dataUrl)));
     // Exported JSON round-trips cleanly through schema import

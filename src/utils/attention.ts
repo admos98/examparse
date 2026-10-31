@@ -223,7 +223,7 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
   // #46: the loop's surviving comments are the attention list. Do not run the old spine's
   // inferred answer/coverage nag machinery on top of the same findings a second time.
   if (doc.loop) {
-    const items: AttentionItem[] = doc.loop.survivingVerdicts.map(verdict => {
+    const items: AttentionItem[] = (Array.isArray(doc.loop.survivingVerdicts) ? doc.loop.survivingVerdicts : []).map(verdict => {
       const affected = questions.filter(q => verdict.questionNumbers.includes(q.no));
       const kind: AttentionKind = verdict.kind === 'empty-stem' ? 'stem-hollow'
         : verdict.kind === 'options-missing-for-type' ? 'options-missing'
@@ -238,12 +238,12 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
       return { id: verdict.id, kind, rootCauseId: verdict.id, plainSentence: `${sentence} [${action.label}]`, action,
         questionIds: affected.map(q => q.id), imageIds: verdict.imageId ? [verdict.imageId] : [], count: 1, severity: 'warn' };
     });
-    for (const page of doc.loop.pages.filter(p => p.status === 'failed' || p.status === 'empty')) items.push({
+    for (const page of (Array.isArray(doc.loop.pages) ? doc.loop.pages : []).filter(p => p.status === 'failed' || p.status === 'empty')) items.push({
       id: `loop-page-${page.page}`, kind: 'read-failed', rootCauseId: `loop-page-${page.page}`,
       plainSentence: `Page ${page.page} was not fully read. Retry it with the local model; the rest of the document is saved. [Retry page]`,
       action: { target: 'page-retry', page: page.page, label: 'Retry page' }, questionIds: [], imageIds: [], count: 1, severity: 'warn',
     });
-    for (const [index, message] of doc.loop.notes.entries()) items.push({
+    for (const [index, message] of (Array.isArray(doc.loop.notes) ? doc.loop.notes : []).entries()) items.push({
       id: `loop-note-${index}`, kind: 'loop-note', rootCauseId: `loop-note-${index}`,
       plainSentence: `${message} [Review]`, action: { target: 'question', label: 'Review' },
       questionIds: [], imageIds: [], count: 1, severity: 'warn',

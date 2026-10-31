@@ -34,7 +34,7 @@ const imageSchema = z.object({
   mime: z.string().max(100), sha: z.string().max(256), width: z.number().int().nonnegative().max(100_000), height: z.number().int().nonnegative().max(100_000), anchorLine: z.number().int().positive().optional(),
   imageFlags: z.array(text(200)).max(100).optional(), duplicateOf: z.string().regex(SAFE_ID).optional(), dHash: z.string().max(256).optional(),
   label: z.object({ role: z.enum(['stem', 'option', 'table', 'decoration']), questionRef: text(100).optional(), caption: text(500).optional(), reason: text(1000).optional(), kind: z.enum(['photo', 'diagram', 'chart', 'table', 'formula', 'handwriting', 'decoration']).optional(), needsText: z.boolean().optional() }).passthrough().optional(),
-  blobKey: text(256), dataUrl: text(8 * 1024 * 1024).optional(), exportPath: text(512).optional(),
+  blobKey: text(256).optional(), dataUrl: text(8 * 1024 * 1024).optional(), exportPath: text(512).nullable().optional(),
 }).passthrough();
 const usageSchema = z.object({ ts: text(100), role: z.enum(LLM_ROLES), provider: text(200), model: text(300), inputTokens: z.number().finite().nonnegative(), outputTokens: z.number().finite().nonnegative(), cachedTokens: z.number().finite().nonnegative().optional(), costUsd: z.number().finite().nonnegative().optional(), label: text(1000), isCachedHit: z.boolean().optional(), dedupeKey: text(300).optional() }).passthrough();
 

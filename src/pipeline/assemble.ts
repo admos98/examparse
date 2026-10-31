@@ -918,7 +918,7 @@ function assembleAndValidateQuestionsInner(
   const minLineId = lineIds.length ? lineIds.reduce((minimum, n) => Math.min(minimum, n), Infinity) : 1;
   const maxLineId = lineIds.length ? lineIds.reduce((maximum, n) => Math.max(maximum, n), 0) : sourceLines.length;
   const keyLines = new Set(options.keyTerritoryLineNos || []);
-  sourceLines.filter(l => l.furniture).forEach(l => keyLines.add(lineNoFromId(l.id)));
+  sourceLines.filter(l => l.furniture || l.tag === 'key').forEach(l => keyLines.add(lineNoFromId(l.id)));
   const allImageIds = options.imageIds ? new Set(options.imageIds) : null;
   const sourceByNo = new Map(sourceLines.map(line => [lineNoFromId(line.id), line]));
   const questionOverlap = new Set<string>();
@@ -1354,6 +1354,15 @@ function assembleAndValidateQuestionsInner(
       answer = undefined;
       answerExtended = false;
       flags.push(flag('ANSWER_ANCHOR_SUSPECT', `Question ${label}: key instructions are not an answer; please check the key.`, 'warn', qId));
+    }
+    if (answer) {
+      const evidenceLines = spanLineNosFromSpans(answer.spans || []);
+      const keyEvidence = evidenceLines.length > 0 && evidenceLines.every(lineNo => { const sourceTag = sourceByNo.get(lineNo)?.tag; return keyLines.has(lineNo) && (sourceTag === undefined || sourceTag === 'key'); });
+      if (!keyEvidence) {
+        answer = undefined;
+        answerExtended = false;
+        flags.push(flag('ANSWER_SOURCE_EVIDENCE_MISSING', `Question ${label}: proposed answer spans do not bind exclusively to source lines tagged as answer-key evidence; answer remains pending.`, 'warn', qId));
+      }
     }
     if (answerRecoveredFromKey) flags.push(flag('ANSWER_KEY_ANCHOR_RECOVERED', `Question ${label}: answer re-sliced from its exact printed answer-key anchor.`, 'info', qId));
     if (answerExtended) flags.push(flag('ANSWER_SPAN_EXTENDED', `Question ${label}: incomplete answer slice was extended to the same item's sentence boundary.`, 'info', qId));

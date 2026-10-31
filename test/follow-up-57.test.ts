@@ -264,12 +264,12 @@ test('#57C placeholder tokens become real asset references: import attaches, Ste
     assert.equal(sha256(new Uint8Array(await entry!.async('uint8array'))), ref);
   }
   const manifest = JSON.parse(await zip.file(`${root}/assets/manifest.json`)!.async('string'));
-  assert.equal(manifest.format, 'appendix-a-assets/1.1');
-  assert.deepEqual(manifest.assets.map((asset: any) => asset.id).sort(), [sha1, sha2].sort());
+  assert.equal(manifest.format, 'examparse.assets');
+  assert.deepEqual(manifest.assets.map((asset: any) => asset.sha256).sort(), [sha1, sha2].sort());
   for (const asset of manifest.assets) {
-    assert.equal(asset.sha256, asset.id);
-    assert.ok(zip.file(`${root}/${asset.file}`), 'manifest file resolves inside the zip');
-    assert.equal(typeof asset.bytes, 'number');
+    assert.match(asset.sha256, /^[a-f0-9]{64}$/);
+    assert.ok(zip.file(`${root}/${asset.path}`), 'manifest file resolves inside the zip');
+    assert.ok(asset.references.length >= 1);
     assert.match(asset.mime, /^image\//);
   }
 });

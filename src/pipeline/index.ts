@@ -157,9 +157,9 @@ export async function runFullPipeline(file: File, settings: AppSettings, callbac
     flags: [], usage: usageRecords, guidanceTokens: job?.guidanceTokens || 0,
   };
   const applyReceipt = (receipt: LoopReceipt) => {
-    const projected = projectAuthoredDocument(receipt.document);
+    const projected = projectAuthoredDocument(receipt.document, lines);
     const meta = { ...doc.meta, ...projected.meta, ...normalizeIdentity(projected.meta.grade ?? doc.meta.grade, projected.meta.subject ?? doc.meta.subject) };
-    doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, instructionGroups: structuredClone(receipt.document.instructionGroups || []), passages: structuredClone(receipt.document.passages || []), images, partial: receipt.survivingVerdicts.length > 0,
+    doc = { ...doc, meta, questions: projected.questions, sections: projected.sections, optionalGroups: projected.optionalGroups, instructionGroups: structuredClone(receipt.document.instructionGroups || []), passages: structuredClone(receipt.document.passages || []), images, partial: receipt.survivingVerdicts.length > 0,
       displayName: nameSource === 'manual' ? displayName : computeDisplayName(meta, file.name),
       usage: [...usageRecords], loop: structuredClone(receipt), guidanceTokens: job?.guidanceTokens || 0 };
     doc.flags = loopFlags(receipt, doc);

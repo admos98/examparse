@@ -105,6 +105,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
       {q.options?.length ? <div className="ep-options">{q.options.map(option => <div key={option.key} className="ep-option">
         <span className="ep-option-key">{option.key}</span>
         <DirectionalText text={option.text || ''} fallback={fallbackDir} />
+        {option.imageRefs?.map(imageId => <React.Fragment key={imageId}>{renderImages([{ imageId, role: 'option' }])}</React.Fragment>)}
       </div>)}</div> : null}
       {mode === 'review' && q.explanation && q.enrichment?.explanationCheck?.state !== 'rejected' && <div className="ep-review-note">{q.explanation.text}</div>}
       {mode === 'paper' && ['short', 'long', 'essay'].includes(q.type) && <div className="ep-writing-lines" style={{ height: q.type === 'essay' ? '80px' : '40px' }} />}

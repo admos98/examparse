@@ -4,11 +4,21 @@ import { sha256 } from '../utils/hash';
 import { normalizeIdentity } from './identity';
 import { isPackageListeningQuestion, packageListeningEvidence } from './packageListening';
 import { findImagePlaceholderTokens, resolvePlaceholderSha, stripImagePlaceholderTokens } from './imagePlaceholders';
+import { validateExamParseInterchange } from '../utils/examparseFormat';
 
 export interface PackageFile { name: string; arrayBuffer(): Promise<ArrayBuffer>; text(): Promise<string>; type?: string; webkitRelativePath?: string }
 /** Appendix-A descriptive types (long_answer) and free-form writing variants import as our essay type. */
 const types: Record<string, Question['type']> = { multiple_choice: 'mcq', true_false: 'truefalse', fill_in_blank: 'fillblank', short_answer: 'short', matching: 'matching', ordering: 'multi', long_answer: 'essay', essay: 'essay', paragraph: 'essay', writing: 'essay' };
 const mimeFor = (name: string) => ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' } as Record<string, string>)[name.split('.').pop()!.toLowerCase()];
+function sniffImageMime(bytes: Uint8Array): string | undefined {
+  if (bytes.length >= 8 && [137,80,78,71,13,10,26,10].every((value, index) => bytes[index] === value)) return 'image/png';
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  const ascii = (start: number, length: number) => String.fromCharCode(...bytes.slice(start, start + length));
+  if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') return 'image/gif';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return 'image/webp';
+  if (ascii(0, 2) === 'BM') return 'image/bmp';
+  return undefined;
+}
 function numberFromTitle(title: string, fallback: number): number {
   const match = /(?:question|\bq)\s*[-#.:]?\s*(\d+)/i.exec(title) || /^\s*(\d+)(?=[A-Za-z]|\s*[.):])/.exec(title);
   return match ? Number(match[1]) : fallback;
@@ -71,6 +81,74 @@ function commonPrefix(a: string, b: string): string {
 export async function importQuestionPackage(files: PackageFile[]): Promise<ExamDoc> {
   const pathOf = (file: PackageFile) => (file.webkitRelativePath || file.name).replace(/\\/g, '/');
   const jsons = files.filter(f => /\.json$/i.test(f.name) && !/export-report\.json$/i.test(f.name));
+  const canonicalFile = jsons.find(file => /(?:^|\/)examparse\.json$/i.test(pathOf(file)));
+  if (canonicalFile) {
+    let canonical: any;
+    try { canonical = JSON.parse(await canonicalFile.text()); } catch { throw new Error('ExamParse interchange JSON is invalid.'); }
+    const validation = validateExamParseInterchange(canonical);
+    if (!validation.valid) throw new Error(`ExamParse interchange is invalid: ${validation.errors.join('; ')}`);
+    const prefix = pathOf(canonicalFile).replace(/[^/]+$/, '');
+    const byPath = new Map(files.map(file => [pathOf(file).toLowerCase(), file]));
+    const manifestFile = byPath.get(`${prefix}assets/manifest.json`.toLowerCase()) || files.find(file => /(?:^|\/)assets\/manifest\.json$/i.test(pathOf(file)));
+    const canonicalize = (value: any): any => Array.isArray(value) ? value.map(canonicalize) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])])) : value;
+    if (!manifestFile) {
+      canonical.completeness.state = 'unverified';
+      canonical.completeness.issues.push({ code: 'asset-manifest-file-missing', message: 'ZIP is missing the required assets/manifest.json sidecar; canonical asset metadata is retained.' });
+    } else {
+      try {
+        const sidecar = JSON.parse(await manifestFile.text());
+        if (JSON.stringify(canonicalize(sidecar)) !== JSON.stringify(canonicalize(canonical.assetManifest))) {
+          canonical.completeness.state = 'unverified';
+          canonical.completeness.issues.push({ code: 'asset-manifest-disagrees', message: 'assets/manifest.json does not match examparse.json.assetManifest; canonical JSON remains the source of truth.' });
+        }
+      } catch {
+        canonical.completeness.state = 'unverified';
+        canonical.completeness.issues.push({ code: 'asset-manifest-invalid', message: 'assets/manifest.json is not valid JSON; canonical asset metadata is retained.' });
+      }
+    }
+    const images: ImageAsset[] = [];
+    for (const record of canonical.assetManifest.assets) {
+      const recordIds: string[] = Array.isArray(record.sourceIds) && record.sourceIds.length ? record.sourceIds.map(String) : [String(record.id)];
+      let sourceFile: PackageFile | undefined;
+      if (['available', 'unassigned'].includes(record.state) && typeof record.path === 'string' && !record.path.startsWith('/') && !record.path.split('/').includes('..')) {
+        sourceFile = byPath.get(`${prefix}${record.path}`.toLowerCase()) || byPath.get(record.path.toLowerCase()) || files.find(file => pathOf(file).toLowerCase().endsWith(`/${record.path.toLowerCase()}`));
+      }
+      let dataUrl: string | undefined;
+      let storageMissing = !['available', 'unassigned'].includes(record.state) || !record.path;
+      if (sourceFile && ['available', 'unassigned'].includes(record.state)) {
+        const bytes = new Uint8Array(await sourceFile.arrayBuffer());
+        if (!globalThis.crypto?.subtle || await sha256(bytes) !== String(record.sha256).toLowerCase() || sniffImageMime(bytes) !== record.mime) storageMissing = true;
+        else {
+          let binary = ''; for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+          dataUrl = `data:${record.mime};base64,${btoa(binary)}`;
+        }
+      } else if (['available', 'unassigned'].includes(record.state) && record.path) storageMissing = true;
+      for (const id of recordIds) {
+        const existing = (canonical.images || []).find((image: any) => image.id === id);
+        images.push({ ...(existing || {}), id, page: existing?.page || 1, bbox: existing?.bbox || { x: 0, y: 0, w: 0, h: 0 }, mime: record.mime || existing?.mime || 'application/octet-stream', sha: record.sha256 || existing?.sha || '', width: existing?.width || 0, height: existing?.height || 0, blobKey: record.sha256 || existing?.blobKey, ...(dataUrl ? { dataUrl } : {}), ...(storageMissing ? { storageMissing: true } : {}) } as ImageAsset);
+      }
+      if (storageMissing) {
+        record.state = 'unavailable';
+        record.reason = sourceFile ? 'asset bytes failed SHA-256 or MIME verification during import' : 'asset file was not supplied with the package';
+        canonical.completeness.issues.push({ code: 'asset-unavailable-on-import', message: record.reason, assetId: String(record.id) });
+      }
+    }
+    const restored = structuredClone(canonical) as ExamDoc & { teacherOnly?: any; assetManifest?: any; completeness?: any; format?: string; formatVersion?: string; exportMeta?: any; parseReport?: any };
+    const scriptRows = restored.teacherOnly?.listeningScripts || [];
+    for (const script of scriptRows) {
+      const matches = restored.questions.filter(question => question.id === script.questionId);
+      if (matches.length === 1) matches[0].imported = { ...(matches[0].imported || {}), script: script.text, scriptNote: script.note, scriptEvidenceType: script.evidenceType };
+    }
+    restored.images = images;
+    for (const question of restored.questions) {
+      for (const reference of question.images || []) if (!images.some(image => image.id === reference.imageId)) {
+        const missing = canonical.assetManifest.assets.find((asset: any) => asset.id === reference.imageId);
+        if (missing) images.push({ id: missing.id, page: 1, bbox: { x: 0, y: 0, w: 0, h: 0 }, mime: missing.mime, sha: missing.sha256 || '', width: 0, height: 0, storageMissing: true } as ImageAsset);
+      }
+    }
+    restored.images = images;
+    return restored;
+  }
   // #58 Part D — a >50-question native export is ONE logical package: every part-N/batch.json is
   // merged, the shared asset pool is resolved once, and a genuinely missing part is reported
   // instead of silently importing a subset.
@@ -419,7 +497,8 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     while (j < paired.length && paired[j][0] === paired[j-1][0] + 1 && signature(paired[j][1]) === signature(paired[i][1]) && paired[j][1][0].sectionId === paired[i][1][0].sectionId && ruleText(paired[j][1]) === ruleText(paired[i][1])) j++;
     const candidates = paired.slice(i,j).flatMap(([, qs]) => qs);
     const announcement = candidates.map(q => `${q.stem || ''} ${q.imported?.instructions || ''}`).join(' ');
-    const announcedBranch = /(?:answer|choose|select)\s+either[\s\S]{0,200}\bor\b|optional\s+group/i.test(announcement);
+    const announcedBranch = /(?:answer|choose|select)\s+either[\s\S]{0,200}\bor\b|optional\s+group|\b(?:all|every|complete)\b[\s\S]{0,160}\bor\b/i.test(announcement);
+    const announcedPerNumber = /one per number|each number.{0,50}one|one from each pair/i.test(announcement);
     // Label pairs are only optional when under a shared instruction, or an explicit rule.
     const instruction = (q: Question) => q.imported?.instructions || (Array.isArray(q.imported?.instructionGroups) ? JSON.stringify(q.imported.instructionGroups) : '');
     const sameInstruction = candidates.every(q => q.sectionId === candidates[0].sectionId && instruction(q) === instruction(candidates[0]));
@@ -427,7 +506,7 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
       const id = `optional_${optionalGroups.length + 1}`; const branches: Record<string,string[]> = {};
       for (const q of candidates) { const branch = /^(?:\d+)([A-Za-z])/.exec(q.label)![1].toUpperCase(); (branches[branch] ||= []).push(q.label); q.optionalGroupId = id; q.optionalBranch = branch; }
       const total = /(?:total|each (?:branch|part))\s*[:=]?\s*(\d+(?:\.\d+)?)/i.exec(announcement);
-      optionalGroups.push({ id, rule: announcedBranch && paired.slice(i,j).length > 1 ? 'choose-one-branch' : 'choose-one-per-number', memberLabels: candidates.map(q => q.label), branches, ...(total ? { printedTotal: Number(total[1]) } : {}) });
+      optionalGroups.push({ id, rule: announcedBranch ? 'choose-one-branch' : announcedPerNumber ? 'choose-one-per-number' : 'unknown', memberLabels: candidates.map(q => q.label), branches, ...(total ? { printedTotal: Number(total[1]) } : {}) });
     }
     i = j;
   }

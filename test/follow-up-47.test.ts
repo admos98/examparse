@@ -18,12 +18,12 @@ test('image assignment is one-owner and document-order, including decoration-lab
  assert.equal(new Set(doc.questions.flatMap(q=>q.imageIds)).size,2);
  assert.equal(checkAuthoredDocument(doc,imgs).filter(v=>v.kind==='image-unassigned').length,1);
 });
-test('duplicate correction uses stem similarity; ambiguous duplicate yields teacher-facing note',()=>{
+test('duplicate correction by number is not resolved by stem similarity; requires explicit identity',()=>{
  const doc=normalizeAuthoredDocument({questions:[{number:57,sectionTitle:'A',type:'short',stem:'The matching answer',options:[]},{number:57,sectionTitle:'B',type:'short',stem:'Choose a different thing',options:[]}]});
  const c=parseCorrections({rawText:JSON.stringify({corrections:[{action:'replace',questionNumber:57,question:{number:57,type:'short',stem:'The matching answer corrected',options:[]}}]})})!;
- const out=applyCorrections(doc,c);assert.match(out.document.questions.find(q=>q.sectionTitle==='A')!.stem,/corrected/);
+ const out=applyCorrections(doc,c);assert.equal(out.applied,0);assert.equal(out.document.questions.find(q=>q.sectionTitle==='A')!.stem,'The matching answer');assert.match(out.notes.join(' '),/ambiguous|pick|identity|disagree/i);
  const ambiguous=parseCorrections({rawText:JSON.stringify({corrections:[{action:'replace',questionNumber:57,question:{number:57,type:'short',stem:'Unrelated wording',options:[]}}]})})!;
- assert.match(applyCorrections(doc,ambiguous).notes.join(' '),/Two questions numbered 57 disagree/);
+ assert.match(applyCorrections(doc,ambiguous).notes.join(' '),/ambiguous|pick|identity|disagree|explicit unique questionIds/i);
 });
 test('explicit remote decide provider resolves; no local-only rejection',()=>{
  const settings={...DEFAULT_SETTINGS,providers:[{id:'remote',name:'AnyRouter',kind:'openai-compatible' as const,baseURL:'https://anyrouter.dev/api/v1',apiKey:'',decideDialect:'thx' as const}],roleMapping:{...DEFAULT_SETTINGS.roleMapping,decide:{providerId:'remote',model:'hal-x/thx-01'}}};
@@ -47,9 +47,9 @@ test('THX adapter sends keyed text-only payload and normalizes choice and noul m
  } finally {globalThis.fetch=original;}
 });
 
-test('mergeDuplicates operation collapses conflicting stem-identical records to one corrected object',()=>{
+test('mergeDuplicates by bare number cannot collapse same-number records without an explicit identity',()=>{
  const doc=normalizeAuthoredDocument({questions:[{number:8,sectionTitle:'A',type:'short',stem:'same exact stem',options:[],answer:'yes'},{number:8,sectionTitle:'A',type:'mcq',stem:'same exact stem',options:[{key:'a',text:'A'},{key:'b',text:'B'}],answer:'a'}]});
  assert.ok(checkAuthoredDocument(doc,[]).some(v=>v.kind==='duplicate-conflict'));
  const correction=parseCorrections({rawText:JSON.stringify({corrections:[{action:'mergeDuplicates',questionNumber:8,question:{number:8,sectionTitle:'A',type:'mcq',stem:'same exact stem',options:[{key:'a',text:'A'},{key:'b',text:'B'}],answer:'a'}}]})})!;
- const merged=applyCorrections(doc,correction);assert.equal(merged.applied,1);assert.equal(merged.document.questions.length,1);assert.equal(merged.document.questions[0].type,'mcq');
+ const merged=applyCorrections(doc,correction);assert.equal(merged.applied,0);assert.equal(merged.document.questions.length,2);assert.match(merged.notes.join(' '),/ambiguous|pick|identity|disagree|explicit unique questionIds/i);
 });

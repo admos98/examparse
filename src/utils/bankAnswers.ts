@@ -253,29 +253,30 @@ export function planBankAnswer(q: Question): BankAnswerPlan {
  * auto-graded item keeps looking keyless so `answer_key_needs_review` survives.
  */
 export function migrateLegacyAiAnswers(doc: ExamDoc): ExamDoc {
-  for (const q of doc.questions || []) {
-    if (q.answer?.source !== 'ai') continue;
-    const text = q.answer.text?.trim();
-    if (text && !q.enrichment?.proposedAnswer) {
-      q.enrichment = {
-        source: 'model', verification: 'unjudged', ...q.enrichment,
-        proposedAnswer: { text, source: 'model' },
-      };
-    }
-    const imported = q.imported as Record<string, unknown> | undefined;
-    const correct = (imported?.answer_key as { correct?: unknown } | undefined)?.correct;
-    const recoverable = AUTO_GRADED_TYPES.has(q.type) && Array.isArray(correct)
-      ? correct.map(String).filter(value => value.trim()) : [];
-    if (recoverable.length) {
-      q.answer = { text: recoverable.join(', '), source: 'paper' };
-      if (imported?.answer_key && typeof imported.answer_key === 'object') {
-        (imported.answer_key as Record<string, unknown>).source = 'paper';
+  const visit = (q: Question) => {
+    if (q.answer?.source === 'ai') {
+      const text = q.answer.text?.trim();
+      if (text && !q.enrichment?.proposedAnswer) {
+        q.enrichment = {
+          source: 'model', verification: 'unjudged', ...q.enrichment,
+          proposedAnswer: { text, source: 'model' },
+        };
       }
-    } else {
-      delete q.answer;
-      if (!q.imported) q.imported = {};
-      q.imported.legacyAiAnswerSourceLost = Boolean(text);
+      const imported = q.imported as Record<string, unknown> | undefined;
+      const correct = (imported?.answer_key as { correct?: unknown } | undefined)?.correct;
+      const recoverable = AUTO_GRADED_TYPES.has(q.type) && Array.isArray(correct)
+        ? correct.map(String).filter(value => value.trim()) : [];
+      if (recoverable.length) {
+        q.answer = { text: recoverable.join(', '), source: 'paper' };
+        if (imported?.answer_key && typeof imported.answer_key === 'object') (imported.answer_key as Record<string, unknown>).source = 'paper';
+      } else {
+        delete q.answer;
+        if (!q.imported) q.imported = {};
+        q.imported.legacyAiAnswerSourceLost = Boolean(text);
+      }
     }
-  }
+    for (const child of q.subQuestions || []) visit(child);
+  };
+  for (const q of doc.questions || []) visit(q);
   return doc;
 }

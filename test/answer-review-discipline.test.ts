@@ -21,7 +21,7 @@ const doc = (questions: Question[] = [q(1)]): ExamDoc => ({ id: 'exam', fileHash
 const flag = (code: string, severity: Flag['severity'], questionId?: string): Flag => ({ id: code, code, severity, questionId, message: `${code} detail` });
 
 test('T1: Q14 trailing mark furniture is removed; instruction-only Q50 is empty and suspect', () => {
-  const lines = [line(1, '14. Question'), line(2, '50. Question'), line(3, '14. games\n۲ نمره (./۵) صحیح پاسخ هر…'), line(4, 'همکار محترم در این بخش ( سوال 50 ) با توجه به رعایت Topic Sentence نمره لحاظ گردد .')];
+  const lines = [line(1, '14. Question'), line(2, '50. Question'), { ...line(3, '14. games\n۲ نمره (./۵) صحیح پاسخ هر…'), tag: 'key' as const }, { ...line(4, 'همکار محترم در این بخش ( سوال 50 ) با توجه به رعایت Topic Sentence نمره لحاظ گردد .'), tag: 'key' as const }];
   const result = assembleAndValidateQuestions([
     { ...q(14), spans: [[1, 1]], answer: { spans: [[3, 3]] } },
     { ...q(50), spans: [[2, 2]], answer: { spans: [[4, 4]] } },

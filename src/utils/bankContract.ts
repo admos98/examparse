@@ -121,7 +121,7 @@ export function rubricRequirementMet(q: Question): boolean {
 
 /** Lossless sidecar entry: everything ExamParse knows about one answer, regardless of contract. */
 export interface PreservedAnswer {
-  label: string;
+  questionId?: string; sectionId?: string; label: string;
   type: string;
   kind: BankAnswerPlan['kind'];
   answer: unknown;
@@ -143,6 +143,7 @@ export function preservedAnswer(doc: ExamDoc, q: Question, tags: string[]): Pres
   const plan = planBankAnswer(q);
   const descriptive = descriptiveArtifacts(doc, q);
   return {
+    questionId: q.id, ...(q.sectionId ? { sectionId: q.sectionId } : {}),
     label: q.label || String(q.no),
     type: q.type,
     kind: plan.kind,

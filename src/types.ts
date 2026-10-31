@@ -102,6 +102,8 @@ export interface Question {
     key: string;
     spans: LineSpan[];
     text?: string;
+    /** Standalone interchange references to option-owned picture assets. */
+    imageRefs?: string[];
   }[];
   /** Map-proposed shared instructions applicable to this question. */
   instructionGroups?: string[];
@@ -308,7 +310,7 @@ export interface ExamDoc {
   sections: ExamSection[];
   /** Map-proposed shared text, with ranges retained for question-level ownership. */
   instructionGroups?: Array<{ appliesToFirst: number; appliesToLast: number; text: string }>;
-  optionalGroups?: Array<{ id: string; rule: 'choose-one-branch' | 'choose-one-per-number'; memberLabels: string[]; branches: Record<string, string[]>; printedTotal?: number }>;
+  optionalGroups?: Array<{ id: string; rule: 'choose-one-branch' | 'choose-one-per-number' | 'unknown'; memberLabels: string[]; branches: Record<string, string[]>; printedTotal?: number }>;
   passages?: Array<{ id: string; sectionTitle: string; text: string; appliesToFirst?: number; appliesToLast?: number }>;
   questions: Question[];
   images: ImageAsset[];

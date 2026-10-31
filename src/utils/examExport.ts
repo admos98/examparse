@@ -9,6 +9,7 @@ import { exportIdentity } from '../pipeline/identity';
 import { stripCredentialFields } from './validation';
 import { buildParseReport, type ParseReport } from '../pipeline/provenance';
 import { migrateLegacyAiAnswers } from './bankAnswers';
+import { buildExamParseInterchange, type InterchangeAssetInput } from './examparseFormat';
 
 /** 2F exam-level Parse report — shared by Step 5 and the JSON export receipt (no secrets). */
 export function parseReportForDoc(doc: ExamDoc): ParseReport {
@@ -49,36 +50,22 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
 }
 
 /** Build the clean export payload: strips heavy inline binary dataUrls while keeping resolvable image references and explicit export metadata. */
-export function buildExportDoc(doc: ExamDoc): any {
-  // Normalize legacy AI-as-answer documents before every structured preview/export boundary.
-  // Clone first so exporting does not mutate the editor's in-memory document.
-  doc = migrateLegacyAiAnswers(structuredClone(doc));
-  const cleanImages = (doc.images || []).map(img => {
-    const { dataUrl, _blob, ...rest } = img as any;
-    const ext = ((img.mime || 'image/jpeg').split('/')[1] || 'jpg').replace('jpeg', 'jpg');
-    const key = img.blobKey || img.sha || '';
-    return {
-      ...rest,
-      exportPath: `images/${img.id}.${ext}`,
-      ...(key ? { localUrl: `/api/images/${encodeURIComponent(key)}` } : {}),
-    };
-  });
-
-  const { pageImages, ...sourceWithoutPageImages } = (doc.source || {}) as any;
+export function buildExportDoc(doc: ExamDoc, writtenAssets: Map<string, InterchangeAssetInput> = new Map()): any {
+  // One standalone, versioned serialization path is shared by structured JSON and ZIP output.
+  // Images are references only here: use the native ZIP export for a self-contained pixel bundle.
+  const safe = migrateLegacyAiAnswers(structuredClone(doc));
+  const output = buildExamParseInterchange(safe, writtenAssets);
   return stripCredentialFields({
-    ...doc,
-    meta: { ...doc.meta, ...exportIdentity(doc.meta.grade, doc.meta.subject) },
-    questions: doc.questions.map(question => exportSafeQuestion(question, doc)),
+    ...output,
+    meta: { ...safe.meta, ...exportIdentity(safe.meta.grade, safe.meta.subject) },
     exportMeta: {
       binariesStripped: true,
-      imageMode: 'folder-blob-reference',
-      imageCount: cleanImages.length,
-      note: 'Binary image dataUrls and pageImages are intentionally stripped from JSON exports; each entry in images[] retains its resolvable blobKey, localUrl (/api/images/{blobKey}), and exportPath.',
+      imageMode: 'relative-asset-reference-only',
+      imageCount: safe.images.length,
+      note: writtenAssets.size ? 'Pixel files are bundled under the referenced safe relative paths in the native ZIP.' : 'This JSON contains portable references and review metadata, not pixel bytes. Use the native ZIP export for a self-contained result.',
     },
-    parseReport: parseReportForDoc(doc),
-    displayName: getDisplayName(doc),
-    images: cleanImages,
-    source: sourceWithoutPageImages,
+    parseReport: parseReportForDoc(safe),
+    displayName: getDisplayName(safe),
   });
 }
 

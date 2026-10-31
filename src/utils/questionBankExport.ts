@@ -10,6 +10,9 @@ import { curriculumLessons, hintsForLesson, emptyCurriculumHints } from '../pipe
 import { AUTO_GRADED_TYPES, DESCRIPTIVE_TYPES, planBankAnswer, typeSuggestion } from './bankAnswers';
 import { CONTRACT_REQUESTS, applyAnswerPlan, applyDescriptiveArtifacts, descriptiveArtifacts, emptyContractReport, preservedAnswer, type PreservedAnswer } from './bankContract';
 import { artifactState, explanationState, rubricFingerprint, sampleFingerprint } from '../pipeline/evidence';
+import { EXAMPARSE_FORMAT_README, type InterchangeAssetInput } from './examparseFormat';
+import { buildExportDoc } from './examExport';
+import { extractInlineDataImages } from './inlineImages';
 
 /**
  * Appendix A / native question-bank export.
@@ -169,31 +172,12 @@ function imageExtension(bytes: Uint8Array): string {
   throw new Error('Unsupported or unrecognized image bytes; cannot determine the correct extension.');
 }
 async function defaultImageLoader(image: ImageAsset): Promise<Blob | undefined> {
-  const blob = image.blobKey ? await getReviewImageBlob(image.blobKey) : undefined;
+  let blob: Blob | undefined;
+  try { blob = image.blobKey ? await getReviewImageBlob(image.blobKey) : undefined; } catch { blob = undefined; }
   return blob || (image.dataUrl?.startsWith('data:') ? dataUrlToBlob(image.dataUrl) : undefined);
 }
 
-/** Decode inline base64 image URIs (markdown or bare) so they can ship as files, never as text. */
-export function extractInlineDataImages(text: string): { text: string; images: Array<{ mime: string; bytes: Uint8Array; offset: number }> } {
-  const images: Array<{ mime: string; bytes: Uint8Array; offset: number }> = [];
-  const pattern = /!?\[[^\]]*\]\(\s*data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)\s*\)|data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/gi;
-  let out = '', last = 0;
-  for (const match of text.matchAll(pattern)) {
-    const start = match.index ?? 0;
-    const mime = match[1] || match[3];
-    const base64 = (match[2] || match[4] || '').replace(/\s+/g, '');
-    let bytes: Uint8Array;
-    try {
-      const binary = atob(base64);
-      bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
-    } catch { continue; }
-    out += text.slice(last, start);
-    images.push({ mime, bytes, offset: out.length });
-    last = start + match[0].length;
-  }
-  out += text.slice(last);
-  return { text: out, images };
-}
+export { extractInlineDataImages } from './inlineImages';
 
 export async function createQuestionBankExport(doc: ExamDoc, options: BankExportOptions, loadImage: (image: ImageAsset) => Promise<Blob | undefined> = defaultImageLoader): Promise<BankExport> {
   const sourceDataset = options.sourceDataset.trim();
@@ -216,7 +200,8 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   const addAssetBytes = async (bytes: Uint8Array, mime: string, ownerKey: string): Promise<string> => {
     const ext = imageExtension(bytes);
     const hash = await realSha256(bytes);
-    if (!assets.has(hash)) assets.set(hash, { ext, bytes, mime: mime || `image/${ext === 'jpg' ? 'jpeg' : ext}`, imageIds: [ownerKey] });
+    const actualMime = ({ png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' } as Record<string, string>)[ext] || 'application/octet-stream';
+    if (!assets.has(hash)) assets.set(hash, { ext, bytes, mime: actualMime, imageIds: [ownerKey] });
     else if (!assets.get(hash)!.imageIds.includes(ownerKey)) assets.get(hash)!.imageIds.push(ownerKey);
     return hash;
   };
@@ -232,6 +217,9 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     const bytes = new Uint8Array(await blob.arrayBuffer());
     try { const hash = await addAssetBytes(bytes, image.mime, imageId); imageHashes.set(imageId, hash); return hash; } catch { imageHashes.set(imageId, null); return null; }
   };
+  // Bundle every saved asset, including currently unassigned images, so the canonical package
+  // can report and preserve them rather than silently dropping unowned pixels.
+  for (const image of doc.images || []) await resolveAsset(image.id);
   if (doc.source.packageSectionReceipt) report.package_section_receipt = doc.source.packageSectionReceipt;
   if (doc.source.enrichmentNotes?.length) report.enrichment_notes = doc.source.enrichmentNotes;
   const batch: BankBatch = { batch_id: crypto.randomUUID(), source_dataset: sourceDataset, questions: [] };
@@ -246,7 +234,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     const extracted = extractInlineDataImages(rawStem);
     const stem = extracted.text.replace(/[ \t]{2,}/g, ' ').trim();
     const inlineAssets: Array<{ hash: string; offset: number }> = [];
-    for (const inline of extracted.images) inlineAssets.push({ hash: await addAssetBytes(inline.bytes, inline.mime, `${q.id}:inline`), offset: inline.offset });
+    for (const [inlineIndex, inline] of extracted.images.entries()) inlineAssets.push({ hash: await addAssetBytes(inline.bytes, inline.mime, `${q.id}:inline:${inlineIndex + 1}`), offset: inline.offset });
     const bankOptionsForQuestion = bankOptions(doc, q);
     const unsupportedOptionImages: string[] = [];
     const optionDataImages: Array<{ optionIndex: number; hash: string }> = [];
@@ -421,7 +409,37 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   if (report.missing_assets.length) contract.pending.push({ question: report.missing_assets.map(entry => entry.question).join(', '), item: 'missing_image', kind: 'missing-asset', reason: 'required pixels unavailable; owner, identity, and reason are retained in preserved metadata and the export report', contract_question: CONTRACT_REQUESTS[7] });
   const slug = `${bankSlug(doc.meta.title || doc.displayName)}-batch`;
   const zip = new JSZip(); const folder = zip.folder(slug)!;
+  const interchangeAssets = new Map<string, InterchangeAssetInput>();
+  for (const image of doc.images || []) {
+    const hash = imageHashes.get(image.id);
+    if (!hash) continue;
+    const asset = assets.get(hash);
+    if (!asset) continue;
+    interchangeAssets.set(image.id, { sha256: hash, path: `assets/${hash}.${asset.ext}`, mime: asset.mime, bytes: asset.bytes.length });
+  }
+  for (const [hash, asset] of assets) for (const ownerKey of asset.imageIds) {
+    const q = questions.find(question => ownerKey.startsWith(`${question.id}:`));
+    const file = { sha256: hash, path: `assets/${hash}.${asset.ext}`, mime: asset.mime, bytes: asset.bytes.length };
+    if (q && /^\d+$/.test(ownerKey.slice(`${q.id}:inline:`.length)) && ownerKey.startsWith(`${q.id}:inline:`)) {
+      const index = Number(ownerKey.slice(`${q.id}:inline:`.length)) - 1;
+      const inline = extractInlineDataImages(bankStem(doc, q)).images[index];
+      interchangeAssets.set(ownerKey, { ...file, assetId: `asset_${hash}`, ownerQuestionId: q.id, location: 'stem', offset: inline?.offset ?? 0 });
+    } else if (q && ownerKey.startsWith(`${q.id}:option`)) {
+      const match = new RegExp(`^${q.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:option(\d+)$`).exec(ownerKey);
+      interchangeAssets.set(`${ownerKey}:asset:${hash}`, { ...file, assetId: `asset_${hash}`, ownerQuestionId: q.id, location: 'option', optionIndex: match ? Number(match[1]) - 1 : undefined });
+    } else if ((doc.images || []).some(image => image.id === ownerKey)) interchangeAssets.set(ownerKey, file);
+  }
+  const canonicalDoc = structuredClone(doc);
+  const preserveHistory = (question: Question) => {
+    const record = preserved.find(item => item.questionId === question.id);
+    if (record?.source_history) question.imported = { ...(question.imported || {}), source_history: structuredClone(record.source_history) };
+    for (const child of question.subQuestions || []) preserveHistory(child);
+  };
+  for (const question of canonicalDoc.questions) preserveHistory(question);
+  const interchange = buildExportDoc(canonicalDoc, interchangeAssets);
   const partCount = Math.ceil(batch.questions.length / 50);
+  folder.file('examparse.json', JSON.stringify(interchange, null, 2));
+  folder.file('examparse-format.md', EXAMPARSE_FORMAT_README);
   if (batch.questions.length <= 50) folder.file('batch.json', JSON.stringify(batch, null, 2));
   else for (let i = 0; i < batch.questions.length; i += 50) {
     const part = Math.floor(i / 50) + 1;
@@ -430,6 +448,18 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     folder.file(`part-${part}/batch.json`, JSON.stringify(chunk, null, 2));
   }
   folder.file('export-report.json', JSON.stringify(report, null, 2));
+  folder.file('legacy-projection.json', JSON.stringify({
+    format: 'examparse.legacy-projection', version: '1.0.0', lossy: true,
+    canonical: 'examparse.json',
+    projection: batch.questions.length <= 50 ? 'batch.json' : `part-1..part-${partCount}/batch.json`,
+    knownLosses: [
+      'The bank row shape is not a full ExamParse document and omits source lines, parser provenance, full review/undo history, and source-key evidence.',
+      'Question labels and section/branch identities may be flattened or reduced to bank-facing fields.',
+      'Unknown optional-group scoring rules, unpriced points, and pending review states are not executable grading instructions.',
+      'Listening scripts, source-answer history, and evidence-bound model proposals are available only in the canonical document or explicit teacher-only sidecars.',
+      'Image ownership/order/positions and unavailable pixels may not be representable by the destination row schema.',
+    ],
+  }, null, 2));
   folder.file('preserved/answers.json', JSON.stringify({ format: 'examparse-preserved-answers/1', executable: false, note: 'Lossless answer facts. Nothing in this file is advisory beyond the bank contract; executable fields exist only in batch.json.', questions: preserved }, null, 2));
   const listeningScripts = questions.flatMap(q => {
     const text = typeof q.imported?.script === 'string' ? q.imported.script : typeof q.imported?.transcript === 'string' ? q.imported.transcript : '';
@@ -438,10 +468,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   });
   if (listeningScripts.length) folder.file('preserved/listening-scripts.json', JSON.stringify({ format: 'examparse-teacher-listening-evidence/1', studentFacing: false, scripts: listeningScripts }, null, 2));
   folder.file('contract/requests.json', JSON.stringify({ profile: contract.profile, verified: false, note: contract.note, requests: CONTRACT_REQUESTS, pending: contract.pending }, null, 2));
-  folder.file('assets/manifest.json', JSON.stringify({
-    format: 'appendix-a-assets/1.1',
-    assets: [...assets.entries()].map(([hash, asset]) => ({ id: hash, file: `assets/${hash}.${asset.ext}`, sha256: hash, mime: asset.mime, bytes: asset.bytes.length, used_by: asset.imageIds })),
-  }, null, 2));
+  folder.file('assets/manifest.json', JSON.stringify(interchange.assetManifest, null, 2));
   for (const [hash, asset] of assets) folder.file(`assets/${hash}.${asset.ext}`, asset.bytes);
   // Multi-part exports share ONE asset pool. Each part folder also gets a pointer manifest so a
   // part can resolve the same files relative to its own folder when the adapter reads it there.

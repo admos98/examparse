@@ -26,7 +26,7 @@ export function groupPackageFiles(files: PackageFile[]): { groups: Map<string, P
   const selectionIsPackage = files.some(file => {
     const parts = relativePath(file).slice(1);
     if (!parts.length) return false;
-    if (parts.length === 1) return /^batch\.json$/i.test(parts[0]);
+    if (parts.length === 1) return /^(?:batch|examparse)\.json$/i.test(parts[0]);
     return /^part-\d+$/i.test(parts[0]) || /^assets$/i.test(parts[0]);
   });
   const groups = new Map<string, PackageFile[]>();

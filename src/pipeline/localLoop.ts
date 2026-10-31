@@ -45,12 +45,18 @@ export interface LoopVerdict {
   hint?: boolean;
 }
 export interface AuthoredQuestion {
+  /** Code-derived stable identity; model-supplied ids are replaced during normalization. */
+  id?: string;
+  /** Full printed label (55A, 17C-a, localized digits) kept verbatim. */
+  label?: string;
   number: number;
   sectionTitle?: string;
   type: Question['type'];
   stem: string;
   options: Array<{ key: string; text: string; [key: string]: unknown }>;
   answer?: string;
+  /** A model-proposed source location; code verifies it against tagged source lines before adoption. */
+  answerEvidence?: { lineIds: string[]; excerpt?: string; sourceKind?: 'paper' | 'keyfile' };
   points?: number;
   imageIds: string[];
   passageId?: string;
@@ -66,6 +72,7 @@ export interface AuthoredDocument {
   questions: AuthoredQuestion[];
   passages?: Array<{ id: string; sectionTitle: string; text: string; appliesToFirst?: number; appliesToLast?: number }>;
   instructionGroups?: Array<{ appliesToFirst: number; appliesToLast: number; text: string }>;
+  optionalGroups?: Array<{ id: string; rule: 'choose-one-branch' | 'choose-one-per-number' | 'unknown'; memberLabels: string[]; branches: Record<string, string[]>; printedTotal?: number }>;
   pointsWithdrawn?: number;
 }
 export interface LoopPageReceipt {
@@ -311,7 +318,11 @@ export const errorMessage = (error: unknown): string => String((error as any)?.m
 const object = (value: unknown): Record<string, any> => value && typeof value === 'object' && !Array.isArray(value) ? value as any : {};
 const text = (value: unknown): string => typeof value === 'string' ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : '';
 const number = (value: unknown): number | undefined => {
-  const n = Number(normalizeDigits(text(value)).replace(/[^\d.-]/g, ''));
+  const raw = text(value).trim();
+  if (!raw) return undefined;
+  const numeric = normalizeDigits(raw).replace(/[^\d.-]/g, '');
+  if (!numeric || !/^-?\d+(?:\.\d+)?$/.test(numeric)) return undefined;
+  const n = Number(numeric);
   return Number.isFinite(n) ? n : undefined;
 };
 const questionNumber = (value: unknown): number | undefined => {
@@ -329,7 +340,7 @@ function questionType(value: unknown): Question['type'] {
 /** Normalize aliases without discarding the model's object or rewriting its authored text. */
 export function normalizeAuthoredQuestion(raw: unknown, page?: number): AuthoredQuestion | undefined {
   const q = object(raw);
-  const no = questionNumber(q.number ?? q.no ?? q.questionNumber);
+  const no = questionNumber(q.number ?? q.no ?? q.questionNumber ?? q.label ?? q.printedLabel);
   if (no === undefined) return undefined;
   const options = Array.isArray(q.options) ? q.options.map((o: any, i: number) => typeof o === 'string'
     ? { key: String.fromCharCode(97 + i), text: o }
@@ -339,7 +350,7 @@ export function normalizeAuthoredQuestion(raw: unknown, page?: number): Authored
   const points = number(q.points ?? q.marks);
   const images = q.imageIds ?? q.images;
   const result: AuthoredQuestion = {
-    ...q, number: no, sectionTitle: sectionTitle(q.sectionTitle ?? q.section), type: questionType(q.type),
+    ...q, number: no, label: text(q.label ?? q.printedLabel) || String(q.number ?? q.no ?? q.questionNumber), sectionTitle: sectionTitle(q.sectionTitle ?? q.section), type: questionType(q.type),
     stem: text(q.stem ?? q.stemText ?? q.questionText), options,
     imageIds: Array.isArray(images) ? [...new Set(images.map((x: any) => text(typeof x === 'string' ? x : x?.imageId ?? x?.id)).filter(Boolean))] as string[] : [],
   };
@@ -361,12 +372,23 @@ export function normalizeAuthoredDocument(raw: unknown): AuthoredDocument {
     if (meta[key] === undefined && value[key] !== undefined) meta[key] = value[key];
   }
   if (meta.totalPoints === undefined && meta.total !== undefined) meta.totalPoints = meta.total;
-  return {
+  const normalized: AuthoredDocument = {
     meta,
     passages: Array.isArray(value.passages) ? value.passages.filter((p:any)=>p && p.text).map((p:any,i:number)=>({id:text(p.id)||`passage_${i+1}`,sectionTitle:sectionTitle(p.sectionTitle),text:text(p.text)})) : [],
     sections: (Array.isArray(value.sections) ? value.sections : []).map((s: any) => typeof s === 'string' ? { title: s } : { ...object(s), title: sectionTitle(s?.title ?? s?.sectionTitle) }).filter((s: any) => s.title),
     questions: (Array.isArray(value.questions) ? value.questions : Array.isArray(raw) ? raw : []).map((q: unknown) => normalizeAuthoredQuestion(q)).filter(Boolean) as AuthoredQuestion[],
+    ...(Array.isArray(value.instructionGroups) ? { instructionGroups: structuredClone(value.instructionGroups) } : {}),
+    ...(Array.isArray(value.optionalGroups) ? { optionalGroups: structuredClone(value.optionalGroups).map((group: any) => ({ ...group, rule: ['choose-one-branch', 'choose-one-per-number'].includes(group?.rule) ? group.rule : 'unknown' })) } : {}),
   };
+  const counts = new Map<string, number>();
+  const assign = (rows: AuthoredQuestion[], parent = '') => rows.forEach(q => {
+    const base = `${parent}/${sectionKey(q.sectionTitle || '')}/${q.label || q.number}/${(q.sourcePages || []).join(',')}`;
+    const occurrence = (counts.get(base) || 0) + 1; counts.set(base, occurrence);
+    q.id = `q_${encodeURIComponent(base).replace(/%/g, '_')}_${occurrence}`;
+    assign(q.subQuestions || [], q.id!);
+  });
+  assign(normalized.questions);
+  return normalized;
 }
 
 /** Complete objects only; a cut-off scalar or half-written question is never invented into data. */
@@ -444,7 +466,7 @@ export function mergePageReads(pages: AuthoredDocument[]): AuthoredDocument {
   return result;
 }
 
-export type Correction = { action: 'replace' | 'insert' | 'delete' | 'mergeDuplicates'; questionNumber: number; question?: AuthoredQuestion; sectionTitle?: string; pointsWithdrawn?: boolean; passages?: Array<{id:string;sectionTitle:string;text:string}> };
+export type Correction = { action: 'replace' | 'insert' | 'delete' | 'mergeDuplicates'; questionNumber: number; question?: AuthoredQuestion; questionId?: string; questionLabel?: string; questionIds?: string[]; sectionTitle?: string; pointsWithdrawn?: boolean; passages?: Array<{id:string;sectionTitle:string;text:string}> };
 export function parseCorrections(response: LoopModelResponse, options: { salvage?: boolean } = {}): Correction[] | undefined {
   // Patch output is all-or-nothing when unparseable. Unlike READ, never apply a guessed partial patch.
   // #50: a response explicitly CUT by the breaker/cap salvages its COMPLETE correction objects only.
@@ -464,20 +486,25 @@ export function parseCorrections(response: LoopModelResponse, options: { salvage
   const result: Correction[] = [];
   const passages = Array.isArray(object(value).passages) ? object(value).passages.filter((p:any)=>p?.text).map((p:any,i:number)=>({id:text(p.id)||`passage_${i+1}`,sectionTitle:sectionTitle(p.sectionTitle),text:text(p.text)})) : [];
   for (const row of rows) {
-    const r = object(row); const no = questionNumber(r.questionNumber ?? r.number ?? r.no);
+    const r = object(row); const suppliedLabel = text(r.questionLabel ?? r.label ?? r.question?.label ?? r.question?.printedLabel); const suppliedId = text(r.questionId ?? r.id); const no = questionNumber(r.questionNumber ?? r.number ?? r.no ?? suppliedLabel);
     const action = r.action ?? r.op ?? (r.delete ? 'delete' : 'replace');
     if (no === undefined || !['replace', 'insert', 'delete', 'mergeDuplicates'].includes(action)) continue;
     const question = action === 'delete' ? undefined : normalizeAuthoredQuestion(r.question ?? r.correctedQuestion ?? r.object);
     if (action !== 'delete' && !question) continue;
-    result.push({ action, questionNumber: no, question, pointsWithdrawn: (r.question ?? r.correctedQuestion ?? r.object)?.points === null, passages, sectionTitle: r.sectionTitle === undefined ? undefined : sectionTitle(r.sectionTitle) });
+    result.push({ action, questionNumber: no, ...(suppliedId ? { questionId: suppliedId } : {}), ...(suppliedLabel ? { questionLabel: suppliedLabel } : {}), ...(Array.isArray(r.questionIds) ? { questionIds: r.questionIds.map(text).filter(Boolean) } : {}), question, pointsWithdrawn: (r.question ?? r.correctedQuestion ?? r.object)?.points === null, passages, sectionTitle: r.sectionTitle === undefined ? undefined : sectionTitle(r.sectionTitle) });
   }
   return result;
+}
+function correctionMatches(q: AuthoredQuestion, correction: Correction): boolean {
+  if (correction.questionId) return q.id === correction.questionId;
+  if (correction.questionLabel) return (q.label || String(q.number)) === correction.questionLabel && (correction.sectionTitle === undefined || sectionKey(q.sectionTitle) === sectionKey(correction.sectionTitle));
+  return q.number === correction.questionNumber && (correction.sectionTitle === undefined || sectionKey(q.sectionTitle) === sectionKey(correction.sectionTitle));
 }
 function replaceInTree(questions: AuthoredQuestion[], correction: Correction): { questions: AuthoredQuestion[]; changed: boolean } {
   let changed = false;
   const next: AuthoredQuestion[] = [];
   for (const q of questions) {
-    const matches = q.number === correction.questionNumber && (correction.sectionTitle === undefined || sectionKey(q.sectionTitle) === sectionKey(correction.sectionTitle));
+    const matches = correctionMatches(q, correction);
     if (matches) { next.push(structuredClone(correction.question!)); changed = true; }
     else {
       const child = correction.question?.subQuestions ? null : replaceInTree(q.subQuestions || [], correction);
@@ -489,7 +516,7 @@ function replaceInTree(questions: AuthoredQuestion[], correction: Correction): {
 function deleteInTree(questions: AuthoredQuestion[], correction: Correction): { questions: AuthoredQuestion[]; changed: boolean } {
   let changed = false; const next: AuthoredQuestion[] = [];
   for (const q of questions) {
-    if (q.number === correction.questionNumber && (correction.sectionTitle === undefined || sectionKey(q.sectionTitle) === sectionKey(correction.sectionTitle))) { changed = true; continue; }
+    if (correctionMatches(q, correction)) { changed = true; continue; }
     const child = deleteInTree(q.subQuestions || [], correction);
     next.push(child.changed ? { ...q, subQuestions: child.questions } : q); changed ||= child.changed;
   }
@@ -500,19 +527,26 @@ export function applyCorrections(doc: AuthoredDocument, corrections: Correction[
   let next = structuredClone(doc); let applied = 0; const notes: string[] = [];
   for (const correction of corrections) {
     if(correction.passages?.length){ next.passages ||= []; for(const p of correction.passages) if(!next.passages.some(x=>x.id===p.id)) next.passages.push(p); }
-    const matches = flatAuthoredQuestions(next).filter(q => q.number === correction.questionNumber && (correction.sectionTitle === undefined || sectionKey(q.sectionTitle) === sectionKey(correction.sectionTitle)));
+    const matches = flatAuthoredQuestions(next).filter(q => correctionMatches(q, correction));
     if (correction.action === 'mergeDuplicates') {
-      const sameNo=flatAuthoredQuestions(next).filter(q=>q.number===correction.questionNumber);
-      const keep=correction.question;
-      if(sameNo.length>=2 && keep){ const first=sameNo[0]; const replacement={...structuredClone(keep),number:correction.questionNumber,sectionTitle:keep.sectionTitle||first.sectionTitle}; const dropped=new Set(sameNo.slice(1)); const prune=(rows:AuthoredQuestion[]):AuthoredQuestion[]=>rows.filter(q=>!dropped.has(q)).map(q=>({...q,subQuestions:prune(q.subQuestions||[])})); next.questions=prune(next.questions); const old=flatAuthoredQuestions(next).find(q=>q.number===correction.questionNumber); if(old) Object.assign(old,replacement); applied++; } else notes.push(`Could not merge duplicate question ${correction.questionNumber}; teacher review required.`); continue;
+      const ids = new Set(correction.questionIds || []);
+      const targets = flatAuthoredQuestions(next).filter(q => q.id && ids.has(q.id));
+      const keep = correction.question;
+      if (ids.size >= 2 && targets.length === ids.size && keep) {
+        const first = targets[0]; const replacement = { ...structuredClone(keep), id: first.id, number: correction.questionNumber, label: keep.label || first.label, sectionTitle: keep.sectionTitle || first.sectionTitle };
+        let inserted = false;
+        const prune = (rows: AuthoredQuestion[]): AuthoredQuestion[] => rows.flatMap(q => {
+          if (!ids.has(q.id || '')) return [{ ...q, subQuestions: prune(q.subQuestions || []) }];
+          if (inserted) return [];
+          inserted = true; return [{ ...replacement, subQuestions: prune(q.subQuestions || []) }];
+        });
+        next.questions = prune(next.questions); applied++;
+      } else notes.push(`Could not merge question ${correction.questionNumber}: explicit unique questionIds are required; originals retained for review.`);
+      continue;
     }
     if (correction.action === 'insert' && matches.length) { notes.push(`Insert for existing question ${correction.questionNumber} ignored; use replace.`); continue; }
     if (correction.action !== 'insert' && !matches.length) { notes.push(`Correction ignored: question ${correction.questionNumber} does not exist.`); continue; }
-    if (matches.length > 1 && correction.sectionTitle === undefined) {
-      const tokens=(v:string)=>new Set(v.toLowerCase().match(/[\p{L}\p{N}]+/gu)||[]); const target=tokens(correction.question?.stem||''); const score=(q:AuthoredQuestion)=>{const t=tokens(q.stem);let n=0;for(const x of target)if(t.has(x))n++;return n/Math.max(1,target.size+t.size-n)}; const ranked=[...matches].sort((a,b)=>score(b)-score(a));
-      if(target.size && (ranked.length===1 || score(ranked[0])-score(ranked[1])>=0.12)) { correction.sectionTitle=ranked[0].sectionTitle; }
-      else { notes.push(`Two questions numbered ${correction.questionNumber} disagree — pick the right one (records: ${matches.map(q=>`${q.sectionTitle||'untitled'}: ${q.stem.slice(0,80)}`).join(' | ')}).`); continue; }
-    }
+    if (matches.length > 1) { notes.push(`Correction for Q${correction.questionLabel || correction.questionNumber} is ambiguous across ${matches.map(q => `${q.id}: ${q.sectionTitle || 'untitled'} ${q.label || q.number}`).join(' | ')}; originals retained and a fully addressed retry is required.`); continue; }
     if (correction.action === 'delete') {
       const removed = deleteInTree(next.questions, correction); next.questions = removed.questions;
       if (removed.changed) applied++;
@@ -522,7 +556,7 @@ export function applyCorrections(doc: AuthoredDocument, corrections: Correction[
       if (title && !next.sections.some(s => sectionKey(s.title) === sectionKey(title))) next.sections.push({ title });
     } else {
       const old = matches[0];
-      const replacement = { ...structuredClone(correction.question!), sectionTitle: correction.question!.sectionTitle || old.sectionTitle, sourcePages: correction.question!.sourcePages || old.sourcePages };
+      const replacement = { ...structuredClone(correction.question!), id: old.id, label: old.label || correction.question!.label || String(old.number), number: old.number, sectionTitle: correction.question!.sectionTitle || old.sectionTitle, sourcePages: correction.question!.sourcePages || old.sourcePages };
       const replaced = replaceInTree(next.questions, { ...correction, question: replacement });
       next.questions = replaced.questions; if (replaced.changed) applied++;
       const title = replacement.sectionTitle;
@@ -608,27 +642,48 @@ export function checkAuthoredDocument(doc: AuthoredDocument, images: ImageAsset[
   return verdicts;
 }
 
+/** A reader proposal becomes a source answer only when the referenced source lines are already
+ * independently tagged as key territory, contain the exact proposed value, and address this item. */
+export function hasVerifiedAuthoredKeyEvidence(q: AuthoredQuestion, lines: SourceLine[]): boolean {
+  const evidence = q.answerEvidence;
+  if (!q.answer?.trim() || !evidence?.lineIds?.length || !lines.length) return false;
+  const refs = evidence.lineIds.map(id => lines.find(line => line.id === id));
+  if (refs.some(line => !line || line.tag !== 'key')) return false;
+  const excerpt = refs.map(line => line!.text).join('\n');
+  if (evidence.excerpt && !excerpt.includes(evidence.excerpt)) return false;
+  const normalized = normalizeDigits(excerpt);
+  const identity = String(q.label || q.number).replace(/[０-９٠-٩]/g, digit => normalizeDigits(digit));
+  const base = String(q.number);
+  if (!(normalized.includes(identity) || new RegExp(`(?:^|\\D)${base}(?:[.)、:]|\\s)`).test(normalized))) return false;
+  return excerpt.includes(q.answer.trim());
+}
+
 /** Projection for the existing PAPERWORK UI. Empty spans mean model-authored text, not sliced source. */
-export function projectAuthoredDocument(doc: AuthoredDocument): { questions: Question[]; sections: ExamDoc['sections']; meta: Partial<ExamDoc['meta']> } {
+export function projectAuthoredDocument(doc: AuthoredDocument, sourceLines: SourceLine[] = []): { questions: Question[]; sections: ExamDoc['sections']; meta: Partial<ExamDoc['meta']>; optionalGroups: NonNullable<ExamDoc['optionalGroups']> } {
   const titles = [...new Set([...doc.sections.map(s => s.title), ...flatAuthoredQuestions(doc).map(q => q.sectionTitle || '').filter(Boolean)])];
   const sections = titles.map((title, index) => {
     const authored = doc.sections.find(s => sectionKey(s.title) === sectionKey(title));
     return { id: `loop_section_${index + 1}`, index: index + 1, title, spans: [], ...(authored?.instructions ? { instructions: text(authored.instructions) } : {}), ...((doc.passages||[]).find(p=>sectionKey(p.sectionTitle)===sectionKey(title)) ? {passage:(doc.passages||[]).find(p=>sectionKey(p.sectionTitle)===sectionKey(title))!.text} : {}), ...(number(authored?.points) !== undefined ? { points: number(authored?.points) } : {}) };
   });
   const questions: Question[] = [];
+  const ids = new Set<string>();
   const visit = (q: AuthoredQuestion, parentId?: string) => {
-    const id = `loop_q_${q.number}${parentId ? `_child_${questions.length + 1}` : questions.some(x => x.no === q.number) ? `_duplicate_${questions.length + 1}` : ''}`;
+    const base = q.id || `loop:${sectionKey(q.sectionTitle || '')}:${q.label || q.number}:${(q.sourcePages || []).join(',')}`;
+    let id = base; let suffix = 2; while (ids.has(id)) id = `${base}#${suffix++}`; ids.add(id);
     const section = sections.find(s => sectionKey(s.title) === sectionKey(q.sectionTitle));
     const projected: Question = {
-      id, no: q.number, label: text(q.label) || String(q.no ?? q.number), type: q.type, stem: q.stem,
-      spans: [], options: q.options.map(o => ({ key: o.key, text: o.text, spans: [] })), images: q.imageIds.map(imageId => ({ imageId, role: 'stem' })), confidence: 1,
+      id, no: q.number, label: text(q.label) || String(q.number), type: q.type, stem: q.stem,
+      spans: [], options: q.options.map(o => ({ key: o.key, text: o.text, spans: [], ...(Array.isArray((o as any).imageRefs) ? { imageRefs: [...(o as any).imageRefs] } : {}) })), images: q.imageIds.map(imageId => ({ imageId, role: 'stem' })), confidence: 1,
       ...(section ? { sectionId: section.id } : {}), ...(parentId ? { parentId } : {}),
+      ...(typeof (q as any).optionalGroupId === 'string' ? { optionalGroupId: (q as any).optionalGroupId } : {}), ...(typeof (q as any).optionalBranch === 'string' ? { optionalBranch: (q as any).optionalBranch } : {}),
+      imported: { localLoopAuthored: { authoredId: q.id || null, sourcePages: [...(q.sourcePages || [])], ...(q.answerEvidence ? { answerEvidence: structuredClone(q.answerEvidence) } : {}) } },
       ...(q.points !== undefined ? { points: q.points } : {}),
       ...(q.passageId ? { passageId: q.passageId } : {}),
       ...((doc.instructionGroups || []).some(g => q.number >= g.appliesToFirst && q.number <= g.appliesToLast) ? { instructionGroups: (doc.instructionGroups || []).filter(g => q.number >= g.appliesToFirst && q.number <= g.appliesToLast).map(g => g.text) } : {}),
       ...(q.difficulty ? { difficulty: q.difficulty as Question['difficulty'], difficultyMode: q.difficultyMode as Question['difficultyMode'] } : {}),
       ...(q.curriculumHints ? { curriculumHints: q.curriculumHints as Question['curriculumHints'], curriculumSource: q.curriculumSource as Question['curriculumSource'] } : {}),
-      ...(q.answer !== undefined ? { answer: { text: q.answer, source: 'paper' as const } } : {}),
+      ...(q.answer !== undefined && hasVerifiedAuthoredKeyEvidence(q, sourceLines) ? { answer: { text: q.answer, source: q.answerEvidence?.sourceKind === 'keyfile' ? 'keyfile' as const : 'paper' as const } } : {}),
+      ...(q.answer !== undefined && !hasVerifiedAuthoredKeyEvidence(q, sourceLines) ? { enrichment: { source: 'model' as const, verification: 'unjudged' as const, proposedAnswer: { text: q.answer, source: 'model' as const } } } : {}),
       ...(Array.isArray(q.wordBank) ? { wordBank: q.wordBank.map(text) } : {}),
     };
     questions.push(projected);
@@ -638,7 +693,7 @@ export function projectAuthoredDocument(doc: AuthoredDocument): { questions: Que
   const meta: Partial<ExamDoc['meta']> = {};
   for (const key of ['title', 'subject', 'grade', 'school', 'term', 'year'] as const) if (doc.meta[key] !== undefined) meta[key] = text(doc.meta[key]);
   for (const key of ['totalPoints', 'durationMinutes'] as const) { const n = number(doc.meta[key]); if (n !== undefined) meta[key] = n; }
-  return { questions, sections, meta };
+  return { questions, sections, meta, optionalGroups: structuredClone(doc.optionalGroups || []) };
 }
 
 export interface LoopPageChunk { page: number; owned: SourceLine[]; context: SourceLine[] }

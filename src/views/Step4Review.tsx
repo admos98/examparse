@@ -1400,6 +1400,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                   <span className="text-[var(--ink)] truncate">
                                     {opt.text}
                                   </span>
+                                  {opt.imageRefs?.map(imageId => {
+                                    const asset = examDoc.images.find(image => image.id === imageId);
+                                    return <span key={imageId} className="inline-flex items-center rounded-[8px] border border-[var(--rule)] p-1" aria-label={imageRefLabel(imageId)}>
+                                      {asset?.dataUrl ? <img src={asset.dataUrl} alt={asset.label?.caption || imageRefLabel(imageId)} className="max-h-16 max-w-24 object-contain" /> : <span className="text-[length:var(--type-12)] text-[var(--warn-ink)]">{imageRefLabel(imageId)} · unavailable</span>}
+                                    </span>;
+                                  })}
                                 </div>
                               ))}
                             </div>

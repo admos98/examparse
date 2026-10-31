@@ -56,11 +56,11 @@ test('batch follows Appendix A, deduplicates and verifies binary assets, and nev
  assert.equal(Object.keys(zip.files).filter(k => /assets\/[^/]+\.png$/.test(k)).length, 1);
  // #57 Part C — v1.1 manifest: asset id → file, sha, mime, byte size (content-addressed).
  const manifest = JSON.parse(await zip.file(`${root}/assets/manifest.json`)!.async('string'));
- assert.equal(manifest.format, 'appendix-a-assets/1.1');
+ assert.equal(manifest.format, 'examparse.assets');
  assert.equal(manifest.assets.length, 1);
- assert.equal(manifest.assets[0].id, hash);
- assert.deepEqual(manifest.assets[0].used_by.sort(), ['i1', 'i2', 'i3']);
- assert.ok(manifest.assets.every((a: any) => a.file === `assets/${hash}.png` && a.sha256 === hash && a.mime === 'image/png' && a.bytes === png.length));
+ assert.equal(manifest.assets[0].sha256, hash);
+ assert.deepEqual(manifest.assets[0].references.map((ref: any) => ref.questionId).sort(), ['q1', 'q2', 'q3']);
+ assert.ok(manifest.assets.every((a: any) => a.path === `assets/${hash}.png` && a.sha256 === hash && a.mime === 'image/png'));
  assert.deepEqual(JSON.parse(await zip.file(`${root}/export-report.json`)!.async('string')), result.report);
  assert.deepEqual(JSON.parse(await zip.file(`${root}/batch.json`)!.async('string')), result.batch);
  const secondExport = await createQuestionBankExport(exam, { sourceDataset: 'english-konkur-1402', includeModelDifficulty: false }, async () => new Blob([png]));

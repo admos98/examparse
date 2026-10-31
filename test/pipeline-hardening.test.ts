@@ -66,7 +66,7 @@ test('splits inline option markers and keeps option text out of stems', () => {
 
 // (3) Grouped answer-key rows are clipped to the matching printed number only.
 test('segments a grouped answer line to the requested question number', () => {
-  const source = makeLines(['2. Solve the equation.', '1-A 2-C 3-B']);
+  const source = makeLines(['2. Solve the equation.', '1-A 2-C 3-B']); source[1].tag = 'key';
   const result = assembleAndValidateQuestions([{
     id: 'q2', no: 2, label: '2', type: 'short', spans: [[1, 1]], answer: { spans: [[2, 2]] }, confidence: 0.9,
   }], source);

@@ -482,7 +482,7 @@ test('#58D a >50-question export ships one asset pool, every part resolves it, a
   assert.equal(result.imported, 1, 'the multipart root is ONE exam');
   assert.equal(result.notPackage, 0, 'no extra "assets" exam');
   assert.equal(saved[0].questions.length, 71);
-  assert.equal(saved[0].source.packageParts?.length, 2);
+  assert.equal(saved[0].source.packageParts?.length || 0, 0, 'canonical full document is not mislabeled as an imported multipart receipt');
   assert.equal(saved[0].images.length, 1, 'the shared asset is loaded exactly once');
   assert.ok(saved[0].questions[0].images.length === 1 && saved[0].questions[50].images.length === 1);
   assert.ok(saved[0].questions.every(question => !/img_[0-9a-f]{16,}/i.test(question.stem || '')), 'no student-facing placeholder token');
@@ -495,7 +495,7 @@ test('#58D a >50-question export ships one asset pool, every part resolves it, a
   assert.equal(parentSaved[0].questions.length, 71);
 
   // A genuinely missing part is reported, never silently imported.
-  const missingPart = rootFiles.filter(item => !/(^|\/)part-2\//.test(item.webkitRelativePath || item.name));
+  const missingPart = rootFiles.filter(item => !/(^|\/)part-2\//.test(item.webkitRelativePath || item.name) && !/(^|\/)examparse\.json$/i.test(item.webkitRelativePath || item.name));
   const missingSaved: ExamDoc[] = [];
   const missingResult = await importPackageFolder(missingPart, [], async next => { missingSaved.push(structuredClone(next)); });
   assert.equal(missingResult.imported, 0);

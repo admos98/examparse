@@ -2,12 +2,14 @@ import { optionalPoints } from '../pipeline/optionalGroups';
 import { curriculumLessons } from '../pipeline/curriculumHints';
 import { prepareReviewDocument, reconcileFinalFlags, repairImageReferences, restoreMissingImageFromSource } from '../pipeline/reviewIntegrity';
 import { IntegrityFlags } from '../components/IntegrityFlags';
-import { attentionQuestionIds, computeAttention, type AttentionItem } from '../utils/attention';
+import { attentionQuestionIds, computeAttention, quietState, type AttentionItem } from '../utils/attention';
 import { getReviewImageBlob, getSourceFile } from '../store';
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
 import { stripImagePlaceholderTokens } from '../pipeline/imagePlaceholders';
 import { confirmTashrihi } from '../pipeline/packageTashrihi';
+import { evidenceFingerprint } from '../pipeline/evidence';
+import { hasTeacherRubric } from '../utils/explanationVisibility';
 import { revertTextRepairOverlays } from '../pipeline/textRepair';
 import { formatSpans } from '../pipeline/spans';
 import React, { useEffect, useRef, useState } from 'react';
@@ -68,27 +70,31 @@ const TashrihiProposalCard: React.FC<{ question: Question; onConfirm: (sample?: 
   const [criteria, setCriteria] = useState<RubricCriterion[]>(question.rubric?.criteria || []);
   const [editing, setEditing] = useState(false);
   const modelArtifacts = question.sampleAnswer?.source === 'model' || question.rubric?.source === 'model';
-  if (!modelArtifacts) return null;
+  const reconfirm = Boolean(question.sampleAnswer?.stale || question.rubric?.stale || question.sampleAnswer?.reconfirm || question.rubric?.reconfirm);
   const badge = (state: string, probability?: number) => (
     <span className={`font-mono px-1.5 py-0.5 rounded-[6px] ${state === 'verified' ? 'bg-[var(--ok-soft)] text-[var(--ok)]' : state === 'rejected' ? 'bg-[var(--danger-soft)] text-[var(--danger)]' : 'bg-[var(--paper)] text-[var(--ink-2)]'}`}>
       {state}{probability != null ? ` ${Math.round(probability * 100)}%` : ''}
     </span>
   );
+  const total = criteria.reduce((sum, row) => sum + (Number(row.maxPoints) || 0), 0);
   return (
     <div data-tashrihi-proposal={question.id} className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2.5 text-[length:var(--type-12)] space-y-1.5">
-      <div className="font-semibold text-[var(--warn-ink)]">model sample + rubric proposed — confirm or edit</div>
-      {question.sampleAnswer && (
+      <div className="font-semibold text-[var(--warn-ink)]">
+        {modelArtifacts ? 'model sample + rubric proposed — confirm or edit' : 'no teacher-confirmed rubric yet — write or confirm one'}
+        {reconfirm && <span className="ms-2 font-normal">· the task changed after this was written — please reconfirm</span>}
+      </div>
+      {(question.sampleAnswer || editing) && (
         <div className="space-y-1">
-          <div className="flex items-center gap-2"><span className="font-semibold text-[var(--ink)]">Model sample answer</span>{badge(question.sampleAnswer.judged, question.sampleAnswer.probability)}</div>
+          <div className="flex items-center gap-2"><span className="font-semibold text-[var(--ink)]">Sample answer{question.sampleAnswer?.source === 'model' ? ' (model proposal)' : question.sampleAnswer?.source === 'teacher' ? ' (teacher)' : question.sampleAnswer?.source ? ' (source)' : ''}</span>{question.sampleAnswer && badge(question.sampleAnswer.judged, question.sampleAnswer.probability)}</div>
           {editing
             ? <textarea rows={2} value={sampleText} onChange={event => setSampleText(event.target.value)} aria-label="Edit sample answer" className="w-full p-2 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-sans" />
-            : <div dir="auto" className="whitespace-pre-wrap text-[var(--ink)]">{question.sampleAnswer.text}</div>}
+            : <div dir="auto" className="whitespace-pre-wrap text-[var(--ink)]">{question.sampleAnswer?.text || 'No sample answer yet.'}</div>}
         </div>
       )}
-      {question.rubric && (
+      {(criteria.length > 0 || editing) && (
         <div className="space-y-1">
-          <div className="flex items-center gap-2"><span className="font-semibold text-[var(--ink)]">Model rubric</span>{badge(question.rubric.judged, question.rubric.probability)}
-            <span className="text-[var(--ink-2)]">{criteria.reduce((sum, row) => sum + (Number(row.maxPoints) || 0), 0)} pts total{typeof question.points === 'number' && question.points > 0 ? ` of ${question.points}` : ''}</span>
+          <div className="flex items-center gap-2"><span className="font-semibold text-[var(--ink)]">Rubric{question.rubric?.source === 'model' ? ' (model proposal)' : question.rubric?.source === 'teacher' ? ' (teacher)' : ''}</span>{question.rubric && badge(question.rubric.judged, question.rubric.probability)}
+            <span className={`text-[var(--ink-2)] ${typeof question.points === 'number' && question.points > 0 && Math.abs(total - question.points) > 1e-9 ? 'font-semibold text-[var(--danger)]' : ''}`}>{total} pts total{typeof question.points === 'number' && question.points > 0 ? ` of ${question.points}` : ' (unpriced)'}</span>
           </div>
           <ol className="space-y-1">
             {criteria.map((row, index) => (
@@ -97,22 +103,27 @@ const TashrihiProposalCard: React.FC<{ question: Question; onConfirm: (sample?: 
                 {editing
                   ? <input value={row.criterion} aria-label={`Criterion ${index + 1}`} onChange={event => setCriteria(current => current.map((item, i) => i === index ? { ...item, criterion: event.target.value } : item))} className="flex-1 min-w-0 p-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)]" />
                   : <span className="flex-1 min-w-0 text-[var(--ink)]">{row.criterion}</span>}
-                <span className="font-mono text-[var(--ok)]">{row.maxPoints}</span>
+                {editing
+                  ? <input type="number" step="0.25" min="0" value={row.maxPoints} aria-label={`Criterion ${index + 1} points`} onChange={event => setCriteria(current => current.map((item, i) => i === index ? { ...item, maxPoints: Number(event.target.value) } : item))} className="w-16 p-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-mono" />
+                  : <span className="font-mono text-[var(--ok)]">{row.maxPoints}</span>}
+                {editing && <button type="button" aria-label={`Remove criterion ${index + 1}`} onClick={() => setCriteria(current => current.filter((_, i) => i !== index))} className="px-1 text-[var(--danger)]">×</button>}
               </li>
             ))}
           </ol>
+          {editing && criteria.length < 4 && <button type="button" onClick={() => setCriteria(current => [...current, { criterion: '', maxPoints: 0 }])} className="text-[var(--accent-ink)] hover:underline">+ Add criterion</button>}
         </div>
       )}
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <button type="button" onClick={() => setEditing(value => !value)} className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-semibold cursor-pointer">{editing ? 'Keep edits' : 'Edit'}</button>
         <button
           type="button"
           data-confirm-tashrihi={question.id}
-          onClick={() => onConfirm(question.sampleAnswer ? sampleText : undefined, question.rubric ? criteria : undefined)}
+          onClick={() => onConfirm(sampleText.trim() || question.sampleAnswer?.text || undefined, criteria.filter(row => row.criterion.trim() && Number(row.maxPoints) > 0))}
           className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer"
         >
           Confirm as teacher-confirmed
         </button>
+        <span className="text-[var(--ink-2)]">A rubric needs 2–4 criteria summing to the printed points.</span>
       </div>
     </div>
   );
@@ -413,7 +424,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
   const handleConfirmTashrihi = (qId: string, sampleText?: string, criteria?: RubricCriterion[]) => {
     const next = {
       ...examDoc,
-      questions: examDoc.questions.map(q => (q.id === qId ? confirmTashrihi(q, sampleText, criteria) : q)),
+      questions: examDoc.questions.map(q => (q.id === qId ? confirmTashrihi(q, sampleText, criteria, evidenceFingerprint(examDoc, q)) : q)),
     };
     onUpdateDoc(next);
     saveExamDoc(next);
@@ -1048,6 +1059,10 @@ export const Step4ReviewContent: React.FC<Props> = ({
             attentionQuestionIdSet.has(root.id) || (hierarchy.children.get(root.id) || []).some(hasAttentionDescendant);
           const attentionRoots = rootQuestions.filter(hasAttentionDescendant);
           const quietRoots = rootQuestions.filter(root => !hasAttentionDescendant(root));
+          // #58 Part E — "quiet" is not "verified": only items whose required checks actually
+          // passed are counted as verified; the rest are labelled not checked.
+          const quietVerified = quietRoots.filter(root => quietState(examDoc, root) === 'verified').length;
+          const quietUnchecked = quietRoots.length - quietVerified;
           const quietNeedle = quietQuery.trim().toLowerCase();
           const visibleQuiet = quietRoots.filter(root => !quietNeedle || `${root.label || root.no} ${root.stem || ''}`.toLowerCase().includes(quietNeedle));
           const displayRoots = attentionMode ? (includeQuiet ? [...attentionRoots, ...visibleQuiet] : attentionRoots) : rootQuestions;
@@ -1107,7 +1122,9 @@ export const Step4ReviewContent: React.FC<Props> = ({
                         })}
                         className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper-raised)] hover:bg-[var(--paper)] cursor-pointer font-medium text-[var(--ink)]"
                       >
-                        {quietRoots.length} verified · {includeQuiet ? 'hide' : 'show'}
+                        {quietUnchecked === 0
+                          ? `${quietVerified} verified`
+                          : `${quietVerified} verified · ${quietUnchecked} not checked`} · {includeQuiet ? 'hide' : 'show'}
                       </button>
                       {includeQuiet && quietRoots.length > 4 && (
                         <input
@@ -1472,7 +1489,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                             )}
                           </div>
                           {/* #57 Part A — judged sample answer + rubric await the teacher's confirmation. */}
-                          {(q.sampleAnswer || q.rubric) && (
+                          {(q.sampleAnswer || q.rubric || (q.imported && ['short', 'long', 'essay'].includes(q.type) && !hasTeacherRubric(q))) && (
                             <TashrihiProposalCard
                               question={q}
                               onConfirm={(sample, criteria) => handleConfirmTashrihi(q.id, sample, criteria)}

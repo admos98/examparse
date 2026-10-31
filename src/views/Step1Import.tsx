@@ -36,6 +36,9 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
   const [importOnly, setImportOnly] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchMessage, setBatchMessage] = useState('');
+  // #58 Part F — a bounded live log for the parent-folder chain (exam i/N, calls, errors/skips).
+  const [batchLog, setBatchLog] = useState<string[]>([]);
+  const pushBatchLog = (message: string) => setBatchLog(previous => [...previous.slice(-160), message]);
   const [dragOver, setDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'upload' | 'paste'>('upload');
@@ -109,7 +112,23 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
     try {
       const summaries = await listExamSummaries();
       const existing = (await Promise.all(summaries.map(s => loadExamDoc(s.id)))).filter((d): d is ExamDoc => !!d);
-      const result = await importPackageFolder(files, existing, doc => saveExamDoc(doc, undefined, { requireImages: true }), setBatchMessage, importOnly ? undefined : (doc, onProgress) => enrichPackage(doc, settings, { onProgress, onJournal: entry => appendJournalCall(`package-enrichment:${doc.fileHash}`, { ...entry, ts: new Date().toISOString(), complete: true }) }));
+      setBatchLog([]);
+      const result = await importPackageFolder(
+        files,
+        existing,
+        doc => saveExamDoc(doc, undefined, { requireImages: true }),
+        message => { setBatchMessage(message); pushBatchLog(message); },
+        importOnly ? undefined : (doc, onProgress) => enrichPackage(doc, settings, {
+          onProgress: message => { setBatchMessage(message); pushBatchLog(message); },
+          onEvent: event => {
+            if (event.kind === 'phase') pushBatchLog(`· ${event.message || ''}`);
+            else if (event.kind === 'call') pushBatchLog(`· check ${event.completed} of ~${event.planned} (estimate) · ${event.label} · ${event.check}`);
+            else if (event.kind === 'error' || event.kind === 'skip') pushBatchLog(`· ${event.kind}: ${event.label || ''} ${event.check || ''} ${event.message || ''}`.trim());
+          },
+          onStream: undefined,
+          onJournal: entry => appendJournalCall(`package-enrichment:${doc.fileHash}`, { ...entry, ts: new Date().toISOString(), complete: true }),
+        }),
+      );
       await onBatchImported?.();
       setBatchMessage(`Imported ${result.imported} / duplicates ${result.duplicates} / failed ${result.failed} / not a package ${result.notPackage}\n${result.details.join('\n')}`);
     } catch (err: any) { setErrorMessage(`Batch import failed: ${err.message || err}`); setBatchMessage(''); } finally { setBatchRunning(false); }
@@ -322,6 +341,10 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
 
       <label className="flex items-center gap-2 text-sm"><input type="checkbox" disabled={batchRunning} checked={importOnly} onChange={e => setImportOnly(e.target.checked)} /> Import only, don’t enrich</label>
       {batchMessage && <div role="status" className="whitespace-pre-line text-sm">{batchMessage}</div>}
+      {batchLog.length > 0 && <details open={batchRunning} className="rounded border border-[var(--rule)] p-2 text-xs" data-batch-live="true">
+        <summary className="cursor-pointer font-semibold">Live run log ({batchLog.length})</summary>
+        <pre aria-live="polite" className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words">{batchLog.join('\n')}</pre>
+      </details>}
 
       {/* Secondary Options Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

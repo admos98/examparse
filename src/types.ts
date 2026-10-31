@@ -109,15 +109,19 @@ export interface Question {
   /** Optional shared or inline word-bank items associated with fill-in-the-blank questions. */
   wordBank?: string[];
   subQuestions?: Question[];
-  /** #57 Part A — model sample answer for a keyless descriptive (tashrihi) item.
-   * Teacher confirmation is the only promotion: `source` flips to 'teacher' on the Step-4 confirm. */
-  sampleAnswer?: { text: string; source: 'model' | 'teacher'; judged: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number };
-  /** #57 Part A — 2–4 graded criteria (bank RubricCriterion shape) proposed for the same item. */
-  rubric?: { criteria: RubricCriterion[]; source: 'model' | 'teacher'; judged: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number };
+  /** #57 Part A / #58 — sample answer for a descriptive (tashrihi) item.
+   * `model` proposals are non-executing and may only travel while verified; `teacher` is the
+   * explicit save; `paper`/`keyfile`/`manual` are genuine source samples (never labelled model).
+   * `evidence` is the fingerprint of the material the judge actually saw (#58 Part B). */
+  sampleAnswer?: { text: string; source: 'model' | 'teacher' | 'paper' | 'keyfile' | 'manual'; judged: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number; evidence?: string; stale?: boolean; reconfirm?: boolean };
+  /** #57 Part A / #58 — 2–4 graded criteria (bank RubricCriterion shape) for the same item. */
+  rubric?: { criteria: RubricCriterion[]; source: 'model' | 'teacher' | 'paper' | 'keyfile' | 'manual'; judged: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number; evidence?: string; stale?: boolean; reconfirm?: boolean };
   answer?: {
     spans?: LineSpan[];
     text?: string;
     source: 'paper' | 'keyfile' | 'manual' | 'ai';
+    /** #58 — an AI Solve value is a proposal: it may never populate an executable field. */
+    nonExecuting?: boolean;
   };
   tables?: {
     html: string;
@@ -153,12 +157,19 @@ export interface RubricCriterion {
 export interface QuestionEnrichment {
   source: 'model';
   verification: 'verified' | 'disagreed' | 'uncertain' | 'unjudged';
+  /** #58 Part B — fingerprint of the evidence these verdicts were produced from. A mismatch
+   * invalidates every judged state on this question (never silently reused as verified). */
+  evidence?: string;
   verificationProbability?: number;
   checkerChoice?: string;
   /** #57 Part B — a proposal for a keyless auto-graded item. Review payload ONLY:
    * never copied into answer / answer_key / correctFillBlanks by any code path, including re-export.
    * Adoption is a teacher action in Step 4 (`adopted` marks their save). */
-  proposedAnswer?: { text: string; source: 'model'; probability?: number; adopted?: boolean };
+  proposedAnswer?: {
+    text: string; source: 'model'; probability?: number; adopted?: boolean;
+    /** #58 — the decision check of the proposal, still review-only and evidence-bound. */
+    check?: { state: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number; evidence?: string };
+  };
   difficultyUncertain?: boolean;
   explanationCheck?: { state: 'verified' | 'rejected' | 'uncertain' | 'unjudged'; probability?: number };
   completeness?: { probability: number };
@@ -303,6 +314,8 @@ export interface ExamDoc {
   source: {
     kind?: 'package' | 'pdf' | 'word';
     packageBatchId?: string;
+    /** #58 — part folders of a multipart native export (>50 questions) merged into this one exam. */
+    packageParts?: string[];
     packageJsonHash?: string;
     packageBatchImport?: boolean;
     packageDataset?: string;
@@ -582,6 +595,8 @@ export type CostTable = Record<string, CostRate>;
 export interface TokenThriftSettings {
   latexNormalization: boolean;
   maxImagesPerVisionCall: number;
+  /** #58 — per-request image limit for the local decision judge (defaults to 4 when unset). */
+  maxImagesPerDecisionCall?: number;
   imageMaxLongEdge: number;
   jpegQuality: number;
   cacheEnabled: boolean;

@@ -192,7 +192,7 @@ test('#57B a checker proposal never touches executable key fields — exports ar
   assert.equal(stripRow(row), stripRow(rowBase));
   assert.ok(JSON.stringify(row.enrichment).includes('"proposedAnswer"'));
   assert.ok(!JSON.stringify({ ...rowBase }).includes('proposedAnswer'));
-  assert.ok(bank.report.needs_answer_key.some(entry => entry.question === 'Q1' && /no answer key/i.test(entry.reason)));
+  assert.ok(bank.report.needs_answer_key.some(entry => entry.question === 'Q1' && /no source answer key/i.test(entry.reason)));
   assert.ok(row.tags.includes('answer_key_needs_review'));
 
   // Attention says exactly what the teacher can do.
@@ -369,14 +369,16 @@ test('#57E abstained members inherit the confident passage lesson (marked, non-o
   assert.equal(out.questions[1].curriculumSource, 'inherited');
   assert.equal(out.questions[1].curriculumHints?.lesson, lessons[0].title);
 
-  // Compressed bank provenance: <file> · p.<page> · item <label> · group <n> (<total>), ≤200 chars.
+  // Compressed bank provenance: <file>[ · p.<page>][ · item <label>][ · group <n> (<total>)], ≤200.
+  // #58 — unknown page/group are OMITTED, never replaced with a fabricated p.1/section index.
   const longName = `a-rather-long-exam-filename-${'x'.repeat(300)}.pdf`;
   const doc: ExamDoc = { ...out, source: { ...out.source, fileName: longName } };
   const bank = await createQuestionBankExport(doc, { sourceDataset: 'inherit' });
   for (const row of bank.batch.questions) {
     const ref = row.provenance.source_ref!;
     assert.ok(ref.length <= 200, `source_ref ≤200 chars (${ref.length})`);
-    assert.match(ref, / · p\.\d+ · item \S+ · group \d+ \(\d+\)$/);
+    assert.match(ref, / · item \S+$/);
+    assert.doesNotMatch(ref, / · p\.1(?: ·|$)/, 'no invented page');
   }
   assert.ok(bank.batch.questions[0].provenance.source_ref!.startsWith('a-rather-long-exam-filename-'));
   assert.ok(bank.batch.questions[0].provenance.source_ref!.length <= 200);
@@ -384,8 +386,11 @@ test('#57E abstained members inherit the confident passage lesson (marked, non-o
   const structured = buildExportDoc(doc);
   assert.equal(structured.questions[0].imported.provenance.source_type, 'claimed');
   assert.match(structured.questions[0].imported.provenance.source_ref, /full prose source reference/);
-  assert.equal(bankProvenance(doc).source_type, 'authored');
-  assert.equal(bank.batch.questions[0].provenance.source_type, 'authored');
+  // #58 — a claimed source stays claimed; the bank remap is explicit opt-in only.
+  assert.equal(bankProvenance(doc).source_type, 'claimed');
+  assert.equal(bank.batch.questions[0].provenance.source_type, 'claimed');
+  assert.equal(bankProvenance(doc, undefined, { remapClaimedTo: 'authored' }).source_type, 'authored');
+  assert.equal((await createQuestionBankExport(doc, { sourceDataset: 'inherit', remapClaimedTo: 'authored' })).batch.questions[0].provenance.source_type, 'authored');
   // The prose ref never rides the bank rows.
   assert.ok(!bank.batch.questions.some(row => /full prose source reference/.test(row.provenance.source_ref || '')));
 });
@@ -514,7 +519,10 @@ test('#57F field-proxy: unattended parent-folder batch import → chain-enrich p
       assert.equal(tashrihi.rubric!.criteria.reduce((sum, criterion) => sum + criterion.maxPoints, 0), 3);
       const keylessRow = bank.batch.questions.find(question => question.label === '17C-a')!;
       assert.equal(keylessRow.answer_key, undefined, 'keyless stays keyless downstream');
-      assert.equal(keylessRow.enrichment?.proposedAnswer, undefined, 'no pixels → the checker proposes nothing (evidence gate)');
+      // #58 — the picture travelled with the item, so the checker may propose; the proposal still
+      // never becomes an executable key.
+      assert.equal(keylessRow.enrichment?.proposedAnswer?.text, 'B');
+      assert.equal(keylessRow.correctFillBlanks, undefined);
       assert.ok(keylessRow.tags.includes('answer_key_needs_review'));
     }
     assert.ok(doc.source.enrichmentNotes!.some(note => /^explanations: \d+ of \d+ keyed questions/.test(note)), 'outcome-first notes lead with final state');

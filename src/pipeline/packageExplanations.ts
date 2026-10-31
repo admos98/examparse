@@ -3,12 +3,14 @@ import type { AppSettings, ExamDoc, LLMRequest, LLMResponse, Question } from '..
 import { LLMAdapter } from '../providers/adapter';
 import { localProviderFor } from './localProvider';
 import { canonicalLetter, parseAnswerLetter } from './answerCorrectness';
+import { salvageJsonObjects } from '../utils/jsonRepair';
+import { executableAnswerText } from '../utils/bankAnswers';
 
 export function explanationKey(q: Question): string | undefined {
   if (!['mcq', 'truefalse', 'fillblank', 'short'].includes(q.type)) return undefined;
   if (q.imported?.disputed || q.imported?.answer_key?.disputed || q.imported?.answer_key?.status === 'disputed') return undefined;
-  if (q.answer?.source === 'ai') return undefined;
-  const answer = q.answer?.text?.trim();
+  // #58 — a legacy AI value or a proposal is not an executable answer and never anchors a check.
+  const answer = executableAnswerText(q);
   if (!answer || (q.answer?.source !== 'manual' && q.imported?.answer_key?.correct?.length !== 1)) return undefined;
   if (q.type === 'mcq' || (q.type === 'truefalse' && (q.options || []).length)) {
     const letter = parseAnswerLetter(answer, q);
@@ -21,6 +23,10 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
   caller?: (request: LLMRequest) => Promise<Pick<LLMResponse, 'json' | 'rawText'>>;
   onProgress?: (message: string) => void;
   onJournal?: (entry: { label: string; rawText: string; requestText: string }) => Promise<void>;
+  /** #58 Part C — false when the item's picture cannot be shown to the writer (no text-only guess). */
+  canDraft?: (question: Question) => boolean;
+  /** #58 Part F — live output of the underlying (single) model call, never a duplicate call. */
+  onStream?: (text: string) => void;
 } = {}): Promise<string[]> {
   // A rerun never carries a stale explanation forward if generation is unavailable or fails.
   for (const q of doc.questions) delete q.explanation;
@@ -35,21 +41,23 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
   let malformed = 0;
   let omittedBatches = 0;
   let failedBatches = 0;
-  const eligible = doc.questions.filter(q => explanationKey(q));
+  const eligible = doc.questions.filter(q => explanationKey(q) && (options.canDraft ? options.canDraft(q) : true));
+  const skippedForPixels = doc.questions.filter(q => explanationKey(q) && options.canDraft && !options.canDraft(q));
   const system = 'Write student-facing explanations in the exam language. For each keyed question, use only the question, passage and options: explain in one or two sentences why the marked answer is correct and, for multiple choice, briefly why it beats the alternatives. Do not use outside facts or invent answers. Return JSON only: {"corrections":[{"questionNumber":"55A","explanation":"..."}]}. Use the exact label supplied as questionNumber. /no_think';
   const run = async (batch: Question[], section: string) => {
     const text = JSON.stringify({ language: doc.meta.language, section, questions: batch.map(q => ({ number: /^\d+$/.test(q.label) ? q.no : q.label, label: q.label, type: q.type, stem: q.stem, options: q.options?.map(o => ({ key: o.key, text: o.text })), passage: doc.passages?.find(p => p.id === q.passageId)?.text, script: q.imported?.script, answer: explanationKey(q) })) });
     const request: LLMRequest = { role: 'read', system, text, providerConfig: provider, label: `Package explanations · ${section}`, maxOutputTokens: Math.min(8192, Math.max(512, batch.length * 160)) };
     options.onProgress?.(`Explain · ${section}`);
     try {
-      const response = await (options.caller || (r => LLMAdapter.execute(r)))(request);
+      const response = await (options.caller
+        ? options.caller(request)
+        : LLMAdapter.execute(request, options.onStream ? { onDelta: (_channel, fullText) => options.onStream!(fullText) } : undefined));
       let value: any = response.json;
       if (response.rawText?.trim()) {
         try { value = JSON.parse(response.rawText.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '')); }
         catch {
-          // Salvage complete JSON objects, never guess truncated explanation text.
-          const rows: any[] = []; for (const m of response.rawText.matchAll(/\{[^{}]*\}/g)) { try { rows.push(JSON.parse(m[0])); } catch { /* incomplete object */ } }
-          value = { corrections: rows }; malformed++;
+          // #58 — nested-aware salvage, never a guessed/ truncated explanation.
+          value = { corrections: salvageJsonObjects(response.rawText) }; malformed++;
         }
       }
       const rows = Array.isArray(value?.corrections) ? value.corrections : [];
@@ -89,6 +97,7 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
     ];
     notes.push(`explanations incomplete: ${parts.length ? parts.join(', ') : 'no usable rows returned'} — ${eligible.length - made} of ${eligible.length} keyed items still missing after one retry each.`);
   }
+  if (skippedForPixels.length) notes.push(`explanations: ${skippedForPixels.length} keyed picture question(s) not drafted because their pixels could not be shown to the writer.`);
   notes.push(`explanations: ${made} of ${eligible.length} keyed questions`);
   return [...new Set(notes)];
 }

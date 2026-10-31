@@ -69,12 +69,60 @@ function commonPrefix(a: string, b: string): string {
   return boundary >= 200 ? prefix.slice(0, boundary).trimEnd() : '';
 }
 export async function importQuestionPackage(files: PackageFile[]): Promise<ExamDoc> {
+  const pathOf = (file: PackageFile) => (file.webkitRelativePath || file.name).replace(/\\/g, '/');
   const jsons = files.filter(f => /\.json$/i.test(f.name) && !/export-report\.json$/i.test(f.name));
-  const json = jsons.find(f => /(^|\/)batch\.json$/i.test(f.webkitRelativePath || f.name)) || (jsons.length === 1 ? jsons[0] : undefined);
-  if (!json) throw new Error('Select one package JSON (or batch.json) together with its images.');
-  const raw = await json.text(); let batch: any;
-  try { batch = JSON.parse(raw); } catch { throw new Error('Package JSON is invalid.'); }
+  // #58 Part D — a >50-question native export is ONE logical package: every part-N/batch.json is
+  // merged, the shared asset pool is resolved once, and a genuinely missing part is reported
+  // instead of silently importing a subset.
+  const partJsons = jsons
+    .map(file => ({ file, match: /(?:^|\/)part-(\d+)\/batch\.json$/i.exec(pathOf(file)) }))
+    .filter((entry): entry is { file: PackageFile; match: RegExpExecArray } => Boolean(entry.match))
+    .map(entry => ({ file: entry.file, part: Number(entry.match[1]) }))
+    .sort((a, b) => a.part - b.part);
+  let json: PackageFile | undefined;
+  let raw = '';
+  let batch: any;
+  let parts: string[] = [];
+  if (partJsons.length) {
+    const numbers = partJsons.map(entry => entry.part);
+    const expected = Math.max(...numbers);
+    const missing = Array.from({ length: expected }, (_, index) => index + 1).filter(number => !numbers.includes(number));
+    if (missing.length) throw new Error(`Multipart package is incomplete: missing part ${missing.join(', ')} of ${expected}. Nothing was imported.`);
+    const parsed: any[] = [];
+    for (const entry of partJsons) {
+      const text = await entry.file.text();
+      let value: any;
+      try { value = JSON.parse(text); } catch { throw new Error(`Package part ${entry.part} is not valid JSON.`); }
+      if (!value || typeof value.batch_id !== 'string' || !Array.isArray(value.questions) || !value.questions.length) throw new Error(`Package part ${entry.part} needs a batch_id and a nonempty questions array.`);
+      parsed.push(value); raw += text;
+    }
+    const baseIds = new Set(parsed.map(value => String(value.batch_id).replace(/-part-\d+$/i, '')));
+    if (baseIds.size !== 1) throw new Error('Package parts do not share one batch_id; they are not the same export.');
+    const declared = parsed.map(value => Number(value.part_total ?? value.parts_total)).find(Number.isFinite);
+    if (declared && declared !== expected) {
+      const missingDeclared = Array.from({ length: declared }, (_, index) => index + 1).filter(number => !numbers.includes(number));
+      throw new Error(`Multipart package is incomplete: missing part ${missingDeclared.join(', ') || `${expected + 1}–${declared}`} of ${declared} (supplied ${expected}). Nothing was imported.`);
+    }
+    batch = {
+      ...parsed[0],
+      batch_id: [...baseIds][0],
+      questions: parsed.flatMap(value => value.questions),
+      ...(parsed.some(value => Array.isArray(value.sections)) ? { sections: parsed.flatMap(value => Array.isArray(value.sections) ? value.sections : []) } : {}),
+    };
+    parts = partJsons.map(entry => `part-${entry.part}`);
+    json = partJsons[0].file;
+  } else {
+    json = jsons.find(f => /(^|\/)batch\.json$/i.test(f.webkitRelativePath || f.name)) || (jsons.length === 1 ? jsons[0] : undefined);
+    if (!json) throw new Error('Select one package JSON (or batch.json) together with its images.');
+    raw = await json.text();
+    try { batch = JSON.parse(raw); } catch { throw new Error('Package JSON is invalid.'); }
+  }
   if (!batch || typeof batch.batch_id !== 'string' || !Array.isArray(batch.questions) || !batch.questions.length) throw new Error('Package must have a batch_id and a nonempty questions array.');
+  // Two different batch.json files that are not parts of one export would silently drop questions.
+  if (!parts.length) {
+    const others = jsons.filter(file => file !== json && /(?:^|\/)batch\.json$/i.test(pathOf(file)));
+    if (others.length) throw new Error('Select one package at a time (several unrelated batch.json files were found).');
+  }
   if (!globalThis.crypto?.subtle) throw new Error('SHA-256 is required to import package images.');
   const images: ImageAsset[] = []; const byHash = new Map<string, ImageAsset>(); const fileAssets = new Map<string, ImageAsset>();
   const addAsset = async (bytes: Uint8Array, mime: string) => {
@@ -326,5 +374,5 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     rootCauseId: `package_image_token_${hit.questionId}_${hit.sha.slice(0, 12)}`,
   }));
   return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language, direction: batch.direction === 'rtl' || (batch.direction !== 'ltr' && /^(?:fa|ar|ur)(?:-|$)/i.test(language)) ? 'rtl' : 'ltr' }, sections, passages, optionalGroups, questions, images,
-    source: { kind: 'package', packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: json.name }, flags: tokenFlags, usage: [] };
+    source: { kind: 'package', ...(parts.length > 1 ? { packageParts: parts } : {}), packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: parts.length > 1 ? `${json.name} (+${parts.length - 1} parts)` : json.name }, flags: tokenFlags, usage: [] };
 }

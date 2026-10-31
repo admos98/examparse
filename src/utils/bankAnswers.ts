@@ -33,7 +33,21 @@ export function isExecutableSourceAnswer(q: Question): boolean {
 
 /** The answer text an engine may execute, or undefined (keyless / AI proposal / empty). */
 export function executableAnswerText(q: Question): string | undefined {
+  // A saved teacher correction supersedes imported paper/keyfile history. Other genuine source
+  // answers remain executable, but a model answer never is.
   return isExecutableSourceAnswer(q) ? q.answer!.text!.trim() : undefined;
+}
+
+/** The value that should be displayed in an answer-key preview (never a model proposal). */
+export function answerKeyDisplayText(q: Question): string | undefined {
+  const answer = executableAnswerText(q);
+  if (answer) return answer;
+  const imported = q.imported as Record<string, unknown> | undefined;
+  const correct = (imported?.answer_key as { correct?: unknown } | undefined)?.correct;
+  if (Array.isArray(correct)) return correct.map(String).join(', ') || undefined;
+  const blanks = imported?.correctFillBlanks ?? imported?.correct_fill_blanks;
+  if (Array.isArray(blanks)) return blanks.map(value => Array.isArray(value) ? value.join(' / ') : String(value)).join(' | ') || undefined;
+  return undefined;
 }
 
 /**
@@ -94,6 +108,9 @@ function asStringArray(value: unknown): string[] {
  * because the package did not say whether they are separate blanks or alternatives).
  */
 export function readFillBlankBlanks(q: Question): { blanks: BlankAnswer[]; ambiguity?: string } | undefined {
+  // Explicit teacher save is the current key; retain it as the single entered answer rather than
+  // silently preferring the imported source history.
+  if (q.answer?.source === 'manual' && q.answer.text?.trim()) return { blanks: [{ accept: [cleanAnswerValue(q.answer.text)] }] };
   const imported = q.imported as Record<string, unknown> | undefined;
   const correctFillBlanks = imported?.correctFillBlanks ?? imported?.correct_fill_blanks;
   if (Array.isArray(correctFillBlanks) && correctFillBlanks.length) {
@@ -190,8 +207,11 @@ export function planBankAnswer(q: Question): BankAnswerPlan {
     return { kind: 'keyless', reason: 'parent question is answered by its sub-questions' };
   }
   if (DESCRIPTIVE_TYPES.has(q.type)) {
-    const text = executableAnswerText(q);
-    if (text) return { kind: 'descriptive', text, source: source! };
+    const sampleSource = q.sampleAnswer?.source;
+    const sampleText = q.sampleAnswer?.text?.trim();
+    const text = executableAnswerText(q) || (sampleText && sampleSource && sampleSource !== 'model' ? sampleText : undefined);
+    const descriptiveSource = source || (sampleSource && sampleSource !== 'model' ? sampleSource as AnswerProvenance : undefined);
+    if (text && descriptiveSource) return { kind: 'descriptive', text, source: descriptiveSource };
     return { kind: 'keyless', reason: 'descriptive item has no source sample answer', ...(proposalText(q) ? { proposal: proposalText(q) } : {}) };
   }
   if (q.type === 'fillblank') {
@@ -211,9 +231,9 @@ export function planBankAnswer(q: Question): BankAnswerPlan {
   }
   if (AUTO_GRADED_TYPES.has(q.type)) {
     // Prefer the richest explicit source: every imported correct value, else the single answer text.
-    const importedCorrect = asStringArray((q.imported?.answer_key as { correct?: unknown } | undefined)?.correct);
+    const importedCorrect = q.answer?.source === 'manual' ? [] : asStringArray((q.imported?.answer_key as { correct?: unknown } | undefined)?.correct);
     const text = executableAnswerText(q);
-    const values = importedCorrect.length ? importedCorrect : text ? [text] : [];
+    const values = text && q.answer?.source === 'manual' ? [text] : importedCorrect.length ? importedCorrect : text ? [text] : [];
     if (values.length) {
       const mapped = optionIndicesFor(q, values);
       if (mapped) return { kind: 'option-key', correct: mapped, optionKeys: (q.options || []).map(option => option.key), source: source || (importedCorrect.length ? 'paper' : 'manual') };
@@ -236,13 +256,25 @@ export function migrateLegacyAiAnswers(doc: ExamDoc): ExamDoc {
   for (const q of doc.questions || []) {
     if (q.answer?.source !== 'ai') continue;
     const text = q.answer.text?.trim();
-    if (text && !q.enrichment?.proposedAnswer && AUTO_GRADED_TYPES.has(q.type)) {
+    if (text && !q.enrichment?.proposedAnswer) {
       q.enrichment = {
-        source: 'model',
-        verification: q.enrichment?.verification || 'unjudged',
-        ...q.enrichment,
+        source: 'model', verification: 'unjudged', ...q.enrichment,
         proposedAnswer: { text, source: 'model' },
       };
+    }
+    const imported = q.imported as Record<string, unknown> | undefined;
+    const correct = (imported?.answer_key as { correct?: unknown } | undefined)?.correct;
+    const recoverable = AUTO_GRADED_TYPES.has(q.type) && Array.isArray(correct)
+      ? correct.map(String).filter(value => value.trim()) : [];
+    if (recoverable.length) {
+      q.answer = { text: recoverable.join(', '), source: 'paper' };
+      if (imported?.answer_key && typeof imported.answer_key === 'object') {
+        (imported.answer_key as Record<string, unknown>).source = 'paper';
+      }
+    } else {
+      delete q.answer;
+      if (!q.imported) q.imported = {};
+      q.imported.legacyAiAnswerSourceLost = Boolean(text);
     }
   }
   return doc;

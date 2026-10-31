@@ -11,14 +11,14 @@ import type { AppSettings, ExamDoc, LLMRequest, Question } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { localProviderFor } from './localProvider';
 import { salvageJsonObjects } from '../utils/jsonRepair';
-import { executableAnswerText, proposalText } from '../utils/bankAnswers';
+import { hasSourceKey, proposalText } from '../utils/bankAnswers';
 import { listeningEvidence } from './evidenceBundle';
 
 /** Keyless, optionless blanks — the only items this pass may touch. */
 export function candidateItems(doc: ExamDoc): Question[] {
   return (doc.questions || []).filter(question =>
     question.type === 'fillblank'
-    && !executableAnswerText(question)
+    && !hasSourceKey(question)
     && !proposalText(question)
     && !(question.options || []).length
     && !question.subQuestions?.length);

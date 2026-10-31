@@ -15,7 +15,7 @@ import type { AppSettings, ExamDoc, Question, RubricCriterion } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { localProviderFor } from './localProvider';
 import { salvageJsonObjects } from '../utils/jsonRepair';
-import { evidenceFingerprint, rubricFingerprint } from './evidence';
+import { evidenceFingerprint, instructionTextFor, rubricFingerprint, sampleFingerprint } from './evidence';
 import type { ImageBundle } from './evidenceBundle';
 
 /** The tashrihi set: descriptive item types that carry no auto-gradable key. */
@@ -63,10 +63,11 @@ export interface RubricValidation { ok: boolean; reason?: string }
 export function validateRubric(criteria: RubricCriterion[] | undefined, points?: number | null): RubricValidation {
   if (!Array.isArray(criteria) || criteria.length < 2 || criteria.length > 4) return { ok: false, reason: 'a rubric needs 2–4 criteria' };
   if (criteria.some(criterion => !criterion.criterion?.trim())) return { ok: false, reason: 'every criterion needs text' };
-  if (criteria.some(criterion => !Number.isFinite(criterion.maxPoints) || criterion.maxPoints <= 0)) return { ok: false, reason: 'every criterion needs a positive maxPoints' };
+  if (typeof points !== 'number' || !Number.isFinite(points) || points <= 0) return { ok: false, reason: 'printed item points are required before a scored rubric can be confirmed' };
+  if (criteria.some(criterion => typeof criterion.maxPoints !== 'number' || !Number.isFinite(criterion.maxPoints) || criterion.maxPoints <= 0)) return { ok: false, reason: 'every criterion needs a positive maxPoints' };
   if (typeof points === 'number' && Number.isFinite(points) && points > 0) {
-    const places = Math.max(...criteria.map(criterion => decimalPlaces(criterion.maxPoints)));
-    const sum = roundTo(criteria.reduce((total, criterion) => total + criterion.maxPoints, 0), places);
+    const places = Math.max(...criteria.map(criterion => decimalPlaces(criterion.maxPoints ?? 0)));
+    const sum = roundTo(criteria.reduce((total, criterion) => total + (criterion.maxPoints ?? 0), 0), places);
     if (Math.abs(sum - points) > 1e-9) return { ok: false, reason: `criteria add up to ${sum}, not the printed ${points}` };
   }
   return { ok: true };
@@ -91,13 +92,15 @@ export function rubricCriteria(raw: unknown, points?: number | null): RubricCrit
       : typeof value?.text === 'string' && value.text.trim() ? value.text.trim() : '';
     if (!criterion) return undefined;
     const rawPoints = Number(value?.maxPoints ?? value?.points);
-    criteria.push({ criterion, maxPoints: Number.isFinite(rawPoints) ? rawPoints : NaN });
+    criteria.push({ criterion, maxPoints: Number.isFinite(rawPoints) ? rawPoints : undefined });
   }
-  // Negative weights are malformed output, never silently repaired into a distribution.
-  if (criteria.some(criterion => Number.isFinite(criterion.maxPoints) && criterion.maxPoints < 0)) return undefined;
   const hasPrintedPoints = typeof points === 'number' && Number.isFinite(points) && points > 0;
-  const allPositive = criteria.every(criterion => Number.isFinite(criterion.maxPoints) && criterion.maxPoints > 0);
-  const noneSupplied = criteria.every(criterion => !Number.isFinite(criterion.maxPoints) || criterion.maxPoints === 0);
+  // Without a printed total, retain useful text only. Model-invented point values are not marks.
+  if (!hasPrintedPoints) return criteria.map(({ criterion }) => ({ criterion }));
+  // Negative weights are malformed output, never silently repaired into a distribution.
+  if (criteria.some(criterion => Number.isFinite(criterion.maxPoints) && (criterion.maxPoints ?? 0) < 0)) return undefined;
+  const allPositive = criteria.every(criterion => typeof criterion.maxPoints === 'number' && Number.isFinite(criterion.maxPoints) && criterion.maxPoints > 0);
+  const noneSupplied = criteria.every(criterion => typeof criterion.maxPoints !== 'number' || !Number.isFinite(criterion.maxPoints) || criterion.maxPoints === 0);
   if (!allPositive && !noneSupplied) return undefined; // mixed positive/zero is malformed
   if (allPositive) {
     if (!hasPrintedPoints) return criteria;
@@ -156,12 +159,11 @@ export function confirmTashrihi(question: Question, sampleText?: string, criteri
     };
   } else if (question.sampleAnswer) delete next.sampleAnswer;
   const validCriteria = criteria && validateRubric(criteria, question.points).ok ? criteria : undefined;
-  const rubricBody = validCriteria || question.rubric?.criteria;
-  if (rubricBody?.length) {
-    const { evidence: _evidence, ...rest } = question.rubric || ({} as NonNullable<Question['rubric']>);
-    next.rubric = { ...rest, criteria: rubricBody, source: 'teacher', judged: 'unjudged', stale: false, ...(evidence ? { evidence } : {}) };
-  } else if (question.rubric) delete next.rubric;
-  const rubricConfirmed = Boolean(next.rubric && next.rubric.source === 'teacher' && validateRubric(next.rubric.criteria, question.points).ok);
+  // Invalid or absent submitted criteria never promote an old model proposal. Keep the draft as-is.
+  if (validCriteria) {
+    next.rubric = { ...(question.rubric || {}), criteria: validCriteria, source: 'teacher', judged: 'unjudged', stale: false, reconfirm: false, ...(evidence ? { evidence } : {}) };
+  }
+  const rubricConfirmed = Boolean(next.rubric && next.rubric.source === 'teacher' && !next.rubric.stale && !next.rubric.reconfirm && validateRubric(next.rubric.criteria, question.points).ok);
   next.tags = (question.tags || []).filter(tag => !(tag === 'needs_rubric' && rubricConfirmed));
   return next;
 }
@@ -171,7 +173,7 @@ export function exportableTashrihi<T extends { judged?: string } | undefined>(ar
   return artifact && artifact.judged === 'rejected' ? undefined : artifact;
 }
 
-const TASHRIHI_SYSTEM = 'Write model sample answers and grading rubrics for descriptive exam tasks in the exam language. For each question write sampleAnswer — a model answer that completes the task as asked (one sentence for a topic-sentence task, a whole paragraph for a paragraph task) — and rubric — 2 to 4 grading criteria, each a short criterion with maxPoints that add up to the question points when points are given (never zero or negative; use at most four decimal places). Use only the question, passage, listening script and pictures supplied: no outside facts, no invented material. Return JSON only: {"corrections":[{"questionNumber":"55A","sampleAnswer":"...","rubric":[{"criterion":"...","maxPoints":1}]}]}. Use the exact label supplied as questionNumber. /no_think';
+const TASHRIHI_SYSTEM = 'Write model sample answers and grading rubrics for descriptive exam tasks in the exam language. For each question write sampleAnswer — a model answer that completes the task as asked (one sentence for a topic-sentence task, a whole paragraph for a paragraph task) — and rubric — 2 to 4 grading criteria, each a short criterion with maxPoints that add up to the question points when points are given (never zero or negative; use at most four decimal places). Use only the question, its applicable instructions, passage, mapped listening script and addressed pictures supplied: no outside facts, no invented material. Return JSON only: {"corrections":[{"questionNumber":"55A","sampleAnswer":"...","rubric":[{"criterion":"...","maxPoints":1}]}]}. Use the exact label supplied as questionNumber. /no_think';
 
 const TASHRIHI_SAMPLE_ONLY = TASHRIHI_SYSTEM.replace('write sampleAnswer — a model answer that completes the task as asked (one sentence for a topic-sentence task, a whole paragraph for a paragraph task) — and rubric — 2 to 4 grading criteria, each a short criterion with maxPoints that add up to the question points when points are given (never zero or negative; use at most four decimal places).', 'write sampleAnswer — a model answer that completes the task as asked. Omit rubric.');
 const TASHRIHI_RUBRIC_ONLY = TASHRIHI_SYSTEM.replace('write sampleAnswer — a model answer that completes the task as asked (one sentence for a topic-sentence task, a whole paragraph for a paragraph task) — and rubric — 2 to 4 grading criteria, each a short criterion with maxPoints that add up to the question points when points are given (never zero or negative; use at most four decimal places).', 'write rubric — 2 to 4 grading criteria whose maxPoints add up to the question points when given (positive only, at most four decimal places). Omit sampleAnswer.');
@@ -192,13 +194,10 @@ export async function generatePackageTashrihi(doc: ExamDoc, settings: AppSetting
   /** #58 Part F — live output of the same call that produces the artifacts. */
   onStream?: (text: string) => void;
 } = {}): Promise<string[]> {
-  for (const q of doc.questions) {
-    if (q.sampleAnswer?.source !== 'teacher') delete q.sampleAnswer;
-    if (q.rubric?.source !== 'teacher') delete q.rubric;
-  }
-  const eligible = tashrihiItems(doc);
+  const eligible = tashrihiItems(doc).filter(q => !q.sampleAnswer || !q.rubric);
   if (!eligible.length) return [];
   const provider = localProviderFor(settings, 'read');
+  const visualProvider = localProviderFor(settings, 'vision');
   if (!provider) return [`sample answers & rubrics: 0 of ${eligible.length} tashrihi items proposed — no local generative read provider configured.`];
   const decide = settings.roleMapping.decide;
   const decisionProvider = decide && settings.providers.find(p => p.id === decide.providerId);
@@ -221,7 +220,7 @@ export async function generatePackageTashrihi(doc: ExamDoc, settings: AppSetting
       const question = batch.find(q => q.label === label)!;
       let wrote = false;
       if (part !== 'rubric' && typeof row?.sampleAnswer === 'string' && row.sampleAnswer.trim() && !question.sampleAnswer) {
-        question.sampleAnswer = { text: row.sampleAnswer.trim(), source: 'model', judged: 'unjudged', evidence: evidenceFingerprint(doc, question) };
+        question.sampleAnswer = { text: row.sampleAnswer.trim(), source: 'model', judged: 'unjudged', evidence: sampleFingerprint(doc, question, row.sampleAnswer.trim()) };
         wrote = true;
       }
       if (part !== 'sample' && !question.rubric) {
@@ -242,20 +241,26 @@ export async function generatePackageTashrihi(doc: ExamDoc, settings: AppSetting
     const bundles = new Map<string, ImageBundle | undefined>();
     if (options.loadBundle) for (const q of batch) bundles.set(q.id, await options.loadBundle(q));
     // Evidence gate: a question whose picture cannot be addressed is not drafted from text alone.
-    const usable = batch.filter(q => {
+    let usable = batch.filter(q => {
       const bundle = bundles.get(q.id);
-      if (!bundle || bundle.required === 0) return true;
-      if (bundle.complete) return true;
+      if (!q.images.length) return true;
+      if (visualProvider && bundle?.complete) return true;
       skippedNoEvidence++;
       if (!noPixels.includes(q.label)) noPixels.push(q.label);
       return false;
     });
+    const candidateImages = usable.flatMap(q => bundles.get(q.id)?.payloads || []);
+    const visualLimit = Math.min(...usable.filter(q => q.images.length).map(q => bundles.get(q.id)?.limit || 4), 4);
+    if (candidateImages.length > visualLimit) {
+      const visualQuestions = usable.filter(q => q.images.length);
+      skippedNoEvidence += visualQuestions.length;
+      for (const q of visualQuestions) if (!noPixels.includes(q.label)) noPixels.push(q.label);
+      usable = usable.filter(q => !q.images.length);
+    }
     if (!usable.length) return;
     const system = part === 'sample' ? TASHRIHI_SAMPLE_ONLY : part === 'rubric' ? TASHRIHI_RUBRIC_ONLY : TASHRIHI_SYSTEM;
-    const usesImages = usable.filter(q => (bundles.get(q.id)?.payloads.length || 0) > 0);
-    // A single addressed bundle per request: image-bearing questions are drafted alone, text-only
-    // questions keep their ≤4 batch.
-    const groups: Question[][] = usesImages.length ? usable.map(q => [q]) : [usable];
+    // One complete addressed bundle for this visual stage, never one call per pictured question.
+    const groups: Question[][] = [usable];
     for (const group of groups) {
       const text = JSON.stringify({
         language: doc.meta.language,
@@ -267,6 +272,8 @@ export async function generatePackageTashrihi(doc: ExamDoc, settings: AppSetting
           stem: q.stem,
           passage: doc.passages?.find(p => p.id === q.passageId)?.text,
           script: q.imported?.script || q.imported?.transcript,
+          instructions: instructionTextFor(doc, q),
+          images: (q.images || []).map(ref => ref.imageId),
           points: q.points,
           sampleAnswer: null,
           rubric: null,
@@ -274,7 +281,7 @@ export async function generatePackageTashrihi(doc: ExamDoc, settings: AppSetting
       });
       const images = group.flatMap(q => bundles.get(q.id)?.payloads || []);
       const request: import('../types').LLMRequest = {
-        role: 'read', system, text, providerConfig: provider,
+        role: 'read', system, text, providerConfig: images.length ? visualProvider! : provider,
         ...(images.length ? { images } : {}),
         label: `Package tashrihi · ${section}`, maxOutputTokens: Math.min(8192, Math.max(512, group.length * 320)),
       };

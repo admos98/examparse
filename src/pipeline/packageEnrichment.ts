@@ -3,11 +3,12 @@ import type { AppSettings, ExamDoc, Question, QuestionEnrichment } from '../type
 import { LLMAdapter } from '../providers/adapter';
 import { canonicalLetter, parseAnswerLetter } from './answerCorrectness';
 import { decisionImageLimit, listeningEvidence, loadImageBundle } from './evidenceBundle';
-import { evidenceFingerprint, rubricFingerprint } from './evidence';
-import { executableAnswerText, migrateLegacyAiAnswers, proposalText } from '../utils/bankAnswers';
+import { localProviderFor } from './localProvider';
+import { evidenceFingerprint, explanationFingerprint, instructionTextFor, rubricFingerprint, sampleFingerprint } from './evidence';
+import { executableAnswerText, hasSourceKey, migrateLegacyAiAnswers, proposalText } from '../utils/bankAnswers';
 import { curriculumLessons, hintsForLesson } from './curriculumHints';
 import { generatePackageExplanations, explanationKey } from './packageExplanations';
-import { generatePackageTashrihi, judgeState, RUBRIC_JUDGE, SAMPLE_ANSWER_JUDGE } from './packageTashrihi';
+import { generatePackageTashrihi, judgeState, RUBRIC_JUDGE, SAMPLE_ANSWER_JUDGE, validateRubric } from './packageTashrihi';
 import { generateFillBlankCandidates } from './packageProposals';
 import { normalizeIdentity } from './identity';
 import { isPackageListeningQuestion } from './packageListening';
@@ -58,19 +59,16 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
   const explanationNotes = await generatePackageExplanations(out, settings, {
     caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal,
     ...(options.onStream ? { onStream: options.onStream } : {}),
-    // #58 Part C — the writer must not draft prose for a picture it cannot see.
-    canDraft: (q: Question) => {
-      if (!q.images.length) return true;
-      if (!decideIsMultimodal(settings, resolveDecisionProvider(settings) || undefined)) return false;
-      return q.images.every(ref => Boolean(out.images.find(image => image.id === ref.imageId)));
-    },
+    // Writer pixels use the configured local vision role, not the decision endpoint's capability.
+    loadBundle: q => loadImageBundle(out, q, decisionImageLimit(settings), options.loadImageBlob),
+    writerCanSeeImages: Boolean(localProviderFor(settings, 'vision')),
   });
   // #57 Part A — the same local generative pass proposes sample answers + rubrics for keyless tashrihi items.
   const imageLimit = decisionImageLimit(settings);
   const multimodal = decideIsMultimodal(settings, resolveDecisionProvider(settings) || undefined);
   const loadBundle = (q: Question) => loadImageBundle(out, q, imageLimit, options.loadImageBlob);
   options.onEvent?.({ kind: 'phase', message: 'sample answers & rubrics' });
-  const tashrihiNotes = await generatePackageTashrihi(out, settings, { caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal, loadBundle: multimodal ? loadBundle : undefined, ...(stream ? { onStream: options.onStream } : {}) });
+  const tashrihiNotes = await generatePackageTashrihi(out, settings, { caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal, loadBundle, ...(stream ? { onStream: options.onStream } : {}) });
   // #58 Part A — keyless OPTIONLESS blanks get a review-only candidate in the same small batch.
   const candidateNotes = await generateFillBlankCandidates(out, settings, { caller: options.explanationCaller, onProgress: options.onProgress, onJournal: options.onJournal });
   options.onEvent?.({ kind: 'phase', message: 'decision checks' });
@@ -96,18 +94,19 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
     + (proposalText(question) || executableAnswerText(question) ? 1 : 0)
     + (question.explanation ? 1 : 0)
     + (question.images?.length || 0), 0);
-  let failures = 0; let calls = 0; let consecutiveErrors = 0;
+  let failures = 0; let calls = 0; let startedCalls = 0; let consecutiveErrors = 0;
   const flag = (q: Question, code: string, message: string) => { out.flags.push({ id: `enrichment_${q.id}_${code}`, code: 'PACKAGE_ENRICHMENT', severity: 'warn', questionId: q.id, message, rootCauseId: `enrichment_${q.id}_${code}` }); };
   out.flags = out.flags.filter(f => f.code !== 'PACKAGE_ENRICHMENT');
   const decide = async (q: Question, name: string, instructions: string, input: Record<string, unknown>, choices?: Record<string, string>, images?: LoopDecisionItem['images']): Promise<LoopDecisionVote | undefined> => {
     if (consecutiveErrors >= 5) return undefined;
     const item: LoopDecisionItem = { id: `${q.id}::${name}`, name: `${q.id} ${name}`, type: name === 'difficulty' ? 'difficulty' : 'complete', questionNumbers: [q.no], instructions, input, ...(choices ? { choices: Object.keys(choices), choiceDescriptions: choices } : {}), ...(images ? { images } : {}) };
     const body = provider.decideDialect === 'thx' ? buildThxDecisionBody(item, provider.model, buildLoopDecisionState(item)) : { input: { exam: doc.fileHash.slice(0, 12), purpose: 'package enrichment' }, questions: [{ name: item.id, type: name === 'difficulty' ? 'score' : choices ? 'choice' : 'probability', instructions, input, ...(name === 'difficulty' ? { criteria: [...DIFFICULTY_LEVELS] } : {}), ...(choices ? { choices: Object.keys(choices), choiceDescriptions: choices } : {}), ...(images ? { images } : {}) }] };
-    options.onProgress?.(`Q${q.label || q.no} · ${name}`); calls++;
-    if (calls > planned) planned = calls;
-    options.onEvent?.({ kind: 'call', completed: calls, planned, label: `Q${q.label || q.no}`, check: name });
+    options.onProgress?.(`Q${q.label || q.no} · ${name}`); startedCalls++;
+    if (startedCalls > planned) planned = startedCalls;
     try {
-      const response = await caller(body); consecutiveErrors = 0; const row = response.results.find(r => r.name === item.id || r.name === item.name);
+      const response = await caller(body); consecutiveErrors = 0; calls++;
+      options.onEvent?.({ kind: 'call', completed: calls, planned, label: `Q${q.label || q.no}`, check: name });
+      const row = response.results.find(r => r.name === item.id || r.name === item.name);
       if (!row || !valid(row.probability)) { failures++; options.onEvent?.({ kind: 'skip', completed: calls, planned, label: `Q${q.label || q.no}`, check: name, message: 'the checker returned no usable verdict' }); return undefined; }
       let choice = row.choice, probability = row.probability;
       if (choices && row.distribution) {
@@ -117,7 +116,7 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       if (choices && (!choice || !(choice in choices))) { failures++; return undefined; }
       try { await options.onJournal?.({ label: `Package enrichment · ${name}`, rawText: JSON.stringify(response.results), requestText: JSON.stringify(body) }); } catch { /* journal best effort */ }
       return { probability, choice, distribution: row.distribution };
-    } catch { failures++; consecutiveErrors++; notes.add('Some decision requests failed; those estimates are unjudged.'); options.onEvent?.({ kind: 'error', completed: calls, planned, label: `Q${q.label || q.no}`, check: name, message: 'decision request failed; this estimate is unjudged' }); if (consecutiveErrors === 5) notes.add('Decision endpoint unreachable — remaining checks were not run.'); return undefined; }
+    } catch { failures++; consecutiveErrors++; calls++; options.onEvent?.({ kind: 'error', completed: calls, planned, label: `Q${q.label || q.no}`, check: name, message: 'decision request failed; this estimate is unjudged' }); notes.add('Some decision requests failed; those estimates are unjudged.'); if (consecutiveErrors === 5) notes.add('Decision endpoint unreachable — remaining checks were not run.'); return undefined; }
   };
   for (const q of out.questions) {
     // The generative pass may already have stored review-only candidates; they survive the reset.
@@ -125,14 +124,14 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
     const e: QuestionEnrichment = { source: 'model', verification: 'unjudged', origin: 'unknown', ...(q.enrichment?.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}), ...(earlierProposal ? { proposedAnswer: earlierProposal } : {}) };
     q.enrichment = e;
     const passage = out.passages?.find(p => p.id === q.passageId);
-    const input = { question: { number: q.no, label: q.label, type: q.type, stem: q.stem, options: (q.options || []).map(o => ({ key: o.key, text: o.text })) }, ...(passage ? { passageText: passage.text } : {}), ...((typeof q.imported?.transcript === 'string' && q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && q.imported.script.trim()) ? { listeningScript: q.imported?.transcript?.trim() || q.imported?.script?.trim() } : {}) };
+    const input = { question: { number: q.no, label: q.label, type: q.type, stem: q.stem, options: (q.options || []).map(o => ({ key: o.key, text: o.text })) }, ...(instructionTextFor(out, q) ? { instructions: instructionTextFor(out, q) } : {}), ...(passage ? { passageText: passage.text } : {}), ...((typeof q.imported?.transcript === 'string' && q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && q.imported.script.trim()) ? { listeningScript: q.imported?.transcript?.trim() || q.imported?.script?.trim() } : {}) };
     const listening = isPackageListeningQuestion(q, out.sections.find(s => s.id === q.sectionId)?.title) && !(/\b(?:listening script|transcript)\s*:/i.test(`${passage?.text || ''} ${q.stem || ''}`) || (typeof q.imported?.transcript === 'string' && !!q.imported.transcript.trim()) || (typeof q.imported?.script === 'string' && !!q.imported.script.trim()));
     // #58 Part C — ONE addressed bundle per question, respecting the endpoint's real image limit.
     // Missing/over-limit evidence leaves the affected visual checks unjudged; nothing is split,
     // sent elsewhere, or guessed from a caption.
     const bundle = multimodal && q.images.length ? await loadImageBundle(out, q, imageLimit, options.loadImageBlob) : undefined;
     const payloads: NonNullable<LoopDecisionItem['images']> = bundle?.complete ? bundle.payloads : [];
-    const visualMissing = Boolean(bundle && !bundle.complete) || (/\b(?:picture|image|photo|illustration)\b/i.test(q.stem || '') && !q.images.length);
+    const visualMissing = (q.images.length > 0 && (!multimodal || !bundle?.complete)) || (/\b(?:picture|image|photo|illustration)\b/i.test(q.stem || '') && !q.images.length);
     if (listening) notes.add('Listening answer checks without an included script are unjudged.');
     if (bundle && !bundle.complete && bundle.reason) evidenceNotes.add(bundle.reason);
     else if (visualMissing) evidenceNotes.add('Image-dependent judgments were unjudged because pixels or a multimodal decision endpoint were unavailable.');
@@ -152,7 +151,7 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       } else if (answer && !opts.length) {
         const vote = await decide(q, 'answer', `The answer '${answer}' is a correct answer to this question.`, input, undefined, payloads);
         if (vote) { e.verificationProbability = vote.probability; e.verification = vote.probability >= .8 ? 'verified' : vote.probability <= .2 ? 'disagreed' : 'uncertain'; if (e.verification === 'disagreed') flag(q, 'answer', 'The checker disagrees with the answer key.'); }
-      } else if (!q.answer?.text?.trim() && opts.length >= 2 && AUTO_GRADED_TYPES.has(q.type)) {
+      } else if (!hasSourceKey(q) && opts.length >= 2 && AUTO_GRADED_TYPES.has(q.type)) {
         // #57 Part B — propose, never execute. The checker may name a candidate for a keyless
         // auto-graded item, but the proposal lives ONLY in enrichment.proposedAnswer: it is never
         // written to answer / answer_key / any executable grading field. Adoption is a teacher
@@ -171,8 +170,8 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       }
     }
     if (q.explanation && !listening && !visualMissing) {
-      const check = await decide(q, 'explanation-check', 'This explanation correctly explains why the marked answer is correct.', { ...input, key: explanationKey(q), explanation: q.explanation.text });
-      e.explanationCheck = check ? { probability: check.probability, state: check.probability >= .8 ? 'verified' : check.probability <= .2 ? 'rejected' : 'uncertain' } : { state: 'unjudged' };
+      const check = await decide(q, 'explanation-check', 'This explanation correctly explains why the marked answer is correct.', { ...input, key: explanationKey(q), explanation: q.explanation.text }, undefined, payloads);
+      e.explanationCheck = check ? { probability: check.probability, state: check.probability >= .8 ? 'verified' : check.probability <= .2 ? 'rejected' : 'uncertain', evidence: explanationFingerprint(out, q, q.explanation.text) } : { state: 'unjudged' };
     }
     if (q.explanation && (listening || visualMissing)) e.explanationCheck = { state: 'unjudged' };
     // #57 Part A — the decision judge grades each model artifact with its single clause and
@@ -185,11 +184,11 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
     if (q.sampleAnswer?.source === 'model') {
       if (evidenceComplete) {
         const check = await decide(q, 'sample-answer-check', SAMPLE_ANSWER_JUDGE, { ...input, sampleAnswer: q.sampleAnswer.text }, undefined, payloads);
-        if (check) { q.sampleAnswer.probability = check.probability; q.sampleAnswer.judged = judgeState(check.probability); q.sampleAnswer.evidence = evidenceFingerprint(out, q); }
+        if (check) { q.sampleAnswer.probability = check.probability; q.sampleAnswer.judged = judgeState(check.probability); q.sampleAnswer.evidence = sampleFingerprint(out, q, q.sampleAnswer.text); }
       } else q.sampleAnswer.judged = 'unjudged';
     }
     if (q.rubric?.source === 'model') {
-      if (evidenceComplete) {
+      if (evidenceComplete && validateRubric(q.rubric.criteria, q.points).ok) {
         const check = await decide(q, 'rubric-check', RUBRIC_JUDGE, { ...input, rubric: q.rubric.criteria, points: typeof q.points === 'number' ? q.points : null }, undefined, payloads);
         if (check) { q.rubric.probability = check.probability; q.rubric.judged = judgeState(check.probability); q.rubric.evidence = rubricFingerprint(out, q, q.rubric.criteria); }
       } else q.rubric.judged = 'unjudged';
@@ -300,6 +299,8 @@ export async function enrichPackage(doc: ExamDoc, settings: AppSettings, options
       for (const member of out.questions.filter(item => item.passageId === passage.id)) {
         // Individual abstention only: a confident individual hint or a teacher lesson is never overridden.
         if (member.enrichment?.teacherLesson || member.curriculumHints?.lesson) continue;
+        const individual = Object.entries(member.enrichment?.lessonDistribution || {}).sort((a, b) => b[1] - a[1]);
+        if (individual[0]?.[0] === OUTSIDE && individual[0][1] >= .5 && individual[0][1] - (individual[1]?.[1] || 0) >= .15) continue;
         if (!member.enrichment?.lessonDistribution) continue;
         member.curriculumHints = hintsForLesson(selected);
         member.curriculumSource = 'inherited';

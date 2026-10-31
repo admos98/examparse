@@ -8,6 +8,7 @@ import { exportSafeQuestion } from './explanationVisibility';
 import { exportIdentity } from '../pipeline/identity';
 import { stripCredentialFields } from './validation';
 import { buildParseReport, type ParseReport } from '../pipeline/provenance';
+import { migrateLegacyAiAnswers } from './bankAnswers';
 
 /** 2F exam-level Parse report — shared by Step 5 and the JSON export receipt (no secrets). */
 export function parseReportForDoc(doc: ExamDoc): ParseReport {
@@ -49,6 +50,9 @@ export function parseReportForDoc(doc: ExamDoc): ParseReport {
 
 /** Build the clean export payload: strips heavy inline binary dataUrls while keeping resolvable image references and explicit export metadata. */
 export function buildExportDoc(doc: ExamDoc): any {
+  // Normalize legacy AI-as-answer documents before every structured preview/export boundary.
+  // Clone first so exporting does not mutate the editor's in-memory document.
+  doc = migrateLegacyAiAnswers(structuredClone(doc));
   const cleanImages = (doc.images || []).map(img => {
     const { dataUrl, _blob, ...rest } = img as any;
     const ext = ((img.mime || 'image/jpeg').split('/')[1] || 'jpg').replace('jpeg', 'jpg');

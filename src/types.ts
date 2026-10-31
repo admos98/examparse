@@ -151,7 +151,8 @@ export interface Question {
 /** #57 Part A — one rubric criterion in the Appendix-A bank shape. */
 export interface RubricCriterion {
   criterion: string;
-  maxPoints: number;
+  /** Absent means retained text-only/unpriced proposal; never a scored rubric. */
+  maxPoints?: number;
 }
 
 export interface QuestionEnrichment {
@@ -171,7 +172,7 @@ export interface QuestionEnrichment {
     check?: { state: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; probability?: number; evidence?: string };
   };
   difficultyUncertain?: boolean;
-  explanationCheck?: { state: 'verified' | 'rejected' | 'uncertain' | 'unjudged'; probability?: number };
+  explanationCheck?: { state: 'verified' | 'rejected' | 'uncertain' | 'unjudged'; probability?: number; evidence?: string };
   completeness?: { probability: number };
   lessons?: Array<{ lesson: string; probability: number }>;
   lessonDistribution?: Record<string, number>;
@@ -316,6 +317,7 @@ export interface ExamDoc {
     packageBatchId?: string;
     /** #58 — part folders of a multipart native export (>50 questions) merged into this one exam. */
     packageParts?: string[];
+    packageMultipartStatus?: 'complete' | 'partial-unverified';
     packageJsonHash?: string;
     packageBatchImport?: boolean;
     packageDataset?: string;

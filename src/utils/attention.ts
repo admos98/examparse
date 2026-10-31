@@ -9,6 +9,9 @@
  */
 import type { ExamDoc, Flag, ImageAsset, Question } from '../types';
 import { plainDecisionSentence } from '../pipeline/localLoop';
+import { AUTO_GRADED_TYPES, DESCRIPTIVE_TYPES, executableAnswerText, hasSourceKey } from './bankAnswers';
+import { hasTeacherRubric, needsAnswerKeyReview } from './explanationVisibility';
+import { artifactState, enrichmentIsCurrent, evidenceFingerprint, explanationState, rubricFingerprint } from '../pipeline/evidence';
 
 export type AttentionKind =
   | 'answer-missing' | 'answer-conflict' | 'stem-hollow' | 'options-missing'
@@ -16,7 +19,9 @@ export type AttentionKind =
   | 'read-failed' | 'audit-catch' | 'loop-verdict' | 'loop-note'
   /** #57 Part D — enrichment-derived kinds (packages): uncertains, rejected explanations,
    * tashrihi awaiting confirmation, and auto-graded items with no key (with/without proposal). */
-  | 'answer-uncertain' | 'explanation-rejected' | 'tashrihi-unconfirmed' | 'keyless-auto';
+  | 'answer-uncertain' | 'explanation-rejected' | 'tashrihi-unconfirmed' | 'keyless-auto'
+  /** #58 — a stored model verdict no longer matches the evidence it was produced from. */
+  | 'checks-stale';
 
 export interface AttentionAction {
   /** 'question' scrolls to + expands that card; 'image-tray' opens the tray; 'page-retry' re-reads one failed page; 'source-page' opens that page in Source. */
@@ -56,10 +61,47 @@ const labelOf = (question: Question | undefined, fallback = 'This question'): st
 
 /** #57 Part B/D — a package keyless auto-graded item (with or without a checker proposal). */
 export function isKeylessAutoGraded(doc: Pick<ExamDoc, 'questions'>, question: Question): boolean {
-  if (question.type !== 'mcq' && question.type !== 'fillblank' && question.type !== 'matching') return false;
-  if (question.answer?.text?.trim()) return false;
+  // #58 — true/false is auto-graded too; a legacy AI value is a proposal, not a key.
+  if (!AUTO_GRADED_TYPES.has(question.type)) return false;
+  if (hasSourceKey(question)) return false;
   if (question.type === 'matching' && !(question.options || []).length) return false;
   return !doc.questions.some(item => item.parentId === question.id);
+}
+
+/** #58 — descriptive item whose rubric has not actually been teacher-confirmed. */
+export function needsTashrihiConfirmation(question: Question): boolean {
+  return DESCRIPTIVE_TYPES.has(question.type) && !executableAnswerText(question) && !hasTeacherRubric(question);
+}
+
+/**
+ * #58 Part E — "quiet" is not the same as "verified". An item is only `verified` when every
+ * applicable required check actually passed against the current evidence; teacher work is
+ * `teacher-confirmed`; anything unjudged/partial/stale is `unchecked`.
+ */
+export type QuietState = 'verified' | 'teacher-confirmed' | 'unchecked';
+export function quietState(doc: ExamDoc, question: Question): QuietState {
+  const enrichment = question.enrichment;
+  const keylessAuto = isKeylessAutoGraded(doc, question);
+  if (keylessAuto) return 'unchecked';
+  if (needsTashrihiConfirmation(question)) return 'unchecked';
+  const teacherWork = Boolean(question.rubric?.source === 'teacher' || question.sampleAnswer?.source === 'teacher' || question.enrichment?.teacherLesson || (question.answer?.source === 'manual' && executableAnswerText(question)));
+  if (enrichment && !enrichmentIsCurrent(doc, question) && (enrichment.verification !== 'unjudged' || enrichment.explanationCheck)) return 'unchecked';
+  if (enrichment?.verification === 'disagreed' || enrichment?.verification === 'uncertain') return 'unchecked';
+  if (explanationState(doc, question) === 'rejected' || explanationState(doc, question) === 'uncertain' || explanationState(doc, question) === 'stale') return 'unchecked';
+  if (question.sampleAnswer?.source === 'model' && artifactState(doc, question, question.sampleAnswer) !== 'verified') return 'unchecked';
+  if (question.rubric?.source === 'model' && artifactState(doc, question, question.rubric as { judged?: 'verified'; evidence?: string }, rubricFingerprint(doc, question, question.rubric.criteria)) !== 'verified') return 'unchecked';
+  if ((question.enrichment?.imagePlacement || []).some(placement => placement.state !== 'verified')) return 'unchecked';
+  if (teacherWork) return 'teacher-confirmed';
+  // A model check that actually ran and passed is verified; a question no check ever reached is not.
+  const attested = enrichment?.verification === 'verified'
+    || (question.explanation ? explanationState(doc, question) === 'verified' : false)
+    || (enrichment?.imagePlacement || []).some(placement => placement.state === 'verified');
+  return attested ? 'verified' : 'unchecked';
+}
+
+/** True only when every applicable required check passed (never for unchecked items). */
+export function questionVerified(doc: ExamDoc, question: Question): boolean {
+  return quietState(doc, question) === 'verified';
 }
 
 function questionItem(params: {
@@ -139,7 +181,7 @@ function budgetExhaustedReadPages(doc: ExamDoc): Set<number> {
  * keyless items, image mismatches, rejected explanations, then everything else. */
 const KIND_PRIORITY: AttentionKind[] = [
   'answer-conflict', 'audit-catch', 'answer-uncertain',
-  'keyless-auto', 'tashrihi-unconfirmed',
+  'keyless-auto', 'tashrihi-unconfirmed', 'checks-stale',
   'image-suspect', 'image-unplaced',
   'explanation-rejected',
   'answer-missing', 'stem-hollow', 'options-missing',
@@ -229,6 +271,9 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
     // keyless auto-graded items as keyless-auto, tashrihi items once a sample/rubric exists.
     if (doc.source?.kind === 'package') {
       if (isKeylessAutoGraded(doc, question)) continue;
+      // #58 — a descriptive item is represented by its tashrihi row until the teacher confirms
+      // a real rubric (not merely because some model artifact exists).
+      if (needsTashrihiConfirmation(question)) continue;
       if (question.sampleAnswer || question.rubric) continue;
     }
     if (question.type === 'essay' || question.type === 'long') {
@@ -433,6 +478,16 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
             : `${labelOf(question)} has no answer key — enter one (the checker has no proposal).`,
           actionLabel: 'Go', severity: 'warn' }));
       }
+      // Tashrihi state is derived from the saved artifacts, so an import-only package (never
+      // enriched) still lists its keyless descriptive items.
+      if (needsTashrihiConfirmation(question)) {
+        const proposed = question.sampleAnswer?.source === 'model' || question.rubric?.source === 'model';
+        items.push(questionItem({ kind: 'tashrihi-unconfirmed', rootCauseId: `question_${question.id}`, question,
+          sentence: proposed
+            ? `${labelOf(question)}: model sample + rubric proposed — confirm or edit.`
+            : `${labelOf(question)}: no teacher-confirmed rubric yet — write or confirm one.`,
+          actionLabel: 'Confirm', severity: 'warn' }));
+      }
       if (!enrichment) continue;
       if (enrichment.verification === 'uncertain') {
         items.push(questionItem({ kind: 'answer-uncertain', rootCauseId: `question_${question.id}`, question,
@@ -442,9 +497,24 @@ export function computeAttention(doc: ExamDoc): AttentionItem[] {
         items.push(questionItem({ kind: 'explanation-rejected', rootCauseId: `question_${question.id}`, question,
           sentence: `${labelOf(question)}'s model explanation was rejected by the checker — rewrite or remove it.`, actionLabel: 'Go', severity: 'warn' }));
       }
-      if (question.sampleAnswer?.source === 'model' || question.rubric?.source === 'model') {
-        items.push(questionItem({ kind: 'tashrihi-unconfirmed', rootCauseId: `question_${question.id}`, question,
-          sentence: `${labelOf(question)}: model sample + rubric proposed — confirm or edit.`, actionLabel: 'Confirm', severity: 'warn' }));
+      // #58 — a verdict produced from different evidence is not a verdict about this question.
+      const staleModelCheck = (question.sampleAnswer?.source === 'model' && artifactState(doc, question, question.sampleAnswer) === 'stale')
+        || (question.rubric?.source === 'model' && question.rubric.criteria?.length && artifactState(doc, question, question.rubric as { judged?: 'verified'; evidence?: string }, rubricFingerprint(doc, question, question.rubric.criteria)) === 'stale')
+        || (question.enrichment?.evidence && question.enrichment.evidence !== evidenceFingerprint(doc, question));
+      if (staleModelCheck) {
+        items.push(questionItem({ kind: 'checks-stale', rootCauseId: `question_${question.id}`, question,
+          sentence: `${labelOf(question)} changed after it was checked — re-run the checks; the old verdicts are not reused.`, actionLabel: 'Go', severity: 'warn' }));
+      }
+      // #58 — a picture check that was skipped or stayed doubtful is actionable, not quiet.
+      for (const placement of question.enrichment?.imagePlacement || []) {
+        if (placement.state === 'verified') continue;
+        const image = doc.images?.find(candidate => candidate.id === placement.imageId);
+        if (!image) continue;
+        items.push(questionItem({ kind: 'image-suspect', rootCauseId: `question_${question.id}_${placement.imageId}`, question,
+          sentence: placement.state === 'disagreed'
+            ? `${labelOf(question)}: the checker thinks this picture belongs elsewhere — confirm its pairing.`
+            : `${labelOf(question)}: this picture could not be checked (${placement.state === 'skipped-no-evidence' ? 'no usable picture evidence' : 'an unsure verdict'}) — confirm its pairing.`,
+          actionLabel: 'Confirm', severity: 'warn' }));
       }
     }
   }

@@ -48,3 +48,48 @@ export function repairTruncatedJson(rawText: string): unknown | null {
   }
   return null;
 }
+
+/**
+ * #58 — nested-aware salvage for a truncated batch of question objects.
+ *
+ * The old flat `/\{[^{}]*\}/g` cannot recover a complete question object that contains a nested
+ * rubric object. This scanner tracks string/escape state and brace depth, so every COMPLETE
+ * top-level object is recovered; a partially written object is never guessed. A truncated envelope
+ * is first attempted with the existing prefix repair.
+ */
+export function salvageJsonObjects(rawText: string): any[] {
+  if (!rawText?.trim()) return [];
+  const repaired = repairTruncatedJson(rawText);
+  if (repaired && typeof repaired === 'object') {
+    const envelope = repaired as { corrections?: unknown };
+    if (Array.isArray(envelope.corrections)) return envelope.corrections;
+    if (Array.isArray(repaired)) return repaired;
+  }
+  const out: any[] = [];
+  let depth = 0, start = -1, quoted = false, escaped = false;
+  for (let i = 0; i < rawText.length; i++) {
+    const c = rawText[i];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') quoted = false;
+      continue;
+    }
+    if (c === '"') { quoted = true; continue; }
+    if (c === '{') { if (depth === 0) start = i; depth++; continue; }
+    if (c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const slice = rawText.slice(start, i + 1);
+        try {
+          const value = JSON.parse(slice);
+          // Skip the response envelope; keep per-question rows.
+          if (!(value && typeof value === 'object' && Array.isArray((value as { corrections?: unknown }).corrections) && Object.keys(value).length === 1)) out.push(value);
+        } catch { /* incomplete or malformed object */ }
+        start = -1;
+      }
+      if (depth < 0) depth = 0;
+    }
+  }
+  return out;
+}

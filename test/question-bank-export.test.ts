@@ -39,7 +39,13 @@ test('batch follows Appendix A, deduplicates and verifies binary assets, and nev
  assert.equal(second.answer_key, undefined); assert.equal(third.answer_key, undefined);
  assert.deepEqual(result.report.needs_answer_key.map(x => x.question), ['Q2','Q3']);
  assert.equal(result.report.asset_count, 1); assert.equal(result.report.total_bytes, png.length);
- assert.deepEqual(result.report.image_options, ['Q3']); assert.match(third.options![0].text, /Image option/);
+ // #58 — a picture option is never faked as a text option: the option text stays the printed
+ // text, the asset ships, and the question carries an explicit unsupported-option-image state.
+ assert.deepEqual(result.report.image_options, ['Q3']);
+ assert.equal(third.options![0].text, 'cat');
+ assert.deepEqual(third.unsupported_option_images, ['1']);
+ assert.ok(third.tags.includes('option_image_unsupported'));
+ assert.ok(result.report.contract.pending.some(entry => entry.kind === 'picture-option'));
  // #57 Part A — essay/paragraph/writing travel as bank long_answer; short_answer stays short_answer.
  assert.equal(fourth.type, 'long_answer'); assert.equal(fourth.points, null);
  assert.equal(result.report.images_placed, 1); assert.equal(result.report.image_references, 2);
@@ -53,7 +59,7 @@ test('batch follows Appendix A, deduplicates and verifies binary assets, and nev
  assert.equal(manifest.format, 'appendix-a-assets/1.1');
  assert.equal(manifest.assets.length, 1);
  assert.equal(manifest.assets[0].id, hash);
- assert.deepEqual(manifest.assets[0].used_by.sort(), ['i1', 'i2']);
+ assert.deepEqual(manifest.assets[0].used_by.sort(), ['i1', 'i2', 'i3']);
  assert.ok(manifest.assets.every((a: any) => a.file === `assets/${hash}.png` && a.sha256 === hash && a.mime === 'image/png' && a.bytes === png.length));
  assert.deepEqual(JSON.parse(await zip.file(`${root}/export-report.json`)!.async('string')), result.report);
  assert.deepEqual(JSON.parse(await zip.file(`${root}/batch.json`)!.async('string')), result.batch);
@@ -61,26 +67,35 @@ test('batch follows Appendix A, deduplicates and verifies binary assets, and nev
  assert.notEqual(result.batch.batch_id, secondExport.batch.batch_id); assert.equal(secondExport.batch.questions[0].difficulty, undefined);
 });
 
-test('#57 missing images export with explicit missing-asset markers and official refs cannot be blank', async () => {
- await assert.rejects(() => createQuestionBankExport(doc(), { sourceDataset: 'dataset', sourceRef: '' }, async () => new Blob([png])), /source reference/);
+test('#57/#58 missing images export with explicit missing-asset markers and explicit official refs cannot be blank', async () => {
+ // #58 — official provenance is explicit, never inferred from a title.
+ const official = doc(); (official.meta as any).official = true;
+ await assert.rejects(() => createQuestionBankExport(official, { sourceDataset: 'dataset', sourceRef: '' }, async () => new Blob([png])), /source reference/);
+ const titled = doc();
+ assert.equal((await createQuestionBankExport(titled, { sourceDataset: 'dataset' }, async () => new Blob([png]))).batch.questions[0].provenance.source_type, 'authored', 'a title never turns a paper official');
  // #57 Part C — unavailable pixels never fail the export and never leave a silent token.
  const result = await createQuestionBankExport(doc(), { sourceDataset: 'dataset' }, async () => undefined);
  assert.deepEqual(result.report.missing_assets.map(entry => entry.image), ['i1', 'i2']);
  assert.equal(result.report.images_placed, 0);
  assert.equal(result.report.image_references, 2);
- assert.ok(result.report.notes.some(note => /missing-asset marker/.test(note)));
- const first = result.batch.questions[0].stem_blocks!.filter(block => block.t === 'img');
- assert.ok(first.length > 0 && first.every(block => block.t === 'img' && block.asset.startsWith('missing:i')));
+ assert.ok(result.report.notes.some(note => /retained in metadata/.test(note)));
+ // #58 — an unresolved reference is retained as metadata, never rendered as a student image block.
+ assert.equal(result.batch.questions.slice(0, 2).flatMap(row => row.stem_blocks || []).filter(block => block.t === 'img').length, 0, 'no broken image block reaches the student content');
+ assert.deepEqual(result.batch.questions[0].unresolved_placeholders?.map(entry => entry.asset), ['i1']);
+ assert.deepEqual(result.batch.questions[1].unresolved_placeholders?.map(entry => entry.asset), ['i2']);
  const zip = await JSZip.loadAsync(result.zip);
  const batchText = await zip.file(`${result.filename.replace(/\.zip$/, '')}/batch.json`)!.async('string');
  assert.doesNotMatch(batchText, /img_[0-9a-f]{16,}/i, 'no placeholder token ever appears in an export');
 });
 
-test('answer audit uncertainty prevents exporting a key', async () => {
+test('#58 an uncertain audit adds review attention but never erases a genuine source answer', async () => {
  const exam = doc(); exam.questions = [q(1, { answer: { source: 'paper', text: 'a' } })]; exam.images = [];
  exam.loop = { auditVerdicts: [{ id:'a', kind:'answer-correct', source:'decision', questionNumbers:[1], probability: .5, message:'' }] } as any;
  const result = await createQuestionBankExport(exam, { sourceDataset: 'dataset' });
- assert.equal(result.batch.questions[0].answer_key, undefined); assert.equal(result.report.needs_answer_key.length, 1);
+ // The source key survives (a judge estimate is not proof), and the row is flagged for review.
+ assert.deepEqual(result.batch.questions[0].answer_key, { correct: ['1'], grading: 'auto' });
+ assert.ok(result.batch.questions[0].tags.includes('answer_key_needs_review'));
+ assert.equal(result.report.needs_answer_key.length, 0);
 });
 
 test('export-time tagging uses keyword first and only asks choices for ambiguous active questions', async () => {

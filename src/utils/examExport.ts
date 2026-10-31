@@ -64,7 +64,7 @@ export function buildExportDoc(doc: ExamDoc): any {
   return stripCredentialFields({
     ...doc,
     meta: { ...doc.meta, ...exportIdentity(doc.meta.grade, doc.meta.subject) },
-    questions: doc.questions.map(exportSafeQuestion),
+    questions: doc.questions.map(question => exportSafeQuestion(question, doc)),
     exportMeta: {
       binariesStripped: true,
       imageMode: 'folder-blob-reference',

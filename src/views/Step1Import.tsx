@@ -38,6 +38,7 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
   const [batchMessage, setBatchMessage] = useState('');
   // #58 Part F — a bounded live log for the parent-folder chain (exam i/N, calls, errors/skips).
   const [batchLog, setBatchLog] = useState<string[]>([]);
+  const [batchLive, setBatchLive] = useState('');
   const pushBatchLog = (message: string) => setBatchLog(previous => [...previous.slice(-160), message]);
   const [dragOver, setDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -112,7 +113,7 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
     try {
       const summaries = await listExamSummaries();
       const existing = (await Promise.all(summaries.map(s => loadExamDoc(s.id)))).filter((d): d is ExamDoc => !!d);
-      setBatchLog([]);
+      setBatchLog([]); setBatchLive('');
       const result = await importPackageFolder(
         files,
         existing,
@@ -125,7 +126,7 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
             else if (event.kind === 'call') pushBatchLog(`· check ${event.completed} of ~${event.planned} (estimate) · ${event.label} · ${event.check}`);
             else if (event.kind === 'error' || event.kind === 'skip') pushBatchLog(`· ${event.kind}: ${event.label || ''} ${event.check || ''} ${event.message || ''}`.trim());
           },
-          onStream: undefined,
+          onStream: text => setBatchLive(text.slice(-4000)),
           onJournal: entry => appendJournalCall(`package-enrichment:${doc.fileHash}`, { ...entry, ts: new Date().toISOString(), complete: true }),
         }),
       );
@@ -341,9 +342,9 @@ export const Step1Import: React.FC<Props> = ({ onDocumentLoaded, onDemoLoaded, o
 
       <label className="flex items-center gap-2 text-sm"><input type="checkbox" disabled={batchRunning} checked={importOnly} onChange={e => setImportOnly(e.target.checked)} /> Import only, don’t enrich</label>
       {batchMessage && <div role="status" className="whitespace-pre-line text-sm">{batchMessage}</div>}
-      {batchLog.length > 0 && <details open={batchRunning} className="rounded border border-[var(--rule)] p-2 text-xs" data-batch-live="true">
+      {(batchLog.length > 0 || batchLive) && <details open={batchRunning} className="rounded border border-[var(--rule)] p-2 text-xs" data-batch-live="true">
         <summary className="cursor-pointer font-semibold">Live run log ({batchLog.length})</summary>
-        <pre aria-live="polite" className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words">{batchLog.join('\n')}</pre>
+        <pre aria-live="polite" className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words">{batchLog.join('\n')}{batchLive ? `\n\nLive model output (same request):\n${batchLive}` : ''}</pre>
       </details>}
 
       {/* Secondary Options Grid */}

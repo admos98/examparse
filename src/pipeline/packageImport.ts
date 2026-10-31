@@ -83,41 +83,67 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
   let raw = '';
   let batch: any;
   let parts: string[] = [];
+  let multipartStatus: 'complete' | 'partial-unverified' | undefined;
   if (partJsons.length) {
     const numbers = partJsons.map(entry => entry.part);
+    if (new Set(numbers).size !== numbers.length) throw new Error('Multipart package contains duplicate part indices.');
+    if (numbers.some(number => !Number.isInteger(number) || number < 1)) throw new Error('Multipart package part indices must be positive integers.');
     const expected = Math.max(...numbers);
     const missing = Array.from({ length: expected }, (_, index) => index + 1).filter(number => !numbers.includes(number));
     if (missing.length) throw new Error(`Multipart package is incomplete: missing part ${missing.join(', ')} of ${expected}. Nothing was imported.`);
-    const parsed: any[] = [];
+    const parsed: Array<{ value: any; part: number }> = [];
     for (const entry of partJsons) {
       const text = await entry.file.text();
       let value: any;
       try { value = JSON.parse(text); } catch { throw new Error(`Package part ${entry.part} is not valid JSON.`); }
       if (!value || typeof value.batch_id !== 'string' || !Array.isArray(value.questions) || !value.questions.length) throw new Error(`Package part ${entry.part} needs a batch_id and a nonempty questions array.`);
-      parsed.push(value); raw += text;
+      if (value.part_index != null && Number(value.part_index) !== entry.part) throw new Error(`Package path part-${entry.part} disagrees with declared part_index ${value.part_index}.`);
+      parsed.push({ value, part: entry.part }); raw += text;
     }
-    const baseIds = new Set(parsed.map(value => String(value.batch_id).replace(/-part-\d+$/i, '')));
+    const baseIds = new Set(parsed.map(({ value }) => String(value.batch_id).replace(/-part-\d+$/i, '')));
     if (baseIds.size !== 1) throw new Error('Package parts do not share one batch_id; they are not the same export.');
-    const declared = parsed.map(value => Number(value.part_total ?? value.parts_total)).find(Number.isFinite);
-    if (declared && declared !== expected) {
+    const declaredTotals = parsed.map(({ value }) => value.part_total ?? value.parts_total).filter((value: unknown) => value != null).map(Number);
+    if (declaredTotals.some((total: number) => !Number.isInteger(total) || total < 1) || new Set(declaredTotals).size > 1) throw new Error('Multipart package parts have inconsistent declared totals.');
+    const declared = declaredTotals[0];
+    if (declared != null) {
       const missingDeclared = Array.from({ length: declared }, (_, index) => index + 1).filter(number => !numbers.includes(number));
-      throw new Error(`Multipart package is incomplete: missing part ${missingDeclared.join(', ') || `${expected + 1}–${declared}`} of ${declared} (supplied ${expected}). Nothing was imported.`);
-    }
+      if (missingDeclared.length || numbers.some(number => number > declared)) throw new Error(`Multipart package is incomplete: missing part ${missingDeclared.join(', ') || `${declared + 1} or later`} of ${declared} (supplied ${numbers.length}). Nothing was imported.`);
+      multipartStatus = 'complete';
+    } else multipartStatus = 'partial-unverified'; // Older #57 parts carry no trustworthy total.
     batch = {
-      ...parsed[0],
+      ...parsed[0].value,
       batch_id: [...baseIds][0],
-      questions: parsed.flatMap(value => value.questions),
-      ...(parsed.some(value => Array.isArray(value.sections)) ? { sections: parsed.flatMap(value => Array.isArray(value.sections) ? value.sections : []) } : {}),
+      questions: parsed.flatMap(({ value }) => value.questions),
+      ...(parsed.some(({ value }) => Array.isArray(value.sections)) ? { sections: parsed.flatMap(({ value }) => Array.isArray(value.sections) ? value.sections : []) } : {}),
     };
     parts = partJsons.map(entry => `part-${entry.part}`);
     json = partJsons[0].file;
-  } else {
+    } else {
     json = jsons.find(f => /(^|\/)batch\.json$/i.test(f.webkitRelativePath || f.name)) || (jsons.length === 1 ? jsons[0] : undefined);
     if (!json) throw new Error('Select one package JSON (or batch.json) together with its images.');
     raw = await json.text();
     try { batch = JSON.parse(raw); } catch { throw new Error('Package JSON is invalid.'); }
   }
   if (!batch || typeof batch.batch_id !== 'string' || !Array.isArray(batch.questions) || !batch.questions.length) throw new Error('Package must have a batch_id and a nonempty questions array.');
+  // Read the ExamParse lossless bridge as well as the bank row. It is intentionally keyed by the
+  // complete source label, never by bare numeric question number.
+  let preservedRows: any[] = [];
+  let preservedScripts: any[] = [];
+  const scriptsFile = files.find(file => /(?:^|\/)preserved\/listening-scripts\.json$/i.test(pathOf(file)));
+  if (scriptsFile) {
+    try { const value = JSON.parse(await scriptsFile.text()); if (Array.isArray(value?.scripts)) preservedScripts = value.scripts; } catch { /* optional sidecar */ }
+  }
+  const preservedFile = files.find(file => /(?:^|\/)preserved\/answers\.json$/i.test(pathOf(file)));
+  if (preservedFile) {
+    try {
+      const preserved = JSON.parse(await preservedFile.text());
+      if (Array.isArray(preserved?.questions)) preservedRows = preserved.questions;
+    } catch { /* an invalid optional sidecar must not discard otherwise valid bank rows */ }
+  }
+  const preservedFor = (label: string) => {
+    const matches = preservedRows.filter(row => String(row?.label || '') === label);
+    return matches.length === 1 ? matches[0] : undefined;
+  }
   // Two different batch.json files that are not parts of one export would silently drop questions.
   if (!parts.length) {
     const others = jsons.filter(file => file !== json && /(?:^|\/)batch\.json$/i.test(pathOf(file)));
@@ -207,13 +233,51 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     const leading = stem.length - stem.trimStart().length;
     positions.forEach(p => { p.offset = Math.max(0, p.offset - leading); });
     const key = row.answer_key;
-    const answer = key && Array.isArray(key.correct) && key.correct.length ? { text: key.correct.map(String).join(', '), source: 'paper' as const } : undefined;
+    const importedType = types[String(row.type || '').toLowerCase()] || 'unknown';
+    const rawCorrect = key && Array.isArray(key.correct) ? key.correct.map(String) : [];
+    const bankCorrect = rawCorrect.map((value: string) => {
+      if (['mcq', 'matching', 'multi'].includes(importedType) && Array.isArray(row.options) && /^\d+$/.test(value)) {
+        const index = Number(value) - 1;
+        if (index >= 0 && index < row.options.length) return String(row.options[index].key);
+      }
+      if (importedType === 'truefalse' && !(row.options || []).length) {
+        if (['1', 'true', 't', 'yes'].includes(value.toLowerCase())) return 'True';
+        if (['2', 'false', 'f', 'no'].includes(value.toLowerCase())) return 'False';
+      }
+      return value;
+    });
+    let answer: Question['answer'] = key && !['short', 'long', 'essay'].includes(importedType) && bankCorrect.length ? { text: bankCorrect.join(', '), source: 'paper' as const } : undefined;
     const { stem: _stem, stem_blocks: _blocks, options: _options, ...metadata } = row;
+    const sidecar = preservedFor(explicitLabel || labelFromTitle(title, no));
+    if (sidecar?.source_history) metadata.source_history = sidecar.source_history;
+    if (sidecar?.teacher_answer && typeof sidecar.teacher_answer.text === 'string' && sidecar.teacher_answer.text.trim()) answer = { text: sidecar.teacher_answer.text.trim(), source: 'manual' };
+    const unresolvedForQuestion = unresolvedImageTokens.filter(hit => hit.questionId === `q_${index + 1}`).map(hit => ({ asset: `img_${hit.sha}`, sha: hit.sha, owner: explicitLabel || labelFromTitle(title, no), reason: 'pixels unavailable in package' }));
+    if (unresolvedForQuestion.length) metadata.unresolved_placeholders = unresolvedForQuestion;
+    const sampleRaw = row.sample_answer || row.sampleAnswer || row.answerKey?.sampleAnswer || row.answer_key?.sampleAnswer;
+    const sidecarSample = Array.isArray(sidecar?.descriptive) ? sidecar.descriptive.find((artifact: any) => typeof artifact?.text === 'string') : undefined;
+    let sampleText = typeof sampleRaw === 'string' ? sampleRaw : typeof sampleRaw?.text === 'string' ? sampleRaw.text : sidecarSample?.text;
+    if (!sampleText && ['short', 'long', 'essay'].includes(importedType) && Array.isArray(key?.correct) && key.correct.length === 1) sampleText = String(key.correct[0]);
+    const sampleSourceRaw = typeof sampleRaw === 'object' ? sampleRaw.source || sampleRaw.provenance : undefined;
+    const sampleSource = ['model', 'teacher', 'paper', 'keyfile', 'manual'].includes(sampleSourceRaw) ? sampleSourceRaw : sidecarSample?.source || (sampleText ? 'paper' : undefined);
+    const sampleJudgedRaw = typeof sampleRaw === 'object' ? sampleRaw.judged : sidecarSample?.judged;
+    const sampleJudged = ['verified', 'uncertain', 'rejected', 'unjudged'].includes(sampleJudgedRaw) ? sampleJudgedRaw : 'unjudged';
+    const rubricRaw = row.rubric || row.rubrics || row.answerKey?.rubric;
+    const sidecarRubric = Array.isArray(sidecar?.descriptive) ? sidecar.descriptive.find((artifact: any) => Array.isArray(artifact?.criteria)) : undefined;
+    const rubricCriteria = Array.isArray(rubricRaw?.criteria) ? rubricRaw.criteria : sidecarRubric?.criteria;
+    const rubricSourceRaw = rubricRaw?.sourceProvenance || rubricRaw?.source || sidecarRubric?.source;
+    const rubricSource = ['model', 'teacher', 'paper', 'keyfile', 'manual'].includes(rubricSourceRaw) ? rubricSourceRaw : undefined;
+    const rubricJudgedRaw = rubricRaw?.judged || sidecarRubric?.judged;
+    const rubricJudged = ['verified', 'uncertain', 'rejected', 'unjudged'].includes(rubricJudgedRaw) ? rubricJudgedRaw : 'unjudged';
+    const preservedTags = Array.isArray(row.tags) ? row.tags : Array.isArray(sidecar?.review_tags) ? sidecar.review_tags : [];
     const scriptRef = originalStem.match(/[^.\n]*(?:listening|transcript)[^\n]*?\.md[^\n]*/i)?.[0]?.trim();
     if (scriptRef) metadata.provenance = { ...(metadata.provenance || {}), source_ref: [metadata.provenance?.source_ref, scriptRef].filter(Boolean).join(' — ') };
-    questions.push({ id: `q_${index + 1}`, no, label: explicitLabel || labelFromTitle(title, no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: types[String(row.type || '').toLowerCase()] || 'unknown',
+    questions.push({ id: `q_${index + 1}`, no, label: explicitLabel || labelFromTitle(title, no), sectionId: sections[sections.length - 1].id, spans: [], stem: stem.trim(), type: importedType,
       options: Array.isArray(row.options) ? row.options.map((o: any) => ({ key: String(o.key), text: String(o.text ?? ''), spans: [] })) : [],
-      ...(answer ? { answer } : {}), points: row.points == null ? null : row.points, images: refs, packageImagePositions: positions, packageSourceTextLength: sourceTextLength, confidence: null as unknown as number, imported: structuredClone(metadata) });
+      ...(answer ? { answer } : {}),
+      ...(typeof sampleText === 'string' && sampleText.trim() ? { sampleAnswer: { text: sampleText.trim(), source: sampleSource || 'paper', judged: sampleJudged, ...(sidecarSample?.evidence ? { evidence: sidecarSample.evidence } : {}), ...(sidecarSample?.stale ? { stale: true } : {}), ...(sidecarSample?.reconfirm ? { reconfirm: true } : {}) } } : {}),
+      ...(Array.isArray(rubricCriteria) && rubricSource ? { rubric: { criteria: rubricCriteria.map((criterion: any) => ({ criterion: String(criterion.criterion || criterion.text || ''), ...((criterion.maxPoints ?? criterion.points) != null && Number.isFinite(Number(criterion.maxPoints ?? criterion.points)) ? { maxPoints: Number(criterion.maxPoints ?? criterion.points) } : {}) })), source: rubricSource, judged: rubricJudged, ...(sidecarRubric?.evidence ? { evidence: sidecarRubric.evidence } : {}), ...(sidecarRubric?.stale ? { stale: true } : {}), ...(sidecarRubric?.reconfirm ? { reconfirm: true } : {}) } } : {}),
+      ...(preservedTags.length ? { tags: [...new Set(preservedTags.map(String))] as string[] } : {}),
+      points: row.points == null ? null : row.points, images: refs, packageImagePositions: positions, packageSourceTextLength: sourceTextLength, confidence: null as unknown as number, imported: structuredClone(metadata) });
   }
   // Only an explicit section or an unambiguous range is evidence of ownership.
   const scripts: Array<{ id: string; text: string; first?: number; last?: number }> = [];
@@ -251,6 +315,18 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     if (mapped) q.imported = { ...q.imported, script: mapped.text };
     else if (!scripts.length && directTranscript?.trim()) q.imported = { ...q.imported, transcript: directTranscript };
     packageScriptReceipt.push({ label: q.label, sectionId: mapped?.id || null });
+  }
+  // Teacher-only scripts are restored by full label plus section title. Ambiguous identities are
+  // deliberately left unmapped instead of selecting the last matching row.
+  for (const entry of preservedScripts) {
+    if (typeof entry?.label !== 'string' || typeof entry?.text !== 'string' || !entry.text.trim()) continue;
+    const matches = questions.filter(q => q.label === entry.label && (!entry.sectionTitle || sections.find(section => section.id === q.sectionId)?.title === entry.sectionTitle));
+    if (matches.length !== 1) continue;
+    const q = matches[0];
+    q.imported = { ...(q.imported || {}), script: entry.text.trim(), scriptEvidenceType: 'teacher-only-script', scriptNote: entry.note || 'Script text only; no audio evidence.' };
+    const receipt = packageScriptReceipt.find(item => item.label === q.label);
+    if (receipt) receipt.sectionId = q.sectionId || null;
+    else packageScriptReceipt.push({ label: q.label, sectionId: q.sectionId || null });
   }
   // Filename assignment is explicit evidence; a duplicate asset may have multiple owners.
   for (const file of files) {
@@ -374,5 +450,5 @@ export async function importQuestionPackage(files: PackageFile[]): Promise<ExamD
     rootCauseId: `package_image_token_${hit.questionId}_${hit.sha.slice(0, 12)}`,
   }));
   return { id: `exam_${fileHash.slice(0, 12)}`, fileHash, createdAt: new Date().toISOString(), displayName: title, meta: { title, ...identity, language, direction: batch.direction === 'rtl' || (batch.direction !== 'ltr' && /^(?:fa|ar|ur)(?:-|$)/i.test(language)) ? 'rtl' : 'ltr' }, sections, passages, optionalGroups, questions, images,
-    source: { kind: 'package', ...(parts.length > 1 ? { packageParts: parts } : {}), packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: parts.length > 1 ? `${json.name} (+${parts.length - 1} parts)` : json.name }, flags: tokenFlags, usage: [] };
+    source: { kind: 'package', ...(parts.length ? { packageParts: parts } : {}), ...(multipartStatus ? { packageMultipartStatus: multipartStatus } : {}), packageBatchId: batch.batch_id, packageJsonHash: await sha256(raw), packageDataset: batch.source_dataset, packageIdentity: { grade: originalGrade, subject: originalSubject, title: batch.title }, packageSectionReceipt, packageScriptReceipt, packageStructureReceipt: { labelsPreserved: questions.length, optionalGroups, collisions }, enrichmentStatus: 'not run', lines: [], pages: 1, ocrUsed: false, fileName: parts.length > 1 ? `${json.name} (+${parts.length - 1} parts)` : json.name }, flags: tokenFlags, usage: [] };
 }

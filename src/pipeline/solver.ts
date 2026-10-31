@@ -8,6 +8,8 @@
 import { LLMRequest, Question, UsageRecord } from '../types';
 import { LLMAdapter } from '../providers/adapter';
 import { T6_SOLVER_SYSTEM } from './prompts';
+import { hasSourceKey, migrateLegacyAiAnswers } from '../utils/bankAnswers';
+import type { ExamDoc } from '../types';
 
 export interface SolverResult {
   updatedQuestions: Question[];
@@ -34,15 +36,16 @@ export async function solveQuestionsWithAI(params: {
   providerConfig: any;
   maxOutputTokens?: number;
 }): Promise<SolverResult> {
-  const { questions, questionIdsToSolve, providerConfig, maxOutputTokens } = params;
+  const { questionIdsToSolve, providerConfig, maxOutputTokens } = params;
+  // Old stored AI answers are normalized before target selection, so they cannot masquerade as keys.
+  const normalized = migrateLegacyAiAnswers({ questions: structuredClone(params.questions) } as ExamDoc).questions;
+  const questions = normalized;
 
-  // Filter questions to solve (either specified IDs, or all questions lacking an answer)
-  const targetQuestions = questions.filter(q => {
-    if (questionIdsToSolve && questionIdsToSolve.length > 0) {
-      return questionIdsToSolve.includes(q.id);
-    }
-    return !q.answer || !q.answer.text;
-  });
+  // A source/keyfile/teacher key is not a missing answer. Explicitly targeted re-solves still
+  // produce proposals, but never overwrite that authoritative value.
+  const targetQuestions = questions.filter(q => questionIdsToSolve?.length
+    ? questionIdsToSolve.includes(q.id)
+    : !hasSourceKey(q));
 
   if (targetQuestions.length === 0) {
     return {
@@ -119,9 +122,9 @@ export async function solveQuestionsWithAI(params: {
       solvedCount++;
       return {
         ...q,
-        answer: {
-          text: answerMap.get(q.id)!,
-          source: 'ai' as const,
+        enrichment: {
+          ...(q.enrichment || { source: 'model' as const, verification: 'unjudged' as const }),
+          proposedAnswer: { text: answerMap.get(q.id)!, source: 'model' as const },
         },
       };
     }
@@ -160,7 +163,7 @@ export async function solveSingleQuestionWithAI(params: {
     maxOutputTokens,
   });
 
-  const ans = res.updatedQuestions[0]?.answer?.text || '';
+  const ans = res.updatedQuestions[0]?.enrichment?.proposedAnswer?.text || '';
   return {
     answerText: ans,
     usageRecord: res.usageRecord,

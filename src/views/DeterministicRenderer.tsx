@@ -5,6 +5,7 @@ import { formatSpans } from '../pipeline/spans';
 import { toPersianDigits } from '../utils/numbers';
 import { buildQuestionTree } from '../utils/questionTree';
 import { ExamSheet } from '../design/ExamSheet';
+import { answerKeyDisplayText } from '../utils/bankAnswers';
 
 export type ExamRenderMode = 'paper' | 'answer-key' | 'review';
 interface Props { doc: ExamDoc; mode: ExamRenderMode }
@@ -66,7 +67,7 @@ export const DeterministicRenderer: React.FC<Props> = ({ doc, mode }) => {
       return <React.Fragment key={q.id}>
         <div className={`ep-answer ${depth ? 'ep-nested-question' : ''}`} data-answer-item="true">
           <strong className="ep-mono shrink-0">{depth ? nestedLabel : `${formatNum(q.label || q.no)}.`}</strong>
-          <DirectionalText text={q.answer?.text || 'پاسخ درج نشده'} fallback={fallbackDir} className="ep-answer-text" />
+          <DirectionalText text={answerKeyDisplayText(q) || 'پاسخ درج نشده'} fallback={fallbackDir} className="ep-answer-text" />
         </div>
         {nested.map((child, index) => renderQuestion(child, children, depth + 1, index))}
       </React.Fragment>;

@@ -7,7 +7,8 @@ import { getReviewImageBlob, getSourceFile } from '../store';
 import { applyExamMutation } from '../pipeline/patch';
 import { decontaminateStem } from '../pipeline/assemble';
 import { stripImagePlaceholderTokens } from '../pipeline/imagePlaceholders';
-import { confirmTashrihi } from '../pipeline/packageTashrihi';
+import { confirmTashrihi, validateRubric } from '../pipeline/packageTashrihi';
+import { hasSourceKey, executableAnswerText, migrateLegacyAiAnswers } from '../utils/bankAnswers';
 import { evidenceFingerprint } from '../pipeline/evidence';
 import { hasTeacherRubric } from '../utils/explanationVisibility';
 import { revertTextRepairOverlays } from '../pipeline/textRepair';
@@ -77,6 +78,8 @@ const TashrihiProposalCard: React.FC<{ question: Question; onConfirm: (sample?: 
     </span>
   );
   const total = criteria.reduce((sum, row) => sum + (Number(row.maxPoints) || 0), 0);
+  const hasPrintedPoints = typeof question.points === 'number' && Number.isFinite(question.points) && question.points > 0;
+  const rubricValid = hasPrintedPoints && validateRubric(criteria, question.points).ok;
   return (
     <div data-tashrihi-proposal={question.id} className="rounded-[10px] border border-[var(--warn)] bg-[var(--warn-soft)] p-2.5 text-[length:var(--type-12)] space-y-1.5">
       <div className="font-semibold text-[var(--warn-ink)]">
@@ -104,8 +107,8 @@ const TashrihiProposalCard: React.FC<{ question: Question; onConfirm: (sample?: 
                   ? <input value={row.criterion} aria-label={`Criterion ${index + 1}`} onChange={event => setCriteria(current => current.map((item, i) => i === index ? { ...item, criterion: event.target.value } : item))} className="flex-1 min-w-0 p-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)]" />
                   : <span className="flex-1 min-w-0 text-[var(--ink)]">{row.criterion}</span>}
                 {editing
-                  ? <input type="number" step="0.25" min="0" value={row.maxPoints} aria-label={`Criterion ${index + 1} points`} onChange={event => setCriteria(current => current.map((item, i) => i === index ? { ...item, maxPoints: Number(event.target.value) } : item))} className="w-16 p-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-mono" />
-                  : <span className="font-mono text-[var(--ok)]">{row.maxPoints}</span>}
+                  ? <input type="number" step="0.0001" min="0" value={row.maxPoints ?? ''} aria-label={`Criterion ${index + 1} points`} onChange={event => setCriteria(current => current.map((item, i) => i === index ? { ...item, maxPoints: Number(event.target.value) } : item))} className="w-16 p-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-mono" />
+                  : <span className="font-mono text-[var(--ok)]">{row.maxPoints ?? 'unpriced'}</span>}
                 {editing && <button type="button" aria-label={`Remove criterion ${index + 1}`} onClick={() => setCriteria(current => current.filter((_, i) => i !== index))} className="px-1 text-[var(--danger)]">×</button>}
               </li>
             ))}
@@ -113,13 +116,17 @@ const TashrihiProposalCard: React.FC<{ question: Question; onConfirm: (sample?: 
           {editing && criteria.length < 4 && <button type="button" onClick={() => setCriteria(current => [...current, { criterion: '', maxPoints: 0 }])} className="text-[var(--accent-ink)] hover:underline">+ Add criterion</button>}
         </div>
       )}
+      {editing && criteria.length > 0 && (!hasPrintedPoints || !validateRubric(criteria, question.points).ok) && (
+        <div role="alert" className="text-[var(--danger)] text-xs">{!hasPrintedPoints ? 'No printed points are available; rubric criteria remain unpriced and cannot be confirmed as scored.' : validateRubric(criteria, question.points).reason}</div>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <button type="button" onClick={() => setEditing(value => !value)} className="px-2 py-1 rounded-[6px] border border-[var(--rule)] bg-[var(--paper)] font-semibold cursor-pointer">{editing ? 'Keep edits' : 'Edit'}</button>
         <button
           type="button"
           data-confirm-tashrihi={question.id}
-          onClick={() => onConfirm(sampleText.trim() || question.sampleAnswer?.text || undefined, criteria.filter(row => row.criterion.trim() && Number(row.maxPoints) > 0))}
-          className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer"
+          onClick={() => onConfirm(sampleText.trim() || question.sampleAnswer?.text || undefined, criteria.length && rubricValid ? criteria : undefined)}
+          disabled={criteria.length > 0 && !rubricValid}
+          className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Confirm as teacher-confirmed
         </button>
@@ -190,6 +197,15 @@ export const Step4ReviewContent: React.FC<Props> = ({
   initialExpandedSectionIds,
   initialFilterType,
 }) => {
+  const needsLegacyAnswerMigration = examDoc.questions.some(question => question.answer?.source === 'ai');
+  if (needsLegacyAnswerMigration) examDoc = migrateLegacyAiAnswers(structuredClone(examDoc));
+  const migrationSaved = useRef(false);
+  useEffect(() => {
+    if (!needsLegacyAnswerMigration || migrationSaved.current) return;
+    migrationSaved.current = true;
+    onUpdateDoc(examDoc);
+    void saveExamDoc(examDoc);
+  }, [needsLegacyAnswerMigration]);
   const [bankExportOpen, setBankExportOpen] = useState(false);
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
   const [patchModalQuestion, setPatchModalQuestion] = useState<Question | null>(null);
@@ -401,22 +417,41 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
   // Update a question in examDoc
   const handleUpdateQuestion = (qId: string, updates: Partial<Question>) => {
-    const contentChanged = ['stem', 'options', 'answer', 'images', 'type'].some(key => Object.prototype.hasOwnProperty.call(updates, key));
+    const contentChanged = ['stem', 'options', 'answer', 'images', 'type', 'points', 'passageId', 'instructionGroups'].some(key => Object.prototype.hasOwnProperty.call(updates, key));
     const updatedQuestions = examDoc.questions.map(q => {
       if (q.id !== qId) return q;
       const updated = { ...q, ...updates };
       if (q.imported && q.enrichment && contentChanged) updated.enrichment = {
-        source: 'model',
+        ...q.enrichment,
         verification: 'unjudged',
+        evidence: undefined,
         ...(q.enrichment.teacherLesson ? { teacherLesson: q.enrichment.teacherLesson } : {}),
-        // #57 Part B — the proposal survives as review provenance; a teacher's adopted key marks it.
-        ...(q.enrichment.proposedAnswer ? { proposedAnswer: { ...q.enrichment.proposedAnswer, ...(updates.answer?.text?.trim() ? { adopted: true } : {}) } } : {}),
+        // Editing a draft is not adoption. Only the explicit Save as key button commits it.
+        ...(q.enrichment.proposedAnswer ? { proposedAnswer: q.enrichment.proposedAnswer } : {}),
       };
+      if (contentChanged) {
+        if (q.sampleAnswer?.source === 'teacher') updated.sampleAnswer = { ...q.sampleAnswer, stale: true, reconfirm: true };
+        if (q.rubric?.source === 'teacher') updated.rubric = { ...q.rubric, stale: true, reconfirm: true };
+      }
       return updated;
     });
     const newDoc = { ...examDoc, questions: updatedQuestions, flags: contentChanged ? examDoc.flags.filter(f => !(f.questionId === qId && f.code === 'PACKAGE_ENRICHMENT')) : examDoc.flags };
     onUpdateDoc(newDoc);
     saveExamDoc(newDoc);
+  };
+
+  const handleSaveProposalAsKey = (qId: string, text: string) => {
+    const current = examDoc.questions.find(question => question.id === qId);
+    if (!current || !text.trim()) return;
+    const updatedQuestions = examDoc.questions.map(question => question.id !== qId ? question : ({
+      ...question,
+      answer: { text: text.trim(), source: 'manual' as const },
+      enrichment: { ...(question.enrichment || { source: 'model' as const, verification: 'unjudged' as const }), verification: 'unjudged' as const, evidence: undefined,
+        ...(question.enrichment?.proposedAnswer ? { proposedAnswer: { ...question.enrichment.proposedAnswer, adopted: true } } : {}) },
+    }));
+    const next = { ...examDoc, questions: updatedQuestions };
+    onUpdateDoc(next);
+    void saveExamDoc(next);
   };
 
   // #57 Part A — teacher confirmation is the ONLY promotion: provenance flips to 'teacher'
@@ -524,7 +559,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
 
   // Solve all questions missing an answer in 1 batched call
   const handleSolveAllMissing = async () => {
-    const targets = examDoc.questions.filter(q => !q.answer || !q.answer.text);
+    const targets = examDoc.questions.filter(q => !hasSourceKey(q));
     if (!(await checkSolverBudget(targets))) return;
     setIsSolvingBatch(true);
     const standardRole = settings.roleMapping.standard;
@@ -595,15 +630,12 @@ export const Step4ReviewContent: React.FC<Props> = ({
       res.usageRecord.costUsd = costUsd;
       appendUsageRecord(res.usageRecord);
 
-      const updatedQ: Question = {
-        ...q,
-        answer: {
-          text: res.answerText,
-          source: 'ai' as const,
+      handleUpdateQuestion(q.id, {
+        enrichment: {
+          ...(q.enrichment || { source: 'model', verification: 'unjudged' }),
+          proposedAnswer: { text: res.answerText, source: 'model' },
         },
-      };
-
-      handleUpdateQuestion(q.id, updatedQ);
+      });
     } catch (err: any) {
       setSolverError(`Failed to solve question: ${err?.message || 'The provider request could not be completed.'}`);
     } finally {
@@ -678,7 +710,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
         <div className="flex items-center gap-2 text-xs">
           {/* Solve Missing with AI Button */}
           {(() => {
-            const missingCount = examDoc.questions.filter(q => !q.answer?.text).length;
+            const missingCount = examDoc.questions.filter(q => !hasSourceKey(q)).length;
             return (
               <button
                 disabled={isSolvingBatch || missingCount === 0}
@@ -1450,7 +1482,7 @@ export const Step4ReviewContent: React.FC<Props> = ({
                                         type="button"
                                         data-adopt-save={q.id}
                                         onClick={() => {
-                                          handleUpdateQuestion(q.id, { answer: { text: adoptProposal.text, source: 'manual' } });
+                                          handleSaveProposalAsKey(q.id, adoptProposal.text);
                                           setAdoptProposal(null);
                                         }}
                                         className="px-2 py-1 rounded-[6px] bg-[var(--accent)] text-[var(--on-accent)] font-semibold cursor-pointer"

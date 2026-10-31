@@ -9,7 +9,7 @@ import { exportIdentity } from '../pipeline/identity';
 import { curriculumLessons, hintsForLesson, emptyCurriculumHints } from '../pipeline/curriculumHints';
 import { AUTO_GRADED_TYPES, DESCRIPTIVE_TYPES, planBankAnswer, typeSuggestion } from './bankAnswers';
 import { CONTRACT_REQUESTS, applyAnswerPlan, applyDescriptiveArtifacts, descriptiveArtifacts, emptyContractReport, preservedAnswer, type PreservedAnswer } from './bankContract';
-import { artifactState, evidenceFingerprint, explanationState, rubricFingerprint } from '../pipeline/evidence';
+import { artifactState, explanationState, rubricFingerprint, sampleFingerprint } from '../pipeline/evidence';
 
 /**
  * Appendix A / native question-bank export.
@@ -36,6 +36,7 @@ export interface BankExportReport {
   untagged: number; tagged: number; asset_count: number; total_bytes: number;
   images_placed: number; image_references: number;
   missing_assets: Array<{ question: string; image: string }>;
+  unresolved_placeholders: Array<{ question: string; image: string; sha: string | null; owner: string; reason: string }>;
   image_options: string[]; notes: string[];
   package_section_receipt?: ExamDoc['source']['packageSectionReceipt'];
   enrichment_notes?: string[];
@@ -58,7 +59,7 @@ export interface BankQuestion {
   enrichment?: Question['enrichment'];
   /** #58 — descriptive artifacts with honest provenance; source samples are non-executing. */
   sample_answer?: { text: string; source: string; provenance?: string; judged?: string };
-  rubric?: { criteria: Array<{ criterion: string; maxPoints: number }>; sourceProvenance?: string };
+  rubric?: { criteria: Array<{ criterion: string; maxPoints?: number }>; sourceProvenance?: string };
   label?: string; optional_group_id?: string; optional_branch?: string;
   explanation: { text: string; source: 'model' } | null; points: number | null; grade: string; subject: string;
   curriculum_hints: { chapter: string | null; lesson: string | null; topic: string | null };
@@ -119,19 +120,19 @@ function firstNumber(...values: unknown[]): number | undefined {
  */
 export function compactBankSourceRef(doc: ExamDoc, q: Question, teacherRef?: string): string {
   const explicitTeacher = teacherRef?.trim();
+  const imported = (q.imported || {}) as Record<string, unknown>;
+  const importedProvenance = (imported.provenance || {}) as Record<string, unknown>;
+  const suppliedRef = explicitTeacher || (typeof importedProvenance.source_ref === 'string' ? importedProvenance.source_ref.trim() : '');
   const file = explicitTeacher || (doc.source.fileName || doc.displayName || 'exam').replace(/\.[^./\\]+$/, '');
   const lineNos = (q.spans || []).map(span => { const value = Array.isArray(span) ? span[0] : span.line; return typeof value === 'number' ? value : NaN; }).filter(Number.isFinite);
   const linePage = lineNos.map(n => doc.source.lines?.[n - 1]?.page).filter(page => Number.isFinite(page))[0];
-  const imported = (q.imported || {}) as Record<string, unknown>;
-  const importedProvenance = (imported.provenance || {}) as Record<string, unknown>;
   // Only a page the source actually supplied counts. A package image defaults to page 1 and a
   // section index is not the paper's group number, so neither is used to invent one.
-  const page = firstNumber(linePage, imported.page, imported.source_page, imported.sourcePage, imported.printed_page, importedProvenance.page);
-  const importedGroup = firstNumber(imported.group, imported.group_no, imported.groupNo, imported.group_number, imported.section_number, imported.sectionNumber);
-  const sectionTitle = doc.sections?.find(section => section.id === q.sectionId)?.title || '';
-  const titleGroup = firstNumber(/(?:\bgroup|\bsection|گروه|پارت)\s*(\d+)/i.exec(sectionTitle)?.[1]);
-  const group = importedGroup ?? titleGroup;
-  const total = group !== undefined ? Math.max(doc.sections?.length || 1, 1) : undefined;
+  const referencePage = /\bpage\s*(\d+)\b/i.exec(suppliedRef)?.[1];
+  const referenceGroup = /\b(?:source\s+)?group\s*(\d+)\b/i.exec(suppliedRef)?.[1];
+  const page = firstNumber(linePage, imported.page, imported.source_page, imported.sourcePage, imported.printed_page, importedProvenance.page, referencePage);
+  const group = firstNumber(imported.group, imported.group_no, imported.groupNo, imported.group_number, imported.section_number, imported.sectionNumber, referenceGroup);
+  const total = firstNumber(imported.group_total, imported.groupTotal, imported.total_groups, imported.totalGroups, importedProvenance.group_total);
   const tail = [
     page !== undefined ? ` · p.${page}` : '',
     ` · item ${q.label || q.no}`,
@@ -206,7 +207,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   const questions = bankQuestions(doc);
   const report: BankExportReport = {
     questions: questions.length, exported: 0, needs_answer_key: [], untagged: 0, tagged: 0, asset_count: 0, total_bytes: 0,
-    images_placed: 0, image_references: 0, missing_assets: [], image_options: [], notes: [],
+    images_placed: 0, image_references: 0, missing_assets: [], unresolved_placeholders: [], image_options: [], notes: [],
     contract, artifacts: { verified: 0, teacher: 0, pending: 0, stale: 0 }, stale_verdicts: [],
     preserved_answers: 'preserved/answers.json',
   };
@@ -241,7 +242,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     if (!typeMap[q.type]) report.notes.push(`${label}: ${q.type} exported as short_answer.`);
     const passage = doc.source.kind === 'package' ? doc.passages?.find(p => p.id === q.passageId)?.text : undefined;
     // Inline base64 pictures become real asset references; no data URI ever survives into a value.
-    const rawStem = stripImagePlaceholderTokens([passage, bankStem(doc, q).trim()].filter(Boolean).join('\n\n')).replace(/[ \t]{2,}/g, ' ').trim();
+    const rawStem = stripImagePlaceholderTokens([passage, bankStem(doc, q).trim()].filter(Boolean).join('\n\n')).replace(/\[\s*\]|\(\s*\)/g, '').replace(/[ \t]{2,}/g, ' ').trim();
     const extracted = extractInlineDataImages(rawStem);
     const stem = extracted.text.replace(/[ \t]{2,}/g, ' ').trim();
     const inlineAssets: Array<{ hash: string; offset: number }> = [];
@@ -311,7 +312,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
       if (artifact.source !== 'model') { report.artifacts.teacher++; continue; }
       if (artifact.current) report.artifacts.verified++;
     }
-    const staleSample = q.sampleAnswer && q.sampleAnswer.source === 'model' && artifactState(doc, q, q.sampleAnswer) !== 'verified';
+    const staleSample = q.sampleAnswer && q.sampleAnswer.source === 'model' && artifactState(doc, q, q.sampleAnswer, sampleFingerprint(doc, q, q.sampleAnswer.text)) !== 'verified';
     const staleRubric = q.rubric && q.rubric.source === 'model' && artifactState(doc, q, q.rubric as { judged?: 'verified'; evidence?: string }, rubricFingerprint(doc, q, q.rubric.criteria)) !== 'verified';
     if (staleSample || staleRubric) {
       report.artifacts.stale++;
@@ -321,6 +322,20 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
     if (q.imported && DESCRIPTIVE_TYPES.has(q.type) && !(q.rubric?.source === 'teacher')) report.artifacts.pending++;
     applyDescriptiveArtifacts(row, q, artifacts, profile, contract);
     preserved.push(preservedAnswer(doc, q, tags));
+    const importedUnresolved = Array.isArray(q.imported?.unresolved_placeholders) ? q.imported.unresolved_placeholders : [];
+    if (importedUnresolved.length) {
+      row.unresolved_placeholders = importedUnresolved.map((item: any) => ({ asset: String(item.asset || ''), sha: typeof item.sha === 'string' ? item.sha : null, reason: String(item.reason || 'pixels unavailable at export time') }));
+      row.missing_assets = row.unresolved_placeholders.map(item => item.asset);
+      report.image_references++;
+
+      for (const item of row.unresolved_placeholders) {
+        const unresolvedRecord = { question: label, image: item.asset, sha: item.sha, owner: String((importedUnresolved.find((value: any) => value.asset === item.asset) as any)?.owner || q.label), reason: item.reason };
+        report.unresolved_placeholders.push(unresolvedRecord);
+        report.missing_assets.push({ question: label, image: item.asset });
+        report.notes.push(`${label}: unresolved image ${item.asset} remains pending in preserved metadata; no pixels were available.`);
+      }
+      preserved[preserved.length - 1] = { ...preserved[preserved.length - 1], unresolved_placeholders: row.unresolved_placeholders } as (typeof preserved)[number];
+    }
 
     // ── stem images: one bundle per question, never a token, never a silent drop ────────────
     const stemImages = (q.images || []).filter(i => i.role === 'stem' || i.role === 'table');
@@ -337,6 +352,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
         missingForQuestion.push(image.imageId);
         unresolvedForQuestion.push({ asset: image.imageId, sha, reason: 'pixels unavailable at export time' });
         report.missing_assets.push({ question: label, image: image.imageId });
+        report.unresolved_placeholders.push({ question: label, image: image.imageId, sha, owner: q.label, reason: 'pixels unavailable at export time' });
         report.notes.push(`${label}: image ${image.imageId} has no available pixels — the reference is retained in metadata (unresolved_placeholders) and reported; nothing is rendered to students.`);
         return undefined;
       }))).filter((block): block is { t: 'img'; asset: string } => Boolean(block));
@@ -353,7 +369,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
           if (position.source === 'inline') blocks.push({ t: 'img', asset: position.hash });
           else {
             const idx = stemImages.findIndex(image => image.imageId === position.imageId);
-            if (idx >= 0) blocks.push(imgBlocks[idx]);
+            if (idx >= 0 && imgBlocks[idx]) blocks.push(imgBlocks[idx]);
           }
           at = Math.min(offset, stem.length);
         }
@@ -402,7 +418,7 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   report.images_placed = assets.size;
   report.total_bytes = [...assets.values()].reduce((sum, asset) => sum + asset.bytes.length, 0);
   if (report.image_references && !report.images_placed) report.notes.push(`${report.image_references} question(s) reference image assets, but no pixels were available — every reference is retained in metadata and reported; nothing is rendered to students.`);
-  if (report.missing_assets.length) contract.pending.push({ question: report.missing_assets.map(entry => entry.question).join(', '), item: 'missing_image', kind: 'missing-asset', reason: 'required picture pixels unavailable; explicit missing marker written', contract_question: CONTRACT_REQUESTS[7] });
+  if (report.missing_assets.length) contract.pending.push({ question: report.missing_assets.map(entry => entry.question).join(', '), item: 'missing_image', kind: 'missing-asset', reason: 'required pixels unavailable; owner, identity, and reason are retained in preserved metadata and the export report', contract_question: CONTRACT_REQUESTS[7] });
   const slug = `${bankSlug(doc.meta.title || doc.displayName)}-batch`;
   const zip = new JSZip(); const folder = zip.folder(slug)!;
   const partCount = Math.ceil(batch.questions.length / 50);
@@ -415,6 +431,12 @@ export async function createQuestionBankExport(doc: ExamDoc, options: BankExport
   }
   folder.file('export-report.json', JSON.stringify(report, null, 2));
   folder.file('preserved/answers.json', JSON.stringify({ format: 'examparse-preserved-answers/1', executable: false, note: 'Lossless answer facts. Nothing in this file is advisory beyond the bank contract; executable fields exist only in batch.json.', questions: preserved }, null, 2));
+  const listeningScripts = questions.flatMap(q => {
+    const text = typeof q.imported?.script === 'string' ? q.imported.script : typeof q.imported?.transcript === 'string' ? q.imported.transcript : '';
+    if (!text.trim()) return [];
+    return [{ label: q.label || String(q.no), sectionTitle: doc.sections.find(section => section.id === q.sectionId)?.title || null, text: text.trim(), evidenceType: 'teacher-only-script', note: 'Script text only; not audio and not independent proof of the original recording.' }];
+  });
+  if (listeningScripts.length) folder.file('preserved/listening-scripts.json', JSON.stringify({ format: 'examparse-teacher-listening-evidence/1', studentFacing: false, scripts: listeningScripts }, null, 2));
   folder.file('contract/requests.json', JSON.stringify({ profile: contract.profile, verified: false, note: contract.note, requests: CONTRACT_REQUESTS, pending: contract.pending }, null, 2));
   folder.file('assets/manifest.json', JSON.stringify({
     format: 'appendix-a-assets/1.1',

@@ -5,13 +5,14 @@ import { importQuestionPackage } from '../src/pipeline/packageImport';
 import { importPackageFolder } from '../src/pipeline/packageBatchImport';
 import { enrichPackage } from '../src/pipeline/packageEnrichment';
 import { generatePackageExplanations } from '../src/pipeline/packageExplanations';
+import { loadImageBundle } from '../src/pipeline/evidenceBundle';
 import { optionalPoints } from '../src/pipeline/optionalGroups';
 import { getExamHealth, validateExamInvariants } from '../src/pipeline/quality';
 import { buildExportDoc } from '../src/utils/examExport';
 import { createQuestionBankExport } from '../src/utils/questionBankExport';
 import { DEFAULT_SETTINGS } from '../src/store';
 
-const settings = {...DEFAULT_SETTINGS, providers:[{id:'read',name:'writer',kind:'openai-compatible' as const,baseURL:'http://localhost:1234',apiKey:''},{id:'d',name:'judge',kind:'openai-compatible' as const,baseURL:'http://localhost:8080',apiKey:'',decideDialect:'thx' as const}],roleMapping:{...DEFAULT_SETTINGS.roleMapping,read:{providerId:'read',model:'writer'},decide:{providerId:'d',model:'judge'}}};
+const settings = {...DEFAULT_SETTINGS, providers:[{id:'read',name:'writer',kind:'openai-compatible' as const,baseURL:'http://localhost:1234',apiKey:''},{id:'d',name:'judge',kind:'openai-compatible' as const,baseURL:'http://localhost:8080',apiKey:'',decideDialect:'thx' as const}],roleMapping:{...DEFAULT_SETTINGS.roleMapping,read:{providerId:'read',model:'writer'},vision:{providerId:'read',model:'writer'},decide:{providerId:'d',model:'judge'}}};
 const row = (label: string, stem: string, extra: any = {}) => ({ type:'multiple_choice',title:`Question ${label}`,stem,options:[{key:'A',text:'yes'},{key:'B',text:'no'}],answer_key:{correct:['A']},points:1,...extra });
 const pack = (id: string, questions: any[]) => file('batch.json',JSON.stringify({batch_id:id,questions}));
 const explanations = async (req: any) => ({rawText:'',json:{corrections:JSON.parse(req.text).questions.map((q:any) => ({questionNumber:q.number,explanation:`Because ${q.label}.`}))}});
@@ -45,20 +46,20 @@ test('#56 alternatives, full labels, totals, and exact image ownership', async()
  const doc=await importQuestionPackage([pack('alternatives',rows),file('question-17C-a.png',png)]);
  assert.equal(doc.questions[0].label,'55A'); assert.equal(doc.questions.find(q=>q.label==='17C-a')?.images.length,1); assert.equal(doc.questions.find(q=>q.label==='17')?.images.length,0);
  assert.equal(doc.optionalGroups?.length,4); assert.equal(doc.optionalGroups?.find(g=>g.memberLabels.includes('55A'))?.rule,'choose-one-branch'); assert.equal(optionalPoints(doc,doc.questions),11); assert.deepEqual(getExamHealth(doc).duplicates,[]); assert.ok(!validateExamInvariants(doc).violations.some(v=>v.code==='I8'));
- const notes=await generatePackageExplanations(doc,settings,{caller:explanations}); assert.match(notes.join(' '),/explanations: 18 of 18/); assert.equal(doc.questions.find(q=>q.label==='55A')?.explanation?.text,'Because 55A.');
+ const notes=await generatePackageExplanations(doc,settings,{caller:explanations,loadBundle:q=>loadImageBundle(doc,q,4,async()=>undefined),writerCanSeeImages:true}); assert.match(notes.join(' '),/explanations: 18 of 18/); assert.equal(doc.questions.find(q=>q.label==='55A')?.explanation?.text,'Because 55A.');
  const exported=buildExportDoc(doc); assert.equal(exported.questions[0].label,'55A'); assert.ok(exported.optionalGroups.length); const bank=await createQuestionBankExport(doc,{sourceDataset:'x'},async()=>new Blob([png])); assert.equal(bank.batch.questions[0].label,'55A'); assert.match(bank.batch.questions[0].title,/55A/);
 });
 
 test('#56 explanation batches salvage partial output and retry missing once', async()=>{
  const doc=await importQuestionPackage([pack('small',Array.from({length:9},(_,i)=>row(String(i+1),'Pick.')))]); const calls:number[]=[];
  const notes=await generatePackageExplanations(doc,settings,{caller:async req=>{ const qs=JSON.parse(req.text).questions; calls.push(qs.length); if(qs.length>1) return {json:null,rawText:`broken {"questionNumber":${qs[0].number},"explanation":"salvaged"} ...`}; return explanations(req); }});
- assert.ok(calls.every(n=>n<=4)); assert.equal(doc.questions.filter(q=>q.explanation).length,9); assert.match(notes.join(' '),/explanations: 9 of 9 keyed questions/); assert.equal(calls.length,9);
+ assert.ok(calls.every(n=>n<=4)); assert.equal(doc.questions.filter(q=>q.explanation).length,9); assert.match(notes.join(' '),/explanations: 9 of 9 keyed questions/); assert.equal(calls.length, 9, 'three initial batches plus one scoped retry for each of six omitted rows');
 });
 
 test('#56 review tags and explanation policy derive from saved enrichment', async()=>{
  const doc=await importQuestionPackage([pack('tags',[row('1','One.',{tags:['existing','manual_review']}),row('2','Two.'),row('3','Three.')])]);
  for(const [i,state] of (['disagreed','uncertain','verified'] as const).entries()){doc.questions[i].enrichment={source:'model',verification:state,explanationCheck:{state:i===0?'rejected':i===1?'uncertain':'verified',probability:i===0?.1:i===1?.5:.9}};doc.questions[i].explanation={source:'model',text:`explanation ${i}`};}
- for(let i=0;i<2;i++){const structured=buildExportDoc(doc);const bank=await createQuestionBankExport(doc,{sourceDataset:'tags'}); assert.ok(structured.questions[0].tags.includes('answer_key_needs_review')); assert.ok(bank.batch.questions[0].tags.includes('answer_key_needs_review')); assert.ok(bank.batch.questions[1].tags.includes('manual_review')); assert.ok(structured.questions[1].tags.includes('manual_review')); assert.equal(structured.questions[1].explanation.text,'explanation 1'); assert.equal(bank.batch.questions[1].explanation,null); assert.equal(bank.batch.questions[2].explanation?.text,'explanation 2'); assert.equal(structured.questions[0].explanation,undefined); assert.ok(!bank.batch.questions[0].tags.includes('explanation_needs_review')); assert.ok(bank.batch.questions[0].tags.includes('existing')); }
+ for(let i=0;i<2;i++){const structured=buildExportDoc(doc);const bank=await createQuestionBankExport(doc,{sourceDataset:'tags'}); assert.ok(structured.questions[0].tags.includes('answer_key_needs_review')); assert.ok(bank.batch.questions[0].tags.includes('answer_key_needs_review')); assert.ok(bank.batch.questions[1].tags.includes('manual_review')); assert.ok(structured.questions[1].tags.includes('manual_review')); assert.equal(structured.questions[1].explanation.text,'explanation 1'); assert.equal(bank.batch.questions[1].explanation,null); assert.equal(bank.batch.questions[2].explanation,null,'legacy model verdict has no fingerprint and is not bank evidence'); assert.equal(structured.questions[0].explanation,undefined); assert.ok(!bank.batch.questions[0].tags.includes('explanation_needs_review')); assert.ok(bank.batch.questions[0].tags.includes('existing')); }
 });
 
 test('#56 range mapping, conflicts and legacy unscoped scripts fail closed', async()=>{

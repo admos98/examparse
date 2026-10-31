@@ -43,6 +43,7 @@ export function IntegrityFlags({
               >
                 {primaryText}
               </button>
+              {(item.reasons?.length || 0) > 1 && <details className="w-full"><summary className="cursor-pointer text-[var(--ink-2)]">{item.reasons!.length} reasons</summary><ul className="ps-4 py-1 space-y-1">{item.reasons!.map((reason, reasonIndex) => <li key={reasonIndex}>{reason}</li>)}</ul></details>}
               {item.secondaryAction && (
                 <button
                   type="button"

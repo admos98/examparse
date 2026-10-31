@@ -131,7 +131,7 @@ test('T4: triage is presentation-only; repair groups have counts and are collaps
   assert.equal(triage.repairs.get('WATERMARK_STRIPPED')?.length, 11);
   assert.equal(triage.technical.length, 1);
   const html = renderToStaticMarkup(React.createElement(IntegrityFlags, { doc: input }));
-  assert.match(html, /2 things need attention/); assert.match(html, /Watermark stripped ×11/);
+  assert.match(html, /1 thing needs attention/); assert.match(html, /Watermark stripped ×11/);
   assert.match(html, /<details><summary[^>]*>WHAT THE APP ALREADY FIXED/);
   assert.match(html, /<details><summary[^>]*>TECHNICAL LOG/);
   assert.doesNotMatch(html, /<details open|Integrity Flags \(14\)/);

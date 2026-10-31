@@ -44,16 +44,8 @@ export class LLMAdapter {
       const data: LLMResponse = await response.json();
       return data;
     } catch (err: any) {
-      // If error might be due to too many images on an OpenAI compatible endpoint, attempt bisection
-      if (
-        request.images &&
-        request.images.length > 2 &&
-        request.providerConfig?.kind === 'openai-compatible'
-      ) {
-        console.warn('Attempting image batch bisection after a provider request failure; error content was omitted.');
-        return await this.bisectAndExecute(request);
-      }
-
+      // Image bundles are addressed evidence. A failed request is reported as failed; silently
+      // splitting it would change the task, lose cross-image context, and violate endpoint limits.
       throw err;
     }
   }
@@ -107,77 +99,6 @@ export class LLMAdapter {
       opts.onInfo?.('stream-fallback');
       return this.execute(request);
     }
-  }
-
-  /**
-   * Auto-bisect an image batch if provider limits are exceeded
-   */
-  private static async bisectAndExecute(request: LLMRequest): Promise<LLMResponse> {
-    const images = request.images || [];
-    const mid = Math.ceil(images.length / 2);
-    const chunk1 = images.slice(0, mid);
-    const chunk2 = images.slice(mid);
-
-    const chunk1Ids = new Set(chunk1.map(i => i.id));
-    const chunk2Ids = new Set(chunk2.map(i => i.id));
-
-    // Slice manifest/context text in request.text to only the images in that chunk
-    const sliceManifestText = (text: string, allowedIds: Set<string>): string => {
-      if (text.includes('MANIFEST:')) {
-        const parts = text.split('MANIFEST:');
-        const header = parts[0];
-        const rest = parts.slice(1).join('MANIFEST:');
-        const entries = rest.split(/\n---\n|\n=====\n/);
-        const filteredEntries = entries.filter(e => {
-          for (const id of allowedIds) {
-            if (e.includes(`Image ${id}:`) || e.includes(`"${id}"`) || e.includes(id)) {
-              return true;
-            }
-          }
-          return false;
-        });
-        return `${header}MANIFEST:\n${filteredEntries.join('\n---\n')}\n\nReturn JSON: {"items": [...]} for the attached ${allowedIds.size} images.`;
-      }
-      return text;
-    };
-
-    const text1 = sliceManifestText(request.text, chunk1Ids);
-    const text2 = sliceManifestText(request.text, chunk2Ids);
-
-    const [res1, res2] = await Promise.all([
-      this.execute({ ...request, images: chunk1, text: text1 }),
-      this.execute({ ...request, images: chunk2, text: text2 }),
-    ]);
-
-    // Merge array or envelope JSON responses
-    let mergedJson: any = [];
-    if (Array.isArray(res1.json) && Array.isArray(res2.json)) {
-      mergedJson = [...res1.json, ...res2.json];
-    } else if (
-      res1.json &&
-      res2.json &&
-      typeof res1.json === 'object' &&
-      typeof res2.json === 'object' &&
-      (Array.isArray((res1.json as any).items) || Array.isArray((res2.json as any).items))
-    ) {
-      mergedJson = {
-        items: [...((res1.json as any).items || []), ...((res2.json as any).items || [])],
-      };
-    } else if (typeof res1.json === 'object' && typeof res2.json === 'object') {
-      mergedJson = { ...(res1.json as any), ...(res2.json as any) };
-    } else {
-      mergedJson = res1.json;
-    }
-
-    return {
-      json: mergedJson,
-      usage: {
-        inputTokens: res1.usage.inputTokens + res2.usage.inputTokens,
-        outputTokens: res1.usage.outputTokens + res2.usage.outputTokens,
-        cachedTokens: (res1.usage.cachedTokens || 0) + (res2.usage.cachedTokens || 0),
-      },
-      rawText: `${res1.rawText}\n---\n${res2.rawText}`,
-    };
   }
 
   /**

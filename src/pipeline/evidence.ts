@@ -23,7 +23,7 @@ export interface EvidenceParts {
   key: string | null;
   keySource: string | null;
   instructions: string;
-  rubric?: Array<[string, number]>;
+  rubric?: Array<[string, number | null]>;
 }
 
 function fnv64(input: string): string {
@@ -66,7 +66,7 @@ export function evidenceParts(doc: ExamDoc, q: Question, rubric?: RubricCriterio
       || (q.imported?.correctFillBlanks?.length ? JSON.stringify(q.imported.correctFillBlanks) : null),
     keySource: q.answer?.source || (q.imported?.answer_key?.correct?.length || q.imported?.correctFillBlanks?.length ? 'keyfile' : null),
     instructions: instructionTextFor(doc, q),
-    ...(rubric ? { rubric: rubric.map(criterion => [criterion.criterion, criterion.maxPoints] as [string, number]) } : {}),
+    ...(rubric ? { rubric: rubric.map(criterion => [criterion.criterion, criterion.maxPoints ?? null] as [string, number | null]) } : {}),
   };
 }
 
@@ -78,6 +78,15 @@ export function evidenceFingerprint(doc: ExamDoc, q: Question): string {
 /** Fingerprint for a rubric verdict: the rubric rows are part of the artifact being checked. */
 export function rubricFingerprint(doc: ExamDoc, q: Question, criteria: RubricCriterion[]): string {
   return fnv64(JSON.stringify(evidenceParts(doc, q, criteria)));
+}
+
+/** Artifact-specific fingerprints: a verdict binds to both task evidence and the exact text checked. */
+export function sampleFingerprint(doc: ExamDoc, q: Question, text: string): string {
+  return fnv64(JSON.stringify({ evidence: evidenceParts(doc, q), sample: text }));
+}
+
+export function explanationFingerprint(doc: ExamDoc, q: Question, text: string): string {
+  return fnv64(JSON.stringify({ evidence: evidenceParts(doc, q), explanation: text }));
 }
 
 export type VerdictState = 'verified' | 'uncertain' | 'rejected' | 'disagreed' | 'unjudged' | 'stale';
@@ -92,9 +101,9 @@ export type VerdictState = 'verified' | 'uncertain' | 'rejected' | 'disagreed' |
 export function artifactState(doc: ExamDoc, q: Question, artifact: { judged?: 'verified' | 'uncertain' | 'rejected' | 'unjudged'; evidence?: string } | undefined, fingerprint = evidenceFingerprint(doc, q)): VerdictState {
   if (!artifact) return 'unjudged';
   if (artifact.judged === 'unjudged') return 'unjudged';
-  // A document written before #58 carries no fingerprint: its recorded verdict is legacy
-  // history and stays usable, but any artifact that DOES carry a fingerprint must match.
-  if (artifact.evidence === undefined) return artifact.judged || 'unjudged';
+  // An unbound legacy model verdict is history only. It is not evidence that this exact artifact
+  // was checked against the current task.
+  if (artifact.evidence === undefined) return 'stale';
   if (artifact.evidence !== fingerprint) return 'stale';
   return artifact.judged || 'unjudged';
 }
@@ -106,9 +115,7 @@ export function verifiedForExport(doc: ExamDoc, q: Question, artifact: { judged?
 
 /** Enrichment-level checks share the same rule (blind answer, explanation, image placement). */
 export function enrichmentIsCurrent(doc: ExamDoc, q: Question): boolean {
-  // Legacy documents (pre-#58) have no fingerprint; their saved verdicts remain usable. Any
-  // fingerprint that exists must match the current evidence.
-  if (!q.enrichment?.evidence) return true;
+  if (!q.enrichment?.evidence) return q.enrichment?.verification === 'unjudged';
   return q.enrichment.evidence === evidenceFingerprint(doc, q);
 }
 
@@ -120,7 +127,9 @@ export function enrichmentState(doc: ExamDoc, q: Question): VerdictState {
 }
 
 export function explanationState(doc: ExamDoc, q: Question): VerdictState {
-  const stored = q.enrichment?.explanationCheck?.state;
+  const check = q.enrichment?.explanationCheck;
+  const stored = check?.state;
   if (!stored || stored === 'unjudged') return 'unjudged';
-  return enrichmentIsCurrent(doc, q) ? stored : 'stale';
+  if (!q.explanation || !check?.evidence) return 'stale';
+  return check.evidence === explanationFingerprint(doc, q, q.explanation.text) ? stored : 'stale';
 }

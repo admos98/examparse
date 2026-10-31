@@ -4,14 +4,18 @@ import { LLMAdapter } from '../providers/adapter';
 import { localProviderFor } from './localProvider';
 import { canonicalLetter, parseAnswerLetter } from './answerCorrectness';
 import { salvageJsonObjects } from '../utils/jsonRepair';
-import { executableAnswerText } from '../utils/bankAnswers';
+import { executableAnswerText, hasSourceKey, readFillBlankBlanks } from '../utils/bankAnswers';
+import { explanationFingerprint, instructionTextFor } from './evidence';
+import type { ImageBundle } from './evidenceBundle';
 
 export function explanationKey(q: Question): string | undefined {
   if (!['mcq', 'truefalse', 'fillblank', 'short'].includes(q.type)) return undefined;
   if (q.imported?.disputed || q.imported?.answer_key?.disputed || q.imported?.answer_key?.status === 'disputed') return undefined;
   // #58 — a legacy AI value or a proposal is not an executable answer and never anchors a check.
-  const answer = executableAnswerText(q);
-  if (!answer || (q.answer?.source !== 'manual' && q.imported?.answer_key?.correct?.length !== 1)) return undefined;
+  const importedCorrect = q.imported?.answer_key?.correct;
+  const fillblanks = q.type === 'fillblank' ? readFillBlankBlanks(q) : undefined;
+  const answer = executableAnswerText(q) || (Array.isArray(importedCorrect) ? importedCorrect.map(String).join(', ') : fillblanks?.blanks.map(blank => blank.accept.join(' / ')).join(' | '));
+  if (!answer || !hasSourceKey(q)) return undefined;
   if (q.type === 'mcq' || (q.type === 'truefalse' && (q.options || []).length)) {
     const letter = parseAnswerLetter(answer, q);
     if (!(q.options || []).some(o => o.key.trim().toLowerCase() === answer.toLowerCase() || o.text?.trim().toLowerCase() === answer.toLowerCase() || (letter && canonicalLetter(o.key) === letter))) return undefined;
@@ -23,14 +27,16 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
   caller?: (request: LLMRequest) => Promise<Pick<LLMResponse, 'json' | 'rawText'>>;
   onProgress?: (message: string) => void;
   onJournal?: (entry: { label: string; rawText: string; requestText: string }) => Promise<void>;
-  /** #58 Part C — false when the item's picture cannot be shown to the writer (no text-only guess). */
-  canDraft?: (question: Question) => boolean;
+  /** Addressed pixels for the local writer; full visual groups are sent together or not at all. */
+  loadBundle?: (question: Question) => Promise<ImageBundle>;
+  writerCanSeeImages?: boolean;
   /** #58 Part F — live output of the underlying (single) model call, never a duplicate call. */
   onStream?: (text: string) => void;
 } = {}): Promise<string[]> {
-  // A rerun never carries a stale explanation forward if generation is unavailable or fails.
-  for (const q of doc.questions) delete q.explanation;
+  // Existing explanations are durable work. Missing/stale items may be retried, but a failed
+  // provider must never erase a prior draft or a still-current checked explanation.
   const provider = localProviderFor(settings, 'read');
+  const visualProvider = localProviderFor(settings, 'vision');
   if (!provider) return ['Explanation generation not run — no local generative read provider configured.', `explanations: 0 of ${doc.questions.filter(q => explanationKey(q)).length} keyed questions`];
   const decide = settings.roleMapping.decide;
   const decisionProvider = decide && settings.providers.find(p => p.id === decide.providerId);
@@ -41,12 +47,30 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
   let malformed = 0;
   let omittedBatches = 0;
   let failedBatches = 0;
-  const eligible = doc.questions.filter(q => explanationKey(q) && (options.canDraft ? options.canDraft(q) : true));
-  const skippedForPixels = doc.questions.filter(q => explanationKey(q) && options.canDraft && !options.canDraft(q));
+  // Existing prose is durable; the decision stage may recheck it against current evidence, but
+  // only a missing explanation is regenerated here.
+  const eligible = doc.questions.filter(q => explanationKey(q) && !q.explanation);
+  const skippedForPixels: Question[] = [];
   const system = 'Write student-facing explanations in the exam language. For each keyed question, use only the question, passage and options: explain in one or two sentences why the marked answer is correct and, for multiple choice, briefly why it beats the alternatives. Do not use outside facts or invent answers. Return JSON only: {"corrections":[{"questionNumber":"55A","explanation":"..."}]}. Use the exact label supplied as questionNumber. /no_think';
   const run = async (batch: Question[], section: string) => {
-    const text = JSON.stringify({ language: doc.meta.language, section, questions: batch.map(q => ({ number: /^\d+$/.test(q.label) ? q.no : q.label, label: q.label, type: q.type, stem: q.stem, options: q.options?.map(o => ({ key: o.key, text: o.text })), passage: doc.passages?.find(p => p.id === q.passageId)?.text, script: q.imported?.script, answer: explanationKey(q) })) });
-    const request: LLMRequest = { role: 'read', system, text, providerConfig: provider, label: `Package explanations · ${section}`, maxOutputTokens: Math.min(8192, Math.max(512, batch.length * 160)) };
+    const bundles = new Map<string, ImageBundle>();
+    if (options.loadBundle) for (const q of batch.filter(question => question.images.length)) bundles.set(q.id, await options.loadBundle(q));
+    const visual = batch.filter(q => q.images.length > 0);
+    const usable = batch.filter(q => !q.images.length || (options.writerCanSeeImages === true && bundles.get(q.id)?.complete));
+    for (const q of visual.filter(q => !usable.includes(q))) skippedForPixels.push(q);
+    const imagePayloads = usable.flatMap(q => bundles.get(q.id)?.payloads || []);
+    const limit = Math.min(...usable.filter(q => q.images.length).map(q => bundles.get(q.id)?.limit || 4), 4);
+    const tooLarge = imagePayloads.length > limit;
+    const sendQuestions = tooLarge ? usable.filter(q => !q.images.length) : usable;
+    if (tooLarge) skippedForPixels.push(...usable.filter(q => q.images.length));
+    if (!sendQuestions.length) return;
+    const text = JSON.stringify({ language: doc.meta.language, section, questions: sendQuestions.map(q => ({
+      number: /^\d+$/.test(q.label) ? q.no : q.label, label: q.label, type: q.type, stem: q.stem,
+      options: q.options?.map(o => ({ key: o.key, text: o.text })), passage: doc.passages?.find(p => p.id === q.passageId)?.text,
+      script: q.imported?.script || q.imported?.transcript, instructions: instructionTextFor(doc, q), answer: explanationKey(q),
+      images: (q.images || []).map(ref => ref.imageId),
+    })) });
+    const request: LLMRequest = { role: 'read', system, text, providerConfig: imagePayloads.length && !tooLarge ? (visualProvider || provider) : provider, ...(imagePayloads.length && !tooLarge ? { images: imagePayloads } : {}), label: `Package explanations · ${section}`, maxOutputTokens: Math.min(8192, Math.max(512, sendQuestions.length * 160)) };
     options.onProgress?.(`Explain · ${section}`);
     try {
       const response = await (options.caller
@@ -55,21 +79,18 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
       let value: any = response.json;
       if (response.rawText?.trim()) {
         try { value = JSON.parse(response.rawText.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '')); }
-        catch {
-          // #58 — nested-aware salvage, never a guessed/ truncated explanation.
-          value = { corrections: salvageJsonObjects(response.rawText) }; malformed++;
-        }
+        catch { value = { corrections: salvageJsonObjects(response.rawText) }; malformed++; }
       }
       const rows = Array.isArray(value?.corrections) ? value.corrections : [];
       const seen = new Set<string>();
       for (const row of rows) {
         const label = String(row?.questionNumber ?? row?.label ?? '');
         if (typeof row?.explanation !== 'string' || !row.explanation.trim() || seen.has(label)) continue;
-        const matches = batch.filter(q => q.label === label);
+        const matches = sendQuestions.filter(q => q.label === label);
         if (matches.length !== 1) continue;
         seen.add(label); matches[0].explanation = { text: row.explanation.trim(), source: 'model' };
       }
-      if (seen.size < batch.length) omittedBatches++;
+      if (seen.size < sendQuestions.length) omittedBatches++;
       try { await options.onJournal?.({ label: request.label, rawText: response.rawText || JSON.stringify(value), requestText: JSON.stringify({ system, text }) }); } catch { /* best effort */ }
     } catch { failedBatches++; }
   };
@@ -85,7 +106,13 @@ export async function generatePackageExplanations(doc: ExamDoc, settings: AppSet
     for (let i = 0; i < questions.length; i += 4) {
       const batch = questions.slice(i, i + 4);
       await run(batch, section);
-      for (const q of batch.filter(q => !q.explanation)) await run([q], section);
+      const retry = batch.filter(q => !q.explanation);
+      // Nonvisual omissions get a precisely scoped one-item retry. Visual omissions stay together
+      // so the addressed pixels are never split into smaller calls.
+      const visualRetry = retry.filter(q => q.images.length > 0);
+      const textRetry = retry.filter(q => q.images.length === 0);
+      if (visualRetry.length) await run(visualRetry, section);
+      for (const q of textRetry) await run([q], section);
     }
   }
   const made = eligible.filter(q => q.explanation).length;

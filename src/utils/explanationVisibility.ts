@@ -1,6 +1,6 @@
 import type { ExamDoc, Question } from '../types';
 import { AUTO_GRADED_TYPES, DESCRIPTIVE_TYPES, hasSourceKey } from './bankAnswers';
-import { artifactState, evidenceFingerprint, rubricFingerprint } from '../pipeline/evidence';
+import { artifactState, evidenceFingerprint, rubricFingerprint, sampleFingerprint } from '../pipeline/evidence';
 
 /**
  * #58 — keyless auto-graded items never silently keep their key: they carry
@@ -16,8 +16,9 @@ export function needsAnswerKeyReview(q: Question): boolean {
 
 /** A rubric is satisfied only by a teacher-confirmed rubric with valid positive criteria. */
 export function hasTeacherRubric(q: Question): boolean {
-  return Boolean(q.rubric && q.rubric.source === 'teacher' && q.rubric.criteria.length >= 2
-    && q.rubric.criteria.every(criterion => Number.isFinite(criterion.maxPoints) && criterion.maxPoints > 0));
+  return Boolean(q.rubric && q.rubric.source === 'teacher' && !q.rubric.stale && !q.rubric.reconfirm && typeof q.points === 'number' && Number.isFinite(q.points) && q.points > 0 && q.rubric.criteria.length >= 2
+    && q.rubric.criteria.every(criterion => typeof criterion.maxPoints === 'number' && Number.isFinite(criterion.maxPoints) && criterion.maxPoints > 0)
+    && Math.abs(q.rubric.criteria.reduce((sum, criterion) => sum + (criterion.maxPoints ?? 0), 0) - q.points) < 1e-9);
 }
 
 /** Imported descriptive item still awaiting a rubric the teacher can stand behind. */
@@ -43,7 +44,8 @@ export function reviewTags(q: Question, doc?: Pick<ExamDoc, 'loop'>): string[] {
     // Legacy AI Solve values are proposals, never keys.
     ...(q.answer?.source === 'ai' && AUTO_GRADED_TYPES.has(q.type) ? ['answer_key_needs_review'] : []),
   ];
-  return [...new Set([...activeInherited, ...(q.tags || []), ...derived])];
+  const activeQuestionTags = (q.tags || []).filter(tag => !(tag === 'needs_rubric' && hasTeacherRubric(q)) && !(tag === 'answer_key_needs_review' && !needsAnswerKeyReview(q)));
+  return [...new Set([...activeInherited, ...activeQuestionTags, ...derived])];
 }
 
 /** Keep rejected prose in the local record for diagnosis, but never in user exports. */
@@ -68,7 +70,7 @@ export function exportSafeQuestion(q: Question, doc?: ExamDoc): Question {
   if (q.rubric?.judged === 'rejected') delete safe.rubric;
   // #58 — a verdict whose evidence changed is exported as stale (history), never as verified.
   if (doc) {
-    if (safe.sampleAnswer && safe.sampleAnswer.source === 'model' && artifactState(doc, q, q.sampleAnswer) === 'stale') safe.sampleAnswer = { ...safe.sampleAnswer, stale: true };
+    if (safe.sampleAnswer && safe.sampleAnswer.source === 'model' && artifactState(doc, q, safe.sampleAnswer, sampleFingerprint(doc, q, safe.sampleAnswer.text)) === 'stale') safe.sampleAnswer = { ...safe.sampleAnswer, stale: true };
     if (safe.rubric && safe.rubric.source === 'model' && artifactState(doc, q, q.rubric as { judged?: 'verified'; evidence?: string }, rubricFingerprint(doc, q, q.rubric!.criteria)) === 'stale') safe.rubric = { ...safe.rubric, stale: true };
     if (safe.enrichment && q.enrichment?.evidence && q.enrichment.evidence !== evidenceFingerprint(doc, q)) safe.enrichment = { ...safe.enrichment, verification: 'unjudged' };
     // Teacher work is preserved, never deleted — a changed task asks for reconfirmation instead.

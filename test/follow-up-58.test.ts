@@ -32,7 +32,7 @@ const settings: AppSettings = {
     { id: 'read', name: 'writer', kind: 'openai-compatible', baseURL: 'http://localhost:1234', apiKey: '' },
     { id: 'd', name: 'judge', kind: 'openai-compatible', baseURL: 'http://localhost:8080', apiKey: '', decideDialect: 'thx' },
   ],
-  roleMapping: { ...DEFAULT_SETTINGS.roleMapping, read: { providerId: 'read', model: 'writer' }, decide: { providerId: 'd', model: 'judge' } },
+  roleMapping: { ...DEFAULT_SETTINGS.roleMapping, read: { providerId: 'read', model: 'writer' }, vision: { providerId: 'read', model: 'writer' }, decide: { providerId: 'd', model: 'judge' } },
 };
 const f = (path: string, data: string | Uint8Array) => { const base = file(path.split('/').pop()!, data); return { ...base, webkitRelativePath: path }; };
 const label = (row: { label?: string }) => row.label;
@@ -76,7 +76,7 @@ test('#58A source answers keep their type: option key, text blanks (with alterna
   assert.equal(doc.questions.length, 8);
   const structured = buildExportDoc(doc);
   assert.equal(structured.questions[2].answer.text, 'she had the money');
-  assert.equal(structured.questions[4].answer.text, 'She had the money.');
+  assert.equal(structured.questions[4].sampleAnswer.text, 'She had the money.');
   assert.equal(structured.questions[3].imported.correctFillBlanks[0][0], 'century');
 
   const plans = doc.questions.map(question => planBankAnswer(question));
@@ -176,14 +176,14 @@ test('#58A proposals (checker, legacy AI Solve, optionless candidate) never popu
   const legacy = await importRows('legacy', list);
   legacy.questions[0].answer = { text: 'B', source: 'ai' } as Question['answer'];
   migrateLegacyAiAnswers(legacy);
-  assert.equal(legacy.questions[0].answer?.text, 'B', 'the user’s work is not deleted');
+  assert.equal(legacy.questions[0].answer, undefined, 'legacy AI is not executable when no source key can be recovered');
   assert.equal(legacy.questions[0].enrichment?.proposedAnswer?.text, 'B');
   assert.equal(hasSourceKey(legacy.questions[0]), false);
   assert.ok(reviewTags(legacy.questions[0]).includes('answer_key_needs_review'));
   const legacyBank = await createQuestionBankExport(legacy, { sourceDataset: 'legacy' });
   assert.equal(legacyBank.batch.questions[0].answer_key, undefined);
   const legacyStructured = buildExportDoc(legacy);
-  assert.equal(legacyStructured.questions[0].answer.nonExecuting, true);
+  assert.equal(legacyStructured.questions[0].answer, undefined);
 
   // An explicit teacher save is the only thing that becomes executable.
   legacy.questions[0].answer = { text: 'B', source: 'manual' };
@@ -203,11 +203,11 @@ test('#58B rubric arithmetic preserves a representable distribution and never in
   assert.equal(rubricCriteria([{ criterion: 'a', maxPoints: 0 }, { criterion: 'b', maxPoints: 0 }, { criterion: 'c', maxPoints: 0 }], 1), undefined);
   assert.equal(rubricCriteria([{ criterion: 'a', maxPoints: -1 }, { criterion: 'b', maxPoints: 2 }], 1), undefined);
   assert.deepEqual(rubricCriteria([{ criterion: 'a', maxPoints: 0 }, { criterion: 'b', maxPoints: 0 }], 2)!.map(criterion => criterion.maxPoints), [1, 1], 'omitted weights with a printed total get an exact split');
-  assert.equal(rubricCriteria([{ criterion: 'a', maxPoints: 0 }, { criterion: 'b', maxPoints: 0 }], null), undefined, 'no printed points → unpriced rubric, never invented weights');
+  assert.deepEqual(rubricCriteria([{ criterion: 'a', maxPoints: 3 }, { criterion: 'b', maxPoints: 1 }], null), [{ criterion: 'a' }, { criterion: 'b' }], 'no printed points → retain text only, never model-invented weights');
   assert.equal(rubricCriteria([{ criterion: 'a', maxPoints: 1 }, { criterion: 'b', maxPoints: 0 }], 2), undefined, 'mixed positive/zero is malformed');
   assert.deepEqual(rubricCriteria([{ criterion: 'a', maxPoints: 2 }, { criterion: 'b', maxPoints: 2 }], 3)!.map(criterion => criterion.maxPoints), [1.5, 1.5], 'a mismatched but representable total gets an exact split, never quarters');
   const unpriced = rubricCriteria([{ criterion: 'a', maxPoints: 2 }, { criterion: 'b', maxPoints: 1 }], null)!;
-  assert.deepEqual(unpriced.map(criterion => criterion.maxPoints), [2, 1]);
+  assert.deepEqual(unpriced.map(criterion => criterion.maxPoints), [undefined, undefined]);
 });
 
 test('#58B nested truncated output is salvaged; each missing part gets one scoped retry', async () => {
@@ -402,11 +402,11 @@ test('#58B an imported artifact of unknown state never becomes verified', async 
   doc.questions[0].sampleAnswer = { text: 'Unknown provenance sample.', source: 'model', judged: 'verified' } as any;
   doc.questions[0].rubric = { criteria: [{ criterion: 'A', maxPoints: 1 }, { criterion: 'B', maxPoints: 1 }], source: 'model', judged: 'verified' } as any;
   const bank = await createQuestionBankExport(doc, { sourceDataset: 'unknown' });
-  assert.equal(bank.batch.questions[0].sample_answer?.text, 'Unknown provenance sample.', 'legacy verified state is honoured');
+  assert.equal(bank.batch.questions[0].sample_answer, undefined, 'an unbound legacy verified state is retained only for review, not exported as verified');
   const changed = structuredClone(doc);
   changed.questions[0].points = 5;
   const staleBank = await createQuestionBankExport(changed, { sourceDataset: 'unknown' });
-  assert.equal(staleBank.batch.questions[0].sample_answer?.text, 'Unknown provenance sample.', 'no fingerprint ⇒ legacy state, not silently dropped');
+  assert.equal(staleBank.batch.questions[0].sample_answer, undefined, 'no fingerprint is not proof of a current check');
   // ...but once a fingerprint exists and the evidence changes, the verdict is not reused.
   doc.questions[0].sampleAnswer!.evidence = 'fingerprint-of-another-version';
   const mismatched = await createQuestionBankExport(doc, { sourceDataset: 'unknown' });
@@ -507,17 +507,16 @@ test('#58D an unresolved placeholder stays in metadata and the report, never as 
   const doc = await importRows('unresolved', [
     { type: 'short_answer', title: 'Question 1', label: '1', stem: 'Look at the picture and describe it. [img_aaaaaaaaaaaaaaaa]', points: 2, grade: '12', subject: 'English' },
   ]);
-  doc.images = [{ id: 'img_aaaaaaaaaaaaaaaa', page: 2, bbox: { x: 0, y: 0, w: 1, h: 1 }, mime: 'image/png', sha: 'f'.repeat(64), width: 1, height: 1, blobKey: 'missing' }];
-  doc.questions[0].images = [{ imageId: 'img_aaaaaaaaaaaaaaaa', role: 'stem' }];
+  // Import receives only an unresolved token: no test-only image object is attached by hand.
   const bank = await createQuestionBankExport(doc, { sourceDataset: 'unresolved' });
   const row = bank.batch.questions[0];
   assert.deepEqual(row.missing_assets, ['img_aaaaaaaaaaaaaaaa']);
-  assert.deepEqual(row.unresolved_placeholders, [{ asset: 'img_aaaaaaaaaaaaaaaa', sha: 'f'.repeat(64), reason: 'pixels unavailable at export time' }]);
-  const studentText = JSON.stringify(row.stem_blocks);
+  assert.deepEqual(row.unresolved_placeholders, [{ asset: 'img_aaaaaaaaaaaaaaaa', sha: 'aaaaaaaaaaaaaaaa', reason: 'pixels unavailable in package' }]);
+  const studentText = row.stem || (row.stem_blocks || []).filter(block => block.t === 'text').map(block => (block as any).v).join(' ');
   assert.doesNotMatch(studentText, /missing:/, 'no missing-marker token travels in student content');
   assert.doesNotMatch(studentText, /img_aaaaaaaaaaaaaaaa/, 'the token is never rendered (it lives in metadata only)');
   assert.doesNotMatch(studentText, /\[\s*\]/, 'removing a placeholder leaves no empty brackets');
-  assert.equal(row.stem_blocks![0].t === 'text' && row.stem_blocks![0].v, 'Look at the picture and describe it.');
+  assert.equal(studentText, 'Look at the picture and describe it.');
   assert.ok(JSON.stringify(row.unresolved_placeholders).includes('img_aaaaaaaaaaaaaaaa'), 'the reference itself is retained');
   const zip = await JSZip.loadAsync(bank.zip);
   const root = bank.filename.replace(/\.zip$/, '');
@@ -577,7 +576,7 @@ test('#58E provenance, page/group and labels are preserved — never inferred or
   const bank = await createQuestionBankExport(doc, { sourceDataset: 'provenance' });
   const row = bank.batch.questions[0];
   assert.equal(row.provenance.source_type, 'claimed');
-  assert.equal(row.provenance.source_ref, `batch · p.6 · item 53 · group 14 (1)`);
+  assert.equal(row.provenance.source_ref, `batch · p.6 · item 53 · group 14`);
   assert.equal(bank.batch.questions[1].label, '17C-a');
   // Unknown page/group are omitted rather than invented.
   const unknown: ExamDoc = { ...doc, source: { ...doc.source, fileName: '' }, questions: [{ ...doc.questions[1], imported: {} }] };

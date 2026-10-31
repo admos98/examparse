@@ -18,7 +18,7 @@
  */
 import type { ExamDoc, Question } from '../types';
 import { planBankAnswer, type BankAnswerPlan, type BlankAnswer, type AnswerProvenance } from './bankAnswers';
-import { artifactState, evidenceFingerprint, rubricFingerprint } from '../pipeline/evidence';
+import { artifactState, rubricFingerprint, sampleFingerprint } from '../pipeline/evidence';
 
 export type BankContractProfile = 'appendix-a-1.1' | 'bank-v2-provisional';
 
@@ -62,16 +62,20 @@ export interface BankRowLike {
   answer_key?: { correct: string[]; grading: 'auto' } | null;
   correctFillBlanks?: Array<string | string[]>;
   sample_answer?: { text: string; source: string; provenance?: string; judged?: string };
-  rubric?: { criteria: Array<{ criterion: string; maxPoints: number }>; sourceProvenance?: string };
+  rubric?: { criteria: Array<{ criterion: string; maxPoints?: number }>; sourceProvenance?: string };
   tags?: string[];
 }
 
 export interface DescriptiveArtifact {
   text?: string;
-  criteria?: Array<{ criterion: string; maxPoints: number }>;
+  criteria?: Array<{ criterion: string; maxPoints?: number }>;
   source: 'model' | 'teacher' | 'paper' | 'keyfile' | 'manual';
   judged?: 'verified' | 'uncertain' | 'rejected' | 'unjudged';
   current: boolean;
+  evidence?: string;
+  stale?: boolean;
+  reconfirm?: boolean;
+  priced?: boolean;
 }
 
 /** Provenance label a destination can trust: source artifacts are never labelled "model". */
@@ -87,19 +91,19 @@ export function artifactProvenance(artifact: { source: string }): string {
  */
 export function descriptiveArtifacts(doc: ExamDoc, q: Question): DescriptiveArtifact[] {
   const out: DescriptiveArtifact[] = [];
-  const fingerprint = evidenceFingerprint(doc, q);
   if (q.sampleAnswer) {
-    const state = artifactState(doc, q, q.sampleAnswer, fingerprint);
+    const state = artifactState(doc, q, q.sampleAnswer, sampleFingerprint(doc, q, q.sampleAnswer.text));
     const teacher = q.sampleAnswer.source !== 'model';
     if (teacher || state === 'verified') {
-      out.push({ text: q.sampleAnswer.text, source: q.sampleAnswer.source as DescriptiveArtifact['source'], judged: q.sampleAnswer.judged, current: teacher ? true : state === 'verified' });
+      out.push({ text: q.sampleAnswer.text, source: q.sampleAnswer.source as DescriptiveArtifact['source'], judged: q.sampleAnswer.judged, current: teacher ? !(q.sampleAnswer.stale || q.sampleAnswer.reconfirm) : state === 'verified', evidence: q.sampleAnswer.evidence, stale: q.sampleAnswer.stale, reconfirm: q.sampleAnswer.reconfirm });
     }
   }
   if (q.rubric) {
     const state = artifactState(doc, q, q.rubric as { judged?: 'verified'; evidence?: string }, rubricFingerprint(doc, q, q.rubric.criteria));
     const teacher = q.rubric.source !== 'model';
-    if (teacher || state === 'verified') {
-      out.push({ criteria: q.rubric.criteria.map(c => ({ criterion: c.criterion, maxPoints: c.maxPoints })), source: q.rubric.source as DescriptiveArtifact['source'], judged: q.rubric.judged, current: teacher ? true : state === 'verified' });
+    const priced = typeof q.points === 'number' && Number.isFinite(q.points) && q.points > 0 && q.rubric.criteria.every(c => typeof c.maxPoints === 'number' && Number.isFinite(c.maxPoints) && c.maxPoints > 0) && Math.abs(q.rubric.criteria.reduce((sum, c) => sum + (c.maxPoints || 0), 0) - q.points) < 1e-9;
+    if (teacher || state === 'verified' || !priced) {
+      out.push({ criteria: q.rubric.criteria.map(c => ({ criterion: c.criterion, ...(typeof c.maxPoints === 'number' ? { maxPoints: c.maxPoints } : {}) })), source: q.rubric.source as DescriptiveArtifact['source'], judged: priced ? q.rubric.judged : 'unjudged', current: priced && (teacher ? !(q.rubric.stale || q.rubric.reconfirm) : state === 'verified'), evidence: q.rubric.evidence, stale: q.rubric.stale, reconfirm: q.rubric.reconfirm, priced });
     }
   }
   // A source-provided manual answer on a descriptive item is the item's honest sample answer.
@@ -112,7 +116,7 @@ export function descriptiveArtifacts(doc: ExamDoc, q: Question): DescriptiveArti
 
 /** Whether the item still needs a (teacher-confirmed) rubric. A sample alone never satisfies it. */
 export function rubricRequirementMet(q: Question): boolean {
-  return Boolean(q.rubric && q.rubric.source === 'teacher' && q.rubric.criteria.length >= 2 && q.rubric.criteria.every(c => Number.isFinite(c.maxPoints) && c.maxPoints > 0));
+  return Boolean(q.rubric && q.rubric.source === 'teacher' && !q.rubric.stale && !q.rubric.reconfirm && typeof q.points === 'number' && Number.isFinite(q.points) && q.points > 0 && q.rubric.criteria.length >= 2 && q.rubric.criteria.every(c => typeof c.maxPoints === 'number' && Number.isFinite(c.maxPoints) && c.maxPoints > 0) && Math.abs(q.rubric.criteria.reduce((sum, c) => sum + (c.maxPoints || 0), 0) - q.points) < 1e-9);
 }
 
 /** Lossless sidecar entry: everything ExamParse knows about one answer, regardless of contract. */
@@ -121,6 +125,8 @@ export interface PreservedAnswer {
   type: string;
   kind: BankAnswerPlan['kind'];
   answer: unknown;
+  teacher_answer?: { text: string; source: 'manual' };
+  source_history?: { answer_key?: unknown; correctFillBlanks?: unknown; correct_fill_blanks?: unknown; answer?: unknown };
   provenance: AnswerProvenance | null;
   executable: boolean;
   pending_reason?: string;
@@ -128,6 +134,9 @@ export interface PreservedAnswer {
   descriptive?: DescriptiveArtifact[];
   needs_rubric: boolean;
   review_tags: string[];
+  unresolved_placeholders?: Array<{ asset: string; sha: string | null; reason: string }>;
+  sample_confirmation?: unknown;
+  rubric_confirmation?: unknown;
 }
 
 export function preservedAnswer(doc: ExamDoc, q: Question, tags: string[]): PreservedAnswer {
@@ -143,11 +152,19 @@ export function preservedAnswer(doc: ExamDoc, q: Question, tags: string[]): Pres
       : plan.kind === 'true-false' ? { value: plan.value }
       : plan.kind === 'descriptive' ? { text: plan.text }
       : null,
+    ...(q.answer?.source === 'manual' && q.answer.text?.trim() ? { teacher_answer: { text: q.answer.text.trim(), source: 'manual' as const } } : {}),
+    ...(q.imported ? { source_history: q.imported.source_history || {
+      ...(q.imported.answer_key !== undefined ? { answer_key: q.imported.answer_key } : {}),
+      ...(q.imported.correctFillBlanks !== undefined ? { correctFillBlanks: q.imported.correctFillBlanks } : {}),
+      ...(q.imported.correct_fill_blanks !== undefined ? { correct_fill_blanks: q.imported.correct_fill_blanks } : {}),
+      ...(q.imported.answer !== undefined ? { answer: q.imported.answer } : {}),
+    } } : {}),
     provenance: 'source' in plan ? (plan.source as AnswerProvenance) : null,
     executable: plan.kind === 'option-key' || plan.kind === 'true-false' || plan.kind === 'text-blanks',
     ...(plan.kind === 'keyless' ? { pending_reason: plan.reason } : {}),
     ...(plan.kind === 'keyless' && plan.proposal ? { proposal: plan.proposal } : {}),
     ...(descriptive.length ? { descriptive } : {}),
+    ...(Array.isArray(q.imported?.unresolved_placeholders) ? { unresolved_placeholders: q.imported.unresolved_placeholders } : {}),
     needs_rubric: Boolean(q.imported) && !rubricRequirementMet(q) && ['short', 'long', 'essay'].includes(q.type),
     review_tags: tags,
   };
@@ -215,7 +232,8 @@ export function applyDescriptiveArtifacts(row: BankRowLike, q: Question, artifac
     }
   }
   if (rubric) {
-    if (profile === 'appendix-a-1.1') pending(report, q, 'rubric', rubric.source, 'rubric preserved in preserved/answers.json; Question.rubrics input shape unconfirmed', 3);
+    if (!rubric.priced) pending(report, q, 'rubric', rubric.source, 'criterion text is retained as unpriced/pending because no valid printed-point distribution is available', 3);
+    else if (profile === 'appendix-a-1.1') pending(report, q, 'rubric', rubric.source, 'rubric preserved in preserved/answers.json; Question.rubrics input shape unconfirmed', 3);
     else {
       row.rubric = { criteria: rubric.criteria!.map(criterion => ({ criterion: criterion.criterion, maxPoints: criterion.maxPoints })), sourceProvenance: rubric.source };
       pending(report, q, 'rubric', rubric.source, 'rubric emitted as Question.rubrics/criteria; confirm criterion precision and points validation', 3);

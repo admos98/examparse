@@ -47,6 +47,8 @@ export interface AttentionItem {
   /** Number of underlying rows folded into this item (1 for a single row). */
   count: number;
   severity: 'warn' | 'error';
+  /** All actionable reasons folded into a single question-level card. */
+  reasons?: string[];
 }
 
 const hasChildren = (doc: Pick<ExamDoc, 'questions'>, question: Question): boolean =>
@@ -192,10 +194,27 @@ function groupedByNeed(items: AttentionItem[]): AttentionItem[] {
     const index = KIND_PRIORITY.indexOf(item.kind);
     return index < 0 ? KIND_PRIORITY.length : index;
   };
-  return items
-    .map((item, order) => ({ item, order }))
+  const sorted = items.map((item, order) => ({ item, order }))
     .sort((a, b) => priority(a.item) - priority(b.item) || a.order - b.order)
     .map(({ item }) => item);
+  const result: AttentionItem[] = [];
+  const byQuestion = new Map<string, number>();
+  for (const item of sorted) {
+    const key = item.questionIds.length === 1 ? item.questionIds[0] : undefined;
+    const existingIndex = key ? byQuestion.get(key) : undefined;
+    if (existingIndex === undefined) {
+      const copy = { ...item, reasons: [item.plainSentence] };
+      if (key) byQuestion.set(key, result.length);
+      result.push(copy);
+      continue;
+    }
+    const current = result[existingIndex];
+    current.reasons = [...(current.reasons || [current.plainSentence]), item.plainSentence];
+    current.questionIds = [...new Set([...current.questionIds, ...item.questionIds])];
+    current.imageIds = [...new Set([...current.imageIds, ...item.imageIds])];
+    current.severity = current.severity === 'error' || item.severity === 'error' ? 'error' : 'warn';
+  }
+  return result;
 }
 
 export function computeAttention(doc: ExamDoc): AttentionItem[] {
